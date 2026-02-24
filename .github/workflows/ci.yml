@@ -14,10 +14,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Zig (master)
-        uses: mlugg/setup-zig@v1
-        with:
-          version: master
-          use-cache: false
+        run: |
+          ZIG_URL=$(curl -s https://ziglang.org/download/index.json \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['master']['x86_64-linux']['tarball'])")
+          mkdir -p /opt/zig
+          curl -L "$ZIG_URL" | tar -xJ -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> $GITHUB_PATH
 
       - name: Run tests
         run: zig build test --summary all
