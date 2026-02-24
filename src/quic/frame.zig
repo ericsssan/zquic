@@ -98,6 +98,14 @@ pub const NewConnectionIdFrame = struct {
     stateless_reset_token: [16]u8,
 };
 
+pub const PathChallengeFrame = struct {
+    data: [8]u8,
+};
+
+pub const PathResponseFrame = struct {
+    data: [8]u8,
+};
+
 // ---------------------------------------------------------------------------
 // Tagged union
 // ---------------------------------------------------------------------------
@@ -118,6 +126,8 @@ pub const Frame = union(enum) {
     handshake_done,
     new_connection_id: NewConnectionIdFrame,
     retire_connection_id: u62,
+    path_challenge: PathChallengeFrame,
+    path_response: PathResponseFrame,
     data_blocked: u62,
     stream_data_blocked: struct { stream_id: u62, max: u62 },
 };
@@ -293,6 +303,76 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
                 .consumed = pos,
             };
         },
+        0x04 => {
+            const sid = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += sid.len;
+            const ec = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += ec.len;
+            const fs = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += fs.len;
+            return .{
+                .frame = .{ .reset_stream = .{
+                    .stream_id  = sid.value,
+                    .error_code = ec.value,
+                    .final_size = fs.value,
+                } },
+                .consumed = pos,
+            };
+        },
+        0x05 => {
+            const sid = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += sid.len;
+            const ec = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += ec.len;
+            return .{
+                .frame = .{ .stop_sending = .{
+                    .stream_id  = sid.value,
+                    .error_code = ec.value,
+                } },
+                .consumed = pos,
+            };
+        },
+        0x18 => {
+            const seq = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += seq.len;
+            const rpt = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += rpt.len;
+            if (pos >= buf.len) return error.InvalidFrame;
+            const cid_len = buf[pos];
+            pos += 1;
+            if (pos + cid_len + 16 > buf.len) return error.BufferTooShort;
+            var f = NewConnectionIdFrame{
+                .sequence_number      = seq.value,
+                .retire_prior_to      = rpt.value,
+                .cid                  = undefined,
+                .cid_len              = cid_len,
+                .stateless_reset_token = undefined,
+            };
+            @memcpy(f.cid[0..cid_len], buf[pos..][0..cid_len]);
+            pos += cid_len;
+            @memcpy(&f.stateless_reset_token, buf[pos..][0..16]);
+            pos += 16;
+            return .{ .frame = .{ .new_connection_id = f }, .consumed = pos };
+        },
+        0x19 => {
+            const seq = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += seq.len;
+            return .{ .frame = .{ .retire_connection_id = seq.value }, .consumed = pos };
+        },
+        0x1a => {
+            if (pos + 8 > buf.len) return error.BufferTooShort;
+            var f = PathChallengeFrame{ .data = undefined };
+            @memcpy(&f.data, buf[pos..][0..8]);
+            pos += 8;
+            return .{ .frame = .{ .path_challenge = f }, .consumed = pos };
+        },
+        0x1b => {
+            if (pos + 8 > buf.len) return error.BufferTooShort;
+            var f = PathResponseFrame{ .data = undefined };
+            @memcpy(&f.data, buf[pos..][0..8]);
+            pos += 8;
+            return .{ .frame = .{ .path_response = f }, .consumed = pos };
+        },
         0x1e => return .{ .frame = .handshake_done, .consumed = pos },
         else => return error.UnknownFrame,
     }
@@ -380,7 +460,49 @@ pub fn encodeFrame(buf: []u8, frame: Frame) usize {
                 pos += varint.encode(buf[pos..], f.ecn_ce);
             }
         },
-        else => {}, // encode-on-demand for other frame types
+        .reset_stream => |f| {
+            buf[pos] = 0x04;
+            pos += 1;
+            pos += varint.encode(buf[pos..], f.stream_id);
+            pos += varint.encode(buf[pos..], f.error_code);
+            pos += varint.encode(buf[pos..], f.final_size);
+        },
+        .stop_sending => |f| {
+            buf[pos] = 0x05;
+            pos += 1;
+            pos += varint.encode(buf[pos..], f.stream_id);
+            pos += varint.encode(buf[pos..], f.error_code);
+        },
+        .new_connection_id => |f| {
+            buf[pos] = 0x18;
+            pos += 1;
+            pos += varint.encode(buf[pos..], f.sequence_number);
+            pos += varint.encode(buf[pos..], f.retire_prior_to);
+            buf[pos] = f.cid_len;
+            pos += 1;
+            @memcpy(buf[pos..][0..f.cid_len], f.cid[0..f.cid_len]);
+            pos += f.cid_len;
+            @memcpy(buf[pos..][0..16], &f.stateless_reset_token);
+            pos += 16;
+        },
+        .retire_connection_id => |seq| {
+            buf[pos] = 0x19;
+            pos += 1;
+            pos += varint.encode(buf[pos..], seq);
+        },
+        .path_challenge => |f| {
+            buf[pos] = 0x1a;
+            pos += 1;
+            @memcpy(buf[pos..][0..8], &f.data);
+            pos += 8;
+        },
+        .path_response => |f| {
+            buf[pos] = 0x1b;
+            pos += 1;
+            @memcpy(buf[pos..][0..8], &f.data);
+            pos += 8;
+        },
+        else => {},
     }
 
     return pos;
@@ -474,6 +596,116 @@ test "frame: PING encode/parse" {
     const result = try parseFrame(buf[0..1]);
     switch (result.frame) {
         .ping => {},
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: RESET_STREAM encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [32]u8 = undefined;
+    const f: Frame = .{ .reset_stream = .{ .stream_id = 3, .error_code = 7, .final_size = 1024 } };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .reset_stream => |r| {
+            try testing.expectEqual(@as(u62, 3),    r.stream_id);
+            try testing.expectEqual(@as(u62, 7),    r.error_code);
+            try testing.expectEqual(@as(u62, 1024), r.final_size);
+        },
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: STOP_SENDING encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const f: Frame = .{ .stop_sending = .{ .stream_id = 5, .error_code = 2 } };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .stop_sending => |s| {
+            try testing.expectEqual(@as(u62, 5), s.stream_id);
+            try testing.expectEqual(@as(u62, 2), s.error_code);
+        },
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: NEW_CONNECTION_ID encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    const tok = [_]u8{0xbb} ** 16;
+    var cid_bytes: [20]u8 = undefined;
+    @memset(&cid_bytes, 0xaa);
+    const f: Frame = .{ .new_connection_id = .{
+        .sequence_number      = 2,
+        .retire_prior_to      = 1,
+        .cid                  = cid_bytes,
+        .cid_len              = 8,
+        .stateless_reset_token = tok,
+    } };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .new_connection_id => |nc| {
+            try testing.expectEqual(@as(u62, 2), nc.sequence_number);
+            try testing.expectEqual(@as(u62, 1), nc.retire_prior_to);
+            try testing.expectEqual(@as(u8, 8),  nc.cid_len);
+            try testing.expectEqualSlices(u8, &tok, &nc.stateless_reset_token);
+            try testing.expectEqualSlices(u8, cid_bytes[0..8], nc.cid[0..8]);
+        },
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: RETIRE_CONNECTION_ID encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [8]u8 = undefined;
+    const f: Frame = .{ .retire_connection_id = 42 };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .retire_connection_id => |seq| try testing.expectEqual(@as(u62, 42), seq),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: PATH_CHALLENGE encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const challenge_data = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const f: Frame = .{ .path_challenge = .{ .data = challenge_data } };
+    const n = encodeFrame(&buf, f);
+    try testing.expectEqual(@as(usize, 9), n); // 1 type byte + 8 data bytes
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .path_challenge => |c| try testing.expectEqualSlices(u8, &challenge_data, &c.data),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: PATH_RESPONSE echoes PATH_CHALLENGE data" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const data = [8]u8{ 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04 };
+
+    // Encode a challenge, then encode a response echoing the same data.
+    const challenge: Frame = .{ .path_challenge = .{ .data = data } };
+    const n_c = encodeFrame(&buf, challenge);
+    const parsed_c = try parseFrame(buf[0..n_c]);
+
+    const echo_data = parsed_c.frame.path_challenge.data;
+    const response: Frame = .{ .path_response = .{ .data = echo_data } };
+    var rbuf: [16]u8 = undefined;
+    const n_r = encodeFrame(&rbuf, response);
+    const parsed_r = try parseFrame(rbuf[0..n_r]);
+    switch (parsed_r.frame) {
+        .path_response => |r| try testing.expectEqualSlices(u8, &data, &r.data),
         else => return error.WrongFrameType,
     }
 }

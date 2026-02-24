@@ -258,6 +258,46 @@ pub fn encodeShortHeader(
     return pos;
 }
 
+/// Encode a Version Negotiation packet (RFC 9000 §17.2.1).
+///
+/// `dcid` is echoed from the client's SCID so the client can demultiplex.
+/// `scid` is the server's own connection ID.
+/// The packet advertises QUIC version 1 as the single supported version.
+/// Returns the number of bytes written.
+pub fn encodeVersionNegotiation(
+    buf: []u8,
+    dcid: ConnectionId,
+    scid: ConnectionId,
+) usize {
+    var pos: usize = 0;
+
+    // First byte: long header bit set (0x80), remaining bits arbitrary.
+    buf[pos] = 0x80;
+    pos += 1;
+
+    // Version = 0x00000000  (identifies this as a VN packet).
+    std.mem.writeInt(u32, buf[pos..][0..4], 0, .big);
+    pos += 4;
+
+    // Destination Connection ID (echoed client SCID).
+    buf[pos] = cid.len;
+    pos += 1;
+    @memcpy(buf[pos..][0..cid.len], &dcid.bytes);
+    pos += cid.len;
+
+    // Source Connection ID (our CID).
+    buf[pos] = cid.len;
+    pos += 1;
+    @memcpy(buf[pos..][0..cid.len], &scid.bytes);
+    pos += cid.len;
+
+    // Supported Versions: QUIC version 1.
+    std.mem.writeInt(u32, buf[pos..][0..4], QUIC_VERSION_1, .big);
+    pos += 4;
+
+    return pos;
+}
+
 /// Decode a full packet number from a truncated value per RFC 9000 §A.3.
 pub fn decodePacketNumber(largest_acked: u64, truncated: u32, pn_bits: u8) u64 {
     const expected: u64 = largest_acked + 1;
@@ -327,4 +367,33 @@ test "packet: decodePacketNumber" {
     const truncated: u32 = 0x9b32;
     const decoded = decodePacketNumber(largest, truncated, 16);
     try testing.expectEqual(@as(u64, 0xa82f9b32), decoded);
+}
+
+test "packet: encodeVersionNegotiation structure" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+
+    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
+    const n = encodeVersionNegotiation(&buf, dcid, scid);
+
+    // Exact wire size: 1 + 4 + 1 + 8 + 1 + 8 + 4 = 27 bytes.
+    try testing.expectEqual(@as(usize, 27), n);
+
+    // Long header bit must be set.
+    try testing.expect(buf[0] & 0x80 != 0);
+
+    // Version field must be 0x00000000.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[1..5], .big));
+
+    // DCID length and bytes.
+    try testing.expectEqual(@as(u8, cid.len), buf[5]);
+    try testing.expectEqualSlices(u8, &dcid.bytes, buf[6..14]);
+
+    // SCID length and bytes.
+    try testing.expectEqual(@as(u8, cid.len), buf[14]);
+    try testing.expectEqualSlices(u8, &scid.bytes, buf[15..23]);
+
+    // Supported version: QUIC v1.
+    try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[23..27], .big));
 }

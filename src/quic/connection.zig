@@ -272,6 +272,21 @@ pub const Connection = struct {
     }
 
     fn processLongHeaderPacket(self: *Connection, data: []const u8, io: std.Io) !usize {
+        // RFC 9000 §6: Version negotiation.
+        // Check the version field before full parsing — VN packets (version 0) have
+        // a different wire format that parseLongHeader cannot handle.
+        if (data.len >= 5) {
+            const ver = std.mem.readInt(u32, data[1..5], .big);
+            if (ver != packet.QUIC_VERSION_1) {
+                if (ver != 0) {
+                    // Unknown non-zero version: send a Version Negotiation response.
+                    self.sendVersionNeg(data) catch {};
+                }
+                // Version 0 = received a VN packet from the peer; ignore it.
+                return data.len;
+            }
+        }
+
         const result = try packet.parseLongHeader(data);
         const hdr = result.header;
 
@@ -413,6 +428,11 @@ pub const Connection = struct {
         if (self.tls_state.isComplete()) {
             self.app_keys = self.tls_state.app_keys;
             self.hot.state = .established;
+
+            // Apply negotiated transport parameters.
+            const params = self.tls_state.peerTransportParams();
+            self.conn_flow.updateSendMax(params.initial_max_data);
+
             try self.queueHandshakeDone();
         }
     }
@@ -451,7 +471,7 @@ pub const Connection = struct {
         var pkt: [MAX_PACKET_SIZE]u8 = undefined;
         var fpos: usize = 0;
         const ack_frame_data: frame.Frame = .{ .ack = .{
-            .largest_acked = self.hot.rx_pn[epoch],
+            .largest_acked = @intCast(self.hot.rx_pn[epoch]),
             .ack_delay = 0,
             .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
             .range_count = 1,
@@ -517,6 +537,29 @@ pub const Connection = struct {
         if (hdr_len + ct_out_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ik, pn, out[0..hdr_len], pkt[0..fpos], out[hdr_len..][0..ct_out_len]);
         try self.enqueueSend(out[0 .. hdr_len + ct_out_len]);
+    }
+
+    /// Encode and enqueue a Version Negotiation packet in response to an
+    /// unknown-version long-header packet.  `raw` is the received datagram.
+    fn sendVersionNeg(self: *Connection, raw: []const u8) !void {
+        // Manually read DCID and SCID lengths to extract the client's SCID,
+        // which becomes the DCID of our VN response.
+        if (raw.len < 7) return;
+        var pos: usize = 5; // skip first_byte (1) + version (4)
+        const dcid_len: usize = raw[pos];
+        pos += 1 + dcid_len;
+        if (pos >= raw.len) return;
+        const scid_len: usize = raw[pos];
+        pos += 1;
+        if (pos + scid_len > raw.len) return;
+
+        var src_cid: cid_mod.ConnectionId = .{};
+        const copy_len = @min(scid_len, cid_mod.len);
+        @memcpy(src_cid.bytes[0..copy_len], raw[pos..][0..copy_len]);
+
+        var vn_buf: [32]u8 = undefined;
+        const n = packet.encodeVersionNegotiation(&vn_buf, src_cid, self.local_cid);
+        try self.enqueueSend(vn_buf[0..n]);
     }
 
     fn queueStreamData(self: *Connection, id: u62, data: []const u8, fin: bool) !void {
@@ -597,4 +640,56 @@ test "connection: tick transitions to draining on idle timeout" {
     conn.tick(2000);
     const testing = std.testing;
     try testing.expectEqual(ConnState.draining, conn.hot.state);
+}
+
+test "connection: unknown version triggers VN response" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Build a minimal long-header packet with an unknown version (0x00000002).
+    // Format: first_byte | version(4) | dcid_len | dcid(8) | scid_len | scid(8)
+    var pkt: [32]u8 = undefined;
+    pkt[0] = 0xc0; // long header, Initial type bits
+    std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big); // unknown version
+    pkt[5] = 8; // DCID length
+    @memset(pkt[6..14], 0xaa); // DCID
+    pkt[14] = 8; // SCID length
+    @memset(pkt[15..23], 0xbb); // SCID (becomes DCID in the VN response)
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
+    conn.receive(&pkt, src, 0, io) catch {};
+
+    // A Version Negotiation packet should be queued.
+    var out: [64]u8 = undefined;
+    const n = conn.send(&out);
+    try testing.expect(n > 0);
+
+    // VN packet has version 0x00000000.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, out[1..5], .big));
+
+    // Long header bit must be set.
+    try testing.expect(out[0] & 0x80 != 0);
+}
+
+test "connection: version 0 packet is silently ignored" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Build a minimal long-header packet with version 0 (VN packet from peer).
+    var pkt: [32]u8 = undefined;
+    pkt[0] = 0x80;
+    std.mem.writeInt(u32, pkt[1..5], 0x00000000, .big); // version 0
+    pkt[5] = 8;
+    @memset(pkt[6..14], 0xcc); // DCID
+    pkt[14] = 8;
+    @memset(pkt[15..23], 0xdd); // SCID
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
+    conn.receive(&pkt, src, 0, io) catch {};
+
+    // No packet should be queued (VN response is NOT sent for version-0 packets).
+    var out: [64]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), conn.send(&out));
 }

@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
+const transport_params = @import("transport_params.zig");
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -79,6 +80,7 @@ const ClientHelloData = struct {
     session_id_len: u8,
     client_x25519_pub: [32]u8,
     has_x25519: bool,
+    peer_transport_params: transport_params.TransportParams,
 };
 
 pub const TlsServer = struct {
@@ -113,6 +115,9 @@ pub const TlsServer = struct {
     // Server app secret
     server_app_secret: [32]u8,
 
+    // Negotiated transport parameters received from the peer.
+    peer_params: transport_params.TransportParams,
+
     // CRYPTO data accumulation buffers
     read_buf: [8192]u8,
     read_len: usize,
@@ -136,6 +141,7 @@ pub const TlsServer = struct {
             .server_hs_secret = [_]u8{0} ** 32,
             .client_app_secret = [_]u8{0} ** 32,
             .server_app_secret = [_]u8{0} ** 32,
+            .peer_params = .{},
             .read_buf = undefined,
             .read_len = 0,
         };
@@ -170,6 +176,11 @@ pub const TlsServer = struct {
         return self.app_keys.server;
     }
 
+    /// Returns the transport parameters received from the peer during the handshake.
+    pub fn peerTransportParams(self: *const TlsServer) transport_params.TransportParams {
+        return self.peer_params;
+    }
+
     /// Feed incoming CRYPTO frame bytes into the state machine.
     /// Returns the number of bytes written to `out` (to be sent as CRYPTO frames).
     pub fn processCrypto(self: *TlsServer, data: []const u8, out: []u8, io: std.Io) !usize {
@@ -198,6 +209,9 @@ pub const TlsServer = struct {
 
     fn handleClientHello(self: *TlsServer, ch: ClientHelloData, out: []u8, io: std.Io) !usize {
         if (!ch.has_x25519) return error.NoX25519KeyShare;
+
+        // Store the client's transport parameters.
+        self.peer_params = ch.peer_transport_params;
 
         // Transcript starts with ClientHello message bytes (reconstructed below)
         // For the key schedule we hash what we received.
@@ -231,8 +245,9 @@ pub const TlsServer = struct {
         // In QUIC they travel in Handshake-epoch CRYPTO frames (caller handles encryption).
         const ee_start = pos;
 
-        // EncryptedExtensions (empty)
-        pos += buildEncryptedExtensions(out[pos..]);
+        // EncryptedExtensions (with QUIC transport parameters).
+        // Server advertises default params; the peer's params are in self.peer_params.
+        pos += buildEncryptedExtensions(out[pos..], transport_params.TransportParams{});
 
         // Certificate
         pos += self.buildCertificateMessage(out[pos..]);
@@ -466,11 +481,12 @@ pub const TlsServer = struct {
     ) !usize {
         // Build the signed content per RFC 8446 §4.4.3:
         //   64 spaces + "TLS 1.3, server CertificateVerify" + 0x00 + transcript_hash
-        var to_sign: [64 + 34 + 1 + 32]u8 = undefined;
+        // "TLS 1.3, server CertificateVerify" is 33 bytes (RFC 8446 §4.4.3).
+        var to_sign: [64 + 33 + 1 + 32]u8 = undefined;
         @memset(to_sign[0..64], 0x20);
-        @memcpy(to_sign[64..98], "TLS 1.3, server CertificateVerify");
-        to_sign[98] = 0x00;
-        @memcpy(to_sign[99..131], transcript_hash);
+        @memcpy(to_sign[64..97], "TLS 1.3, server CertificateVerify");
+        to_sign[97] = 0x00;
+        @memcpy(to_sign[98..130], transcript_hash);
 
         const sig = try self.sign_kp.sign(&to_sign, null);
         const sig_bytes = sig.toBytes();
@@ -521,6 +537,7 @@ fn parseClientHello(data: []const u8) !ClientHelloData {
         .session_id_len = 0,
         .client_x25519_pub = [_]u8{0} ** 32,
         .has_x25519 = false,
+        .peer_transport_params = .{},
     };
     pos += 32;
 
@@ -573,6 +590,10 @@ fn parseClientHello(data: []const u8) !ClientHelloData {
                 }
                 ksp += key_len;
             }
+        }
+
+        if (ext_type == EXT_QUIC_TRANSPORT_PARAMS) {
+            ch.peer_transport_params = try transport_params.decode(ext_data);
         }
 
         pos += ext_len;
@@ -709,14 +730,41 @@ fn buildCertificate(pub_key: [32]u8, sig: *const [64]u8, buf: []u8) usize {
 // Frame building helpers
 // ---------------------------------------------------------------------------
 
-fn buildEncryptedExtensions(out: []u8) usize {
-    // EncryptedExtensions with empty extensions list
+fn buildEncryptedExtensions(out: []u8, params: transport_params.TransportParams) usize {
+    var pos: usize = 4; // skip HS header, fill in later
+
+    // Extensions list total length (u16 placeholder).
+    const ext_list_len_pos = pos;
+    pos += 2;
+
+    // Extension type 0x0039 (quic_transport_parameters).
+    std.mem.writeInt(u16, out[pos..][0..2], EXT_QUIC_TRANSPORT_PARAMS, .big);
+    pos += 2;
+
+    // Extension data length (u16 placeholder).
+    const ext_data_len_pos = pos;
+    pos += 2;
+
+    // Encode the transport parameters.
+    const params_start = pos;
+    pos += transport_params.encode(params, out[pos..]);
+    const params_len = pos - params_start;
+
+    // Fill extension data length.
+    std.mem.writeInt(u16, out[ext_data_len_pos..][0..2], @intCast(params_len), .big);
+
+    // Fill extensions list length (type + data_len_field + data).
+    const ext_list_len = pos - ext_list_len_pos - 2;
+    std.mem.writeInt(u16, out[ext_list_len_pos..][0..2], @intCast(ext_list_len), .big);
+
+    // Fill the HS header.
     out[0] = HS_ENCRYPTED_EXTENSIONS;
-    out[1] = 0;
-    out[2] = 0;
-    out[3] = 2; // body length = 2
-    std.mem.writeInt(u16, out[4..][0..2], 0, .big); // empty extensions
-    return 6;
+    const body_len = pos - 4;
+    out[1] = @intCast((body_len >> 16) & 0xff);
+    out[2] = @intCast((body_len >> 8) & 0xff);
+    out[3] = @intCast(body_len & 0xff);
+
+    return pos;
 }
 
 fn buildFinishedMessage(out: []u8, verify_data: *const [32]u8) usize {
@@ -782,13 +830,53 @@ test "tls: TlsServer init generates distinct keys" {
     try testing.expect(true); // init didn't panic
 }
 
-test "tls: EncryptedExtensions builds correctly" {
+test "tls: EncryptedExtensions contains QUIC transport params extension" {
     const testing = std.testing;
-    var buf: [16]u8 = undefined;
-    const n = buildEncryptedExtensions(&buf);
-    try testing.expectEqual(@as(usize, 6), n);
+    var buf: [256]u8 = undefined;
+    const n = buildEncryptedExtensions(&buf, transport_params.TransportParams{});
+
+    // Must be a valid EncryptedExtensions message.
     try testing.expectEqual(@as(u8, HS_ENCRYPTED_EXTENSIONS), buf[0]);
-    try testing.expectEqual(@as(u8, 2), buf[3]); // body length
+    // Body must be non-trivial (has transport params).
+    try testing.expect(n > 6);
+    // Extension type at bytes 6-7 must be 0x0039.
+    try testing.expectEqual(@as(u16, EXT_QUIC_TRANSPORT_PARAMS),
+        std.mem.readInt(u16, buf[6..8], .big));
+}
+
+test "tls: EncryptedExtensions transport params round-trip" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+
+    const sent = transport_params.TransportParams{
+        .initial_max_data           = 4 * 1024 * 1024,
+        .initial_max_streams_bidi   = 50,
+        .disable_active_migration   = true,
+    };
+    const n = buildEncryptedExtensions(&buf, sent);
+
+    // Locate extension data: after HS header (4) + ext_list_len (2) + ext_type (2) + ext_data_len (2).
+    const ext_data_len = std.mem.readInt(u16, buf[8..10], .big);
+    const decoded = try transport_params.decode(buf[10..][0..ext_data_len]);
+
+    try testing.expectEqual(sent.initial_max_data,         decoded.initial_max_data);
+    try testing.expectEqual(sent.initial_max_streams_bidi, decoded.initial_max_streams_bidi);
+    try testing.expect(decoded.disable_active_migration);
+    _ = n;
+}
+
+test "tls: peer transport params default when no extension" {
+    // When the ClientHello doesn't include a 0x0039 extension, peer_params
+    // should be the default TransportParams{}.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var server = try TlsServer.init(io);
+
+    // Verify initial state is defaults.
+    const params = server.peerTransportParams();
+    const defaults = transport_params.TransportParams{};
+    try testing.expectEqual(defaults.initial_max_data, params.initial_max_data);
+    try testing.expect(params.stateless_reset_token == null);
 }
 
 test "tls: Finished message builds correctly" {

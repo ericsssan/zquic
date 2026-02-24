@@ -34,6 +34,7 @@ pub fn build(b: *std.Build) void {
         "src/quic/stream.zig",
         "src/quic/flow_control.zig",
         "src/quic/congestion/cubic.zig",
+        "src/quic/transport_params.zig",
         "src/quic/tls.zig",
         "src/quic/connection.zig",
     };
