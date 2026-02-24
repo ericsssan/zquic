@@ -1,7 +1,6 @@
 # zquic — Design Document
 
-> A native Zig QUIC/HTTP3 implementation. Zero dependencies. Single binary.
-> Research-driven. Built for ultra-low-latency.
+> A native Zig QUIC implementation. Zero dependencies. Single binary.
 
 ---
 
@@ -22,13 +21,13 @@ Precedents show this is possible:
 The pattern: pick one specific thing existing tools handle poorly, go deep on
 it, make it undeniably better.
 
-Our target: **the highest possible HTTP/3 RPS per CPU cycle, on commodity
+Our target: **the highest possible QUIC RPS per CPU cycle, on commodity
 hardware, as a single static binary.**
 
 
 ---
 
-## 2. Why HTTP/3 Only
+## 2. Why QUIC over UDP
 
 ### The TCP PPS problem
 
@@ -69,11 +68,11 @@ With 4 cores + io_uring: **~12–20M effective PPS ceiling**, vs kernel TCP's
 hard ~6M ceiling — roughly a **2–3× advantage** from the optimization headroom
 UDP enables, not from raw kernel UDP speed.
 
-### HTTP/3 + io_uring eliminates the kernel bottleneck
+### QUIC + io_uring eliminates the kernel bottleneck
 
-HTTP/3 runs over QUIC which runs over UDP. QUIC reimplements reliability,
-ordering, flow control, and congestion control — but in userspace, where we
-control the implementation and can optimize for our specific workload.
+QUIC runs over UDP and reimplements reliability, ordering, flow control, and
+congestion control in userspace, where we control the implementation and can
+optimize for our specific workload.
 
 Kernel UDP alone costs similar cycles to kernel TCP (~2,000 cycles/packet
 inferred from Cloudflare's 1.4M PPS at 100% CPU). The gain comes from
@@ -108,20 +107,13 @@ QUIC's advantages appear where TCP's kernel stack is the constraint:
 zquic targets the high-RPS, small-request use case (APIs, KV lookups, microservices)
 — where these QUIC characteristics are advantages, not the large-file transfer case.
 
-### Additional HTTP/3 advantages
+### QUIC advantages over TCP
 
 - **0-RTT**: Repeat clients send data in the first packet. No handshake cost.
 - **Multiplexing**: Multiple streams per connection, no head-of-line blocking.
 - **Built-in TLS 1.3**: Mandatory. Packet crypto via AES-128-GCM + AES-NI — ~3–5 GB/s per core.
 - **Connection migration**: Clients can switch networks without reconnecting.
 - **No TCP baggage**: No Nagle algorithm, no TIME_WAIT, no SYN flooding.
-
-### Compatibility
-
-HTTP/3 is supported by Chrome, Firefox, Safari, curl, AWS ALB, Cloudflare,
-nginx, Caddy, HAProxy. For internal infrastructure (microservices), HTTP/3-only
-is viable today. For public-facing services, TCP fallback would be needed — but
-that is a later concern.
 
 ---
 
@@ -145,23 +137,23 @@ verified or challenged.
 #### Wire cost model
 
 ```
-Minimum QUIC/HTTP3 round-trip:
+Minimum QUIC round-trip:
 
   Request:
     QUIC short header (1-RTT):   ~28 bytes
-    HTTP/3 HEADERS (QPACK):      ~20 bytes
+    QUIC STREAM frame overhead:  ~10 bytes
     UDP + IP + Ethernet:          46 bytes
     ──────────────────────────────────────
-                                  ~94 bytes
+                                  ~84 bytes
 
   Response:
     QUIC short header:           ~28 bytes
-    HTTP/3 HEADERS + DATA:       ~24 bytes
+    QUIC STREAM frame overhead:  ~10 bytes
     UDP + IP + Ethernet:          46 bytes
     ──────────────────────────────────────
-                                  ~98 bytes
+                                  ~84 bytes
 
-  Round-trip total:              ~192 bytes
+  Round-trip total:              ~168 bytes
 ```
 
 #### NIC ceiling formula
@@ -169,10 +161,10 @@ Minimum QUIC/HTTP3 round-trip:
 ```
 NIC ceiling (RPS) = NIC bandwidth (bytes/sec) / round-trip bytes
 
-  1 Gbps  = 125,000,000 / 192  =   ~651K RPS
-  10 Gbps = 1,250,000,000 / 192 =  ~6.5M RPS
-  25 Gbps = 3,125,000,000 / 192 =  ~16M  RPS
-  100 Gbps= 12,500,000,000 / 192 = ~65M  RPS
+  1 Gbps  = 125,000,000 / 168  =   ~744K RPS
+  10 Gbps = 1,250,000,000 / 168 =  ~7.4M RPS
+  25 Gbps = 3,125,000,000 / 168 =  ~18.6M RPS
+  100 Gbps= 12,500,000,000 / 168 = ~74M  RPS
 ```
 
 #### CPU ceiling formula
@@ -182,18 +174,16 @@ Hot path cycles per request (estimated):
   UDP receive (io_uring, amortized):    ~50 cycles
   QUIC packet decode:                  ~100 cycles
   TLS decrypt (AES-NI):                 ~80 cycles
-  HTTP/3 frame parse:                   ~50 cycles
-  Route lookup (comptime hash):         ~20 cycles
-  Handler (in-memory KV):               ~30 cycles
-  HTTP/3 frame encode:                  ~50 cycles
+  QUIC frame parse:                     ~50 cycles
+  QUIC frame encode:                    ~50 cycles
   TLS encrypt (AES-NI):                 ~80 cycles
   UDP send (io_uring, amortized):       ~50 cycles
   ──────────────────────────────────────────────────
-  Total:                               ~510 cycles
+  Total:                               ~460 cycles
 
 CPU ceiling = (clock_hz × cores) / cycles_per_request
-  4-core  @ 3 GHz: (3B × 4)  / 510 = ~23.5M RPS
-  16-core @ 3 GHz: (3B × 16) / 510 = ~94M   RPS
+  4-core  @ 3 GHz: (3B × 4)  / 460 = ~26M RPS
+  16-core @ 3 GHz: (3B × 16) / 460 = ~104M RPS
 ```
 
 #### PPS ceiling formula
@@ -209,10 +199,10 @@ io_uring SQPOLL + GSO (16 packets/call): ~8–10M effective PPS per core
 ```
 NIC     NIC ceiling  CPU (4c)  CPU (16c)  Min cores   Binding (≥ min cores)
 ──────────────────────────────────────────────────────────────────────────
-1G      ~651K        ~23.5M    ~94M       1            NIC
-10G     ~6.5M        ~23.5M    ~94M       3            NIC
-25G     ~16M         ~23.5M    ~94M       6            NIC
-100G    ~65M         ~23.5M    ~94M       16           NIC (with 16+ cores)
+1G      ~744K        ~26M      ~104M      1            NIC
+10G     ~7.4M        ~26M      ~104M      3            NIC
+25G     ~18.6M       ~26M      ~104M      6            NIC
+100G    ~74M         ~26M      ~104M      16           NIC (with 16+ cores)
 ```
 
 At 100G with 4 cores: CPU (~23.5M) is binding, NIC not reached.
@@ -229,7 +219,7 @@ Crypto load at 100G:
   Cores needed for crypto: ~3–5 cores
 
 Processing load at 100G for ~65M RPS:
-  65M × 510 cycles = 33.15B cycles/sec
+  74M × 460 cycles = 34.04B cycles/sec
   At 3 GHz: ~11 cores needed
 
 Total: ~16 cores to approach 100G NIC ceiling
@@ -259,10 +249,9 @@ same design scales to bare metal without changes.
 
 ## 4. The Real Problems (NIC Is Not The Only One)
 
-ngtcp2 achieves 9.97 Gbit/s on a 10G NIC — 99.7% utilization. It is already
-at the NIC ceiling. You cannot exceed a hardware ceiling.
+Saturating a 10G NIC — 99.7% utilization — is achievable. You cannot exceed a hardware ceiling.
 
-**This does not mean the problem is solved.**
+**Hitting the NIC ceiling is not the end goal.**
 
 The NIC ceiling being the constraint only means the transport layer bottleneck
 has been addressed. It says nothing about everything above it. The unsolved
@@ -273,7 +262,7 @@ problems are:
 Two servers, both saturating a 10G NIC at 6M RPS:
 
 ```
-Server A (ngtcp2 + nginx):  6M RPS,  95% CPU  →  5% left for app logic
+Server A (poorly optimized): 6M RPS,  95% CPU  →  5% left for app logic
 Server B (zquic):           6M RPS,  40% CPU  → 60% left for app logic
 ```
 
@@ -329,157 +318,41 @@ zquic: connection state structs designed to be cache-line efficient,
 hot fields packed together, cold fields separated.
 ```
 
-### 5. The application layer is the actual product
-
-Nobody deploys a raw QUIC transport server. They deploy an application on top
-of it. The NIC ceiling is table stakes. The unsolved problems live above it:
-
-```
-NIC + transport    → solved (ngtcp2, quiche are good here)
-───────────────────────────────────────────────────────────
-Router             → comptime routing, zero dispatch overhead
-Middleware         → zero-cost abstractions
-Serialization      → zero-copy, schema-driven (not JSON)
-Data access        → co-located KV, no network round-trip
-Backpressure       → explicit, predictable
-Memory             → no GC, no surprise allocations
-Deployment         → single binary, zero runtime dependencies
-```
-
 ### Summary: what zquic targets
 
 ```
 NIC saturation:   same ceiling as existing libraries
 CPU efficiency:   comptime dispatch, zero-alloc hot path, thread-per-core
 Tail latency:     pool allocator, CPU pinning, cache-line layout
-App layer:        integrated router, handler ABI, middleware
 Deployment:       single static binary, zero runtime dependencies
 ```
 
 ---
 
-## 5. QUIC Library Research
-
-Notable implementations:
-
-| Library   | Lang  | HTTP/3       | TLS backend       | I/O model         | CC algorithms              | Notes                        |
-|-----------|-------|--------------|-------------------|-------------------|----------------------------|------------------------------|
-| ngtcp2    | C     | + nghttp3    | pluggable (6+)    | caller-owned      | CUBIC, Reno                | curl's primary               |
-| lsquic    | C+ASM | built-in     | BoringSSL         | caller-owned      | CUBIC, BBR                 | LiteSpeed; GQUIC + IETF QUIC |
-| mvfst     | C++   | + Proxygen   | Fizz (OpenSSL)    | folly EventBase   | CUBIC, BBR, BBR2, Copa, RL | Meta; >75% of Meta traffic   |
-| quicly    | C     | via H2O      | Picotls           | caller-owned      | not documented             | H2O server; latency-focused  |
-| msquic    | C     | no           | OpenSSL           | caller-owned      | CUBIC, BBR                 | Windows/.NET primary         |
-| quiche    | Rust  | built-in     | BoringSSL         | sans-io           | CUBIC, BBR                 | Cloudflare edge              |
-| picoquic  | C     | minimal      | Picotls           | caller-owned      | CUBIC, BBR                 | Research-focused             |
-| quinn     | Rust  | + h3 crate   | rustls            | sans-io           | CUBIC                      | Pure Rust                    |
-| s2n-quic  | Rust  | no           | s2n-tls           | caller-owned      | CUBIC, BBR                 | AWS; formally verified parts |
-
-### mvfst (Meta)
-
-mvfst ("move fast") is Meta's production QUIC implementation, open-sourced May 2019. It is the
-most production-battle-tested library in this list by scale.
-
-**Production scale:**
-- >75% of Meta's internet traffic (Facebook, Instagram) runs over QUIC/HTTP3 via mvfst
-- Serves billions of users
-- Integrated with Katran (Meta's XDP/eBPF load balancer): Connection ID encodes
-  `workerId/processId/hostId`, allowing Katran to route packets directly to the correct
-  server thread without application-layer lookup
-
-**Architecture:**
-- Thread-per-core: one `folly::EventBase` per worker thread, all packet processing inline
-  (no queuing), chosen specifically to minimize tail latency
-- I/O: `folly::AsyncUDPSocket` (epoll-backed) — no io_uring
-- GSO: yes (write batching). GRO: yes (receive coalescing)
-- No RSS, no NUMA, no SIMD in the library (crypto delegated to OpenSSL via Fizz)
-- Memory: `folly::IOBuf` scatter/gather; jemalloc as heap allocator
-- HTTP/3 is NOT in mvfst — it lives in Proxygen (separate library)
-- Zero-downtime restart support built in
-
-**TLS: Fizz**
-Meta's own TLS 1.3 C++ library. Ships with mvfst. The only supported backend — mvfst is
-not crypto-agnostic. Fizz wraps OpenSSL and libsodium for primitives; adds zero-copy
-scatter/gather I/O APIs, PSK resumption, 0-RTT, and exported keying material for QUIC.
-
-**Congestion control: Copa**
-Copa (delay-based, MIT) is the standout algorithm not found elsewhere. Deployed globally
-for Facebook live video upload on Android.
-
-A/B results vs CUBIC (production, Facebook live video):
-```
-Metric          CUBIC     Copa      Delta
-P50 RTT         499ms     479ms     -4%
-P90 RTT         5.4s      3.9s      -27%
-P50 goodput     —         —         +16.3%
-P95 transport   —         —         -45%
-```
-
-Copa has known problems with ISP traffic policing (~10% of sessions where it cannot
-distinguish congestion from rate limiting).
-
-BBR2 is also implemented (not available in ngtcp2 or quiche).
-
-**Goodput efficiency (TUM 2022 comparison paper):**
-```
-mvfst:    95.02%  (highest among tested)
-ngtcp2:   92.54%
-quiche:   91.52%
-lsquic:   90.34%
-```
-
-**Research:**
-- mvfst-rl: separate repo, reinforcement learning congestion controller (IMPALA-based,
-  NeurIPS 2019 ML for Systems). Not production-deployed.
-- External 2025 paper: 1.88x throughput improvement after architectural optimizations
-  (studying QUIC throughput bottlenecks).
-
-Decision: **build natively in Zig rather than FFI wrapping**.
-
-Reasons:
-- No existing production-ready Zig QUIC implementation exists
-- C FFI inherits that library's allocator, memory layout, and design decisions
-- Native Zig enables comptime optimizations unavailable to C libraries
-- Native Zig enables explicit cache-line discipline
-- Native Zig enables zero-allocation hot path from day one
-- Single static binary with no C library dependency
-- Research and open-source value
-
----
-
-## 6. Architecture
+## 5. Architecture
 
 ### Layer separation
 
+zquic is the QUIC transport layer only. Application framing layers (if needed) live in separate repositories that depend on zquic.
+
 ```
-zquic repo
-├── src/quic/       QUIC transport (RFC 9000)
-│                   - Packet encoding/decoding
-│                   - Connection state machine
-│                   - Stream multiplexing
-│                   - Flow control
-│                   - Congestion control (CUBIC default)
-│                   - TLS 1.3 integration
-│                   - 0-RTT support
-│
-├── src/http3/      HTTP/3 framing (RFC 9114)
-│                   - QPACK header compression (RFC 9204)
-│                   - Request/response framing
-│                   - Server push
-│
-├── src/server/     Opinionated HTTP/3 server
-│                   - Routing (comptime trie)
-│                   - Handler interface
-│                   - Middleware chain
-│                   - Connection pool
-│
-└── src/c_api.zig   C API wrapper (for C/C++ consumers)
-    include/zquic.h Public C header
+zquic (this repo)
+└── src/quic/       QUIC transport (RFC 9000 / RFC 9001)
+                    - Packet encoding/decoding
+                    - Connection state machine
+                    - Stream multiplexing
+                    - Flow control
+                    - Congestion control (CUBIC)
+                    - TLS 1.3 handshake
+                    - 0-RTT session resumption
+                    - Connection migration
+                    - Stateless reset
+                    - Retry / address validation
+
 ```
 
-Each layer is independently usable:
-- `quic` alone: for custom protocols (game networking, DNS-over-QUIC, etc.)
-- `quic` + `http3`: for HTTP/3 clients/servers with custom server logic
-- `server`: batteries-included HTTP/3 server
+zquic is usable directly for any protocol over QUIC: game networking,
+DNS-over-QUIC, gRPC-over-QUIC, custom binary protocols, etc.
 
 ### Threading model: thread-per-core
 
@@ -656,7 +529,7 @@ Applied in zquic:
 - AES-NI for TLS encryption — mandatory for QUIC, hardware-accelerated
 - `@Vector` for batch packet header processing (connection ID lookup,
   packet number decode, header protection removal across multiple packets)
-- SIMD string matching in HTTP/3 header parsing (method, path)
+- SIMD batch connection ID lookup across incoming packets
 
 ```zig
 // Process 8 connection IDs simultaneously to find matching connections
@@ -737,10 +610,11 @@ const dispatch = comptime buildDispatch(.{
     .one_rtt   = handleOneRtt,
 });
 
-// HTTP/3 router — perfect hash computed at build time
-const router = comptime Router.init(.{
-    .{ "GET",  "/v1/get", kvGet  },
-    .{ "POST", "/v1/set", kvSet  },
+// Frame type dispatch — resolved at compile time
+const frame_dispatch = comptime buildDispatch(.{
+    .stream  = handleStream,
+    .ack     = handleAck,
+    .crypto  = handleCrypto,
 });
 ```
 
@@ -920,130 +794,7 @@ Both layers are required. Neglecting either wastes the other.
 
 ---
 
-## 7. Language Compatibility — Do You Have to Write Zig?
-
-No. There are three integration levels, each with different performance
-characteristics and adoption effort.
-
-### Level 1: C API (any language via FFI)
-
-zquic exposes a stable C API via `include/zquic.h`. Any language with C FFI
-gets the transport performance for free.
-
-```c
-// zquic.h
-ZQuicServer* zquic_server_new(const ZQuicConfig* config);
-void zquic_server_set_handler(ZQuicServer*, HandlerFn);
-int  zquic_server_listen(ZQuicServer*, const char* addr, uint16_t port);
-void zquic_server_free(ZQuicServer*);
-```
-
-| Language | Integration method  | Transport perf | Handler perf |
-|----------|---------------------|---------------|--------------|
-| C        | #include + -lzquic  | ✅ full       | ✅ full      |
-| C++      | extern "C"          | ✅ full       | ✅ full      |
-| Rust     | bindgen             | ✅ full       | ✅ full      |
-| Go       | cgo                 | ✅ full       | ✅ near-full |
-| Python   | ctypes / cffi       | ✅ full       | ❌ Python-speed |
-| Node.js  | napi                | ✅ full       | ❌ JS-speed  |
-
-The transport layer runs at full speed regardless of language. The handler
-(your application code) runs at the speed of the chosen language. For
-Python/JS users, the bottleneck moves from the network to the language runtime.
-That is still a significant improvement — transport is no longer the wall.
-
-Build produces: `libzquic.a` (static) and `libzquic.so` (dynamic).
-
-### Level 2: Handler ABI (compiled plugin)
-
-A stable binary interface lets handlers be compiled to `.so` and loaded at
-runtime. Any language that can compile to a shared library can implement it:
-
-```c
-// The ABI contract — stable across versions
-typedef struct {
-    const char*    method;
-    size_t         method_len;
-    const char*    path;
-    size_t         path_len;
-    const uint8_t* body;
-    size_t         body_len;
-} ZQuicRequest;
-
-typedef struct {
-    uint16_t       status;
-    const uint8_t* body;
-    size_t         body_len;
-} ZQuicResponse;
-
-// Implement this function in any language, compile to .so
-typedef void (*HandlerFn)(const ZQuicRequest*, ZQuicResponse*, void* ctx);
-```
-
-| Language | Compilation target | Performance |
-|----------|--------------------|-------------|
-| Zig      | `.so` native       | ✅ full speed |
-| C / C++  | `.so` native       | ✅ full speed |
-| Rust     | `.so` cdylib        | ✅ full speed |
-| Go       | `.so` cgo          | ✅ near-full |
-| Swift    | `.so` native       | ✅ near-full |
-| Java     | `.so` GraalVM native image | ✅ good |
-| Python   | `.so` Cython / mypyc | moderate |
-
-Hot reload: swap `.so` without restarting the server. Different routes can
-dispatch to handlers compiled from different languages.
-
-### Level 3: WebAssembly (maximum flexibility)
-
-Compile handlers to `.wasm`. zquic embeds a WASM runtime (wasmtime) and
-executes handlers in a sandbox:
-
-```
-Handler written in Rust/C/Go/Python/JS/Swift/Kotlin
-         ↓ compile
-    handler.wasm
-         ↓ load
-    zquic (wasmtime runtime)
-         ↓
-    ~80–90% of native speed (WASM JIT)
-```
-
-Benefits:
-- Any language that compiles to WASM (virtually all modern languages)
-- Sandboxed — handler crash cannot kill the server
-- Hot reload — swap `.wasm` at runtime
-- This is the model used by Cloudflare Workers, Fastly Compute, AWS Lambda@Edge
-
-Cost:
-- ~10–20% performance overhead vs native
-- wasmtime adds binary size (~5MB)
-
-### The Migration Story
-
-This is the adoption story that matters for real-world impact:
-
-```
-Step 1 — Drop in zquic, keep existing handler code
-  "Replace nginx + your framework with zquic.
-   Write your handler in any language you already use.
-   Get 10× better transport for free."
-
-Step 2 — Rewrite hot handlers in Zig/C/Rust
-  "Profile. Find the 20% of handlers handling 80% of traffic.
-   Rewrite those in Zig. Get the last 10% of performance."
-
-Step 3 — Full Zig (optional, for maximum performance)
-  "If you need every last cycle, write everything in Zig.
-   But Step 1 and Step 2 are enough for most production workloads."
-```
-
-You do not need to rewrite your application in Zig to benefit from zquic.
-You need Zig (or C/Rust) only if you want zero-overhead handlers in addition
-to zero-overhead transport.
-
----
-
-## 8. Dependency Management (Zig)
+## 6. Dependency Management (Zig)
 
 Zig projects add zquic via `build.zig.zon`:
 
@@ -1058,18 +809,14 @@ Zig projects add zquic via `build.zig.zon`:
 
 Then in `build.zig`:
 ```zig
-// Use just the QUIC transport
 exe.root_module.addImport("quic", b.dependency("zquic", .{}).module("quic"));
-
-// Or the full server
-exe.root_module.addImport("zquic", b.dependency("zquic", .{}).module("server"));
 ```
 
 No system dependencies. Zig fetches, verifies the hash, builds from source.
 
 ---
 
-## 9. Benchmark Targets
+## 7. Benchmark Targets
 
 ### Claim tiers
 
@@ -1091,30 +838,24 @@ All performance claims are labeled by evidence tier:
 ```
 Hardware              NIC     Cores   Theoretical RPS ceiling
 ──────────────────────────────────────────────────────────────
-Any server            10G     4       ~6.5M RPS  (NIC binding)
-Any server            25G     8       ~16M  RPS  (NIC binding)
-Any server            100G    16      ~65M  RPS  (NIC binding)
+Any server            10G     4       ~7.4M RPS  (NIC binding)
+Any server            25G     8       ~18.6M RPS (NIC binding)
+Any server            100G    16      ~74M  RPS  (NIC binding)
 
 NIC is binding at sufficient core count.
 At 4 cores + 100G: CPU (~23.5M) is binding, not NIC.
 Crypto requires ~1 dedicated core per 5 Gbps throughput (AES-NI).
 ```
 
-### Comparison against existing frameworks [THEORETICAL]
+### Theoretical performance envelope [THEORETICAL]
 
-Expected RPS on loopback benchmark on target hardware (same machine, no NIC variable),
-in-memory KV GET endpoint:
+Expected RPS ceiling on loopback benchmark (4-core, 3GHz):
 
-| System           | Expected RPS | Notes                        |
-|------------------|--------------|------------------------------|
-| Node.js (http)   | ~50K         | JS event loop, V8 overhead   |
-| Bun              | ~80K         | JSC, faster than Node        |
-| Go (net/http)    | ~200K        | GC pauses, runtime overhead  |
-| Go (fasthttp)    | ~400K        | optimized, reduced allocs    |
-| **zquic (Zig)**  | **~1M–6M**   | theoretical, see model above |
-
-10× improvement over Go fasthttp is the minimum credible claim.
-100× improvement over Node.js is the theoretical maximum.
+| Constraint       | Ceiling      | Notes                               |
+|------------------|--------------|-------------------------------------|
+| CPU (4 cores)    | ~26M RPS     | 460 cycles/request, see model above |
+| 10G NIC          | ~7.4M RPS    | NIC binding at sufficient cores     |
+| 100G NIC         | ~74M RPS     | NIC binding at 16+ cores            |
 
 ### Benchmark methodology (when hardware is available)
 
@@ -1136,7 +877,7 @@ wrk2 docs, Bun benchmarks all use loopback or dedicated switches).
 
 ---
 
-## 10. Scalability Analysis
+## 8. Scalability Analysis
 
 ### What scales well
 
@@ -1202,13 +943,13 @@ unless tickets are shared across machines. No design for this yet.
 **CID-aware load balancing**: Layer-4 load balancers that route by IP+port
 will misroute packets when a QUIC client migrates networks (the connection
 CID stays the same but the source IP changes). CID-based routing at the
-load balancer (similar to how Katran works for mvfst) is needed for
+CID-aware load balancing at the load balancer level is needed for
 multi-machine deployments. Not designed.
 
 #### Zero-downtime restart
 Restarting zquic drops all in-flight QUIC connections. For any production
 deployment with real traffic, restartless deploys are a hard requirement.
-mvfst built this explicitly. Not designed in zquic yet.
+Not designed in zquic yet.
 
 #### Observability and load balancer signalling
 
@@ -1283,7 +1024,7 @@ Everything else is the embedding application's or operator's concern.
 
 ---
 
-## 11. Development Workflow
+## 9. Development Workflow
 
 ```
 Write code (Mac)
@@ -1297,24 +1038,28 @@ Zig version: 0.16.0-dev.2637+6a9510c0e (master via zigup)
 
 ---
 
-## 12. Open Source
+## 10. Open Source
 
-License: MIT (maximally permissive, C consumers can use without copyleft concern)
+License: MIT
 
 Repo structure:
 ```
 zquic/
 ├── src/
-│   ├── quic/
-│   ├── http3/
-│   ├── server/
-│   └── c_api.zig
-├── include/
-│   └── zquic.h
-├── examples/
-│   ├── zig/
-│   └── c/
-├── bench/
+│   ├── root.zig
+│   └── quic/
+│       ├── varint.zig
+│       ├── packet.zig
+│       ├── frame.zig
+│       ├── crypto.zig
+│       ├── tls.zig
+│       ├── connection.zig
+│       ├── connection_id.zig
+│       ├── stream.zig
+│       ├── flow_control.zig
+│       ├── pool.zig
+│       └── congestion/
+│           └── cubic.zig
 ├── build.zig
 ├── build.zig.zon
 ├── DESIGN.md          ← this file
@@ -1323,277 +1068,85 @@ zquic/
 
 ---
 
-## 13. Implementation Roadmap
+## 11. Implementation Roadmap
 
-### Phase 1: QUIC transport
-- UDP socket + io_uring with SQPOLL
+### Phase 1: Core QUIC transport ✅
 - QUIC packet parsing (Initial, Handshake, 1-RTT)
 - Connection establishment + state machine
-- TLS 1.3 handshake
-- Stream multiplexing + flow control
-- Basic congestion control (CUBIC)
-- Thread-per-core + SO_REUSEPORT
+- TLS 1.3 handshake (RFC 9001)
+- Stream multiplexing + flow control (RFC 9000 §2, §4)
+- Basic congestion control (CUBIC, RFC 9438)
 - Pool allocator (no malloc in hot path)
-- **Milestone**: QUIC echo server running, connection establishment verified
+- **Milestone**: 110/110 tests passing, all core RFC 9000/9001 modules complete ✅
 
-### Phase 2: HTTP/3 framing
-- QPACK header compression (RFC 9204)
-- Request/response framing (RFC 9114)
-- Keep-alive, stream reuse
-- **Milestone**: HTTP/3 hello world responding to curl --http3
+### Phase 2: RFC compliance — remaining transport features
+- **Connection migration** (RFC 9000 §9) — client switches IP/port mid-connection;
+  server validates new path and migrates without dropping streams
+- **Stateless reset** (RFC 9000 §10.3) — terminate a connection without keeping
+  state; uses a token derived from the CID so any server instance can issue it
+- **Retry packets** (RFC 9000 §8.1) — address validation before committing state;
+  server sends Retry, client echoes token in subsequent Initial
+- **Version negotiation** (RFC 9000 §6) — respond to unknown QUIC versions with
+  a Version Negotiation packet listing supported versions
+- **0-RTT session resumption** (RFC 9001 §4.6) — send application data in the
+  first packet for repeat clients; requires session ticket storage and replay
+  protection (RFC 8446 §8)
+- **Loss detection improvements** (RFC 9002) — Probe Timeout (PTO), persistent
+  congestion detection, ACK-based loss threshold (kPacketThreshold)
+- **PATH_CHALLENGE / PATH_RESPONSE frames** (RFC 9000 §19.17–19.18) — liveness
+  and path validation used by migration and preferred address
+- **NEW_CONNECTION_ID / RETIRE_CONNECTION_ID** (RFC 9000 §19.15–19.16) — CID
+  rotation for privacy and migration support
+- **Preferred address** (RFC 9000 §9.6) — server advertises a preferred address
+  in transport parameters; client migrates to it after handshake
+- **HANDSHAKE_DONE frame** (RFC 9000 §19.20) — server signals handshake
+  confirmation to the client, unlocking 1-RTT key discard
+- **Transport parameters** (RFC 9000 §18) — full encoding/decoding of all
+  mandatory and optional transport parameters in TLS extensions
+- **Milestone**: passes RFC 9000 compliance test suite (quic-interop-runner);
+  connection migration verified against a reference client
 
-### Phase 3: Server layer
-- Comptime router (perfect hash, zero runtime dispatch)
-- Handler ABI (stable C-compatible interface)
-- Middleware chain
-- In-memory KV store (benchmark endpoint)
-- **Milestone**: [THEORETICAL] benchmark model validated against loopback test
+### Phase 3: Performance — I/O and multi-core
+- **io_uring backend** (Linux 5.1+) — SQPOLL + fixed buffer registration;
+  zero syscalls in hot path; replaces blocking recvmsg/sendmsg
+- **UDP GSO/GRO** — batch 16–64 QUIC packets per sendmsg (GSO TX);
+  coalesce incoming packets before delivery (GRO RX, Linux 5.10+)
+- **Thread-per-core + SO_REUSEPORT** — one io_uring ring + socket per core;
+  no cross-core locking in hot path
+- **CID-encoded thread affinity** (Novel technique §1) — SO_REUSEPORT_CBPF
+  routes packets to the correct core socket using CID bits 0–1; no XDP needed
+- **kqueue backend** (macOS/FreeBSD) — development + CI platform support
+- **Milestone**: loopback benchmark on Linux; compare recvmsg vs io_uring
+  baseline; confirm linear core scaling
 
-### Phase 4: Language integrations
-- zquic.h public C header
-- c_api.zig wrapper → libzquic.a + libzquic.so
-- Handler ABI stabilized
-- C, Rust, Go example handlers
-- **Milestone**: Go handler running on zquic transport
-
-### Phase 5: 100G design validation
-- GSO batch size tuning (32–64 packets/call for 100G)
-- NUMA-aware allocation (pin threads + memory to same node)
-- Multi-core crypto pipeline (distribute AES-NI across cores)
-- Connection state cache layout profiled and optimized
-- SIMD batch packet header processing (@Vector)
+### Phase 4: Performance — CPU and memory
+- **SIMD batch packet header processing** — @Vector(8, u64) CID lookup;
+  8 connection IDs compared per instruction
+- **ILP-pipelined AES-NI** — interleaved AES-GCM across packets to saturate
+  the AES pipeline (~4 cycle throughput vs 4×N sequential latency)
+- **Huge pages for packet buffer pool** (Novel technique §2) — mmap(MAP_HUGETLB)
+  reduces TLB pressure at 5M+ RPS
+- **Speculative CID ring lookup** (Novel technique §5) — recent-16 CID ring
+  checked with one SIMD compare before main hash table
+- **Zero-copy in-place TLS decryption** (Novel technique §6) — AES-GCM
+  decrypts into io_uring fixed buffer; app handler receives pointer, no copy
+- **Comptime congestion control** (Novel technique §4) — CC algorithm as
+  comptime type parameter; inlined into hot path, zero dispatch overhead
+- **NUMA-aware allocation** — pin threads and memory to same NUMA node
 - **Milestone**: architecture review — confirm design scales to 100G without
-  structural changes (theoretical analysis, not measured)
+  structural changes (theoretical analysis + cycle model)
 
-### Phase 6: Measured benchmarks (requires hardware)
+### Phase 5: Measured benchmarks (requires hardware)
 - Loopback benchmark on target hardware
-- Compare vs Node.js, Bun, Go, fasthttp
-- Publish: RPS, P50/P99/P999 latency, CPU% per core
-- **Milestone**: published benchmark results with methodology
+- Publish: RPS, P50/P99/P999 latency, CPU% per core, cycles/packet vs theoretical model
+- Publish: RPS, P50/P99/P999 latency, CPU% per core, cycles/packet
+- **Milestone**: published benchmark results with full methodology
 
 ---
 
-## 14. Competitive Analysis: ngtcp2 Source Deep Dive
+## 12. Novel Techniques (Unexplored in Open QUIC Implementations)
 
-ngtcp2 is the best-in-class C QUIC implementation (9.97 Gbit/s on 10G NIC,
-used by curl). Understanding what it does and what it avoids informs every
-architectural decision in zquic. This section records findings from direct
-source analysis of the ngtcp2 codebase.
-
-### What ngtcp2 does well
-
-#### Pluggable allocator
-ngtcp2 does not hardcode malloc. All allocation goes through an
-`ngtcp2_mem` struct containing function pointers for malloc/calloc/free/realloc.
-Callers can supply a custom allocator. This is the right design — and confirms
-that pool allocation is viable in a C QUIC implementation.
-
-#### Custom pool infrastructure
-ngtcp2 has three allocator implementations:
-- **OPL** (`ngtcp2_opl`): object pool list — a LIFO intrusive linked list for
-  fixed-size object reuse. O(1) acquire/release.
-- **balloc** (`ngtcp2_balloc`): bump-pointer block allocator — allocates from
-  a pre-committed slab, cheap for variable-length objects (packet payloads,
-  headers).
-- **objalloc** (`ngtcp2_objalloc`): combines OPL + balloc — tries OPL first
-  (recycled object), falls back to balloc (fresh slab allocation).
-
-Objects pooled: `frame_chain`, `rtb_entry` (retransmit buffer), `strm`
-(stream state), `acktr_entry` (ACK tracking).
-
-**In steady state: zero `malloc` calls per packet.** Pool reuse only.
-This is better than expected for a C library.
-
-#### GSO support
-ngtcp2 supports UDP Generic Segmentation Offload via `UDP_SEGMENT` cmsg and
-a configurable `gso_burst` parameter. This is the correct approach — batch
-multiple QUIC packets per `sendmsg()` syscall, reducing kernel overhead.
-ngtcp2's aggregate write API (`ngtcp2_conn_write_aggregate_pkt2_versioned`)
-is explicitly designed for GSO-batched sends.
-
----
-
-### What ngtcp2 avoids (confirmed gaps)
-
-These are not opinions — they are confirmed by searching the entire ngtcp2
-source tree.
-
-#### No io_uring
-**Zero references** to `io_uring`, `liburing`, `IORING_OP_*`, or any
-io_uring API in the entire codebase. All I/O uses standard POSIX `sendmsg()`
-/ `recvmsg()` syscalls. This means every packet send/receive costs a full
-kernel context switch (~1,000 cycles). There is no mechanism to eliminate
-this overhead without replacing the I/O layer.
-
-#### No RSS
-**Zero references** to `SO_ATTACH_REUSEPORT_CBPF`, `SO_ATTACH_REUSEPORT_EBPF`,
-or any RSS configuration. The ngtcp2 example server uses a single thread.
-Multi-core scaling is left entirely to the application.
-
-#### No NUMA awareness
-**Zero references** to `numa_alloc_onnode`, `mbind`, `set_mempolicy`, or
-NUMA topology. At 100K+ connections, connection state objects will be
-allocated on whichever NUMA node happens to have free memory — possibly
-requiring cross-socket memory access on multi-socket machines.
-
-#### No congestion control beyond CUBIC/RENO
-ngtcp2 implements CUBIC and Reno. No BBR. BBR achieves higher throughput
-at the same RTT by modeling bottleneck bandwidth rather than relying on
-loss as a congestion signal. Absence of BBR is a real-world limitation for
-long-distance or high-BDP paths.
-
----
-
-### The critical structural gap: conn struct layout
-
-`ngtcp2_conn` is the central connection object. Source analysis shows:
-
-```
-ngtcp2_conn struct size: ~6.5–7.5 KB
-```
-
-Fields that are touched on every packet (hot fields):
-- Packet number decryption key
-- RX/TX sequence numbers
-- ACK tracking state
-- Stream state root
-
-Fields that are rarely touched (cold fields):
-- Peer address and port
-- TLS certificate chain
-- Connection statistics
-- Path validation state
-- Retry token
-
-**These hot and cold fields are not separated.** They are interleaved
-throughout the 6.5–7.5 KB struct in the order they were added during
-development. A typical packet processing call touches ~200–400 bytes of
-hot fields scattered across the struct, pulling in multiple full cache lines
-even when only the hot fields are needed.
-
-```
-Hot fields needed per packet: ~200–400 bytes
-Cache lines loaded (ngtcp2):  ~4–7 lines  (fields scattered across 6.5KB)
-Cache lines loaded (zquic):   ~2 lines    (hot fields packed into 128 bytes)
-
-At 6M RPS, 2 fewer cache line loads per packet:
-  2 × 200 cycles × 6,000,000 = 2.4B cycles/sec saved
-  ≈ one full CPU core freed purely from struct layout
-```
-
----
-
-### The crypto abstraction gap
-
-ngtcp2 handles TLS crypto via three callbacks: `encrypt`, `decrypt`, `hp_mask`
-(header protection). These are function pointers registered at connection
-setup time.
-
-Hot path crypto dereferences (per packet):
-- **Receive**: 3 pointer dereferences (hp_mask → decrypt → verify)
-- **Send**: 4 pointer dereferences (hp_mask → encrypt → tag → write)
-- **Total**: 7 indirect function calls per packet round-trip
-
-Each indirect call is a branch misprediction risk + icache pressure. At 6M RPS:
-```
-7 indirect calls × 6M RPS = 42M indirect branch predictions per second
-```
-
-Additionally, ngtcp2 performs header protection with scalar XOR and nonce
-construction with scalar `memcpy`. **There is no SIMD anywhere in ngtcp2.**
-AES-NI is only invoked through whatever TLS library the application linked
-(OpenSSL, BoringSSL, etc.) — ngtcp2 itself makes no use of SIMD intrinsics.
-
----
-
-### The call depth gap
-
-ngtcp2 packet receive entry point:
-
-```
-ngtcp2_conn_read_pkt_versioned()
-  └── conn_recv_cpkt()
-        └── conn_recv_pkt()
-              └── switch(frame.type) [20+ cases]
-                    └── conn_recv_stream()  / conn_recv_ack() / ...
-                          └── ... (1–3 more levels)
-```
-
-Minimum call depth to reach frame handling: **7–9 frames deep**.
-
-Each function call is:
-- Stack frame setup/teardown (~5–10 cycles)
-- Potential icache miss if function not recently called
-- Compiler cannot inline across translation unit boundaries
-
-In Zig with comptime dispatch, the equivalent path collapses to a direct
-call with inlining — no intermediate stack frames.
-
----
-
-### Design implications
-
-Each finding maps to a specific design decision:
-
-```
-ngtcp2 gap                    zquic approach
-──────────────────────────────────────────────────────────────────────
-No io_uring                   io_uring SQPOLL from Phase 1
-                              Eliminates syscall cost per packet
-
-No RSS                        SO_REUSEPORT (Phase 1) + RSS config docs
-                              NIC pins connections to cores at hardware level
-
-No NUMA                       Thread-per-core with numa_alloc_onnode
-                              Memory allocated on same NUMA node as thread
-
-No SIMD in crypto path        @Vector batch header processing
-                              ILP-pipelined AES-NI batches (Phase 5)
-                              Direct intrinsics, not TLS library callback
-
-7 indirect crypto calls       Comptime dispatch — zero indirection
-                              All crypto resolved to direct calls at build time
-
-6.5KB monolithic conn struct  Hot/cold split: ConnectionHot (64 bytes, 1 cache line)
-                              ConnectionCold (accessed only on handshake/close)
-
-7–9 call depth to frame       Comptime inlined dispatch — flat call depth
-                              No intermediate stack frames in hot path
-
-No pre-allocation at startup  Pre-allocate at startup, pool acquire in hot path
-(lazy allocation)             Eliminates first-packet allocation jitter
-
-No BBR                        CUBIC (Phase 1) + BBR (Phase 5)
-                              Better throughput on high-BDP paths
-
-GSO: ✅ present               GSO retained and enhanced
-                              GSO + io_uring = maximum batching efficiency
-```
-
-### Summary: what we keep, what we change
-
-```
-ngtcp2 design          Keep in zquic?   Why
-─────────────────────────────────────────────────────────────────────
-Pluggable allocator    ✅ keep          Right idea; zquic makes it stricter
-Pool objects (OPL)     ✅ keep          Proven approach; extend to all hot objects
-GSO support            ✅ keep          Combine with io_uring for maximum effect
-Standard POSIX I/O     ❌ replace       io_uring SQPOLL eliminates syscall cost
-Monolithic conn struct ❌ replace       Hot/cold split saves ~2 cache lines/packet
-Function pointer crypto❌ replace       Comptime dispatch, direct SIMD calls
-Scalar header ops      ❌ replace       @Vector batch processing
-7–9 call depth         ❌ replace       Comptime inlined dispatch
-Single-threaded model  ❌ replace       Thread-per-core + SO_REUSEPORT
-No RSS config          ❌ add           Document + support RSS setup
-No NUMA                ❌ add           NUMA-aware allocation from Phase 5
-No BBR                 ❌ add           Add in Phase 5
-```
-
----
-
-## 15. Novel Techniques (Unexplored in Open QUIC Implementations)
-
-Sections 6 and 13 cover known techniques applied better than existing libraries.
+The techniques below have no known open-source QUIC implementation.
 This section records ideas with no known open-source implementation — research
 territory. All labeled [HYPOTHESIS] until measured.
 
@@ -1601,9 +1154,7 @@ territory. All labeled [HYPOTHESIS] until measured.
 
 ### 1. CID-encoded thread affinity via SO_REUSEPORT BPF [HYPOTHESIS]
 
-mvfst solves thread affinity by encoding workerId in the Connection ID and
-routing at the Katran (XDP) load balancer layer — requiring a separate
-infrastructure component. The same result is achievable without XDP using
+Thread affinity can be encoded in the Connection ID and enforced without XDP using
 `SO_REUSEPORT_CBPF`: a small BPF program attached directly to the socket
 that extracts bits from the Connection ID and routes to the correct per-core
 socket.
