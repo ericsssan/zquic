@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig (master)
+        uses: mlugg/setup-zig@v1
+        with:
+          version: master
+
+      - name: Run tests
+        run: zig build test --summary all
