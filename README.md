@@ -83,10 +83,10 @@ pub const ConnectionHot = struct {
 
 ## Roadmap
 
-- **Phase 2** — I/O integration: POSIX UDP backend (kqueue/epoll), echo server example
-- **Phase 3** — HTTP/3 (RFC 9114) + QPACK (RFC 9204)
-- **Phase 4** — Connection migration, preferred address, stateless reset
-- **Phase 5** — Multi-core: thread-per-core with SO_REUSEPORT, CID-based routing
+- **Phase 2** — Connection migration, preferred address, stateless reset
+- **Phase 3** — Multi-core: thread-per-core with SO_REUSEPORT, CID-based routing
+
+HTTP/3, QPACK, and server I/O integration live in a separate library that depends on zquic.
 
 ## License
 
