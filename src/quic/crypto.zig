@@ -283,6 +283,52 @@ test "crypto: encrypt-decrypt round-trip" {
     try testing.expectEqualSlices(u8, &plaintext, &recovered);
 }
 
+test "crypto: decryptPayload short buffer (< tag_length) returns TooShort" {
+    const ck = deriveInitialKeys(&test_dcid).client;
+    const short: [15]u8 = .{0} ** 15; // one byte short of the 16-byte tag
+    var out: [0]u8 = .{};
+    try std.testing.expectError(error.TooShort, decryptPayload(ck, 0, &.{}, &short, &out));
+}
+
+test "crypto: decryptPayload with corrupted authentication tag returns error" {
+    const ck = deriveInitialKeys(&test_dcid).client;
+    const pn: u64 = 7;
+    const header = [_]u8{0xC3}; // arbitrary header byte
+    const plaintext = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+
+    // Encrypt first
+    var ct_tag: [plaintext.len + 16]u8 = undefined;
+    encryptPayload(ck, pn, &header, &plaintext, &ct_tag);
+
+    // Corrupt the last byte of the authentication tag
+    ct_tag[ct_tag.len - 1] ^= 0xFF;
+
+    var recovered: [plaintext.len]u8 = undefined;
+    try std.testing.expectError(error.AuthenticationFailed,
+        decryptPayload(ck, pn, &header, &ct_tag, &recovered));
+}
+
+test "crypto: applyHeaderProtection is self-inverse (XOR involution)" {
+    const hp_key = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10,
+                          0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
+    // Use a non-zero sample to get a non-trivial mask
+    const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                          0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    var first_byte: u8 = 0xC3; // long header (bit 7 = 1)
+    var pn_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x01 }; // 4-byte PN
+
+    const orig_first = first_byte;
+    const orig_pn = pn_bytes;
+
+    // Apply once (protect)
+    applyHeaderProtection(hp_key, &first_byte, &pn_bytes, &sample);
+    // Apply again (remove — same XOR operation)
+    applyHeaderProtection(hp_key, &first_byte, &pn_bytes, &sample);
+
+    try std.testing.expectEqual(orig_first, first_byte);
+    try std.testing.expectEqualSlices(u8, &orig_pn, &pn_bytes);
+}
+
 test "crypto: nonce build" {
     // iv = 0xfa044b2f42a3fd3b46fb255c, pn = 2
     // nonce = iv XOR (pn left-padded to 12 bytes)

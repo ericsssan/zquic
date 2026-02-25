@@ -73,10 +73,7 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     // For QUIC v1, CID length must match our fixed 8-byte CID format.
     if (version == QUIC_VERSION_1 and dcid_len != cid.len) return error.UnsupportedCidLength;
     var dest_cid: ConnectionId = .{};
-    if (dcid_len > 0) {
-        const copy_len = @min(dcid_len, cid.len);
-        @memcpy(dest_cid.bytes[0..copy_len], buf[pos..][0..copy_len]);
-    }
+    if (dcid_len > 0) @memcpy(&dest_cid.bytes, buf[pos..][0..dcid_len]);
     pos += dcid_len;
 
     // Source CID
@@ -87,10 +84,7 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     // For QUIC v1, CID length must match our fixed 8-byte CID format.
     if (version == QUIC_VERSION_1 and scid_len != cid.len) return error.UnsupportedCidLength;
     var src_cid: ConnectionId = .{};
-    if (scid_len > 0) {
-        const copy_len = @min(scid_len, cid.len);
-        @memcpy(src_cid.bytes[0..copy_len], buf[pos..][0..copy_len]);
-    }
+    if (scid_len > 0) @memcpy(&src_cid.bytes, buf[pos..][0..scid_len]);
     pos += scid_len;
 
     const pkt_type = longHeaderType(first_byte);
@@ -415,4 +409,36 @@ test "packet: encodeVersionNegotiation structure" {
 
     // Supported version: QUIC v1.
     try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[23..27], .big));
+}
+
+test "packet: longHeaderType extracts all four packet types" {
+    // First byte layout: 1 (long) | 1 (fixed) | type[1:0] | reserved | pn_len
+    // Bits 5-4 encode the PacketType.
+    try std.testing.expectEqual(PacketType.initial,  longHeaderType(0xC0)); // type=0b00
+    try std.testing.expectEqual(PacketType.zero_rtt, longHeaderType(0xD0)); // type=0b01
+    try std.testing.expectEqual(PacketType.handshake,longHeaderType(0xE0)); // type=0b10
+    try std.testing.expectEqual(PacketType.retry,    longHeaderType(0xF0)); // type=0b11
+}
+
+test "packet: decodePacketNumber wrap-around" {
+    // largest_acked=250, truncated=5, pn_bits=8:
+    //   expected = 251, pn_win = 256, candidate = (251 & ~255) | 5 = 5
+    //   5 <= 251 - 128 = 123  →  return 5 + 256 = 261
+    try std.testing.expectEqual(@as(u64, 261), decodePacketNumber(250, 5, 8));
+}
+
+test "packet: parseLongHeader with non-empty Initial token" {
+    const testing = std.testing;
+    var buf: [300]u8 = undefined;
+    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
+    const tok = [_]u8{ 0xAB, 0xCD, 0xEF, 0x01 }; // 4-byte token
+
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, dcid, scid, &tok, 99, 20);
+    @memset(buf[hdr_len..][0..20], 0xBB);
+
+    const result = try parseLongHeader(buf[0 .. hdr_len + 20]);
+    try testing.expectEqual(PacketType.initial, result.header.packet_type);
+    try testing.expectEqualSlices(u8, &tok, result.header.token);
+    try testing.expectEqual(@as(u32, 99), result.header.packet_number);
 }

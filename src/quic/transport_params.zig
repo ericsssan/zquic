@@ -427,6 +427,56 @@ test "transport_params: more than 64 params returns error" {
     try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
 }
 
+test "transport_params: max_ack_delay exactly 16383 is accepted" {
+    // 16383 = (1<<14) - 1: the largest valid value (< 16384)
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_MAX_ACK_DELAY);
+    pos += varint.encode(buf[pos..], 2); // 2-byte varint length
+    pos += varint.encode(buf[pos..], 16383);
+    const decoded = try decode(buf[0..pos]);
+    try testing.expectEqual(@as(u64, 16383), decoded.max_ack_delay_ms);
+}
+
+test "transport_params: max_ack_delay 16384 returns error" {
+    // 16384 = 1<<14: violates RFC 9000 §18.2 (must be < 2^14)
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_MAX_ACK_DELAY);
+    pos += varint.encode(buf[pos..], 2);
+    pos += varint.encode(buf[pos..], 16384);
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: max_udp_payload_size exactly 1200 is accepted" {
+    // 1200 is the minimum allowed value (>= 1200)
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_MAX_UDP_PAYLOAD_SIZE);
+    pos += varint.encode(buf[pos..], 2);
+    pos += varint.encode(buf[pos..], 1200);
+    const decoded = try decode(buf[0..pos]);
+    try testing.expectEqual(@as(u64, 1200), decoded.max_udp_payload_size);
+}
+
+test "transport_params: exactly 64 params is accepted" {
+    // 64 params is at the limit; 65 is rejected (tested elsewhere)
+    const testing = std.testing;
+    var buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        pos += varint.encode(buf[pos..], 0x55 + @as(u62, @intCast(i)) * 2);
+        pos += varint.encode(buf[pos..], 0); // zero-length unknown param
+    }
+    // Must not error — 64 is exactly at the limit
+    _ = try decode(buf[0..pos]);
+    try testing.expect(true); // reached here without error
+}
+
 test "transport_params: initial_source_connection_id round-trip" {
     const testing = std.testing;
     var buf: [512]u8 = undefined;

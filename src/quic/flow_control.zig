@@ -133,6 +133,37 @@ test "flow_control: onReceived tracks total bytes received" {
     try testing.expect(!fc.shouldSendMaxData());
 }
 
+test "flow_control: shouldSendMaxData exact 75% boundary (integer arithmetic)" {
+    // 75/100 = exactly 3/4: recv_total*4 == recv_max*3 → must trigger
+    const testing = std.testing;
+    var fc = FlowController.init(100, 100);
+    fc.onReceived(75);
+    try testing.expect(fc.shouldSendMaxData());
+
+    // 74/100: 74*4=296 < 100*3=300 → must NOT trigger
+    var fc2 = FlowController.init(100, 100);
+    fc2.onReceived(74);
+    try testing.expect(!fc2.shouldSendMaxData());
+}
+
+test "flow_control: shouldSendMaxData large-number overflow safety" {
+    // recv_max near (1<<62)-1; recv_total*4 must not overflow u64.
+    // recv_total = (recv_max * 3) / 4 rounded down → exactly at threshold.
+    const testing = std.testing;
+    const max: u64 = (1 << 62) - 1; // largest valid QUIC varint
+    // max % 4 == 3, so plain (max/4)*3 truncates below 75%.
+    // Correct minimum-passing value: ceil(max*3/4) = max*3/4 + 1.
+    // max*3 fits in u64 since max < 2^62 → max*3 < 2^63.6 < 2^64.
+    var fc = FlowController.init(max, max);
+    fc.recv_total = max * 3 / 4 + 1; // ceil(75%): passes threshold
+    try testing.expect(fc.shouldSendMaxData());
+
+    // One byte below ceil threshold: must NOT trigger
+    var fc2 = FlowController.init(max, max);
+    fc2.recv_total = max * 3 / 4; // truncated floor: just below 75%
+    try testing.expect(!fc2.shouldSendMaxData());
+}
+
 test "flow_control: updateSendMax ignores shrink" {
     const testing = std.testing;
     var fc = FlowController.init(1_000, 500);

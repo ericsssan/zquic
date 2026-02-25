@@ -854,6 +854,100 @@ test "frame: ACK range_count > 256 returns InvalidFrame" {
     try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
+test "frame: ACK range_count exactly 256 is accepted" {
+    // 256 is the cap — must parse successfully (only > 256 is rejected).
+    var buf: [2048]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x02; pos += 1;           // ACK type
+    pos += varint.encode(buf[pos..], 511); // largest_acked (needs room for 256 ranges)
+    pos += varint.encode(buf[pos..], 0);   // ack_delay
+    pos += varint.encode(buf[pos..], 256); // range_count = 256
+    pos += varint.encode(buf[pos..], 0);   // first ACK range (ack_range=0)
+    // range_count=256 means 256 additional (gap, ack_range) pairs after the first ACK range.
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        pos += varint.encode(buf[pos..], 0); // gap
+        pos += varint.encode(buf[pos..], 0); // ack_range
+    }
+    const result = try parseFrame(buf[0..pos]);
+    switch (result.frame) {
+        .ack => |a| try std.testing.expect(a.range_count > 0),
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: parseFrame empty buffer returns BufferEmpty" {
+    try std.testing.expectError(error.BufferEmpty, parseFrame(&.{}));
+}
+
+test "frame: parseFrame unknown byte frame type (0x07) returns UnknownFrame" {
+    // 0x07 is NEW_TOKEN, not implemented; falls to else → UnknownFrame.
+    // Note: 0x04 is RESET_STREAM and IS handled; choose a true gap.
+    const buf = [_]u8{0x07};
+    try std.testing.expectError(error.UnknownFrame, parseFrame(&buf));
+}
+
+test "frame: parseFrame varint frame type > 0xFF returns UnknownFrame" {
+    // 2-byte varint encoding of value 256 (0x41 0x00)
+    const buf = [_]u8{ 0x41, 0x00 };
+    try std.testing.expectError(error.UnknownFrame, parseFrame(&buf));
+}
+
+test "frame: PADDING consecutive zero bytes counts all" {
+    const buf = [_]u8{ 0x00, 0x00, 0x00, 0x00, 0x00 }; // 5 PADDING bytes
+    const result = try parseFrame(&buf);
+    switch (result.frame) {
+        .padding => |n| try std.testing.expectEqual(@as(usize, 5), n),
+        else => return error.WrongFrameType,
+    }
+    try std.testing.expectEqual(@as(usize, 5), result.consumed);
+}
+
+test "frame: ACK_ECN (0x03) with ECN counts parses has_ecn=true" {
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x03; pos += 1;           // ACK_ECN type
+    pos += varint.encode(buf[pos..], 10); // largest_acked
+    pos += varint.encode(buf[pos..], 0);  // ack_delay
+    pos += varint.encode(buf[pos..], 0);  // range_count = 0
+    pos += varint.encode(buf[pos..], 5);  // first ACK range
+    pos += varint.encode(buf[pos..], 7);  // ECT0
+    pos += varint.encode(buf[pos..], 3);  // ECT1
+    pos += varint.encode(buf[pos..], 1);  // ECN_CE
+    const result = try parseFrame(buf[0..pos]);
+    switch (result.frame) {
+        .ack => |a| {
+            try std.testing.expect(a.has_ecn);
+            try std.testing.expectEqual(@as(u64, 7), a.ect0);
+            try std.testing.expectEqual(@as(u64, 3), a.ect1);
+            try std.testing.expectEqual(@as(u64, 1), a.ecn_ce);
+        },
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: STREAM without length field (0x08) consumes to buffer end" {
+    // Type 0x08: no offset bit, no length bit, no FIN bit
+    var buf: [12]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x08; pos += 1;           // STREAM, no flags
+    pos += varint.encode(buf[pos..], 42); // stream_id = 42
+    const payload = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+    @memcpy(buf[pos..][0..payload.len], &payload);
+    pos += payload.len;
+    const result = try parseFrame(buf[0..pos]);
+    switch (result.frame) {
+        .stream => |s| {
+            try std.testing.expectEqual(@as(u62, 42), s.stream_id);
+            try std.testing.expectEqual(@as(u62, 0), s.offset);
+            try std.testing.expect(!s.fin);
+            try std.testing.expectEqualSlices(u8, &payload, s.data);
+        },
+        else => return error.WrongFrameType,
+    }
+    try std.testing.expectEqual(pos, result.consumed);
+}
+
 test "frame: PATH_RESPONSE echoes PATH_CHALLENGE data" {
     const testing = std.testing;
     var buf: [16]u8 = undefined;

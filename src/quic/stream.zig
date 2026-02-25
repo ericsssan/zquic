@@ -584,6 +584,73 @@ test "stream: receiveData overflow-safe offset + len check" {
     try std.testing.expectError(error.FlowControlViolation, err);
 }
 
+test "ringbuf: two-segment write and read crossing wrap boundary" {
+    // Write 6 bytes to advance wp to 6, read 5 to advance rp to 5.
+    // Then write 4 bytes: splits across the wrap (bytes at [6,7] and [0,1]).
+    // Read all 5 remaining bytes: also crosses the wrap.
+    const testing = std.testing;
+    var rb: RingBuf(8) = .{};
+    _ = rb.write("abcdef");    // wp=6, rp=0
+    var sink: [5]u8 = undefined;
+    _ = rb.read(&sink);        // rp=5, consumed "abcde"
+
+    const written = rb.write("WXYZ"); // 4 bytes; start=6, first=2, second=2
+    try testing.expectEqual(@as(usize, 4), written);
+
+    var out: [5]u8 = undefined;
+    const n = rb.read(&out);   // readable=5 ("f","W","X","Y","Z")
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqualSlices(u8, "fWXYZ", out[0..n]);
+}
+
+test "ringbuf: two-segment peek crossing wrap boundary" {
+    // Same setup as above; peek must not advance rp.
+    const testing = std.testing;
+    var rb: RingBuf(8) = .{};
+    _ = rb.write("abcdef");
+    var sink: [5]u8 = undefined;
+    _ = rb.read(&sink);
+    _ = rb.write("WXYZ");
+
+    var p1: [3]u8 = undefined;
+    const n1 = rb.peek(0, &p1); // should yield "fWX"
+    try testing.expectEqual(@as(usize, 3), n1);
+    try testing.expectEqualSlices(u8, "fWX", p1[0..n1]);
+
+    var p2: [2]u8 = undefined;
+    const n2 = rb.peek(3, &p2); // should yield "YZ"
+    try testing.expectEqual(@as(usize, 2), n2);
+    try testing.expectEqualSlices(u8, "YZ", p2[0..n2]);
+
+    // rp must be unchanged
+    try testing.expectEqual(@as(usize, 5), rb.readable());
+}
+
+test "stream_table: single-pass getOrCreate uses first empty slot" {
+    // Verify that with holes in the table the first free index is chosen.
+    const testing = std.testing;
+    var table: StreamTable = .{};
+    _ = table.getOrCreate(10); // occupies slot 0
+    _ = table.getOrCreate(20); // occupies slot 1
+    _ = table.getOrCreate(30); // occupies slot 2
+    table.close(20);           // frees slot 1
+
+    // getOrCreate for a new ID should land in slot 1 (lowest free).
+    const s = table.getOrCreate(99).?;
+    try testing.expectEqual(@as(u62, 99), s.id);
+    try testing.expectEqual(&table.streams[1], s);
+}
+
+test "stream: receiveData exact-boundary: offset + len == u64 max is not overflow" {
+    // offset + len == u64 max exactly (no overflow) and <= recv_max → success
+    var s = Stream.init(0);
+    s.recv_max = std.math.maxInt(u64);
+    const offset: u64 = std.math.maxInt(u64) - 4;
+    const data = [_]u8{ 1, 2, 3, 4 }; // len=4; offset+4 == u64 max (no overflow)
+    // Must succeed — no flow control violation and no overflow.
+    try s.receiveData(offset, &data, false);
+}
+
 test "stream_reset: initiateReset sets pending and transitions state" {
     const testing = std.testing;
     var s = Stream.init(0);
@@ -593,4 +660,51 @@ test "stream_reset: initiateReset sets pending and transitions state" {
     try testing.expectEqual(@as(u62, 5), s.pending_reset.?.error_code);
     try testing.expectEqual(@as(u62, 100), s.pending_reset.?.final_size);
     try testing.expectEqual(StreamState.reset, s.state);
+}
+
+test "stream: canSend returns false in half_closed_local state" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.sendFin(); // transitions to half_closed_local
+    try testing.expectEqual(StreamState.half_closed_local, s.state);
+    try testing.expect(!s.canSend(1));
+}
+
+test "stream: canSend returns false in closed state" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.sendFin(); // half_closed_local
+    // Simulate receiving FIN → closed
+    try s.receiveData(0, &.{}, true); // fin on recv side → half_closed_remote then closed
+    try testing.expectEqual(StreamState.closed, s.state);
+    try testing.expect(!s.canSend(1));
+}
+
+test "stream: canSend returns false in reset state" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.initiateReset(0);
+    try testing.expectEqual(StreamState.reset, s.state);
+    try testing.expect(!s.canSend(1));
+}
+
+test "stream: canSend returns false when window exhausted" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    // send_max = STREAM_BUF_SIZE = 4096, send_offset = 0
+    // Asking for exactly send_max is fine (0 + 4096 <= 4096)
+    try testing.expect(s.canSend(STREAM_BUF_SIZE));
+    // Asking for one more byte exceeds window
+    try testing.expect(!s.canSend(STREAM_BUF_SIZE + 1));
+}
+
+test "stream: onAcked with non-consecutive offset is a no-op" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    const data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    _ = s.bufferSendData(&data);
+    s.onSent(data.len);
+    // send_acked = 0, send_offset = 8; ack for offset=4 (non-consecutive) → no-op
+    s.onAcked(4, 4);
+    try testing.expectEqual(@as(u64, 0), s.send_acked); // must not advance
 }

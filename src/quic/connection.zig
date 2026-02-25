@@ -205,8 +205,10 @@ pub const Connection = struct {
     closing_frame_len: usize,
 
     // Scratch buffer shared by all queue* helpers for frame serialisation.
+    // enc_scratch holds the encrypted packet output (header + ciphertext).
     // Safe to share because those helpers are never called re-entrantly.
     pkt_scratch: [MAX_PACKET_SIZE]u8,
+    enc_scratch: [MAX_PACKET_SIZE]u8,
 
     // Pending retransmit flags
     pending_handshake_done: bool,
@@ -274,6 +276,7 @@ pub const Connection = struct {
             .closing_frame_buf = undefined,
             .closing_frame_len = 0,
             .pkt_scratch = undefined,
+            .enc_scratch = undefined,
             .pending_handshake_done = false,
             .pending_max_data = false,
             .pending_reset_count = 0,
@@ -846,13 +849,12 @@ pub const Connection = struct {
             const n = frame.encodeFrame(&self.pkt_scratch, .ping);
             const pn = self.hot.tx_pn[2];
             self.hot.tx_pn[2] += 1;
-            var out: [MAX_PACKET_SIZE]u8 = undefined;
-            const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
             const ct_len = n + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..n], out[hdr_len..][0..ct_len]);
+            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..n], self.enc_scratch[hdr_len..][0..ct_len]);
             const out_len = hdr_len + ct_len;
-            try self.enqueueSend(out[0..out_len]);
+            try self.enqueueSend(self.enc_scratch[0..out_len]);
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .ping;
             fi.count = 1;
@@ -872,13 +874,12 @@ pub const Connection = struct {
         if (self.app_keys) |ak| {
             const pn = self.hot.tx_pn[2];
             self.hot.tx_pn[2] += 1;
-            var out: [MAX_PACKET_SIZE]u8 = undefined;
-            const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
             const ct_len = pos + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..pos], out[hdr_len..][0..ct_len]);
+            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
             const out_len = hdr_len + ct_len;
-            try self.enqueueSend(out[0..out_len]);
+            try self.enqueueSend(self.enc_scratch[0..out_len]);
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .handshake_done;
             fi.count = 1;
@@ -901,9 +902,8 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[0];
         self.hot.tx_pn[0] += 1;
 
-        var out: [MAX_PACKET_SIZE]u8 = undefined;
         const hdr_len = packet.encodeLongHeader(
-            &out,
+            &self.enc_scratch,
             .initial,
             packet.QUIC_VERSION_1,
             self.peer_cid,
@@ -915,9 +915,9 @@ pub const Connection = struct {
 
         const ct_out_len = fpos + 16;
         if (hdr_len + ct_out_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ik, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_out_len]);
+        crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_out_len]);
         const out_len = hdr_len + ct_out_len;
-        try self.enqueueSend(out[0..out_len]);
+        try self.enqueueSend(self.enc_scratch[0..out_len]);
 
         var fi = loss_recovery_mod.SentFrameInfo{};
         fi.frames[0] = .{ .crypto_frame = .{
@@ -977,13 +977,12 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        var out: [MAX_PACKET_SIZE]u8 = undefined;
-        const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_len]);
+        crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
         const out_len = hdr_len + ct_len;
-        try self.enqueueSend(out[0..out_len]);
+        try self.enqueueSend(self.enc_scratch[0..out_len]);
 
         var fi = loss_recovery_mod.SentFrameInfo{};
         fi.frames[0] = .{ .stream = .{
@@ -1016,19 +1015,18 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        var out: [MAX_PACKET_SIZE]u8 = undefined;
-        const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
         const ct_len = self.closing_frame_len + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(
             ak.server,
             pn,
-            out[0..hdr_len],
+            self.enc_scratch[0..hdr_len],
             self.closing_frame_buf[0..self.closing_frame_len],
-            out[hdr_len..][0..ct_len],
+            self.enc_scratch[hdr_len..][0..ct_len],
         );
         const out_len = hdr_len + ct_len;
-        try self.enqueueSend(out[0..out_len]);
+        try self.enqueueSend(self.enc_scratch[0..out_len]);
         // Not tracked for retransmission — closing state re-sends on every receive().
     }
 
@@ -1047,13 +1045,12 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        var out: [MAX_PACKET_SIZE]u8 = undefined;
-        const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_len]);
+        crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
         const out_len = hdr_len + ct_len;
-        try self.enqueueSend(out[0..out_len]);
+        try self.enqueueSend(self.enc_scratch[0..out_len]);
 
         var fi = loss_recovery_mod.SentFrameInfo{};
         fi.frames[0] = .{ .reset_stream = .{
@@ -1078,13 +1075,12 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        var out: [MAX_PACKET_SIZE]u8 = undefined;
-        const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_len]);
+        crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
         const out_len = hdr_len + ct_len;
-        try self.enqueueSend(out[0..out_len]);
+        try self.enqueueSend(self.enc_scratch[0..out_len]);
 
         var fi = loss_recovery_mod.SentFrameInfo{};
         fi.frames[0] = .{ .max_data = new_max };
@@ -1652,6 +1648,101 @@ test "security: processAck malformed underflow is safe" {
     };
     // Must not panic; the underflow guard breaks the loop early.
     conn.processAck(ack, 0);
+}
+
+test "security: VN rate limit suppresses second response within 1s" {
+    // First unknown-version packet at t=0 → VN sent.
+    // Second at t=500ms (< 1s) → no VN.
+    // Third at t=1001ms (≥ 1s) → VN sent again.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    var pkt: [32]u8 = undefined;
+    pkt[0] = 0xc0;
+    std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big);
+    pkt[5] = 8; @memset(pkt[6..14], 0xaa);
+    pkt[14] = 8; @memset(pkt[15..23], 0xbb);
+    const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
+
+    // t=0: first packet → VN response queued
+    conn.receive(&pkt, src, 0, io) catch {};
+    var out: [64]u8 = undefined;
+    try testing.expect(conn.send(&out) > 0); // VN sent
+
+    // t=500ms: second packet → rate-limited, no VN
+    conn.receive(&pkt, src, 500_000_000, io) catch {};
+    try testing.expectEqual(@as(usize, 0), conn.send(&out)); // suppressed
+
+    // t=1001ms: third packet → 1s elapsed, VN allowed again
+    conn.receive(&pkt, src, 1_001_000_000, io) catch {};
+    try testing.expect(conn.send(&out) > 0); // VN sent again
+}
+
+test "event_queue: wraparound maintains FIFO order" {
+    // Push/pop 20 events total (> EVENT_QUEUE_DEPTH=16) in batches so head and
+    // tail wrap around the ring buffer. Verify FIFO order is preserved.
+    const testing = std.testing;
+    var q = EventQueue{};
+
+    // Fill and drain twice to force head/tail past the buffer boundary.
+    var round: usize = 0;
+    while (round < 2) : (round += 1) {
+        var i: usize = 0;
+        while (i < EVENT_QUEUE_DEPTH) : (i += 1) {
+            q.push(.{ .stream_data = .{ .stream_id = @intCast(round * EVENT_QUEUE_DEPTH + i) } });
+        }
+        i = 0;
+        while (i < EVENT_QUEUE_DEPTH) : (i += 1) {
+            const ev = q.pop().?;
+            const expected: u62 = @intCast(round * EVENT_QUEUE_DEPTH + i);
+            try testing.expectEqual(expected, ev.stream_data.stream_id);
+        }
+    }
+    try testing.expect(q.isEmpty());
+}
+
+test "connection: cached_ack_delay_exp default is 3" {
+    // RFC 9000 §18.2 default for ack_delay_exponent is 3.
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection.accept(.{}, io);
+    try testing.expectEqual(@as(u6, 3), conn.cached_ack_delay_exp);
+}
+
+test "connection: idle_timeout_i64 matches config at accept()" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection.accept(.{ .idle_timeout_ns = 10_000_000_000 }, io);
+    try testing.expectEqual(@as(i64, 10_000_000_000), conn.idle_timeout_i64);
+}
+
+test "connection: idle_timeout_i64 is zero when idle_timeout_ns is zero" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection.accept(.{ .idle_timeout_ns = 0 }, io);
+    try testing.expectEqual(@as(i64, 0), conn.idle_timeout_i64);
+}
+
+test "connection: nextTimeout returns null when all deadlines are null" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.idle_deadline_ns = null;
+    conn.pto_deadline_ns = null;
+    conn.drain_deadline_ns = null;
+    try testing.expectEqual(@as(?i64, null), conn.nextTimeout());
+}
+
+test "connection: nextTimeout sentinel does not leak as a valid deadline" {
+    // Even if two timers are null, the returned value must be the one real deadline.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.idle_deadline_ns = null;
+    conn.pto_deadline_ns = 42;
+    conn.drain_deadline_ns = null;
+    try testing.expectEqual(@as(?i64, 42), conn.nextTimeout());
 }
 
 test "stream_reset: processFrames handles STOP_SENDING and pushes event" {

@@ -565,6 +565,29 @@ test "pto: deadline is clamped at 2^20 backoff" {
     try testing.expect(d_at_20 > d0);
 }
 
+test "rtt: ack_delay exceeding sample_ns does not underflow adjusted_rtt" {
+    // If ack_delay > sample_ns, the guard `adjusted_rtt >= delay` prevents underflow.
+    // Result: adjusted_rtt stays at sample_ns (50ns), smoothed_rtt converges safely.
+    const testing = std.testing;
+    var rtt = RttEstimator{};
+    rtt.update(100_000_000, 0, 25_000_000); // first sample: 100ms
+    // Now min_rtt=100ms, sample=50ms < min_rtt: no delay adjustment attempted.
+    // The `sample_ns > self.min_rtt` guard is false → adjusted_rtt = sample_ns = 50ms
+    rtt.update(50_000_000, 200_000_000, 25_000_000); // ack_delay=200ms >> sample=50ms
+    try testing.expect(rtt.smoothed_rtt > 0); // must not crash or produce 0
+    try testing.expect(rtt.min_rtt <= 50_000_000); // min_rtt updated to new low
+}
+
+test "loss_recovery: onAckReceived with empty ranges slice is safe" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    const result = lr.onAckReceived(1, 0, &[_]AckedRange{}, 0, 0, 25_000_000);
+    // No ranges → nothing acked, nothing lost
+    try testing.expectEqual(@as(u32, 0), result.newly_acked);
+    try testing.expectEqual(@as(u64, 1200), lr.bytes_in_flight); // still in flight
+}
+
 test "sent_table: eviction decrements bytes_in_flight to avoid double-counting" {
     const testing = std.testing;
     var lr = LossRecovery.init();
@@ -742,6 +765,33 @@ test "frame_info: MAX_LOSS_EVENTS caps lost_frames output" {
     // lost_frame_count capped at MAX_LOSS_EVENTS, newly_lost exceeds it
     try testing.expectEqual(@as(usize, MAX_LOSS_EVENTS), result.lost_frame_count);
     try testing.expect(result.newly_lost > @as(u32, MAX_LOSS_EVENTS));
+}
+
+test "sent_table: power-of-two slot collision evicts correctly" {
+    // pn=0 and pn=64 map to the same slot (0 & 63 == 0, 64 & 63 == 0).
+    // Adding pn=64 must evict pn=0; get(0, 0) must then return null.
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    lr.onPacketSent(0, 0, 1200, true, 1_000, .{});
+    try testing.expect(lr.sent.get(0, 0) != null);
+
+    lr.onPacketSent(MAX_SENT, 0, 1200, true, 2_000, .{}); // maps to slot 0, evicts pn=0
+    try testing.expectEqual(@as(?SentPacket, null), lr.sent.get(0, 0)); // pn=0 gone
+    try testing.expect(lr.sent.get(MAX_SENT, 0) != null);              // pn=64 present
+}
+
+test "sent_table: epoch mismatch in same slot returns null" {
+    // Two packets with different epochs that land in the same slot.
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0,
+                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    // pn=65 & 63 == 1, same slot, different epoch
+    _ = table.add(.{ .pn = 65, .sent_ns = 0, .size = 100, .epoch = 2,
+                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(?SentPacket, null), table.get(1, 0));  // evicted
+    try testing.expect(table.get(65, 2) != null);                       // present
 }
 
 test "frame_info: ring buffer eviction preserves new packet frame info" {

@@ -229,6 +229,33 @@ test "cubic: non-monotonic clock (negative t_ns) is a no-op" {
     try testing.expectEqual(cwnd_before, c.cwnd);
 }
 
+test "cubic: cubicWindow formula W_cubic(t)=C*(t-K)^3+W_max" {
+    // cubicWindow(t, k, w_max) = C*(t-k)^3 + w_max
+    // With C=0.4, t=2.0, k=1.0, w_max=10.0:
+    //   W_cubic = 0.4 * (2-1)^3 + 10 = 0.4 * 1 + 10 = 10.4
+    const result = cubicWindow(2.0, 1.0, 10.0);
+    const expected: f64 = C * (2.0 - 1.0) * (2.0 - 1.0) * (2.0 - 1.0) + 10.0;
+    try std.testing.expectApproxEqAbs(expected, result, 1e-9);
+}
+
+test "cubic: second consecutive loss further reduces cwnd" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    c.cwnd = 100 * MSS;
+    c.onPacketLost(1_000_000_000);
+    const after_first = c.cwnd;
+    // Second loss: cwnd should be further reduced
+    c.onPacketLost(1_001_000_000);
+    try testing.expect(c.cwnd < after_first);
+}
+
+test "cubic: initial ssthresh is max (slow start from scratch)" {
+    const c = Cubic.init();
+    try std.testing.expectEqual(std.math.maxInt(u64), c.ssthresh);
+    // In slow start, cwnd < ssthresh always holds at initialization
+    try std.testing.expect(c.cwnd < c.ssthresh);
+}
+
 test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {
     const testing = std.testing;
     var c = Cubic.init();
