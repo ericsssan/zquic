@@ -36,8 +36,12 @@ pub fn streamKind(id: u62) StreamKind {
     return @enumFromInt(@as(u1, @intCast((id >> 1) & 1)));
 }
 
-/// A fixed-size ring buffer for stream receive data.
+/// A fixed-size ring buffer for stream data (receive or send side).
+/// `cap` must be a power of two (enforced by comptime assert).
 pub fn RingBuf(comptime cap: usize) type {
+    comptime {
+        std.debug.assert(cap > 0 and cap & (cap - 1) == 0);
+    }
     return struct {
         const Self = @This();
         buf: [cap]u8 = undefined,
@@ -54,8 +58,12 @@ pub fn RingBuf(comptime cap: usize) type {
 
         pub fn write(self: *Self, data: []const u8) usize {
             const n = @min(data.len, self.writable());
-            for (0..n) |i| {
-                self.buf[(self.wp + i) % cap] = data[i];
+            if (n == 0) return 0;
+            const start = self.wp & (cap - 1);
+            const first = @min(n, cap - start);
+            @memcpy(self.buf[start..][0..first], data[0..first]);
+            if (n > first) {
+                @memcpy(self.buf[0..n - first], data[first..n]);
             }
             self.wp += n;
             return n;
@@ -63,11 +71,37 @@ pub fn RingBuf(comptime cap: usize) type {
 
         pub fn read(self: *Self, out: []u8) usize {
             const n = @min(out.len, self.readable());
-            for (0..n) |i| {
-                out[i] = self.buf[(self.rp + i) % cap];
+            if (n == 0) return 0;
+            const start = self.rp & (cap - 1);
+            const first = @min(n, cap - start);
+            @memcpy(out[0..first], self.buf[start..][0..first]);
+            if (n > first) {
+                @memcpy(out[first..n], self.buf[0..n - first]);
             }
             self.rp += n;
             return n;
+        }
+
+        /// Read bytes at rel_offset from the read pointer without consuming.
+        pub fn peek(self: *const Self, rel_offset: usize, out: []u8) usize {
+            const avail = self.readable();
+            if (rel_offset >= avail) return 0;
+            const n = @min(out.len, avail - rel_offset);
+            if (n == 0) return 0;
+            const start = (self.rp + rel_offset) & (cap - 1);
+            const first = @min(n, cap - start);
+            @memcpy(out[0..first], self.buf[start..][0..first]);
+            if (n > first) {
+                @memcpy(out[first..n], self.buf[0..n - first]);
+            }
+            return n;
+        }
+
+        /// Discard n bytes from the read side (advance rp without copying).
+        pub fn discard(self: *Self, n: usize) usize {
+            const actual = @min(n, self.readable());
+            self.rp += actual;
+            return actual;
         }
     };
 }
@@ -83,6 +117,19 @@ pub const Stream = struct {
     /// Maximum bytes we are allowed to send on this stream (set by remote).
     send_max: u64,
 
+    // Send-side buffer: holds data until acknowledged (for retransmission).
+    send_buf: RingBuf(STREAM_BUF_SIZE),
+    /// Cumulative bytes acknowledged on the send side.
+    send_acked: u64,
+    /// FIN has been queued for sending.
+    send_fin: bool,
+    /// FIN has been acknowledged by the remote.
+    fin_acked: bool,
+    /// Pending RESET_STREAM to send (set by initiateReset / onStopSendingReceived).
+    pending_reset: ?struct { error_code: u62, final_size: u62 },
+    /// Pending STOP_SENDING error code (set when we want to stop receiving).
+    pending_stop: ?u62,
+
     pub fn init(id: u62) Stream {
         return .{
             .id = id,
@@ -92,6 +139,12 @@ pub const Stream = struct {
             .recv_buf = .{},
             .recv_max = STREAM_BUF_SIZE,
             .send_max = STREAM_BUF_SIZE,
+            .send_buf = .{},
+            .send_acked = 0,
+            .send_fin = false,
+            .fin_acked = false,
+            .pending_reset = null,
+            .pending_stop = null,
         };
     }
 
@@ -108,7 +161,8 @@ pub const Stream = struct {
 
     /// Buffer incoming data. Returns error if exceeds receive window or buffer is full.
     pub fn receiveData(self: *Stream, offset: u64, data: []const u8, fin: bool) !void {
-        if (offset + data.len > self.recv_max) return error.FlowControlViolation;
+        const end = std.math.add(u64, offset, data.len) catch return error.FlowControlViolation;
+        if (end > self.recv_max) return error.FlowControlViolation;
 
         // Simple in-order delivery only for Phase 1
         if (offset == self.recv_offset) {
@@ -151,6 +205,69 @@ pub const Stream = struct {
             .open => self.state = .half_closed_local,
             .half_closed_remote => self.state = .closed,
             else => {},
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Send-side buffer API (Phase 3)
+    // -----------------------------------------------------------------------
+
+    /// Write data into the send buffer (retained until ACKed for retransmission).
+    /// Returns the number of bytes actually buffered.
+    pub fn bufferSendData(self: *Stream, data: []const u8) usize {
+        return self.send_buf.write(data);
+    }
+
+    /// Called when the remote acknowledges bytes [offset, offset+len).
+    /// Advances send_acked and frees the corresponding space in send_buf.
+    pub fn onAcked(self: *Stream, offset: u64, len: u16) void {
+        if (offset != self.send_acked) return; // only handle contiguous acks
+        _ = self.send_buf.discard(len);
+        self.send_acked += len;
+    }
+
+    /// Return a peek of buffered send data starting at `offset`.
+    /// Returns 0 if offset is below send_acked (already freed).
+    pub fn getSendData(self: *const Stream, offset: u64, out: []u8) usize {
+        if (offset < self.send_acked) return 0;
+        const rel: usize = @intCast(offset - self.send_acked);
+        return self.send_buf.peek(rel, out);
+    }
+
+    // -----------------------------------------------------------------------
+    // Reset / stop-sending state machine (Phase 3 / Step 6)
+    // -----------------------------------------------------------------------
+
+    /// Handle an incoming RESET_STREAM frame.
+    pub fn onResetReceived(self: *Stream, error_code: u62, final_size: u62) !void {
+        _ = error_code;
+        // RFC 9000 §19.4: final_size must be >= bytes already received.
+        if (final_size < self.recv_offset) return error.FinalSizeError;
+        switch (self.state) {
+            .open, .half_closed_remote => self.state = .reset,
+            .half_closed_local => self.state = .closed,
+            .closed, .reset => {},
+        }
+    }
+
+    /// Handle an incoming STOP_SENDING frame — we respond by resetting the stream.
+    pub fn onStopSendingReceived(self: *Stream, error_code: u62) void {
+        self.pending_reset = .{
+            .error_code = error_code,
+            .final_size = @intCast(self.send_offset),
+        };
+    }
+
+    /// Initiate a local reset of this stream.
+    pub fn initiateReset(self: *Stream, error_code: u62) void {
+        self.pending_reset = .{
+            .error_code = error_code,
+            .final_size = @intCast(self.send_offset),
+        };
+        switch (self.state) {
+            .open, .half_closed_remote => self.state = .reset,
+            .half_closed_local => self.state = .closed,
+            .closed, .reset => {},
         }
     }
 };
@@ -331,4 +448,151 @@ test "ringbuf: wrap-around" {
     const n = rb.read(&out2);
     try testing.expectEqual(@as(usize, 6), n);
     try testing.expectEqualSlices(u8, "efgxyz", out2[0..n]);
+}
+
+// ---------------------------------------------------------------------------
+// New tests — send-side buffer (Step 2)
+// ---------------------------------------------------------------------------
+
+test "stream_send: bufferSendData and getSendData round-trip" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    const n = s.bufferSendData("hello");
+    try testing.expectEqual(@as(usize, 5), n);
+
+    var buf: [16]u8 = undefined;
+    const m = s.getSendData(0, &buf);
+    try testing.expectEqual(@as(usize, 5), m);
+    try testing.expectEqualSlices(u8, "hello", buf[0..m]);
+}
+
+test "stream_send: onAcked advances send_acked and frees send_buf space" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    _ = s.bufferSendData("hello world"); // 11 bytes
+    s.send_offset = 11; // simulate having sent all
+
+    const writable_before = s.send_buf.writable();
+    s.onAcked(0, 5); // ack first 5 bytes
+    try testing.expectEqual(@as(u64, 5), s.send_acked);
+    try testing.expect(s.send_buf.writable() > writable_before);
+}
+
+test "stream_send: getSendData returns data for un-acked offset" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    _ = s.bufferSendData("abcdefgh"); // 8 bytes at offset 0
+
+    var buf: [8]u8 = undefined;
+    const n = s.getSendData(0, &buf);
+    try testing.expectEqual(@as(usize, 8), n);
+    try testing.expectEqualSlices(u8, "abcdefgh", buf[0..n]);
+}
+
+test "stream_send: getSendData returns 0 for already-acked offset" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    _ = s.bufferSendData("hello");
+    s.onAcked(0, 5);
+
+    var buf: [16]u8 = undefined;
+    const n = s.getSendData(0, &buf); // offset 0 is already acked
+    try testing.expectEqual(@as(usize, 0), n);
+}
+
+test "stream_send: send_fin and fin_acked flags" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    try testing.expect(!s.send_fin);
+    try testing.expect(!s.fin_acked);
+
+    s.send_fin = true;
+    try testing.expect(s.send_fin);
+    s.fin_acked = true;
+    try testing.expect(s.fin_acked);
+}
+
+test "ringbuf: peek does not consume" {
+    const testing = std.testing;
+    var rb: RingBuf(16) = .{};
+    _ = rb.write("hello world");
+
+    var buf1: [5]u8 = undefined;
+    const n1 = rb.peek(0, &buf1);
+    try testing.expectEqual(@as(usize, 5), n1);
+    try testing.expectEqualSlices(u8, "hello", buf1[0..n1]);
+    // readable count unchanged
+    try testing.expectEqual(@as(usize, 11), rb.readable());
+
+    var buf2: [5]u8 = undefined;
+    const n2 = rb.peek(6, &buf2);
+    try testing.expectEqual(@as(usize, 5), n2);
+    try testing.expectEqualSlices(u8, "world", buf2[0..n2]);
+}
+
+test "ringbuf: discard advances rp" {
+    const testing = std.testing;
+    var rb: RingBuf(16) = .{};
+    _ = rb.write("hello");
+    const discarded = rb.discard(3);
+    try testing.expectEqual(@as(usize, 3), discarded);
+    try testing.expectEqual(@as(usize, 2), rb.readable());
+    var buf: [4]u8 = undefined;
+    const n = rb.read(&buf);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualSlices(u8, "lo", buf[0..n]);
+}
+
+// ---------------------------------------------------------------------------
+// New tests — stream state machine (Step 6)
+// ---------------------------------------------------------------------------
+
+test "stream_reset: onResetReceived open to reset" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    try s.onResetReceived(42, 0);
+    try testing.expectEqual(StreamState.reset, s.state);
+}
+
+test "stream_reset: onResetReceived half_closed_local to closed" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.state = .half_closed_local;
+    try s.onResetReceived(0, 0);
+    try testing.expectEqual(StreamState.closed, s.state);
+}
+
+test "stream_reset: onResetReceived bad final_size returns FinalSizeError" {
+    var s = Stream.init(0);
+    s.recv_offset = 100;
+    try std.testing.expectError(error.FinalSizeError, s.onResetReceived(0, 50));
+}
+
+test "stream_reset: onStopSendingReceived sets pending_reset" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.send_offset = 200;
+    s.onStopSendingReceived(7);
+    try testing.expect(s.pending_reset != null);
+    try testing.expectEqual(@as(u62, 7), s.pending_reset.?.error_code);
+    try testing.expectEqual(@as(u62, 200), s.pending_reset.?.final_size);
+}
+
+test "stream: receiveData overflow-safe offset + len check" {
+    // offset near u64 max: offset + data.len would overflow — must return FlowControlViolation
+    var s = Stream.init(0);
+    s.recv_max = std.math.maxInt(u64);
+    const err = s.receiveData(std.math.maxInt(u64) - 2, "hello", false);
+    try std.testing.expectError(error.FlowControlViolation, err);
+}
+
+test "stream_reset: initiateReset sets pending and transitions state" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.send_offset = 100;
+    s.initiateReset(5);
+    try testing.expect(s.pending_reset != null);
+    try testing.expectEqual(@as(u62, 5), s.pending_reset.?.error_code);
+    try testing.expectEqual(@as(u62, 100), s.pending_reset.?.final_size);
+    try testing.expectEqual(StreamState.reset, s.state);
 }

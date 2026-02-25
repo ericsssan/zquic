@@ -38,6 +38,7 @@ pub fn build(b: *std.Build) void {
         "src/quic/loss_recovery.zig",
         "src/quic/tls.zig",
         "src/quic/connection.zig",
+        "src/quic/fuzz.zig",
     };
 
     for (test_files) |path| {

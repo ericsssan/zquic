@@ -129,8 +129,11 @@ pub fn decode(buf: []const u8) !TransportParams {
     // Bitmask tracking which known parameter IDs (0x01..0x0f) have been seen.
     // bit i set ⟺ parameter with ID (i+1) was already decoded.
     var seen: u16 = 0;
+    var param_count: usize = 0;
 
     while (pos < buf.len) {
+        param_count += 1;
+        if (param_count > 64) return error.InvalidParams;
         const id_vi = varint.decode(buf[pos..]) orelse return error.InvalidParams;
         pos += id_vi.len;
 
@@ -162,6 +165,7 @@ pub fn decode(buf: []const u8) !TransportParams {
             },
             TP_MAX_UDP_PAYLOAD_SIZE => {
                 const v = varint.decode(param_data) orelse return error.InvalidParams;
+                if (v.value < 1200) return error.InvalidParams; // RFC 9000 §18.2
                 params.max_udp_payload_size = v.value;
             },
             TP_INITIAL_MAX_DATA => {
@@ -190,10 +194,12 @@ pub fn decode(buf: []const u8) !TransportParams {
             },
             TP_ACK_DELAY_EXPONENT => {
                 const v = varint.decode(param_data) orelse return error.InvalidParams;
+                if (v.value > 20) return error.InvalidParams; // RFC 9000 §18.2
                 params.ack_delay_exponent = v.value;
             },
             TP_MAX_ACK_DELAY => {
                 const v = varint.decode(param_data) orelse return error.InvalidParams;
+                if (v.value >= (1 << 14)) return error.InvalidParams; // RFC 9000 §18.2: < 2^14 ms
                 params.max_ack_delay_ms = v.value;
             },
             TP_DISABLE_ACTIVE_MIGRATION => {
@@ -201,6 +207,7 @@ pub fn decode(buf: []const u8) !TransportParams {
             },
             TP_ACTIVE_CONNECTION_ID_LIMIT => {
                 const v = varint.decode(param_data) orelse return error.InvalidParams;
+                if (v.value < 2) return error.InvalidParams; // RFC 9000 §18.2
                 params.active_connection_id_limit = v.value;
             },
             TP_INITIAL_SOURCE_CONNECTION_ID => {
@@ -375,6 +382,49 @@ test "transport_params: unknown IDs are not subject to duplicate check" {
     // Defaults should remain
     const defaults = TransportParams{};
     try testing.expectEqual(defaults.initial_max_data, decoded.initial_max_data);
+}
+
+test "transport_params: ack_delay_exponent > 20 returns error" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_ACK_DELAY_EXPONENT);
+    pos += varint.encode(buf[pos..], 1); // length
+    pos += varint.encode(buf[pos..], 21); // value 21 > max 20
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: active_connection_id_limit < 2 returns error" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_ACTIVE_CONNECTION_ID_LIMIT);
+    pos += varint.encode(buf[pos..], 1); // length
+    pos += varint.encode(buf[pos..], 1); // value 1 < min 2
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: max_udp_payload_size < 1200 returns error" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_MAX_UDP_PAYLOAD_SIZE);
+    pos += varint.encode(buf[pos..], 2); // length
+    pos += varint.encode(buf[pos..], 1199); // value < 1200
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: more than 64 params returns error" {
+    const testing = std.testing;
+    var buf: [1024]u8 = undefined;
+    var pos: usize = 0;
+    // Write 65 unknown params
+    var i: usize = 0;
+    while (i < 65) : (i += 1) {
+        pos += varint.encode(buf[pos..], 0x55 + @as(u62, @intCast(i)) * 2); // unique unknown IDs
+        pos += varint.encode(buf[pos..], 0); // zero-length value
+    }
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
 }
 
 test "transport_params: initial_source_connection_id round-trip" {

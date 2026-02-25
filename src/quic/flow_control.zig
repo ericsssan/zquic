@@ -4,9 +4,6 @@ const std = @import("std");
 
 pub const DEFAULT_MAX_DATA: u64 = 1024 * 1024; // 1 MiB
 pub const DEFAULT_MAX_STREAM_DATA: u64 = 256 * 1024; // 256 KiB
-/// Emit a MAX_DATA update when usage exceeds this fraction of the window.
-const UPDATE_THRESHOLD = 0.75;
-
 pub const FlowController = struct {
     /// Maximum bytes the remote is allowed to send to us (receive window).
     recv_max: u64,
@@ -42,11 +39,12 @@ pub const FlowController = struct {
     }
 
     /// True when we should emit a MAX_DATA frame to extend the peer's window.
+    /// Uses integer arithmetic: recv_total/recv_max >= 3/4 ⟺ recv_total*4 >= recv_max*3.
+    /// Safe from overflow because recv_total <= recv_max <= (1<<62)-1,
+    /// so *4 stays within u64.
     pub fn shouldSendMaxData(self: *const FlowController) bool {
         if (self.recv_max == 0) return false; // guard: avoid divide-by-zero
-        const used_fraction = @as(f64, @floatFromInt(self.recv_total)) /
-            @as(f64, @floatFromInt(self.recv_max));
-        return used_fraction >= UPDATE_THRESHOLD;
+        return self.recv_total * 4 >= self.recv_max * 3;
     }
 
     /// Compute the new MAX_DATA value to advertise (doubles the window).

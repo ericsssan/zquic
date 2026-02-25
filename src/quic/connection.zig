@@ -48,6 +48,43 @@ pub const SocketAddr = union(enum(u1)) {
 };
 
 // ---------------------------------------------------------------------------
+// Event queue
+// ---------------------------------------------------------------------------
+
+pub const EVENT_QUEUE_DEPTH = 16;
+
+pub const Event = union(enum) {
+    stream_data: struct { stream_id: u62 },
+    stream_reset: struct { stream_id: u62, error_code: u62 },
+    connection_closed: struct { error_code: u62, is_app: bool },
+    connected,
+    stop_sending: struct { stream_id: u62, error_code: u62 },
+};
+
+const EventQueue = struct {
+    items: [EVENT_QUEUE_DEPTH]Event = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+
+    pub fn push(self: *EventQueue, ev: Event) void {
+        if (self.tail - self.head >= EVENT_QUEUE_DEPTH) return; // drop if full
+        self.items[self.tail % EVENT_QUEUE_DEPTH] = ev;
+        self.tail += 1;
+    }
+
+    pub fn pop(self: *EventQueue) ?Event {
+        if (self.head == self.tail) return null;
+        const ev = self.items[self.head % EVENT_QUEUE_DEPTH];
+        self.head += 1;
+        return ev;
+    }
+
+    pub fn isEmpty(self: *const EventQueue) bool {
+        return self.head == self.tail;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Hot path struct — exactly 64 bytes, cache-line aligned
 // ---------------------------------------------------------------------------
 
@@ -55,8 +92,9 @@ pub const ConnState = enum(u8) {
     idle = 0,
     handshake = 1,
     established = 2,
-    draining = 3,
-    closed = 4,
+    closing = 3,
+    draining = 4,
+    closed = 5,
 };
 
 pub const ConnectionHot = struct {
@@ -145,6 +183,8 @@ pub const Connection = struct {
     // Timers
     idle_deadline_ns: ?i64,
     pto_deadline_ns: ?i64,
+    /// Deadline for transitioning out of closing/draining state.
+    drain_deadline_ns: ?i64,
 
     // Stats
     bytes_sent: u64,
@@ -154,6 +194,29 @@ pub const Connection = struct {
 
     // Config
     config: Config,
+
+    // Event queue
+    events: EventQueue,
+
+    // Connection close
+    closing_frame_buf: [128]u8,
+    closing_frame_len: usize,
+
+    // Scratch buffer shared by all queue* helpers for frame serialisation.
+    // Safe to share because those helpers are never called re-entrantly.
+    pkt_scratch: [MAX_PACKET_SIZE]u8,
+
+    // Pending retransmit flags
+    pending_handshake_done: bool,
+    pending_max_data: bool,
+    /// Count of streams with a pending_reset set; avoids O(MAX_STREAMS) scan in tick().
+    pending_reset_count: u8,
+    /// Timestamp of the last Version Negotiation response (nanoseconds).
+    /// Used to rate-limit VN responses to 1 per second.
+    last_vn_ns: i64,
+
+    // Per-epoch TLS send offset (for FrameInfo tracking)
+    crypto_send_offset: [3]u64,
 
     /// Create a server-side connection.  Call `receive()` with the first
     /// datagram to start the handshake.
@@ -190,11 +253,21 @@ pub const Connection = struct {
             .sq_tail = 0,
             .idle_deadline_ns = null,
             .pto_deadline_ns = null,
+            .drain_deadline_ns = null,
             .bytes_sent = 0,
             .bytes_recv = 0,
             .pkts_sent = 0,
             .pkts_recv = 0,
             .config = config,
+            .events = .{},
+            .closing_frame_buf = undefined,
+            .closing_frame_len = 0,
+            .pkt_scratch = undefined,
+            .pending_handshake_done = false,
+            .pending_max_data = false,
+            .pending_reset_count = 0,
+            .last_vn_ns = -1_000_000_000, // sentinel: "1s before the epoch" so first VN is always allowed
+            .crypto_send_offset = .{ 0, 0, 0 },
         };
     }
 
@@ -211,6 +284,24 @@ pub const Connection = struct {
         _ = src;
         self.current_time_ns = now_ns;
 
+        // Closing: retransmit CONNECTION_CLOSE, do not process the datagram.
+        if (self.hot.state == .closing) {
+            self.queueConnectionClose() catch {};
+            return;
+        }
+
+        // Draining / closed: silently discard.
+        if (self.hot.state == .draining or self.hot.state == .closed) return;
+
+        // Refresh idle timer.
+        if (self.config.idle_timeout_ns > 0) {
+            const timeout: i64 = @intCast(@min(
+                self.config.idle_timeout_ns,
+                @as(u64, std.math.maxInt(i64)),
+            ));
+            self.idle_deadline_ns = now_ns +| timeout;
+        }
+
         // Process all coalesced packets in the datagram
         var remaining = data;
         while (remaining.len > 0) {
@@ -222,8 +313,10 @@ pub const Connection = struct {
 
     /// Write the next UDP payload to `out`. Returns bytes written (0 = nothing pending).
     pub fn send(self: *Connection, out: []u8) usize {
+        // RFC 9000 §10.2: draining state — must not send anything.
+        if (self.hot.state == .draining) return 0;
         if (self.sq_head == self.sq_tail) return 0;
-        const slot = &self.sq[self.sq_head % SEND_QUEUE_DEPTH];
+        const slot = &self.sq[self.sq_head & (SEND_QUEUE_DEPTH - 1)];
         const n = @min(slot.len, out.len);
         @memcpy(out[0..n], slot.buf[0..n]);
         self.sq_head += 1;
@@ -240,6 +333,9 @@ pub const Connection = struct {
         if (self.pto_deadline_ns) |d| {
             if (min == null or d < min.?) min = d;
         }
+        if (self.drain_deadline_ns) |d| {
+            if (min == null or d < min.?) min = d;
+        }
         return min;
     }
 
@@ -247,28 +343,117 @@ pub const Connection = struct {
     pub fn tick(self: *Connection, now_ns: i64) void {
         self.current_time_ns = now_ns;
 
+        // Drain timer: closing/draining → closed.
+        if (self.drain_deadline_ns) |d| {
+            if (now_ns >= d) {
+                self.hot.state = .closed;
+                self.drain_deadline_ns = null;
+            }
+        }
+
+        // Idle timeout → closed (RFC 9000 §10.1).
         if (self.idle_deadline_ns) |d| {
             if (now_ns >= d) {
-                self.hot.state = .draining;
+                self.hot.state = .closed;
                 self.idle_deadline_ns = null;
             }
         }
-        if (self.pto_deadline_ns) |d| {
-            if (now_ns >= d) {
-                // PTO: send a PING probe, then double the backoff
-                self.loss.onPtoFired();
-                self.queuePing() catch {};
-                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+
+        // PTO: suppress in closing/draining/closed states.
+        if (self.hot.state != .closing and
+            self.hot.state != .draining and
+            self.hot.state != .closed)
+        {
+            if (self.pto_deadline_ns) |d| {
+                if (now_ns >= d) {
+                    // PTO: send a PING probe, then double the backoff
+                    self.loss.onPtoFired();
+                    self.queuePing() catch {};
+                    self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                }
             }
         }
+
+        // Flush pending retransmits.
+        if (self.pending_handshake_done) {
+            self.pending_handshake_done = false;
+            self.queueHandshakeDone() catch {};
+        }
+        if (self.pending_max_data) {
+            self.pending_max_data = false;
+            self.queueMaxData() catch {};
+        }
+
+        // Flush pending stream resets (fast-path: skip scan when nothing is pending).
+        if (self.pending_reset_count > 0) self.flushPendingResets() catch {};
     }
 
     pub fn isClosed(self: *const Connection) bool {
-        return self.hot.state == .closed or self.hot.state == .draining;
+        return self.hot.state == .closed or
+            self.hot.state == .draining or
+            self.hot.state == .closing;
+    }
+
+    pub fn isDraining(self: *const Connection) bool {
+        return self.hot.state == .draining;
     }
 
     pub fn isEstablished(self: *const Connection) bool {
         return self.hot.state == .established;
+    }
+
+    /// Drain the next application event, or null if none pending.
+    pub fn pollEvent(self: *Connection) ?Event {
+        return self.events.pop();
+    }
+
+    /// Buffer stream data for sending and queue a packet.
+    pub fn streamSend(self: *Connection, stream_id: u62, data: []const u8, fin: bool) !void {
+        const st = self.streams.getOrCreate(stream_id) orelse return error.TooManyStreams;
+        if (!st.canSend(@intCast(data.len))) return error.StreamNotWritable;
+        const n = st.bufferSendData(data);
+        if (n < data.len) return error.BufferFull;
+        if (fin) st.send_fin = true;
+        if (self.hot.state == .established) {
+            try self.queueStreamData(stream_id, data, fin);
+        }
+    }
+
+    /// Initiate a connection close.  Transitions to closing, queues a CONNECTION_CLOSE,
+    /// and arms the drain timer.
+    pub fn close(self: *Connection, error_code: u62, is_app: bool, reason: []const u8) !void {
+        if (self.hot.state == .closing or
+            self.hot.state == .draining or
+            self.hot.state == .closed) return;
+        self.hot.state = .closing;
+
+        // Serialize CONNECTION_CLOSE into the persistent frame buffer.
+        const cc_frame: frame.Frame = .{ .connection_close = .{
+            .error_code = error_code,
+            .frame_type = 0,
+            .reason = reason,
+            .is_app = is_app,
+        } };
+        self.closing_frame_len = frame.encodeFrame(&self.closing_frame_buf, cc_frame);
+
+        // Drain deadline: now + 3 × PTO.
+        const pto = self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns);
+        const pto3 = @min(pto *| 3, @as(u64, std.math.maxInt(i64)));
+        self.drain_deadline_ns = self.current_time_ns +| @as(i64, @intCast(pto3));
+
+        // Queue the CONNECTION_CLOSE frame.
+        self.queueConnectionClose() catch {};
+
+        // Notify the application.
+        self.events.push(.{ .connection_closed = .{ .error_code = error_code, .is_app = is_app } });
+    }
+
+    /// Reset a stream and queue a RESET_STREAM frame.
+    pub fn resetStream(self: *Connection, stream_id: u62, error_code: u62) !void {
+        const st = self.streams.get(stream_id) orelse return error.StreamNotFound;
+        st.initiateReset(error_code);
+        self.pending_reset_count += 1;
+        try self.flushPendingResets();
     }
 
     // -----------------------------------------------------------------------
@@ -293,8 +478,11 @@ pub const Connection = struct {
             const ver = std.mem.readInt(u32, data[1..5], .big);
             if (ver != packet.QUIC_VERSION_1) {
                 if (ver != 0) {
-                    // Unknown non-zero version: send a Version Negotiation response.
-                    self.sendVersionNeg(data) catch {};
+                    // Rate-limit VN responses to 1 per second to prevent amplification.
+                    if (self.current_time_ns - self.last_vn_ns >= 1_000_000_000) {
+                        self.last_vn_ns = self.current_time_ns;
+                        self.sendVersionNeg(data) catch {};
+                    }
                 }
                 // Version 0 = received a VN packet from the peer; ignore it.
                 return data.len;
@@ -411,7 +599,41 @@ pub const Connection = struct {
                     }
                 },
                 .handshake_done => self.hot.state = .established,
-                .connection_close => self.hot.state = .draining,
+                .connection_close => |cc| {
+                    if (self.hot.state != .closing and
+                        self.hot.state != .draining and
+                        self.hot.state != .closed)
+                    {
+                        self.hot.state = .draining;
+                        const pto = self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns);
+                        const pto3 = @min(pto *| 3, @as(u64, std.math.maxInt(i64)));
+                        self.drain_deadline_ns = self.current_time_ns +| @as(i64, @intCast(pto3));
+                        self.events.push(.{ .connection_closed = .{
+                            .error_code = cc.error_code,
+                            .is_app = cc.is_app,
+                        } });
+                    }
+                },
+                .reset_stream => |rs| {
+                    if (self.streams.get(rs.stream_id)) |st| {
+                        st.onResetReceived(rs.error_code, rs.final_size) catch {};
+                    }
+                    self.events.push(.{ .stream_reset = .{
+                        .stream_id = rs.stream_id,
+                        .error_code = rs.error_code,
+                    } });
+                },
+                .stop_sending => |ss| {
+                    if (self.streams.get(ss.stream_id)) |st| {
+                        st.onStopSendingReceived(ss.error_code);
+                        self.pending_reset_count += 1;
+                    }
+                    self.events.push(.{ .stop_sending = .{
+                        .stream_id = ss.stream_id,
+                        .error_code = ss.error_code,
+                    } });
+                    self.flushPendingResets() catch {};
+                },
                 else => {},
             }
         }
@@ -453,14 +675,13 @@ pub const Connection = struct {
     }
 
     fn processStreamFrame(self: *Connection, f: frame.StreamFrame) !void {
+        // Server must only receive client-initiated streams (bit 0 = 0).
+        if (f.stream_id & 1 != 0) return error.StreamStateError;
         const st = self.streams.getOrCreate(f.stream_id) orelse return error.TooManyStreams;
         self.conn_flow.onReceived(@intCast(f.data.len));
         try st.receiveData(f.offset, f.data, f.fin);
-
-        // Echo: if we received data, send it back on the same stream
-        if (self.hot.state == .established and f.data.len > 0) {
-            try self.queueStreamData(f.stream_id, f.data, f.fin);
-        }
+        // Notify the application; the echo behaviour from Phase 1 is removed.
+        self.events.push(.{ .stream_data = .{ .stream_id = f.stream_id } });
     }
 
     fn processAck(self: *Connection, ack: frame.AckFrame, epoch: u8) void {
@@ -471,11 +692,15 @@ pub const Connection = struct {
         var range_count: usize = 0;
         var high: u64 = @as(u64, ack.largest_acked);
         for (0..ack.range_count) |i| {
-            const low = high - @as(u64, ack.ranges[i].ack_range);
+            const ack_range_val = @as(u64, ack.ranges[i].ack_range);
+            if (ack_range_val > high) break; // malformed: would underflow
+            const low = high - ack_range_val;
             ranges_buf[range_count] = .{ .low = low, .high = high };
             range_count += 1;
             if (i + 1 < ack.range_count) {
-                high = low - 1 - @as(u64, ack.ranges[i + 1].gap);
+                const gap_val = @as(u64, ack.ranges[i + 1].gap);
+                if (low == 0 or gap_val >= low) break; // malformed: would underflow
+                high = low - 1 - gap_val;
             }
         }
 
@@ -509,8 +734,76 @@ pub const Connection = struct {
             self.congestion.onPacketLost(self.current_time_ns);
         }
 
+        // Process acked / lost frames for retransmission.
+        self.processAckedFrames(result);
+        self.processLostFrames(result);
+
         // Refresh PTO timer after any ACK
         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+    }
+
+    // -----------------------------------------------------------------------
+    // Retransmission helpers (Step 4)
+    // -----------------------------------------------------------------------
+
+    fn processAckedFrames(self: *Connection, result: loss_recovery_mod.AckResult) void {
+        for (result.acked_frames[0..result.acked_frame_count]) |fi| {
+            for (fi.frames[0..fi.count]) |frame_info| {
+                switch (frame_info) {
+                    .stream => |s| {
+                        if (self.streams.get(s.stream_id)) |st| {
+                            st.onAcked(s.offset, s.len);
+                            if (s.fin) {
+                                st.fin_acked = true;
+                                if (st.state == .closed) {
+                                    self.streams.close(s.stream_id);
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    }
+
+    fn processLostFrames(self: *Connection, result: loss_recovery_mod.AckResult) void {
+        for (result.lost_frames[0..result.lost_frame_count]) |fi| {
+            for (fi.frames[0..fi.count]) |frame_info| {
+                switch (frame_info) {
+                    .stream => |s| {
+                        if (self.streams.get(s.stream_id)) |st| {
+                            var buf: [MAX_PACKET_SIZE]u8 = undefined;
+                            const n = st.getSendData(s.offset, &buf);
+                            if (n > 0 or s.fin) {
+                                self.encryptAndEnqueueStreamFrame(
+                                    s.stream_id,
+                                    s.offset,
+                                    buf[0..n],
+                                    s.fin,
+                                ) catch {};
+                            }
+                        }
+                    },
+                    .handshake_done => {
+                        self.pending_handshake_done = true;
+                    },
+                    .max_data => {
+                        self.pending_max_data = true;
+                    },
+                    .ping => {
+                        self.queuePing() catch {};
+                    },
+                    .reset_stream => |rs| {
+                        self.queueResetStream(rs.stream_id, rs.error_code, rs.final_size) catch {};
+                    },
+                    .connection_close => {
+                        self.queueConnectionClose() catch {};
+                    },
+                    .crypto_frame, .max_stream_data, .none => {},
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -521,7 +814,7 @@ pub const Connection = struct {
         // Use monotonic head/tail subtraction (not modular comparison) to correctly
         // detect full queue regardless of wrap-around.
         if (self.sq_tail - self.sq_head >= SEND_QUEUE_DEPTH) return error.SendQueueFull;
-        const slot = &self.sq[self.sq_tail % SEND_QUEUE_DEPTH];
+        const slot = &self.sq[self.sq_tail & (SEND_QUEUE_DEPTH - 1)];
         const n = @min(data.len, MAX_PACKET_SIZE);
         @memcpy(slot.buf[0..n], data[0..n]);
         slot.len = n;
@@ -546,15 +839,33 @@ pub const Connection = struct {
     }
 
     fn queuePing(self: *Connection) !void {
-        var pkt: [4]u8 = undefined;
-        const n = frame.encodeFrame(&pkt, .ping);
-        try self.enqueueSend(pkt[0..n]);
+        if (self.app_keys) |ak| {
+            // Post-handshake: send an encrypted PING in a 1-RTT packet.
+            const n = frame.encodeFrame(&self.pkt_scratch, .ping);
+            const pn = self.hot.tx_pn[2];
+            self.hot.tx_pn[2] += 1;
+            var out: [MAX_PACKET_SIZE]u8 = undefined;
+            const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+            const ct_len = n + 16;
+            if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+            crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..n], out[hdr_len..][0..ct_len]);
+            const out_len = hdr_len + ct_len;
+            try self.enqueueSend(out[0..out_len]);
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .ping;
+            fi.count = 1;
+            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
+            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+        } else {
+            // Pre-handshake: send a raw (unencrypted) PING for testing purposes.
+            const n = frame.encodeFrame(&self.pkt_scratch, .ping);
+            try self.enqueueSend(self.pkt_scratch[0..n]);
+        }
     }
 
     fn queueHandshakeDone(self: *Connection) !void {
-        var pkt: [MAX_PACKET_SIZE]u8 = undefined;
         var pos: usize = 0;
-        pos += frame.encodeFrame(pkt[pos..], .handshake_done);
+        pos += frame.encodeFrame(self.pkt_scratch[pos..], .handshake_done);
         // Encrypt with 1-RTT keys and send
         if (self.app_keys) |ak| {
             const pn = self.hot.tx_pn[2];
@@ -563,10 +874,13 @@ pub const Connection = struct {
             const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
             const ct_len = pos + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, out[0..hdr_len], pkt[0..pos], out[hdr_len..][0..ct_len]);
+            crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..pos], out[hdr_len..][0..ct_len]);
             const out_len = hdr_len + ct_len;
             try self.enqueueSend(out[0..out_len]);
-            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns);
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .handshake_done;
+            fi.count = 1;
+            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
             self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
         }
     }
@@ -577,7 +891,8 @@ pub const Connection = struct {
         var pkt: [MAX_PACKET_SIZE]u8 = undefined;
         var fpos: usize = 0;
 
-        const crypto_frame: frame.Frame = .{ .crypto = .{ .offset = 0, .data = tls_data } };
+        const tls_offset = self.crypto_send_offset[0];
+        const crypto_frame: frame.Frame = .{ .crypto = .{ .offset = @intCast(tls_offset), .data = tls_data } };
         fpos += frame.encodeFrame(pkt[fpos..], crypto_frame);
 
         // Encrypt with server initial keys and emit as Initial packet
@@ -602,7 +917,15 @@ pub const Connection = struct {
         crypto.encryptPayload(ik, pn, out[0..hdr_len], pkt[0..fpos], out[hdr_len..][0..ct_out_len]);
         const out_len = hdr_len + ct_out_len;
         try self.enqueueSend(out[0..out_len]);
-        self.loss.onPacketSent(pn, 0, out_len, true, self.current_time_ns);
+
+        var fi = loss_recovery_mod.SentFrameInfo{};
+        fi.frames[0] = .{ .crypto_frame = .{
+            .offset = @intCast(tls_offset),
+            .len = @intCast(@min(tls_data.len, 0xffff)),
+        } };
+        fi.count = 1;
+        self.crypto_send_offset[0] += tls_data.len;
+        self.loss.onPacketSent(pn, 0, out_len, true, self.current_time_ns, fi);
         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
     }
 
@@ -629,24 +952,26 @@ pub const Connection = struct {
         try self.enqueueSend(vn_buf[0..n]);
     }
 
-    fn queueStreamData(self: *Connection, id: u62, data: []const u8, fin: bool) !void {
+    /// Low-level: encrypt and enqueue a STREAM frame at an explicit offset.
+    /// Does NOT advance stream.send_offset (caller is responsible for that).
+    fn encryptAndEnqueueStreamFrame(
+        self: *Connection,
+        id: u62,
+        offset: u62,
+        data: []const u8,
+        fin: bool,
+    ) !void {
         if (self.app_keys == null) return;
         const ak = self.app_keys.?;
 
-        const st = self.streams.getOrCreate(id) orelse return;
-        const offset = st.send_offset;
-        st.onSent(data.len);
-
-        var pkt: [MAX_PACKET_SIZE]u8 = undefined;
         var fpos: usize = 0;
-
         const sf: frame.Frame = .{ .stream = .{
             .stream_id = id,
-            .offset = @intCast(offset),
+            .offset = offset,
             .fin = fin,
             .data = data,
         } };
-        fpos += frame.encodeFrame(pkt[fpos..], sf);
+        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], sf);
 
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
@@ -655,11 +980,129 @@ pub const Connection = struct {
         const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ak.server, pn, out[0..hdr_len], pkt[0..fpos], out[hdr_len..][0..ct_len]);
+        crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_len]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(out[0..out_len]);
-        self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns);
+
+        var fi = loss_recovery_mod.SentFrameInfo{};
+        fi.frames[0] = .{ .stream = .{
+            .stream_id = id,
+            .offset = offset,
+            .len = @intCast(@min(data.len, 0xffff)),
+            .fin = fin,
+        } };
+        fi.count = 1;
+        self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+    }
+
+    fn queueStreamData(self: *Connection, id: u62, data: []const u8, fin: bool) !void {
+        if (self.app_keys == null) return;
+
+        const st = self.streams.getOrCreate(id) orelse return;
+        const offset: u62 = @intCast(st.send_offset);
+        st.onSent(data.len);
+
+        try self.encryptAndEnqueueStreamFrame(id, offset, data, fin);
+    }
+
+    /// Encrypt and enqueue the pre-serialized CONNECTION_CLOSE frame.
+    fn queueConnectionClose(self: *Connection) !void {
+        if (self.app_keys == null) return;
+        if (self.closing_frame_len == 0) return;
+        const ak = self.app_keys.?;
+
+        const pn = self.hot.tx_pn[2];
+        self.hot.tx_pn[2] += 1;
+
+        var out: [MAX_PACKET_SIZE]u8 = undefined;
+        const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+        const ct_len = self.closing_frame_len + 16;
+        if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+        crypto.encryptPayload(
+            ak.server,
+            pn,
+            out[0..hdr_len],
+            self.closing_frame_buf[0..self.closing_frame_len],
+            out[hdr_len..][0..ct_len],
+        );
+        const out_len = hdr_len + ct_len;
+        try self.enqueueSend(out[0..out_len]);
+        // Not tracked for retransmission — closing state re-sends on every receive().
+    }
+
+    /// Queue a RESET_STREAM frame for `stream_id`.
+    fn queueResetStream(self: *Connection, stream_id: u62, error_code: u62, final_size: u62) !void {
+        if (self.app_keys == null) return;
+        const ak = self.app_keys.?;
+
+        var fpos: usize = 0;
+        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .reset_stream = .{
+            .stream_id = stream_id,
+            .error_code = error_code,
+            .final_size = final_size,
+        } });
+
+        const pn = self.hot.tx_pn[2];
+        self.hot.tx_pn[2] += 1;
+
+        var out: [MAX_PACKET_SIZE]u8 = undefined;
+        const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+        const ct_len = fpos + 16;
+        if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+        crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_len]);
+        const out_len = hdr_len + ct_len;
+        try self.enqueueSend(out[0..out_len]);
+
+        var fi = loss_recovery_mod.SentFrameInfo{};
+        fi.frames[0] = .{ .reset_stream = .{
+            .stream_id = stream_id,
+            .error_code = error_code,
+            .final_size = final_size,
+        } };
+        fi.count = 1;
+        self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
+        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+    }
+
+    /// Queue a MAX_DATA frame advertising the current connection receive window.
+    fn queueMaxData(self: *Connection) !void {
+        if (self.app_keys == null) return;
+        const ak = self.app_keys.?;
+
+        const new_max: u62 = @intCast(@min(self.conn_flow.recv_max, std.math.maxInt(u62)));
+        var fpos: usize = 0;
+        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .max_data = new_max });
+
+        const pn = self.hot.tx_pn[2];
+        self.hot.tx_pn[2] += 1;
+
+        var out: [MAX_PACKET_SIZE]u8 = undefined;
+        const hdr_len = packet.encodeShortHeader(&out, self.peer_cid, @intCast(pn), false);
+        const ct_len = fpos + 16;
+        if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+        crypto.encryptPayload(ak.server, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_len]);
+        const out_len = hdr_len + ct_len;
+        try self.enqueueSend(out[0..out_len]);
+
+        var fi = loss_recovery_mod.SentFrameInfo{};
+        fi.frames[0] = .{ .max_data = new_max };
+        fi.count = 1;
+        self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
+        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+    }
+
+    /// Scan all streams for pending_reset and queue a RESET_STREAM frame for each.
+    fn flushPendingResets(self: *Connection) !void {
+        for (0..stream_mod.MAX_STREAMS) |i| {
+            if (!self.streams.used[i]) continue;
+            const st = &self.streams.streams[i];
+            if (st.pending_reset) |pr| {
+                st.pending_reset = null;
+                if (self.pending_reset_count > 0) self.pending_reset_count -= 1;
+                try self.queueResetStream(st.id, pr.error_code, pr.final_size);
+            }
+        }
     }
 };
 
@@ -703,13 +1146,13 @@ test "connection: enqueue and drain send queue" {
     try testing.expectEqualSlices(u8, &data, out[0..n]);
 }
 
-test "connection: tick transitions to draining on idle timeout" {
+test "connection: tick transitions to closed on idle timeout" {
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
     conn.idle_deadline_ns = 1000;
     conn.tick(2000);
     const testing = std.testing;
-    try testing.expectEqual(ConnState.draining, conn.hot.state);
+    try testing.expectEqual(ConnState.closed, conn.hot.state);
 }
 
 test "connection: unknown version triggers VN response" {
@@ -774,7 +1217,7 @@ test "loss: onPacketSent wires bytes_in_flight and pto_deadline" {
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
     conn.current_time_ns = 1_000_000;
-    conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns);
+    conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
     try testing.expect(conn.loss.ptoDeadline(conn.cached_max_ack_delay_ns) != null);
 }
@@ -803,7 +1246,7 @@ test "loss: onAckReceived decrements bytes_in_flight" {
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
     conn.current_time_ns = 0;
-    conn.loss.onPacketSent(1, 0, 1200, true, 0);
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
 
     const ranges = [_]loss_recovery_mod.AckedRange{.{ .low = 1, .high = 1 }};
@@ -841,7 +1284,7 @@ test "connection: processAck uses packet epoch not connection epoch" {
     conn.current_time_ns = 0;
 
     // Record a sent packet in epoch 0
-    conn.loss.onPacketSent(1, 0, 1200, true, 0);
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
 
     // Build an ACK frame acknowledging pn=1
@@ -879,4 +1322,361 @@ test "connection: version 0 packet is silently ignored" {
     // No packet should be queued (VN response is NOT sent for version-0 packets).
     var out: [64]u8 = undefined;
     try testing.expectEqual(@as(usize, 0), conn.send(&out));
+}
+
+// ---------------------------------------------------------------------------
+// New tests — event queue (Step 3)
+// ---------------------------------------------------------------------------
+
+test "event_queue: push and pop FIFO" {
+    const testing = std.testing;
+    var q = EventQueue{};
+    try testing.expect(q.isEmpty());
+
+    q.push(.{ .stream_data = .{ .stream_id = 1 } });
+    q.push(.{ .stream_data = .{ .stream_id = 2 } });
+    q.push(.connected);
+
+    const ev1 = q.pop().?;
+    try testing.expectEqual(@as(u62, 1), ev1.stream_data.stream_id);
+    const ev2 = q.pop().?;
+    try testing.expectEqual(@as(u62, 2), ev2.stream_data.stream_id);
+    const ev3 = q.pop().?;
+    switch (ev3) {
+        .connected => {},
+        else => try testing.expect(false),
+    }
+    try testing.expectEqual(@as(?Event, null), q.pop());
+}
+
+test "event: pollEvent returns null when empty" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    try testing.expectEqual(@as(?Event, null), conn.pollEvent());
+}
+
+test "event_queue: full queue drops new events" {
+    const testing = std.testing;
+    var q = EventQueue{};
+    // Fill to capacity
+    var i: usize = 0;
+    while (i < EVENT_QUEUE_DEPTH) : (i += 1) {
+        q.push(.connected);
+    }
+    // This push must be silently dropped (no panic)
+    q.push(.{ .stream_data = .{ .stream_id = 99 } });
+    // Pop all — should only get EVENT_QUEUE_DEPTH items, all .connected
+    var count: usize = 0;
+    while (q.pop()) |ev| {
+        switch (ev) {
+            .connected => {},
+            else => try testing.expect(false),
+        }
+        count += 1;
+    }
+    try testing.expectEqual(EVENT_QUEUE_DEPTH, count);
+}
+
+// ---------------------------------------------------------------------------
+// New tests — retransmission (Step 4)
+// ---------------------------------------------------------------------------
+
+test "retransmit: acked stream frame advances send_acked" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Set up a stream with buffered send data
+    const st = conn.streams.getOrCreate(0).?;
+    _ = st.bufferSendData("hello world"); // 11 bytes at offset 0
+    st.send_offset = 11;
+
+    // Simulate an AckResult acknowledging 11 bytes of stream data at offset 0
+    var ack_result = loss_recovery_mod.AckResult{};
+    var fi = loss_recovery_mod.SentFrameInfo{};
+    fi.frames[0] = .{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .len = 11,
+        .fin = false,
+    } };
+    fi.count = 1;
+    ack_result.acked_frames[0] = fi;
+    ack_result.acked_frame_count = 1;
+
+    conn.processAckedFrames(ack_result);
+
+    try testing.expectEqual(@as(u64, 11), st.send_acked);
+}
+
+test "retransmit: acked FIN on closed stream triggers stream reclamation" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const st = conn.streams.getOrCreate(4).?;
+    st.state = .closed;
+    _ = st.bufferSendData("bye");
+    st.send_offset = 3;
+
+    var ack_result = loss_recovery_mod.AckResult{};
+    var fi = loss_recovery_mod.SentFrameInfo{};
+    fi.frames[0] = .{ .stream = .{
+        .stream_id = 4,
+        .offset = 0,
+        .len = 3,
+        .fin = true,
+    } };
+    fi.count = 1;
+    ack_result.acked_frames[0] = fi;
+    ack_result.acked_frame_count = 1;
+
+    conn.processAckedFrames(ack_result);
+
+    // Stream should have been reclaimed
+    try testing.expectEqual(@as(?*stream_mod.Stream, null), conn.streams.get(4));
+}
+
+test "retransmit: lost HANDSHAKE_DONE sets pending_handshake_done flag" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    var lost_result = loss_recovery_mod.AckResult{};
+    var fi = loss_recovery_mod.SentFrameInfo{};
+    fi.frames[0] = .handshake_done;
+    fi.count = 1;
+    lost_result.lost_frames[0] = fi;
+    lost_result.lost_frame_count = 1;
+
+    conn.processLostFrames(lost_result);
+
+    try testing.expect(conn.pending_handshake_done);
+}
+
+test "retransmit: lost MAX_DATA sets pending_max_data flag" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    var lost_result = loss_recovery_mod.AckResult{};
+    var fi = loss_recovery_mod.SentFrameInfo{};
+    fi.frames[0] = .{ .max_data = 65536 };
+    fi.count = 1;
+    lost_result.lost_frames[0] = fi;
+    lost_result.lost_frame_count = 1;
+
+    conn.processLostFrames(lost_result);
+
+    try testing.expect(conn.pending_max_data);
+}
+
+// ---------------------------------------------------------------------------
+// New tests — connection close (Step 5)
+// ---------------------------------------------------------------------------
+
+test "close: close() transitions to closing state" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 0;
+    try conn.close(0, false, &[_]u8{});
+    try testing.expectEqual(ConnState.closing, conn.hot.state);
+}
+
+test "close: close() is idempotent when already closing" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 0;
+    try conn.close(0, false, &[_]u8{});
+    try conn.close(1, true, &[_]u8{}); // must not change state or panic
+    try testing.expectEqual(ConnState.closing, conn.hot.state);
+}
+
+test "close: drain_deadline arms after close()" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    try conn.close(0, false, &[_]u8{});
+    try testing.expect(conn.drain_deadline_ns != null);
+    try testing.expect(conn.drain_deadline_ns.? > 1_000_000_000);
+}
+
+test "close: drain timer in tick transitions to closed" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .closing;
+    conn.drain_deadline_ns = 5000;
+    conn.tick(6000);
+    try testing.expectEqual(ConnState.closed, conn.hot.state);
+    try testing.expectEqual(@as(?i64, null), conn.drain_deadline_ns);
+}
+
+test "close: draining state suppresses send()" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .draining;
+    // Queue something
+    try conn.enqueueSend(&[_]u8{0x01});
+    var out: [8]u8 = undefined;
+    try testing.expectEqual(@as(usize, 0), conn.send(&out));
+}
+
+test "close: nextTimeout includes drain_deadline" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.drain_deadline_ns = 2000;
+    conn.idle_deadline_ns = 5000;
+    // drain is smaller → nextTimeout returns drain
+    try testing.expectEqual(@as(?i64, 2000), conn.nextTimeout());
+}
+
+test "close: close() pushes connection_closed event" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 0;
+    try conn.close(42, true, &[_]u8{});
+    const ev = conn.pollEvent().?;
+    switch (ev) {
+        .connection_closed => |cc| {
+            try testing.expectEqual(@as(u62, 42), cc.error_code);
+            try testing.expect(cc.is_app);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "close: closing state discards incoming packets (returns early)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .closing;
+    conn.current_time_ns = 0;
+
+    // Feed a dummy packet — should not panic and connection stays closing.
+    const dummy = [_]u8{0x00} ** 10;
+    const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
+    conn.receive(&dummy, src, 0, io) catch {};
+    try testing.expectEqual(ConnState.closing, conn.hot.state);
+}
+
+test "close: receive refreshes idle_deadline on active connection" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.idle_deadline_ns = 500;
+
+    // Feed a (malformed but non-empty) packet at time 1000.
+    const dummy = [_]u8{0x00} ** 5;
+    const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
+    conn.receive(&dummy, src, 1_000_000_000, io) catch {};
+
+    // idle_deadline should be refreshed beyond 500.
+    try testing.expect(conn.idle_deadline_ns.? > 500);
+}
+
+// ---------------------------------------------------------------------------
+// New tests — RESET_STREAM / STOP_SENDING (Step 6)
+// ---------------------------------------------------------------------------
+
+test "stream_reset: processFrames handles RESET_STREAM and pushes event" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Create a stream first
+    _ = conn.streams.getOrCreate(0).?;
+
+    // Build a raw RESET_STREAM frame
+    var buf: [32]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .reset_stream = .{
+        .stream_id = 0,
+        .error_code = 7,
+        .final_size = 0,
+    } });
+
+    // processFrames directly
+    conn.processFrames(buf[0..n], 2, null) catch {};
+
+    const ev = conn.pollEvent().?;
+    switch (ev) {
+        .stream_reset => |r| {
+            try testing.expectEqual(@as(u62, 0), r.stream_id);
+            try testing.expectEqual(@as(u62, 7), r.error_code);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "security: processStreamFrame rejects server-initiated stream ID" {
+    // A server-side connection must reject STREAM frames with server-initiated IDs (bit 0 = 1).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    var buf: [32]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 1, // bit 0 = 1 → server-initiated, invalid for received frames
+        .offset = 0,
+        .fin = false,
+        .data = "hi",
+    } });
+    try testing.expectError(error.StreamStateError, conn.processFrames(buf[0..n], 2, null));
+}
+
+test "security: processAck malformed underflow is safe" {
+    // An ACK with ack_range > largest_acked should not panic (underflow guard fires).
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const ack = frame.AckFrame{
+        .largest_acked = 2,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 10 }} // 10 > largest_acked=2
+                ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    };
+    // Must not panic; the underflow guard breaks the loop early.
+    conn.processAck(ack, 0);
+}
+
+test "stream_reset: processFrames handles STOP_SENDING and pushes event" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const st = conn.streams.getOrCreate(0).?;
+    st.send_offset = 100;
+
+    // Build a raw STOP_SENDING frame
+    var buf: [32]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stop_sending = .{
+        .stream_id = 0,
+        .error_code = 3,
+    } });
+    conn.processFrames(buf[0..n], 2, null) catch {};
+
+    // pending_reset is consumed by flushPendingResets() (set then cleared).
+    // The observable result is the stop_sending event.
+    const ev = conn.pollEvent().?;
+    switch (ev) {
+        .stop_sending => |s| {
+            try testing.expectEqual(@as(u62, 0), s.stream_id);
+            try testing.expectEqual(@as(u62, 3), s.error_code);
+        },
+        else => try testing.expect(false),
+    }
 }

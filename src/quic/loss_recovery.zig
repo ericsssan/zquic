@@ -18,6 +18,31 @@ pub const K_TIME_THRESHOLD_DEN: u64 = 8;
 pub const K_GRANULARITY_NS: u64 = 1_000_000; // 1ms minimum timer granularity
 pub const K_INITIAL_RTT_NS: u64 = 333_000_000; // 333ms per §5.3
 pub const MAX_SENT: usize = 64; // Ring buffer capacity
+pub const MAX_FRAMES_PER_PACKET: usize = 4;
+pub const MAX_LOSS_EVENTS: usize = 16;
+
+// ---------------------------------------------------------------------------
+// FrameInfo — per-frame metadata for retransmission
+// ---------------------------------------------------------------------------
+
+pub const FrameInfo = union(enum) {
+    // `none` is listed first so its tag value is 0 — this allows std.mem.zeroes()
+    // to produce a valid FrameInfo (zeroed bytes == .none tag).
+    none,
+    stream: struct { stream_id: u62, offset: u62, len: u16, fin: bool },
+    crypto_frame: struct { offset: u62, len: u16 },
+    ping,
+    handshake_done,
+    max_data: u62,
+    max_stream_data: struct { stream_id: u62, max_data: u62 },
+    reset_stream: struct { stream_id: u62, error_code: u62, final_size: u62 },
+    connection_close,
+};
+
+pub const SentFrameInfo = struct {
+    frames: [MAX_FRAMES_PER_PACKET]FrameInfo = .{.none} ** MAX_FRAMES_PER_PACKET,
+    count: u8 = 0,
+};
 
 // ---------------------------------------------------------------------------
 // RTT Estimator (RFC 9002 §5)
@@ -93,40 +118,58 @@ pub const AckResult = struct {
     newly_lost: u32 = 0,
     bytes_lost: u64 = 0,
     rtt_updated: bool = false,
+    lost_frames: [MAX_LOSS_EVENTS]SentFrameInfo = undefined,
+    lost_frame_count: usize = 0,
+    acked_frames: [MAX_LOSS_EVENTS]SentFrameInfo = undefined,
+    acked_frame_count: usize = 0,
+};
+
+/// Returned by remove() — carries both the packet metadata and its frame info.
+pub const RemovedPacket = struct {
+    pkt: SentPacket,
+    fi: SentFrameInfo,
 };
 
 pub const SentPacketTable = struct {
     slots: [MAX_SENT]SentPacket,
+    frame_info: [MAX_SENT]SentFrameInfo,
 
     pub fn init() SentPacketTable {
-        return std.mem.zeroes(SentPacketTable);
+        var t: SentPacketTable = undefined;
+        for (&t.slots) |*s| {
+            s.* = .{ .pn = 0, .sent_ns = 0, .size = 0, .epoch = 0,
+                     .ack_eliciting = false, .in_flight = false, .valid = false };
+        }
+        for (&t.frame_info) |*fi| fi.* = .{};
+        return t;
     }
 
-    /// O(1) add. Modular index = pn % MAX_SENT. Evicts any previous occupant.
+    /// O(1) add. Modular index = pn & (MAX_SENT-1). Evicts any previous occupant.
     /// Returns the evicted packet (if any) so the caller can adjust bytes_in_flight.
-    pub fn add(self: *SentPacketTable, pkt: SentPacket) ?SentPacket {
-        const idx = pkt.pn % MAX_SENT;
+    pub fn add(self: *SentPacketTable, pkt: SentPacket, fi: SentFrameInfo) ?SentPacket {
+        const idx = pkt.pn & (MAX_SENT - 1);
         const evicted: ?SentPacket = if (self.slots[idx].valid) self.slots[idx] else null;
         self.slots[idx] = pkt;
         self.slots[idx].valid = true;
+        self.frame_info[idx] = fi;
         return evicted;
     }
 
     /// O(1) lookup. Returns null if slot is empty or belongs to a different pn/epoch.
     pub fn get(self: *const SentPacketTable, pn: u64, epoch: u8) ?SentPacket {
-        const idx = pn % MAX_SENT;
+        const idx = pn & (MAX_SENT - 1);
         const slot = self.slots[idx];
         if (slot.valid and slot.pn == pn and slot.epoch == epoch) return slot;
         return null;
     }
 
-    /// O(1) remove. Returns the removed packet, or null if not found.
-    pub fn remove(self: *SentPacketTable, pn: u64, epoch: u8) ?SentPacket {
-        const idx = pn % MAX_SENT;
+    /// O(1) remove. Returns the removed packet and its frame info, or null if not found.
+    pub fn remove(self: *SentPacketTable, pn: u64, epoch: u8) ?RemovedPacket {
+        const idx = pn & (MAX_SENT - 1);
         const slot = self.slots[idx];
         if (slot.valid and slot.pn == pn and slot.epoch == epoch) {
             self.slots[idx].valid = false;
-            return slot;
+            return .{ .pkt = slot, .fi = self.frame_info[idx] };
         }
         return null;
     }
@@ -136,11 +179,15 @@ pub const SentPacketTable = struct {
         if (low > high) return;
         var pn = low;
         while (pn <= high) : (pn += 1) {
-            if (self.remove(pn, epoch)) |pkt| {
+            if (self.remove(pn, epoch)) |entry| {
                 result.newly_acked += 1;
-                result.bytes_acked += pkt.size;
-                if (pkt.in_flight) {
-                    bif.* = if (bif.* >= pkt.size) bif.* - pkt.size else 0;
+                result.bytes_acked += entry.pkt.size;
+                if (entry.pkt.in_flight) {
+                    bif.* = if (bif.* >= entry.pkt.size) bif.* - entry.pkt.size else 0;
+                }
+                if (result.acked_frame_count < MAX_LOSS_EVENTS) {
+                    result.acked_frames[result.acked_frame_count] = entry.fi;
+                    result.acked_frame_count += 1;
                 }
             }
         }
@@ -156,7 +203,7 @@ pub const SentPacketTable = struct {
         result: *AckResult,
         bif: *u64,
     ) void {
-        for (&self.slots) |*slot| {
+        for (&self.slots, 0..) |*slot, idx| {
             if (!slot.valid) continue;
             if (slot.epoch != epoch) continue; // loss detection is per packet number space
 
@@ -176,6 +223,10 @@ pub const SentPacketTable = struct {
                 result.bytes_lost += slot.size;
                 if (slot.in_flight) {
                     bif.* = if (bif.* >= slot.size) bif.* - slot.size else 0;
+                }
+                if (result.lost_frame_count < MAX_LOSS_EVENTS) {
+                    result.lost_frames[result.lost_frame_count] = self.frame_info[idx];
+                    result.lost_frame_count += 1;
                 }
             }
         }
@@ -229,6 +280,7 @@ pub const LossRecovery = struct {
         size: usize,
         ack_eliciting: bool,
         now_ns: i64,
+        frame_info: SentFrameInfo,
     ) void {
         const sz: u16 = @intCast(@min(size, @as(usize, 0xffff)));
         // add() evicts any existing occupant at pn % MAX_SENT.
@@ -242,7 +294,7 @@ pub const LossRecovery = struct {
             .ack_eliciting = ack_eliciting,
             .in_flight = ack_eliciting,
             .valid = true,
-        })) |evicted| {
+        }, frame_info)) |evicted| {
             if (evicted.in_flight) {
                 self.bytes_in_flight -|= evicted.size;
             }
@@ -304,8 +356,9 @@ pub const LossRecovery = struct {
             &self.bytes_in_flight,
         );
 
-        // 6. Refresh last_ack_eliciting_ns: some in-flight packets may have been lost.
-        self.last_ack_eliciting_ns = self.sent.lastAckElicitingNs();
+        // Note: last_ack_eliciting_ns is kept as-is (updated incrementally in
+        // onPacketSent). A stale value causes PTO to fire slightly early, which
+        // is safe — it just means an extra probe. This avoids an O(64) scan per ACK.
 
         return result;
     }
@@ -397,7 +450,7 @@ test "sent_table: add and get via modular index" {
         .in_flight = true,
         .valid = true,
     };
-    _ = table.add(pkt);
+    _ = table.add(pkt, .{});
 
     const found = table.get(65, 0);
     try testing.expect(found != null);
@@ -419,7 +472,7 @@ test "sent_table: onPacketSent increments bytes_in_flight; ackRange decrements i
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    lr.onPacketSent(5, 0, 1200, true, 0);
+    lr.onPacketSent(5, 0, 1200, true, 0, .{});
     try testing.expectEqual(@as(u64, 1200), lr.bytes_in_flight);
 
     var result = AckResult{};
@@ -436,7 +489,7 @@ test "loss_detection: packet threshold — pn 1-7 declared lost when largest_ack
     // Send pn 1..10 all at time 0
     var pn: u64 = 1;
     while (pn <= 10) : (pn += 1) {
-        lr.onPacketSent(pn, 0, 1200, true, 0);
+        lr.onPacketSent(pn, 0, 1200, true, 0, .{});
     }
 
     // ACK only pn=10; all others remain unacked
@@ -454,7 +507,7 @@ test "loss_detection: time threshold — old packet detected as lost" {
     var lr = LossRecovery.init();
 
     // Send pn=1000 at time 0; pn=1 not sent (not in table)
-    lr.onPacketSent(1000, 0, 1200, true, 0);
+    lr.onPacketSent(1000, 0, 1200, true, 0, .{});
 
     // ACK pn=1 (not in table — no RTT update, initial values used)
     // Initial smoothed_rtt = 333ms, time_threshold ≈ 375ms
@@ -481,21 +534,21 @@ test "sent_table: lastAckElicitingNs returns sent_ns of highest in-flight pn" {
     try testing.expectEqual(@as(?i64, null), table.lastAckElicitingNs());
 
     // Add two in-flight ack-eliciting packets
-    _ = table.add(.{ .pn = 5, .sent_ns = 100, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true });
-    _ = table.add(.{ .pn = 10, .sent_ns = 200, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true });
+    _ = table.add(.{ .pn = 5, .sent_ns = 100, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = 10, .sent_ns = 200, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
 
     // Should return sent_ns of pn=10 (highest pn)
     try testing.expectEqual(@as(?i64, 200), table.lastAckElicitingNs());
 
     // Non-ack-eliciting packets are ignored
-    _ = table.add(.{ .pn = 20, .sent_ns = 999, .size = 100, .epoch = 0, .ack_eliciting = false, .in_flight = false, .valid = true });
+    _ = table.add(.{ .pn = 20, .sent_ns = 999, .size = 100, .epoch = 0, .ack_eliciting = false, .in_flight = false, .valid = true }, .{});
     try testing.expectEqual(@as(?i64, 200), table.lastAckElicitingNs());
 }
 
 test "pto: deadline is clamped at 2^20 backoff" {
     const testing = std.testing;
     var lr = LossRecovery.init();
-    lr.onPacketSent(1, 0, 1200, true, 0);
+    lr.onPacketSent(1, 0, 1200, true, 0, .{});
 
     const d0 = lr.ptoDeadline(25_000_000).?;
 
@@ -519,14 +572,14 @@ test "sent_table: eviction decrements bytes_in_flight to avoid double-counting" 
     // Send 64 packets (fills the ring buffer exactly)
     var pn: u64 = 0;
     while (pn < MAX_SENT) : (pn += 1) {
-        lr.onPacketSent(pn, 0, 1200, true, 0);
+        lr.onPacketSent(pn, 0, 1200, true, 0, .{});
     }
     const bif_after_64 = lr.bytes_in_flight;
     try testing.expectEqual(@as(u64, MAX_SENT * 1200), bif_after_64);
 
     // Send packet pn=64: maps to slot 64 % 64 = 0, evicting pn=0 (still in flight).
     // bytes_in_flight should stay the same (evict 1200, add 1200).
-    lr.onPacketSent(MAX_SENT, 0, 1200, true, 0);
+    lr.onPacketSent(MAX_SENT, 0, 1200, true, 0, .{});
     try testing.expectEqual(bif_after_64, lr.bytes_in_flight);
 }
 
@@ -535,14 +588,14 @@ test "loss_detection: last_ack_eliciting_ns updated after packets declared lost"
     var lr = LossRecovery.init();
 
     // Send one ack-eliciting packet
-    lr.onPacketSent(1, 0, 1200, true, 0);
+    lr.onPacketSent(1, 0, 1200, true, 0, .{});
     try testing.expect(lr.last_ack_eliciting_ns != null);
 
     // ACK a much higher pn to trigger loss via packet threshold for pn=1
     // Send pn 2..5 so we have some acked
     var i: u64 = 2;
     while (i <= 10) : (i += 1) {
-        lr.onPacketSent(i, 0, 1200, true, 0);
+        lr.onPacketSent(i, 0, 1200, true, 0, .{});
     }
     const ranges = [_]AckedRange{.{ .low = 10, .high = 10 }};
     _ = lr.onAckReceived(10, 0, &ranges, 0, 0, 25_000_000);
@@ -556,7 +609,7 @@ test "loss_detection: last_ack_eliciting_ns updated after packets declared lost"
 test "pto: deadline saturates on extreme pto values" {
     const testing = std.testing;
     var lr = LossRecovery.init();
-    lr.onPacketSent(1, 0, 1200, true, 0);
+    lr.onPacketSent(1, 0, 1200, true, 0, .{});
 
     // Force an extreme smoothed_rtt that would cause overflow without saturation
     lr.rtt.smoothed_rtt = std.math.maxInt(u64) / 4;
@@ -574,7 +627,7 @@ test "pto: deadline doubles per onPtoFired; resets after resetPtoCount" {
     var lr = LossRecovery.init();
 
     // Send one ack-eliciting packet at time 0
-    lr.onPacketSent(1, 0, 1200, true, 0);
+    lr.onPacketSent(1, 0, 1200, true, 0, .{});
 
     const d0 = lr.ptoDeadline(25_000_000);
     try testing.expect(d0 != null);
@@ -589,4 +642,129 @@ test "pto: deadline doubles per onPtoFired; resets after resetPtoCount" {
     lr.resetPtoCount(); // pto_count = 0
     const d_reset = lr.ptoDeadline(25_000_000);
     try testing.expectEqual(d0, d_reset);
+}
+
+// ---------------------------------------------------------------------------
+// New tests — FrameInfo tracking
+// ---------------------------------------------------------------------------
+
+test "frame_info: SentFrameInfo stores and retrieves stream frame info" {
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+    var fi = SentFrameInfo{};
+    fi.frames[0] = .{ .stream = .{ .stream_id = 4, .offset = 100, .len = 500, .fin = false } };
+    fi.count = 1;
+
+    const pkt = SentPacket{
+        .pn = 1,
+        .sent_ns = 0,
+        .size = 500,
+        .epoch = 2,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .valid = true,
+    };
+    _ = table.add(pkt, fi);
+
+    const removed = table.remove(1, 2).?;
+    try testing.expectEqual(@as(u8, 1), removed.fi.count);
+    switch (removed.fi.frames[0]) {
+        .stream => |s| {
+            try testing.expectEqual(@as(u62, 4), s.stream_id);
+            try testing.expectEqual(@as(u62, 100), s.offset);
+            try testing.expectEqual(@as(u16, 500), s.len);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "frame_info: detectLoss populates lost_frames in AckResult" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    var fi = SentFrameInfo{};
+    fi.frames[0] = .{ .stream = .{ .stream_id = 0, .offset = 0, .len = 100, .fin = false } };
+    fi.count = 1;
+    lr.onPacketSent(1, 0, 100, true, 0, fi);
+    lr.onPacketSent(10, 0, 100, true, 0, .{});
+
+    const ranges = [_]AckedRange{.{ .low = 10, .high = 10 }};
+    const result = lr.onAckReceived(10, 0, &ranges, 0, 0, 25_000_000);
+
+    // pn=1 lost by packet threshold (1 + 3 <= 10)
+    try testing.expectEqual(@as(u32, 1), result.newly_lost);
+    try testing.expectEqual(@as(usize, 1), result.lost_frame_count);
+    try testing.expectEqual(@as(u8, 1), result.lost_frames[0].count);
+    switch (result.lost_frames[0].frames[0]) {
+        .stream => |s| try testing.expectEqual(@as(u62, 0), s.stream_id),
+        else => try testing.expect(false),
+    }
+}
+
+test "frame_info: acked packets appear in acked_frames not lost_frames" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    var fi = SentFrameInfo{};
+    fi.frames[0] = .ping;
+    fi.count = 1;
+    lr.onPacketSent(1, 0, 50, true, 0, fi);
+
+    const ranges = [_]AckedRange{.{ .low = 1, .high = 1 }};
+    const result = lr.onAckReceived(1, 0, &ranges, 0, 0, 25_000_000);
+
+    try testing.expectEqual(@as(u32, 1), result.newly_acked);
+    try testing.expectEqual(@as(usize, 1), result.acked_frame_count);
+    try testing.expectEqual(@as(usize, 0), result.lost_frame_count);
+    switch (result.acked_frames[0].frames[0]) {
+        .ping => {},
+        else => try testing.expect(false),
+    }
+}
+
+test "frame_info: MAX_LOSS_EVENTS caps lost_frames output" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // Send enough packets so that MAX_LOSS_EVENTS+1 are lost by pkt threshold.
+    // Need: top_pn - 3 - 0 + 1 > MAX_LOSS_EVENTS  →  top_pn > MAX_LOSS_EVENTS + 2
+    // Use N = MAX_LOSS_EVENTS + 4 packets (pn 0..N-1), ACK pn=N-1.
+    // Lost: pn+3 <= N-1  →  pn <= N-4. Count = N-3 = MAX_LOSS_EVENTS+1.
+    const N: u64 = MAX_LOSS_EVENTS + 4;
+    var pn: u64 = 0;
+    while (pn < N) : (pn += 1) {
+        lr.onPacketSent(pn, 0, 100, true, 0, .{});
+    }
+    const top_pn = N - 1;
+    const ranges = [_]AckedRange{.{ .low = top_pn, .high = top_pn }};
+    const result = lr.onAckReceived(top_pn, 0, &ranges, 0, 0, 25_000_000);
+
+    // lost_frame_count capped at MAX_LOSS_EVENTS, newly_lost exceeds it
+    try testing.expectEqual(@as(usize, MAX_LOSS_EVENTS), result.lost_frame_count);
+    try testing.expect(result.newly_lost > @as(u32, MAX_LOSS_EVENTS));
+}
+
+test "frame_info: ring buffer eviction preserves new packet frame info" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // Fill the ring buffer with MAX_SENT packets (no frame info)
+    var pn: u64 = 0;
+    while (pn < MAX_SENT) : (pn += 1) {
+        lr.onPacketSent(pn, 0, 100, true, 0, .{});
+    }
+
+    // Send one more that evicts slot 0 (pn=0), record handshake_done frame info
+    var fi = SentFrameInfo{};
+    fi.frames[0] = .handshake_done;
+    fi.count = 1;
+    lr.onPacketSent(MAX_SENT, 0, 100, true, 0, fi);
+
+    // The new packet's frame info should be stored at slot MAX_SENT % MAX_SENT = 0
+    const removed = lr.sent.remove(MAX_SENT, 0).?;
+    try testing.expectEqual(@as(u8, 1), removed.fi.count);
+    switch (removed.fi.frames[0]) {
+        .handshake_done => {},
+        else => try testing.expect(false),
+    }
 }

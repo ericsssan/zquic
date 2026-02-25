@@ -164,6 +164,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             const count_vi = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += count_vi.len;
             const range_count: usize = @intCast(count_vi.value);
+            if (range_count > 256) return error.InvalidFrame;
 
             var ack: AckFrame = .{
                 .largest_acked = la.value,
@@ -836,6 +837,20 @@ test "frame: STREAM_DATA_BLOCKED encode/parse round-trip" {
         else => return error.WrongFrameType,
     }
     try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: ACK range_count > 256 returns InvalidFrame" {
+    // Build an ACK with range_count = 257 (one past the cap).
+    // Use a 2-byte varint for range_count to fit > 63.
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x02; pos += 1; // ACK type
+    pos += varint.encode(buf[pos..], 10);  // largest_acked
+    pos += varint.encode(buf[pos..], 0);   // ack_delay
+    pos += varint.encode(buf[pos..], 257); // range_count > 256
+    pos += varint.encode(buf[pos..], 5);   // first ACK range
+    // Do NOT add 257 additional range pairs — the cap fires before the loop.
+    try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
 test "frame: PATH_RESPONSE echoes PATH_CHALLENGE data" {
