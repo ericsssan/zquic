@@ -89,6 +89,33 @@ test "flow_control: shouldSendMaxData threshold" {
     try testing.expect(!fc2.shouldSendMaxData());
 }
 
+test "flow_control: updateRecvMax ignores shrink" {
+    const testing = std.testing;
+    var fc = FlowController.init(1_000, 500);
+    fc.updateRecvMax(500);  // smaller → ignored
+    try testing.expectEqual(@as(u64, 1_000), fc.recv_max);
+    fc.updateRecvMax(2_000);
+    try testing.expectEqual(@as(u64, 2_000), fc.recv_max);
+}
+
+test "flow_control: nextMaxData doubles recv window" {
+    const testing = std.testing;
+    const fc = FlowController.init(1_000, 500);
+    try testing.expectEqual(@as(u64, 2_000), fc.nextMaxData());
+}
+
+test "flow_control: onReceived tracks total bytes received" {
+    const testing = std.testing;
+    var fc = FlowController.init(1_000, 1_000);
+    try testing.expectEqual(@as(u64, 0), fc.recv_total);
+    fc.onReceived(300);
+    try testing.expectEqual(@as(u64, 300), fc.recv_total);
+    fc.onReceived(200);
+    try testing.expectEqual(@as(u64, 500), fc.recv_total);
+    // Threshold not yet reached (50% < 75%)
+    try testing.expect(!fc.shouldSendMaxData());
+}
+
 test "flow_control: updateSendMax ignores shrink" {
     const testing = std.testing;
     var fc = FlowController.init(1_000, 500);

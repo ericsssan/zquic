@@ -21,6 +21,7 @@ const stream_mod = @import("stream.zig");
 const flow_control = @import("flow_control.zig");
 const cubic_mod = @import("congestion/cubic.zig");
 const pool_mod = @import("pool.zig");
+const loss_recovery_mod = @import("loss_recovery.zig");
 
 const ConnectionId = cid_mod.ConnectionId;
 
@@ -129,6 +130,13 @@ pub const Connection = struct {
     // Congestion control
     congestion: cubic_mod.Cubic,
 
+    // Loss recovery (RTT estimation, sent-packet tracking, PTO)
+    loss: loss_recovery_mod.LossRecovery,
+    /// Monotonic time updated by receive() and tick().
+    current_time_ns: i64,
+    /// Cached max_ack_delay from peer transport params (ns). Default 25 ms.
+    cached_max_ack_delay_ns: u64,
+
     // Send queue (ring buffer of ready-to-send packets)
     sq: [SEND_QUEUE_DEPTH]SendSlot,
     sq_head: usize,
@@ -174,6 +182,9 @@ pub const Connection = struct {
                 config.initial_max_data,
             ),
             .congestion = cubic_mod.Cubic.init(),
+            .loss = loss_recovery_mod.LossRecovery.init(),
+            .current_time_ns = 0,
+            .cached_max_ack_delay_ns = 25_000_000,
             .sq = undefined,
             .sq_head = 0,
             .sq_tail = 0,
@@ -198,7 +209,7 @@ pub const Connection = struct {
     /// `io`      — I/O handle (needed for TLS key generation).
     pub fn receive(self: *Connection, data: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
         _ = src;
-        _ = now_ns;
+        self.current_time_ns = now_ns;
 
         // Process all coalesced packets in the datagram
         var remaining = data;
@@ -234,6 +245,8 @@ pub const Connection = struct {
 
     /// Drive timer events. Call when `nextTimeout()` deadline has passed.
     pub fn tick(self: *Connection, now_ns: i64) void {
+        self.current_time_ns = now_ns;
+
         if (self.idle_deadline_ns) |d| {
             if (now_ns >= d) {
                 self.hot.state = .draining;
@@ -242,9 +255,10 @@ pub const Connection = struct {
         }
         if (self.pto_deadline_ns) |d| {
             if (now_ns >= d) {
-                // PTO: send a PING to probe
+                // PTO: send a PING probe, then double the backoff
+                self.loss.onPtoFired();
                 self.queuePing() catch {};
-                self.pto_deadline_ns = null;
+                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
             }
         }
     }
@@ -432,6 +446,7 @@ pub const Connection = struct {
             // Apply negotiated transport parameters.
             const params = self.tls_state.peerTransportParams();
             self.conn_flow.updateSendMax(params.initial_max_data);
+            self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
 
             try self.queueHandshakeDone();
         }
@@ -448,9 +463,56 @@ pub const Connection = struct {
         }
     }
 
-    fn processAck(self: *Connection, _: frame.AckFrame) void {
-        // Simplified: just record that we got an ACK
-        _ = self;
+    fn processAck(self: *Connection, ack: frame.AckFrame) void {
+        // Convert AckFrame ranges into loss_recovery.AckedRange slices.
+        // ranges[0] has gap=0 (first ACK range); subsequent entries carry the gap
+        // to the *next* range (stored in the following slot by the frame parser).
+        var ranges_buf: [32]loss_recovery_mod.AckedRange = undefined;
+        var range_count: usize = 0;
+        var high: u64 = @as(u64, ack.largest_acked);
+        for (0..ack.range_count) |i| {
+            const low = high - @as(u64, ack.ranges[i].ack_range);
+            ranges_buf[range_count] = .{ .low = low, .high = high };
+            range_count += 1;
+            if (i + 1 < ack.range_count) {
+                high = low - 1 - @as(u64, ack.ranges[i + 1].gap);
+            }
+        }
+
+        // ack_delay field is in units of 2^ack_delay_exponent µs; convert to ns.
+        const params = self.tls_state.peerTransportParams();
+        const ack_delay_exp: u6 = @intCast(@min(params.ack_delay_exponent, 20));
+        const ack_delay_ns: u64 = @as(u64, ack.ack_delay) *
+            (@as(u64, 1) << ack_delay_exp) * 1000;
+
+        const epoch = self.hot.epoch;
+        const result = self.loss.onAckReceived(
+            @as(u64, ack.largest_acked),
+            ack_delay_ns,
+            ranges_buf[0..range_count],
+            epoch,
+            self.current_time_ns,
+            self.cached_max_ack_delay_ns,
+        );
+
+        // Feed acknowledgement data to CUBIC
+        if (result.newly_acked > 0) {
+            self.congestion.onAckReceived(
+                result.bytes_acked,
+                self.loss.rtt.smoothed_rtt,
+                self.current_time_ns,
+            );
+            self.loss.resetPtoCount();
+        }
+
+        // Each lost packet triggers a congestion event
+        var i: u32 = 0;
+        while (i < result.newly_lost) : (i += 1) {
+            self.congestion.onPacketLost(self.current_time_ns);
+        }
+
+        // Refresh PTO timer after any ACK
+        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
     }
 
     // -----------------------------------------------------------------------
@@ -473,7 +535,7 @@ pub const Connection = struct {
         const ack_frame_data: frame.Frame = .{ .ack = .{
             .largest_acked = @intCast(self.hot.rx_pn[epoch]),
             .ack_delay = 0,
-            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
             .range_count = 1,
             .ect0 = 0,
             .ect1 = 0,
@@ -503,7 +565,10 @@ pub const Connection = struct {
             const ct_len = pos + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
             crypto.encryptPayload(ak.server, pn, out[0..hdr_len], pkt[0..pos], out[hdr_len..][0..ct_len]);
-            try self.enqueueSend(out[0 .. hdr_len + ct_len]);
+            const out_len = hdr_len + ct_len;
+            try self.enqueueSend(out[0..out_len]);
+            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns);
+            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
         }
     }
 
@@ -536,7 +601,10 @@ pub const Connection = struct {
         const ct_out_len = fpos + 16;
         if (hdr_len + ct_out_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ik, pn, out[0..hdr_len], pkt[0..fpos], out[hdr_len..][0..ct_out_len]);
-        try self.enqueueSend(out[0 .. hdr_len + ct_out_len]);
+        const out_len = hdr_len + ct_out_len;
+        try self.enqueueSend(out[0..out_len]);
+        self.loss.onPacketSent(pn, 0, out_len, true, self.current_time_ns);
+        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
     }
 
     /// Encode and enqueue a Version Negotiation packet in response to an
@@ -589,7 +657,10 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, out[0..hdr_len], pkt[0..fpos], out[hdr_len..][0..ct_len]);
-        try self.enqueueSend(out[0 .. hdr_len + ct_len]);
+        const out_len = hdr_len + ct_len;
+        try self.enqueueSend(out[0..out_len]);
+        self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns);
+        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
     }
 };
 
@@ -670,6 +741,75 @@ test "connection: unknown version triggers VN response" {
 
     // Long header bit must be set.
     try testing.expect(out[0] & 0x80 != 0);
+}
+
+test "connection: nextTimeout returns minimum of active deadlines" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    try testing.expectEqual(@as(?i64, null), conn.nextTimeout());
+
+    conn.idle_deadline_ns = 5000;
+    try testing.expectEqual(@as(?i64, 5000), conn.nextTimeout());
+
+    conn.pto_deadline_ns = 3000;
+    try testing.expectEqual(@as(?i64, 3000), conn.nextTimeout()); // min wins
+
+    conn.idle_deadline_ns = null;
+    try testing.expectEqual(@as(?i64, 3000), conn.nextTimeout());
+}
+
+test "loss: connection initializes with zeroed loss recovery" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection.accept(.{}, io);
+    try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
+    try testing.expectEqual(@as(u32, 0), conn.loss.pto_count);
+    try testing.expectEqual(@as(?i64, null), conn.loss.last_ack_eliciting_ns);
+    try testing.expectEqual(@as(?i64, null), conn.pto_deadline_ns);
+    try testing.expectEqual(@as(u64, 25_000_000), conn.cached_max_ack_delay_ns);
+}
+
+test "loss: onPacketSent wires bytes_in_flight and pto_deadline" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 1_000_000;
+    conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns);
+    try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
+    try testing.expect(conn.loss.ptoDeadline(conn.cached_max_ack_delay_ns) != null);
+}
+
+test "loss: pto_deadline_ns null when no ack-eliciting packets in flight" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection.accept(.{}, io);
+    try testing.expectEqual(@as(?i64, null), conn.pto_deadline_ns);
+}
+
+test "loss: onPtoFired increments pto_count; resetPtoCount zeroes it" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.loss.onPtoFired();
+    try testing.expectEqual(@as(u32, 1), conn.loss.pto_count);
+    conn.loss.onPtoFired();
+    try testing.expectEqual(@as(u32, 2), conn.loss.pto_count);
+    conn.loss.resetPtoCount();
+    try testing.expectEqual(@as(u32, 0), conn.loss.pto_count);
+}
+
+test "loss: onAckReceived decrements bytes_in_flight" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 0;
+    conn.loss.onPacketSent(1, 0, 1200, true, 0);
+    try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
+
+    const ranges = [_]loss_recovery_mod.AckedRange{.{ .low = 1, .high = 1 }};
+    _ = conn.loss.onAckReceived(1, 0, &ranges, 0, 1_000_000, conn.cached_max_ack_delay_ns);
+    try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
 }
 
 test "connection: version 0 packet is silently ignored" {

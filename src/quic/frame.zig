@@ -689,6 +689,64 @@ test "frame: PATH_CHALLENGE encode/parse round-trip" {
     try testing.expectEqual(n, result.consumed);
 }
 
+test "frame: MAX_DATA encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const f: Frame = .{ .max_data = 1_000_000 };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .max_data => |v| try testing.expectEqual(@as(u62, 1_000_000), v),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: MAX_STREAM_DATA encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [32]u8 = undefined;
+    const f: Frame = .{ .max_stream_data = .{ .stream_id = 4, .max_data = 65536 } };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .max_stream_data => |m| {
+            try testing.expectEqual(@as(u62, 4), m.stream_id);
+            try testing.expectEqual(@as(u62, 65536), m.max_data);
+        },
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: ACK with multiple ranges encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [128]u8 = undefined;
+    var ranges: [32]AckRange = [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    ranges[0] = .{ .gap = 0, .ack_range = 4 }; // first range: pn 16..20
+    ranges[1] = .{ .gap = 2, .ack_range = 3 }; // gap=2, second range: 4 pkts
+    const ack = AckFrame{
+        .largest_acked = 20,
+        .ack_delay = 5,
+        .ranges = ranges,
+        .range_count = 2,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    };
+    const n = encodeFrame(&buf, .{ .ack = ack });
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .ack => |a| {
+            try testing.expectEqual(@as(u62, 20), a.largest_acked);
+            try testing.expectEqual(@as(u62, 5), a.ack_delay);
+            try testing.expectEqual(@as(usize, 2), a.range_count);
+            try testing.expectEqual(@as(u62, 4), a.ranges[0].ack_range);
+            try testing.expectEqual(@as(u62, 2), a.ranges[1].gap);
+            try testing.expectEqual(@as(u62, 3), a.ranges[1].ack_range);
+        },
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
 test "frame: PATH_RESPONSE echoes PATH_CHALLENGE data" {
     const testing = std.testing;
     var buf: [16]u8 = undefined;

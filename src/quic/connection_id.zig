@@ -55,13 +55,26 @@ test "connection_id: zero CID" {
     try testing.expect(ConnectionId.eql(ConnectionId.zero, ConnectionId.zero));
 }
 
-test "connection_id: two generated CIDs are not equal (probabilistic)" {
+test "connection_id: two generated CIDs are not equal" {
+    const testing = std.testing;
     const io = std.testing.io;
     const a = ConnectionId.generate(0, io);
     const b = ConnectionId.generate(0, io);
-    // With 56 random bits the probability of collision is negligible.
-    // This test may theoretically fail but is effectively impossible.
-    _ = a;
-    _ = b;
-    // Just verify they compile and run without panic.
+    // 56 random bits — collision probability is negligible (~1 in 2^56)
+    try testing.expect(!ConnectionId.eql(a, b));
+}
+
+test "connection_id: generate randomises the non-thread bytes" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const cid = ConnectionId.generate(3, io);
+    // Thread index preserved in byte 0
+    try testing.expectEqual(@as(u8, 3), cid.bytes[0]);
+    // At least one of the remaining 7 bytes must be non-zero
+    // (std.testing.io fills with deterministic non-zero data)
+    var any_nonzero = false;
+    for (cid.bytes[1..]) |b| {
+        if (b != 0) { any_nonzero = true; break; }
+    }
+    try testing.expect(any_nonzero);
 }

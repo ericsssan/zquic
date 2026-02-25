@@ -241,6 +241,44 @@ test "stream_table: capacity limit" {
     try testing.expectEqual(@as(?*Stream, null), overflow);
 }
 
+test "stream: streamDir and streamKind decode ID bits" {
+    const testing = std.testing;
+    // ID bit 0: 0=client, 1=server.  Bit 1: 0=bidi, 1=uni.
+    try testing.expectEqual(StreamDir.client_initiated, streamDir(0)); // 0b00
+    try testing.expectEqual(StreamKind.bidirectional,   streamKind(0));
+    try testing.expectEqual(StreamDir.server_initiated, streamDir(1)); // 0b01
+    try testing.expectEqual(StreamKind.bidirectional,   streamKind(1));
+    try testing.expectEqual(StreamDir.client_initiated, streamDir(2)); // 0b10
+    try testing.expectEqual(StreamKind.unidirectional,  streamKind(2));
+    try testing.expectEqual(StreamDir.server_initiated, streamDir(3)); // 0b11
+    try testing.expectEqual(StreamKind.unidirectional,  streamKind(3));
+}
+
+test "stream: onSent advances send_offset" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    try testing.expectEqual(@as(u64, 0), s.send_offset);
+    s.onSent(100);
+    try testing.expectEqual(@as(u64, 100), s.send_offset);
+    s.onSent(200);
+    try testing.expectEqual(@as(u64, 300), s.send_offset);
+}
+
+test "stream: out-of-order data is silently dropped" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    // Data at offset 5 before offset 0 has been received — silently ignored
+    try s.receiveData(5, "world", false);
+    var buf: [16]u8 = undefined;
+    const n = s.read(&buf);
+    try testing.expectEqual(@as(usize, 0), n);
+    // In-order data at offset 0 is buffered normally
+    try s.receiveData(0, "hello", false);
+    const n2 = s.read(&buf);
+    try testing.expectEqual(@as(usize, 5), n2);
+    try testing.expectEqualSlices(u8, "hello", buf[0..n2]);
+}
+
 test "ringbuf: wrap-around" {
     const testing = std.testing;
     var rb: RingBuf(8) = .{};

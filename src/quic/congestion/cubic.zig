@@ -85,7 +85,7 @@ pub const Cubic = struct {
         const w_cubic = cubicWindow(t_s, self.k, self.w_max);
         // TCP-friendly comparison
         const rtt_s: f64 = @as(f64, @floatFromInt(rtt_ns)) / 1e9;
-        const w_est = tcpFriendlyWindow(bytes_acked, rtt_s, self.cwnd_at_epoch, t_s);
+        const w_est = tcpFriendlyWindow(bytes_acked, rtt_s);
 
         const target = @max(w_cubic, w_est);
         const target_bytes: u64 = @intFromFloat(@max(target, 0));
@@ -108,12 +108,11 @@ fn cubicWindow(t: f64, k: f64, w_max: f64) f64 {
     return C * dt * dt * dt + w_max;
 }
 
-fn tcpFriendlyWindow(bytes_acked: u64, rtt: f64, _: f64, t: f64) f64 {
+fn tcpFriendlyWindow(bytes_acked: u64, rtt: f64) f64 {
     // W_est grows like TCP Reno: W_est += 3*beta/(2-beta) * (acked/cwnd)
     // Simplified: track linear growth
     if (rtt <= 0) return 0;
     const acked_f: f64 = @floatFromInt(bytes_acked);
-    _ = t;
     return acked_f * 3.0 * BETA_CUBIC / (2.0 - BETA_CUBIC);
 }
 
@@ -161,4 +160,34 @@ test "cubic: canSend" {
     try testing.expect(c.canSend());
     c.cwnd = 0;
     try testing.expect(!c.canSend());
+}
+
+test "cubic: onAckReceived with zero bytes is a no-op" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    const before = c.cwnd;
+    c.onAckReceived(0, 50_000_000, 1_000_000_000);
+    try testing.expectEqual(before, c.cwnd);
+}
+
+test "cubic: slow start adds bytes_acked directly to cwnd" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    // ssthresh = maxInt(u64) by default — we are in slow start
+    const initial = c.cwnd;
+    c.onAckReceived(MSS, 50_000_000, 1_000_000_000);
+    try testing.expectEqual(initial + MSS, c.cwnd);
+    c.onAckReceived(2 * MSS, 50_000_000, 1_050_000_000);
+    try testing.expectEqual(initial + 3 * MSS, c.cwnd);
+}
+
+test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    c.cwnd = 10 * MSS; // 12000 bytes
+    c.onPacketLost(0);
+    // Expected: floor(12000 * 0.7) = 8400
+    try testing.expectEqual(@as(u64, 8400), c.cwnd);
+    try testing.expectEqual(c.cwnd, c.ssthresh);
+    try testing.expectEqual(@as(f64, 12000.0), c.w_max);
 }
