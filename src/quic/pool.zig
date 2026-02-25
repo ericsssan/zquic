@@ -25,17 +25,25 @@ pub fn Pool(comptime T: type, comptime capacity: usize) type {
         },
         free_top: usize = capacity,
 
+        // Tracks which slots are currently acquired (for double-free detection).
+        in_use: [capacity]bool = [_]bool{false} ** capacity,
+
         /// Acquire a slot from the pool. Returns null when exhausted.
         pub fn acquire(self: *Self) ?*T {
             if (self.free_top == 0) return null;
             self.free_top -= 1;
-            return &self.items[self.free[self.free_top]];
+            const idx = self.free[self.free_top];
+            self.in_use[idx] = true;
+            return &self.items[idx];
         }
 
         /// Return a previously acquired slot back to the pool.
         /// `ptr` must point into this pool's `items` array.
+        /// Asserts in debug mode that the slot was actually acquired (double-free detection).
         pub fn release(self: *Self, ptr: *T) void {
             const idx = self.indexOf(ptr);
+            std.debug.assert(self.in_use[idx]); // double-free detection
+            self.in_use[idx] = false;
             self.free[self.free_top] = @intCast(idx);
             self.free_top += 1;
         }
@@ -46,7 +54,9 @@ pub fn Pool(comptime T: type, comptime capacity: usize) type {
             const p = @intFromPtr(ptr);
             if (p < base) return false;
             const offset = p - base;
-            return offset < capacity * @sizeOf(T) and offset % @sizeOf(T) == 0;
+            if (offset >= capacity * @sizeOf(T) or offset % @sizeOf(T) != 0) return false;
+            const idx = offset / @sizeOf(T);
+            return self.in_use[idx];
         }
 
         /// Number of available slots.
@@ -127,5 +137,26 @@ test "pool: owns" {
     const testing = std.testing;
     try testing.expect(pool.owns(p));
     pool.release(p);
-    try testing.expect(pool.owns(p)); // owns doesn't track allocation state
+    try testing.expect(!pool.owns(p)); // released slot is no longer owned
+}
+
+test "pool: owns tracks allocation state across acquire/release cycles" {
+    const testing = std.testing;
+    var pool: Pool(u32, 4) = .{};
+
+    const a = pool.acquire().?;
+    const b = pool.acquire().?;
+    try testing.expect(pool.owns(a));
+    try testing.expect(pool.owns(b));
+
+    pool.release(a);
+    try testing.expect(!pool.owns(a)); // released: not owned
+    try testing.expect(pool.owns(b));  // still acquired: owned
+
+    const c = pool.acquire().?; // reuses a's slot
+    try testing.expect(pool.owns(c)); // acquired again: owned
+    pool.release(b);
+    pool.release(c);
+    try testing.expect(!pool.owns(b));
+    try testing.expect(!pool.owns(c));
 }

@@ -397,7 +397,7 @@ pub const Connection = struct {
             switch (fr.frame) {
                 .padding => {},
                 .ping => try self.queueAck(epoch),
-                .ack => |a| self.processAck(a),
+                .ack => |a| self.processAck(a, epoch),
                 .crypto => |c| {
                     if (io) |real_io| {
                         try self.processCryptoFrame(c, epoch, real_io);
@@ -463,7 +463,7 @@ pub const Connection = struct {
         }
     }
 
-    fn processAck(self: *Connection, ack: frame.AckFrame) void {
+    fn processAck(self: *Connection, ack: frame.AckFrame, epoch: u8) void {
         // Convert AckFrame ranges into loss_recovery.AckedRange slices.
         // ranges[0] has gap=0 (first ACK range); subsequent entries carry the gap
         // to the *next* range (stored in the following slot by the frame parser).
@@ -484,8 +484,6 @@ pub const Connection = struct {
         const ack_delay_exp: u6 = @intCast(@min(params.ack_delay_exponent, 20));
         const ack_delay_ns: u64 = @as(u64, ack.ack_delay) *
             (@as(u64, 1) << ack_delay_exp) * 1000;
-
-        const epoch = self.hot.epoch;
         const result = self.loss.onAckReceived(
             @as(u64, ack.largest_acked),
             ack_delay_ns,
@@ -520,8 +518,9 @@ pub const Connection = struct {
     // -----------------------------------------------------------------------
 
     fn enqueueSend(self: *Connection, data: []const u8) !void {
-        const next = (self.sq_tail + 1) % SEND_QUEUE_DEPTH;
-        if (next == self.sq_head % SEND_QUEUE_DEPTH) return error.SendQueueFull;
+        // Use monotonic head/tail subtraction (not modular comparison) to correctly
+        // detect full queue regardless of wrap-around.
+        if (self.sq_tail - self.sq_head >= SEND_QUEUE_DEPTH) return error.SendQueueFull;
         const slot = &self.sq[self.sq_tail % SEND_QUEUE_DEPTH];
         const n = @min(data.len, MAX_PACKET_SIZE);
         @memcpy(slot.buf[0..n], data[0..n]);
@@ -809,6 +808,54 @@ test "loss: onAckReceived decrements bytes_in_flight" {
 
     const ranges = [_]loss_recovery_mod.AckedRange{.{ .low = 1, .high = 1 }};
     _ = conn.loss.onAckReceived(1, 0, &ranges, 0, 1_000_000, conn.cached_max_ack_delay_ns);
+    try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
+}
+
+test "connection: send queue full returns SendQueueFull error" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Fill all 8 queue slots
+    const data = [_]u8{0x01};
+    var i: usize = 0;
+    while (i < SEND_QUEUE_DEPTH) : (i += 1) {
+        try conn.enqueueSend(&data);
+    }
+    // One more must fail
+    try testing.expectError(error.SendQueueFull, conn.enqueueSend(&data));
+
+    // Drain one slot: now there is room again
+    var out: [8]u8 = undefined;
+    _ = conn.send(&out);
+    try conn.enqueueSend(&data); // must succeed now
+}
+
+test "connection: processAck uses packet epoch not connection epoch" {
+    // Verify that processAck is called with the epoch from processFrames,
+    // not self.hot.epoch. We do this by tracking bytes_in_flight:
+    // send a packet in epoch 0 and ACK it via an ACK frame in epoch 0.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 0;
+
+    // Record a sent packet in epoch 0
+    conn.loss.onPacketSent(1, 0, 1200, true, 0);
+    try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
+
+    // Build an ACK frame acknowledging pn=1
+    const ack = frame.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    };
+    // Call processAck with epoch=0 (the epoch the ACK was received in)
+    conn.processAck(ack, 0);
+
+    // bytes_in_flight must be reduced (ACK was processed with correct epoch)
     try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
 }
 

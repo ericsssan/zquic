@@ -70,6 +70,8 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     const dcid_len = buf[pos];
     pos += 1;
     if (pos + dcid_len > buf.len) return error.PacketTooShort;
+    // For QUIC v1, CID length must match our fixed 8-byte CID format.
+    if (version == QUIC_VERSION_1 and dcid_len != cid.len) return error.UnsupportedCidLength;
     var dest_cid: ConnectionId = .{};
     if (dcid_len > 0) {
         const copy_len = @min(dcid_len, cid.len);
@@ -82,6 +84,8 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     const scid_len = buf[pos];
     pos += 1;
     if (pos + scid_len > buf.len) return error.PacketTooShort;
+    // For QUIC v1, CID length must match our fixed 8-byte CID format.
+    if (version == QUIC_VERSION_1 and scid_len != cid.len) return error.UnsupportedCidLength;
     var src_cid: ConnectionId = .{};
     if (scid_len > 0) {
         const copy_len = @min(scid_len, cid.len);
@@ -367,6 +371,21 @@ test "packet: decodePacketNumber" {
     const truncated: u32 = 0x9b32;
     const decoded = decodePacketNumber(largest, truncated, 16);
     try testing.expectEqual(@as(u64, 0xa82f9b32), decoded);
+}
+
+test "packet: long header with wrong CID length returns UnsupportedCidLength" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    // Build a QUIC v1 Initial packet with a 4-byte DCID (not the expected 8 bytes)
+    buf[0] = 0xc0; // long header, Initial
+    std.mem.writeInt(u32, buf[1..5], QUIC_VERSION_1, .big);
+    buf[5] = 4; // DCID length = 4 (wrong; must be 8 for our library)
+    @memset(buf[6..10], 0xaa);
+    buf[10] = 8; // SCID length
+    @memset(buf[11..19], 0xbb);
+    // pad rest
+    @memset(buf[19..32], 0);
+    try testing.expectError(error.UnsupportedCidLength, parseLongHeader(buf[0..32]));
 }
 
 test "packet: encodeVersionNegotiation structure" {

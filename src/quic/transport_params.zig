@@ -121,10 +121,14 @@ pub fn encode(params: TransportParams, buf: []u8) usize {
 
 /// Decode transport parameters from `buf`.
 /// Unknown parameter IDs are silently skipped (RFC 9000 §18.1).
+/// Duplicate known parameter IDs are rejected per RFC 9000 §18.1.
 /// Parameters absent from `buf` retain their default values.
 pub fn decode(buf: []const u8) !TransportParams {
     var params = TransportParams{};
     var pos: usize = 0;
+    // Bitmask tracking which known parameter IDs (0x01..0x0f) have been seen.
+    // bit i set ⟺ parameter with ID (i+1) was already decoded.
+    var seen: u16 = 0;
 
     while (pos < buf.len) {
         const id_vi = varint.decode(buf[pos..]) orelse return error.InvalidParams;
@@ -137,6 +141,13 @@ pub fn decode(buf: []const u8) !TransportParams {
         if (pos + param_len > buf.len) return error.InvalidParams;
 
         const param_data = buf[pos..][0..param_len];
+
+        // Check for duplicates among known IDs 0x01..0x0f
+        if (id_vi.value >= 1 and id_vi.value <= 15) {
+            const bit: u16 = @as(u16, 1) << @intCast(id_vi.value - 1);
+            if (seen & bit != 0) return error.DuplicateParam;
+            seen |= bit;
+        }
 
         switch (id_vi.value) {
             TP_MAX_IDLE_TIMEOUT => {
@@ -327,6 +338,43 @@ test "transport_params: disable_active_migration encoded as empty value" {
     const n_off = encode(params_off, &buf);
     const decoded_off = try decode(buf[0..n_off]);
     try testing.expect(!decoded_off.disable_active_migration);
+}
+
+test "transport_params: duplicate param ID returns error" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+
+    // Encode TP_INITIAL_MAX_DATA (0x04) twice — second occurrence is a violation.
+    pos += varint.encode(buf[pos..], 0x04);
+    pos += varint.encode(buf[pos..], 2);
+    pos += varint.encode(buf[pos..], 1000);
+
+    pos += varint.encode(buf[pos..], 0x04); // duplicate
+    pos += varint.encode(buf[pos..], 2);
+    pos += varint.encode(buf[pos..], 2000);
+
+    try testing.expectError(error.DuplicateParam, decode(buf[0..pos]));
+}
+
+test "transport_params: unknown IDs are not subject to duplicate check" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+
+    // Two unknown params with the same ID — silently skipped (no error)
+    pos += varint.encode(buf[pos..], 0x55);
+    pos += varint.encode(buf[pos..], 1);
+    buf[pos] = 0xaa; pos += 1;
+
+    pos += varint.encode(buf[pos..], 0x55); // duplicate unknown ID: allowed
+    pos += varint.encode(buf[pos..], 1);
+    buf[pos] = 0xbb; pos += 1;
+
+    const decoded = try decode(buf[0..pos]);
+    // Defaults should remain
+    const defaults = TransportParams{};
+    try testing.expectEqual(defaults.initial_max_data, decoded.initial_max_data);
 }
 
 test "transport_params: initial_source_connection_id round-trip" {

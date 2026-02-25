@@ -106,7 +106,7 @@ pub const Stream = struct {
             self.send_offset + bytes <= self.send_max;
     }
 
-    /// Buffer incoming data. Returns error if exceeds receive window.
+    /// Buffer incoming data. Returns error if exceeds receive window or buffer is full.
     pub fn receiveData(self: *Stream, offset: u64, data: []const u8, fin: bool) !void {
         if (offset + data.len > self.recv_max) return error.FlowControlViolation;
 
@@ -114,6 +114,9 @@ pub const Stream = struct {
         if (offset == self.recv_offset) {
             const written = self.recv_buf.write(data);
             self.recv_offset += written;
+            // If the ring buffer was full and couldn't accept all data, report the error.
+            // The caller must drain the buffer before sending more data.
+            if (written < data.len) return error.BufferFull;
         }
 
         if (fin) {
@@ -126,8 +129,15 @@ pub const Stream = struct {
     }
 
     /// Read buffered receive data into `out`. Returns bytes read.
+    /// Advances recv_max to reflect freed buffer space, allowing the remote to send more.
     pub fn read(self: *Stream, out: []u8) usize {
-        return self.recv_buf.read(out);
+        const n = self.recv_buf.read(out);
+        if (n > 0) {
+            // recv_buf.rp is the total bytes consumed (monotonically increasing).
+            // New recv_max = consumed_so_far + STREAM_BUF_SIZE.
+            self.recv_max = self.recv_buf.rp + STREAM_BUF_SIZE;
+        }
+        return n;
     }
 
     /// Record that we sent `bytes` (advances send_offset).
@@ -277,6 +287,37 @@ test "stream: out-of-order data is silently dropped" {
     const n2 = s.read(&buf);
     try testing.expectEqual(@as(usize, 5), n2);
     try testing.expectEqualSlices(u8, "hello", buf[0..n2]);
+}
+
+test "stream: receiveData returns BufferFull when ring buffer is full" {
+    var s = Stream.init(0);
+    // Fill the ring buffer to capacity with in-order data
+    var data: [STREAM_BUF_SIZE]u8 = undefined;
+    @memset(&data, 0xaa);
+    try s.receiveData(0, &data, false);
+
+    // Extend flow-control window so the check doesn't fire early
+    s.recv_max = STREAM_BUF_SIZE + 100;
+
+    // Buffer is full; another byte at the next offset must fail with BufferFull
+    try std.testing.expectError(error.BufferFull, s.receiveData(STREAM_BUF_SIZE, &[_]u8{0x01}, false));
+}
+
+test "stream: recv_max extends after read" {
+    const testing = std.testing;
+    var s = Stream.init(4);
+    const initial_max = s.recv_max; // STREAM_BUF_SIZE
+
+    // Receive some data
+    try s.receiveData(0, "hello world", false);
+
+    var buf: [16]u8 = undefined;
+    const n = s.read(&buf);
+    try testing.expectEqual(@as(usize, 11), n);
+
+    // recv_max must grow: consumed (11) + STREAM_BUF_SIZE
+    try testing.expect(s.recv_max > initial_max);
+    try testing.expectEqual(STREAM_BUF_SIZE + @as(u64, 11), s.recv_max);
 }
 
 test "ringbuf: wrap-around" {

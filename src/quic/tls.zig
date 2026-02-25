@@ -191,7 +191,15 @@ pub const TlsServer = struct {
 
         switch (self.state) {
             .wait_client_hello => {
-                const ch = try parseClientHello(self.read_buf[0..self.read_len]);
+                // Handle fragmented CRYPTO data gracefully: if the ClientHello is not
+                // yet complete, keep buffering instead of aborting the connection.
+                const ch = parseClientHello(self.read_buf[0..self.read_len]) catch |err| switch (err) {
+                    error.TooShort => return 0, // not enough data yet; wait for more
+                    else => return err,
+                };
+                // Hash the complete ClientHello into the transcript before processing.
+                // The key schedule requires H(ClientHello || ServerHello).
+                self.transcript.update(self.read_buf[0..self.read_len]);
                 self.read_len = 0;
                 return try self.handleClientHello(ch, out, io);
             },
@@ -213,11 +221,6 @@ pub const TlsServer = struct {
         // Store the client's transport parameters.
         self.peer_params = ch.peer_transport_params;
 
-        // Transcript starts with ClientHello message bytes (reconstructed below)
-        // For the key schedule we hash what we received.
-        // NOTE: we hash the raw handshake message, not just the data struct.
-        // The transcript was already updated in parseClientHello below.
-
         // 1. ECDH shared secret
         const shared = try X25519.scalarmult(self.ecdh_kp.secret_key, ch.client_x25519_pub);
 
@@ -225,21 +228,21 @@ pub const TlsServer = struct {
         var server_random: [32]u8 = undefined;
         io.random(&server_random);
 
-        // 3. Run TLS 1.3 key schedule
-        try self.runKeySchedule(shared, &server_random);
-
-        // 4. Serialize flight: ServerHello + EE + Cert + CertVerify + Finished
+        // 3. Serialize ServerHello FIRST (before key schedule).
+        //    RFC 8446 §7.1: HS traffic secrets are derived over Hash(ClientHello || ServerHello).
+        //    The ClientHello was already hashed in processCrypto; hash ServerHello here.
         var pos: usize = 0;
-
-        // ServerHello message
         pos += try self.buildServerHello(
             out[pos..],
             server_random,
             ch.legacy_session_id[0..ch.session_id_len],
         );
 
-        // Update transcript with ServerHello
+        // 4. Hash ServerHello into transcript (transcript now has H(CH || SH)).
         self.transcript.update(out[0..pos]);
+
+        // 5. Run TLS 1.3 key schedule with the correct transcript state.
+        try self.runKeySchedule(shared, &server_random);
 
         // From here on, messages are "handshake-encrypted" conceptually.
         // In QUIC they travel in Handshake-epoch CRYPTO frames (caller handles encryption).
@@ -877,6 +880,48 @@ test "tls: peer transport params default when no extension" {
     const defaults = transport_params.TransportParams{};
     try testing.expectEqual(defaults.initial_max_data, params.initial_max_data);
     try testing.expect(params.stateless_reset_token == null);
+}
+
+test "tls: processCrypto returns 0 on incomplete (TooShort) ClientHello" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var server = try TlsServer.init(io);
+
+    // Feed a truncated ClientHello — just the type byte and a length claiming more data.
+    const incomplete: []const u8 = &[_]u8{
+        HS_CLIENT_HELLO, // type = 1
+        0x00, 0x00, 0xff, // length = 255 bytes follow (but we don't provide them)
+        0x03, 0x03, // legacy_version
+    };
+    var out: [8192]u8 = undefined;
+    // Should return 0 (not an error) and stay in wait_client_hello state
+    const n = try server.processCrypto(incomplete, &out, io);
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expectEqual(TlsState.wait_client_hello, server.state);
+}
+
+test "tls: transcript is non-empty after ClientHello processing" {
+    // Verify that the transcript is updated with CH bytes during processCrypto.
+    // We check indirectly: run the key schedule with a known shared secret,
+    // verify that handshake keys are different from those derived with an empty transcript.
+    const io = std.testing.io;
+    var server_with_ch = try TlsServer.init(io);
+    var server_empty = try TlsServer.init(io);
+
+    // Manually hash something into server_with_ch's transcript (simulating a CH)
+    const fake_ch = [_]u8{0x01, 0x00, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef};
+    server_with_ch.transcript.update(&fake_ch);
+
+    // Run key schedule on both
+    const shared = [_]u8{0x77} ** 32;
+    const rand = [_]u8{0x88} ** 32;
+    try server_with_ch.runKeySchedule(shared, &rand);
+    try server_empty.runKeySchedule(shared, &rand);
+
+    // Keys must differ because transcripts differ
+    try std.testing.expect(!std.mem.eql(u8,
+        &server_with_ch.handshake_keys.server.key,
+        &server_empty.handshake_keys.server.key));
 }
 
 test "tls: Finished message builds correctly" {

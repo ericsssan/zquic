@@ -43,14 +43,17 @@ pub const FlowController = struct {
 
     /// True when we should emit a MAX_DATA frame to extend the peer's window.
     pub fn shouldSendMaxData(self: *const FlowController) bool {
+        if (self.recv_max == 0) return false; // guard: avoid divide-by-zero
         const used_fraction = @as(f64, @floatFromInt(self.recv_total)) /
             @as(f64, @floatFromInt(self.recv_max));
         return used_fraction >= UPDATE_THRESHOLD;
     }
 
     /// Compute the new MAX_DATA value to advertise (doubles the window).
+    /// Saturates at the QUIC maximum varint value (2^62 - 1) to prevent overflow.
     pub fn nextMaxData(self: *const FlowController) u64 {
-        return self.recv_max * 2;
+        const quic_max: u64 = (1 << 62) - 1;
+        return @min(self.recv_max *| 2, quic_max);
     }
 
     /// Update the receive window.
@@ -102,6 +105,22 @@ test "flow_control: nextMaxData doubles recv window" {
     const testing = std.testing;
     const fc = FlowController.init(1_000, 500);
     try testing.expectEqual(@as(u64, 2_000), fc.nextMaxData());
+}
+
+test "flow_control: shouldSendMaxData with recv_max=0 returns false" {
+    const testing = std.testing;
+    var fc = FlowController.init(0, 0);
+    fc.recv_total = 0;
+    // Must not divide by zero
+    try testing.expect(!fc.shouldSendMaxData());
+}
+
+test "flow_control: nextMaxData saturates at QUIC max varint" {
+    const testing = std.testing;
+    const quic_max: u64 = (1 << 62) - 1;
+    // recv_max near overflow: doubling would exceed u64 max
+    const fc = FlowController.init(quic_max, quic_max);
+    try testing.expectEqual(quic_max, fc.nextMaxData());
 }
 
 test "flow_control: onReceived tracks total bytes received" {

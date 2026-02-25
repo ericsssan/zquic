@@ -19,21 +19,25 @@ pub const Cubic = struct {
     ssthresh: u64,
     /// W_max: window at the last congestion event (bytes, as float for formula).
     w_max: f64,
-    /// Epoch start timestamp (ns). 0 means not in a cubic epoch.
-    epoch_start_ns: i64,
+    /// Epoch start timestamp (ns). null means no cubic epoch has started yet.
+    /// Using optional instead of sentinel 0 avoids confusion when clock starts at 0.
+    epoch_start_ns: ?i64,
     /// K: time to reach W_max from cwnd_at_epoch (seconds).
     k: f64,
     /// cwnd at start of current epoch.
     cwnd_at_epoch: f64,
+    /// TCP-friendly estimated window (running accumulator per RFC 9438 §5.1).
+    w_est: f64,
 
     pub fn init() Cubic {
         return .{
             .cwnd = INITIAL_CWND_PACKETS * MSS,
             .ssthresh = std.math.maxInt(u64),
             .w_max = 0,
-            .epoch_start_ns = 0,
+            .epoch_start_ns = null,
             .k = 0,
             .cwnd_at_epoch = 0,
+            .w_est = 0,
         };
     }
 
@@ -62,15 +66,20 @@ pub const Cubic = struct {
         self.cwnd = @intFromFloat(@as(f64, @floatFromInt(self.cwnd)) * BETA_CUBIC);
         if (self.cwnd < MSS) self.cwnd = MSS;
         self.ssthresh = self.cwnd;
-        self.epoch_start_ns = now_ns;
+        self.epoch_start_ns = now_ns; // begin new epoch at loss time
         self.cwnd_at_epoch = @floatFromInt(self.cwnd);
+        self.w_est = self.cwnd_at_epoch; // reset TCP-friendly estimate to post-loss cwnd
         self.k = computeK(self.w_max, self.cwnd_at_epoch);
     }
 
     fn updateCwndCubic(self: *Cubic, bytes_acked: u64, rtt_ns: u64, now_ns: i64) void {
-        if (self.epoch_start_ns == 0) {
+        _ = rtt_ns; // RTT not used in CUBIC window computation; w_est uses per-packet accumulation
+
+        if (self.epoch_start_ns == null) {
+            // Start a new CUBIC epoch
             self.epoch_start_ns = now_ns;
             self.cwnd_at_epoch = @floatFromInt(self.cwnd);
+            self.w_est = self.cwnd_at_epoch; // reset TCP-friendly estimate
             if (self.w_max < self.cwnd_at_epoch) {
                 self.w_max = self.cwnd_at_epoch;
                 self.k = 0;
@@ -79,15 +88,21 @@ pub const Cubic = struct {
             }
         }
 
-        const t_ns = now_ns - self.epoch_start_ns;
+        const t_ns = now_ns - self.epoch_start_ns.?;
+        // Guard against non-monotonic clocks: if t_ns is negative, skip this update.
+        if (t_ns < 0) return;
+
         const t_s: f64 = @as(f64, @floatFromInt(t_ns)) / 1e9;
 
         const w_cubic = cubicWindow(t_s, self.k, self.w_max);
-        // TCP-friendly comparison
-        const rtt_s: f64 = @as(f64, @floatFromInt(rtt_ns)) / 1e9;
-        const w_est = tcpFriendlyWindow(bytes_acked, rtt_s);
 
-        const target = @max(w_cubic, w_est);
+        // TCP-friendly window: RFC 9438 §5.1 running accumulator.
+        // W_est += alpha_aimd * (bytes_acked / cwnd)  per ACK event.
+        const alpha_aimd: f64 = 3.0 * BETA_CUBIC / (2.0 - BETA_CUBIC);
+        const cwnd_f: f64 = @floatFromInt(self.cwnd);
+        self.w_est += alpha_aimd * @as(f64, @floatFromInt(bytes_acked)) / cwnd_f;
+
+        const target = @max(w_cubic, self.w_est);
         const target_bytes: u64 = @intFromFloat(@max(target, 0));
 
         if (target_bytes > self.cwnd) {
@@ -106,14 +121,6 @@ fn computeK(w_max: f64, cwnd: f64) f64 {
 fn cubicWindow(t: f64, k: f64, w_max: f64) f64 {
     const dt = t - k;
     return C * dt * dt * dt + w_max;
-}
-
-fn tcpFriendlyWindow(bytes_acked: u64, rtt: f64) f64 {
-    // W_est grows like TCP Reno: W_est += 3*beta/(2-beta) * (acked/cwnd)
-    // Simplified: track linear growth
-    if (rtt <= 0) return 0;
-    const acked_f: f64 = @floatFromInt(bytes_acked);
-    return acked_f * 3.0 * BETA_CUBIC / (2.0 - BETA_CUBIC);
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +186,47 @@ test "cubic: slow start adds bytes_acked directly to cwnd" {
     try testing.expectEqual(initial + MSS, c.cwnd);
     c.onAckReceived(2 * MSS, 50_000_000, 1_050_000_000);
     try testing.expectEqual(initial + 3 * MSS, c.cwnd);
+}
+
+test "cubic: epoch_start_ns null sentinel prevents spurious reset at clock=0" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    // Force into CUBIC phase by setting ssthresh below cwnd
+    c.cwnd = 50 * MSS;
+    c.onPacketLost(0); // epoch_start_ns = Some(0), not null
+    const cwnd_after_loss = c.cwnd;
+
+    // ACK at t=1ms: epoch should NOT reinitialize (epoch_start_ns is Some(0), not null)
+    c.onAckReceived(MSS, 50_000_000, 1_000_000); // 1ms later
+    // cwnd must be >= post-loss cwnd (no spurious reset)
+    try testing.expect(c.cwnd >= cwnd_after_loss);
+    // epoch_start_ns must still be Some(0), not changed
+    try testing.expectEqual(@as(?i64, 0), c.epoch_start_ns);
+}
+
+test "cubic: w_est accumulates across ACKs in CUBIC phase" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    c.cwnd = 50 * MSS;
+    c.onPacketLost(0); // enter CUBIC phase
+    const w_est_after_loss = c.w_est; // reset to cwnd at loss
+
+    // w_est should grow with each ACK
+    c.onAckReceived(MSS, 50_000_000, 100_000_000);
+    try testing.expect(c.w_est > w_est_after_loss);
+}
+
+test "cubic: non-monotonic clock (negative t_ns) is a no-op" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    c.cwnd = 50 * MSS;
+    c.onPacketLost(1_000_000_000); // epoch_start_ns = 1s
+    const cwnd_before = c.cwnd;
+
+    // Call with now_ns < epoch_start_ns (clock went backward)
+    c.onAckReceived(MSS, 50_000_000, 500_000_000); // 500ms < 1000ms
+    // cwnd must not change (early return due to negative t_ns)
+    try testing.expectEqual(cwnd_before, c.cwnd);
 }
 
 test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {

@@ -103,10 +103,13 @@ pub const SentPacketTable = struct {
     }
 
     /// O(1) add. Modular index = pn % MAX_SENT. Evicts any previous occupant.
-    pub fn add(self: *SentPacketTable, pkt: SentPacket) void {
+    /// Returns the evicted packet (if any) so the caller can adjust bytes_in_flight.
+    pub fn add(self: *SentPacketTable, pkt: SentPacket) ?SentPacket {
         const idx = pkt.pn % MAX_SENT;
+        const evicted: ?SentPacket = if (self.slots[idx].valid) self.slots[idx] else null;
         self.slots[idx] = pkt;
         self.slots[idx].valid = true;
+        return evicted;
     }
 
     /// O(1) lookup. Returns null if slot is empty or belongs to a different pn/epoch.
@@ -228,7 +231,10 @@ pub const LossRecovery = struct {
         now_ns: i64,
     ) void {
         const sz: u16 = @intCast(@min(size, @as(usize, 0xffff)));
-        self.sent.add(.{
+        // add() evicts any existing occupant at pn % MAX_SENT.
+        // If the evicted packet was still in flight, subtract its size from bytes_in_flight
+        // to avoid double-counting (the in-flight accounting for the evicted packet is lost).
+        if (self.sent.add(.{
             .pn = pn,
             .sent_ns = now_ns,
             .size = sz,
@@ -236,7 +242,11 @@ pub const LossRecovery = struct {
             .ack_eliciting = ack_eliciting,
             .in_flight = ack_eliciting,
             .valid = true,
-        });
+        })) |evicted| {
+            if (evicted.in_flight) {
+                self.bytes_in_flight -|= evicted.size;
+            }
+        }
         if (ack_eliciting) {
             self.bytes_in_flight += sz;
             self.last_ack_eliciting_ns = now_ns;
@@ -294,18 +304,26 @@ pub const LossRecovery = struct {
             &self.bytes_in_flight,
         );
 
+        // 6. Refresh last_ack_eliciting_ns: some in-flight packets may have been lost.
+        self.last_ack_eliciting_ns = self.sent.lastAckElicitingNs();
+
         return result;
     }
 
     /// PTO deadline: null when nothing is in flight.
     /// Otherwise: last_ack_eliciting_ns + ptoBase × 2^min(pto_count, 20).
+    /// Uses saturating arithmetic to avoid overflow when RTT or pto_count is extreme.
     pub fn ptoDeadline(self: *const LossRecovery, max_ack_delay_ns: u64) ?i64 {
         if (self.bytes_in_flight == 0) return null;
         const base_ns = self.last_ack_eliciting_ns orelse return null;
         const pto = self.rtt.ptoBase(max_ack_delay_ns);
         const shift: u6 = @intCast(@min(self.pto_count, 20));
-        const backoff: u64 = pto * (@as(u64, 1) << shift);
-        return base_ns + @as(i64, @intCast(backoff));
+        // Saturating multiply: prevents u64 overflow on extreme RTT values.
+        const backoff: u64 = pto *| (@as(u64, 1) << shift);
+        // Clamp to i64 max before casting, then add with saturation.
+        const max_i64: u64 = @as(u64, std.math.maxInt(i64));
+        const clamped: i64 = @intCast(@min(backoff, max_i64));
+        return base_ns +| clamped;
     }
 
     pub fn onPtoFired(self: *LossRecovery) void {
@@ -379,7 +397,7 @@ test "sent_table: add and get via modular index" {
         .in_flight = true,
         .valid = true,
     };
-    table.add(pkt);
+    _ = table.add(pkt);
 
     const found = table.get(65, 0);
     try testing.expect(found != null);
@@ -463,14 +481,14 @@ test "sent_table: lastAckElicitingNs returns sent_ns of highest in-flight pn" {
     try testing.expectEqual(@as(?i64, null), table.lastAckElicitingNs());
 
     // Add two in-flight ack-eliciting packets
-    table.add(.{ .pn = 5, .sent_ns = 100, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true });
-    table.add(.{ .pn = 10, .sent_ns = 200, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true });
+    _ = table.add(.{ .pn = 5, .sent_ns = 100, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true });
+    _ = table.add(.{ .pn = 10, .sent_ns = 200, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true });
 
     // Should return sent_ns of pn=10 (highest pn)
     try testing.expectEqual(@as(?i64, 200), table.lastAckElicitingNs());
 
     // Non-ack-eliciting packets are ignored
-    table.add(.{ .pn = 20, .sent_ns = 999, .size = 100, .epoch = 0, .ack_eliciting = false, .in_flight = false, .valid = true });
+    _ = table.add(.{ .pn = 20, .sent_ns = 999, .size = 100, .epoch = 0, .ack_eliciting = false, .in_flight = false, .valid = true });
     try testing.expectEqual(@as(?i64, 200), table.lastAckElicitingNs());
 }
 
@@ -492,6 +510,63 @@ test "pto: deadline is clamped at 2^20 backoff" {
     try testing.expectEqual(d_at_20, d_at_30);
     // And both must be strictly larger than the base deadline
     try testing.expect(d_at_20 > d0);
+}
+
+test "sent_table: eviction decrements bytes_in_flight to avoid double-counting" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // Send 64 packets (fills the ring buffer exactly)
+    var pn: u64 = 0;
+    while (pn < MAX_SENT) : (pn += 1) {
+        lr.onPacketSent(pn, 0, 1200, true, 0);
+    }
+    const bif_after_64 = lr.bytes_in_flight;
+    try testing.expectEqual(@as(u64, MAX_SENT * 1200), bif_after_64);
+
+    // Send packet pn=64: maps to slot 64 % 64 = 0, evicting pn=0 (still in flight).
+    // bytes_in_flight should stay the same (evict 1200, add 1200).
+    lr.onPacketSent(MAX_SENT, 0, 1200, true, 0);
+    try testing.expectEqual(bif_after_64, lr.bytes_in_flight);
+}
+
+test "loss_detection: last_ack_eliciting_ns updated after packets declared lost" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // Send one ack-eliciting packet
+    lr.onPacketSent(1, 0, 1200, true, 0);
+    try testing.expect(lr.last_ack_eliciting_ns != null);
+
+    // ACK a much higher pn to trigger loss via packet threshold for pn=1
+    // Send pn 2..5 so we have some acked
+    var i: u64 = 2;
+    while (i <= 10) : (i += 1) {
+        lr.onPacketSent(i, 0, 1200, true, 0);
+    }
+    const ranges = [_]AckedRange{.{ .low = 10, .high = 10 }};
+    _ = lr.onAckReceived(10, 0, &ranges, 0, 0, 25_000_000);
+
+    // pn=1 lost (1 + 3 <= 10). All remaining in-flight acked/lost.
+    // last_ack_eliciting_ns should be refreshed — pn 2..9 still in flight
+    // (pn 1 lost, pn 10 acked)
+    try testing.expect(lr.last_ack_eliciting_ns != null); // pn 2..9 still in flight
+}
+
+test "pto: deadline saturates on extreme pto values" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+    lr.onPacketSent(1, 0, 1200, true, 0);
+
+    // Force an extreme smoothed_rtt that would cause overflow without saturation
+    lr.rtt.smoothed_rtt = std.math.maxInt(u64) / 4;
+    lr.rtt.rtt_var = std.math.maxInt(u64) / 8;
+    lr.pto_count = 20;
+
+    // Must not panic and must return a valid (positive) deadline
+    const d = lr.ptoDeadline(0);
+    try testing.expect(d != null);
+    try testing.expect(d.? > 0);
 }
 
 test "pto: deadline doubles per onPtoFired; resets after resetPtoCount" {

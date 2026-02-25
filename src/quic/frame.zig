@@ -280,6 +280,18 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             pos += v.len;
             return .{ .frame = .{ .max_streams_uni = v.value }, .consumed = pos };
         },
+        0x14 => {
+            const v = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += v.len;
+            return .{ .frame = .{ .data_blocked = v.value }, .consumed = pos };
+        },
+        0x15 => {
+            const sid = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += sid.len;
+            const max = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += max.len;
+            return .{ .frame = .{ .stream_data_blocked = .{ .stream_id = sid.value, .max = max.value } }, .consumed = pos };
+        },
         0x1c, 0x1d => {
             const ec = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += ec.len;
@@ -502,7 +514,27 @@ pub fn encodeFrame(buf: []u8, frame: Frame) usize {
             @memcpy(buf[pos..][0..8], &f.data);
             pos += 8;
         },
-        else => {},
+        .max_streams_bidi => |v| {
+            buf[pos] = 0x12;
+            pos += 1;
+            pos += varint.encode(buf[pos..], v);
+        },
+        .max_streams_uni => |v| {
+            buf[pos] = 0x13;
+            pos += 1;
+            pos += varint.encode(buf[pos..], v);
+        },
+        .data_blocked => |v| {
+            buf[pos] = 0x14;
+            pos += 1;
+            pos += varint.encode(buf[pos..], v);
+        },
+        .stream_data_blocked => |f| {
+            buf[pos] = 0x15;
+            pos += 1;
+            pos += varint.encode(buf[pos..], f.stream_id);
+            pos += varint.encode(buf[pos..], f.max);
+        },
     }
 
     return pos;
@@ -741,6 +773,65 @@ test "frame: ACK with multiple ranges encode/parse round-trip" {
             try testing.expectEqual(@as(u62, 4), a.ranges[0].ack_range);
             try testing.expectEqual(@as(u62, 2), a.ranges[1].gap);
             try testing.expectEqual(@as(u62, 3), a.ranges[1].ack_range);
+        },
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: MAX_STREAMS_BIDI encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const f: Frame = .{ .max_streams_bidi = 128 };
+    const n = encodeFrame(&buf, f);
+    try testing.expect(n > 0);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .max_streams_bidi => |v| try testing.expectEqual(@as(u62, 128), v),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: MAX_STREAMS_UNI encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const f: Frame = .{ .max_streams_uni = 64 };
+    const n = encodeFrame(&buf, f);
+    try testing.expect(n > 0);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .max_streams_uni => |v| try testing.expectEqual(@as(u62, 64), v),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: DATA_BLOCKED encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const f: Frame = .{ .data_blocked = 500_000 };
+    const n = encodeFrame(&buf, f);
+    try testing.expect(n > 0);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .data_blocked => |v| try testing.expectEqual(@as(u62, 500_000), v),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: STREAM_DATA_BLOCKED encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [32]u8 = undefined;
+    const f: Frame = .{ .stream_data_blocked = .{ .stream_id = 7, .max = 32768 } };
+    const n = encodeFrame(&buf, f);
+    try testing.expect(n > 0);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .stream_data_blocked => |s| {
+            try testing.expectEqual(@as(u62, 7), s.stream_id);
+            try testing.expectEqual(@as(u62, 32768), s.max);
         },
         else => return error.WrongFrameType,
     }
