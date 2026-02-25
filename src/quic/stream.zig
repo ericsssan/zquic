@@ -282,21 +282,19 @@ pub const StreamTable = struct {
 
     /// Open or retrieve a stream by ID. Returns null if capacity exceeded.
     pub fn getOrCreate(self: *StreamTable, id: u62) ?*Stream {
-        // Look for existing
+        // Single pass: find existing stream OR record first free slot.
+        var empty: ?usize = null;
         for (0..MAX_STREAMS) |i| {
-            if (self.used[i] and self.streams[i].id == id) {
-                return &self.streams[i];
+            if (self.used[i]) {
+                if (self.streams[i].id == id) return &self.streams[i];
+            } else if (empty == null) {
+                empty = i;
             }
         }
-        // Allocate a new slot
-        for (0..MAX_STREAMS) |i| {
-            if (!self.used[i]) {
-                self.streams[i] = Stream.init(id);
-                self.used[i] = true;
-                return &self.streams[i];
-            }
-        }
-        return null;
+        const i = empty orelse return null;
+        self.streams[i] = Stream.init(id);
+        self.used[i] = true;
+        return &self.streams[i];
     }
 
     pub fn get(self: *StreamTable, id: u62) ?*Stream {

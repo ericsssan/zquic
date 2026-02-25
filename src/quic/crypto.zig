@@ -71,7 +71,9 @@ pub fn hkdfExpandLabel(
     label: []const u8,
     context: []const u8,
 ) void {
-    var info_buf: [2 + 1 + 6 + 255 + 1 + 255]u8 = undefined;
+    // Max needed for QUIC: 2 + 1 + 6 + 12 ("c ap traffic") + 1 + 32 (hash) = 54.
+    std.debug.assert(2 + 1 + 6 + label.len + 1 + context.len <= 64);
+    var info_buf: [64]u8 = undefined;
     const info = buildHkdfLabel(&info_buf, @intCast(out.len), label, context);
     HkdfSha256.expand(out, info, secret);
 }

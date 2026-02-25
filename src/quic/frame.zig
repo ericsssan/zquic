@@ -416,11 +416,12 @@ pub fn encodeFrame(buf: []u8, frame: Frame) usize {
             pos += f.data.len;
         },
         .stream => |f| {
-            const flags: u8 = 0x02 | (if (f.offset != 0) @as(u8, 0x04) else 0) | (if (f.fin) @as(u8, 0x01) else 0);
+            const has_offset = f.offset != 0;
+            const flags: u8 = 0x02 | (if (has_offset) @as(u8, 0x04) else 0) | (if (f.fin) @as(u8, 0x01) else 0);
             buf[pos] = 0x08 | flags;
             pos += 1;
             pos += varint.encode(buf[pos..], f.stream_id);
-            if (f.offset != 0) {
+            if (has_offset) {
                 pos += varint.encode(buf[pos..], f.offset);
             }
             pos += varint.encode(buf[pos..], @intCast(f.data.len));
