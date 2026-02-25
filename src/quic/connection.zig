@@ -68,13 +68,13 @@ const EventQueue = struct {
 
     pub fn push(self: *EventQueue, ev: Event) void {
         if (self.tail - self.head >= EVENT_QUEUE_DEPTH) return; // drop if full
-        self.items[self.tail % EVENT_QUEUE_DEPTH] = ev;
+        self.items[self.tail & (EVENT_QUEUE_DEPTH - 1)] = ev;
         self.tail += 1;
     }
 
     pub fn pop(self: *EventQueue) ?Event {
         if (self.head == self.tail) return null;
-        const ev = self.items[self.head % EVENT_QUEUE_DEPTH];
+        const ev = self.items[self.head & (EVENT_QUEUE_DEPTH - 1)];
         self.head += 1;
         return ev;
     }
@@ -174,6 +174,8 @@ pub const Connection = struct {
     current_time_ns: i64,
     /// Cached max_ack_delay from peer transport params (ns). Default 25 ms.
     cached_max_ack_delay_ns: u64,
+    /// Cached ack_delay_exponent from peer transport params. Default 3 (RFC 9000 §18.2).
+    cached_ack_delay_exp: u6,
 
     // Send queue (ring buffer of ready-to-send packets)
     sq: [SEND_QUEUE_DEPTH]SendSlot,
@@ -217,12 +219,19 @@ pub const Connection = struct {
 
     // Per-epoch TLS send offset (for FrameInfo tracking)
     crypto_send_offset: [3]u64,
+    /// Cached idle timeout cast to i64 — computed once in accept() so receive() avoids
+    /// the @intCast/@min per packet. Zero when idle timeout is disabled.
+    idle_timeout_i64: i64,
 
     /// Create a server-side connection.  Call `receive()` with the first
     /// datagram to start the handshake.
     pub fn accept(config: Config, io: std.Io) !Connection {
         const tls_server = try tls.TlsServer.init(io);
         const local_cid = ConnectionId.generate(0, io);
+        const idle_timeout_i64: i64 = if (config.idle_timeout_ns > 0)
+            @intCast(@min(config.idle_timeout_ns, @as(u64, std.math.maxInt(i64))))
+        else
+            0;
 
         return Connection{
             .hot = .{
@@ -248,6 +257,8 @@ pub const Connection = struct {
             .loss = loss_recovery_mod.LossRecovery.init(),
             .current_time_ns = 0,
             .cached_max_ack_delay_ns = 25_000_000,
+            .cached_ack_delay_exp = 3,
+            .idle_timeout_i64 = idle_timeout_i64,
             .sq = undefined,
             .sq_head = 0,
             .sq_tail = 0,
@@ -294,12 +305,8 @@ pub const Connection = struct {
         if (self.hot.state == .draining or self.hot.state == .closed) return;
 
         // Refresh idle timer.
-        if (self.config.idle_timeout_ns > 0) {
-            const timeout: i64 = @intCast(@min(
-                self.config.idle_timeout_ns,
-                @as(u64, std.math.maxInt(i64)),
-            ));
-            self.idle_deadline_ns = now_ns +| timeout;
+        if (self.idle_timeout_i64 > 0) {
+            self.idle_deadline_ns = now_ns +| self.idle_timeout_i64;
         }
 
         // Process all coalesced packets in the datagram
@@ -328,15 +335,11 @@ pub const Connection = struct {
     /// Returns the nanosecond deadline when `tick()` must be called,
     /// or null if no timer is active.
     pub fn nextTimeout(self: *const Connection) ?i64 {
-        var min: ?i64 = null;
-        if (self.idle_deadline_ns) |d| min = d;
-        if (self.pto_deadline_ns) |d| {
-            if (min == null or d < min.?) min = d;
-        }
-        if (self.drain_deadline_ns) |d| {
-            if (min == null or d < min.?) min = d;
-        }
-        return min;
+        const idle  = self.idle_deadline_ns  orelse std.math.maxInt(i64);
+        const pto   = self.pto_deadline_ns   orelse std.math.maxInt(i64);
+        const drain = self.drain_deadline_ns orelse std.math.maxInt(i64);
+        const m = @min(@min(idle, pto), drain);
+        return if (m == std.math.maxInt(i64)) null else m;
     }
 
     /// Drive timer events. Call when `nextTimeout()` deadline has passed.
@@ -669,6 +672,7 @@ pub const Connection = struct {
             const params = self.tls_state.peerTransportParams();
             self.conn_flow.updateSendMax(params.initial_max_data);
             self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
+            self.cached_ack_delay_exp = @intCast(@min(params.ack_delay_exponent, 20));
 
             try self.queueHandshakeDone();
         }
@@ -705,10 +709,8 @@ pub const Connection = struct {
         }
 
         // ack_delay field is in units of 2^ack_delay_exponent µs; convert to ns.
-        const params = self.tls_state.peerTransportParams();
-        const ack_delay_exp: u6 = @intCast(@min(params.ack_delay_exponent, 20));
         const ack_delay_ns: u64 = @as(u64, ack.ack_delay) *
-            (@as(u64, 1) << ack_delay_exp) * 1000;
+            (@as(u64, 1) << self.cached_ack_delay_exp) * 1000;
         const result = self.loss.onAckReceived(
             @as(u64, ack.largest_acked),
             ack_delay_ns,
@@ -768,18 +770,19 @@ pub const Connection = struct {
     }
 
     fn processLostFrames(self: *Connection, result: loss_recovery_mod.AckResult) void {
+        // Declared once outside the loop; reused for each retransmitted stream frame.
+        var stream_retx_buf: [MAX_PACKET_SIZE]u8 = undefined;
         for (result.lost_frames[0..result.lost_frame_count]) |fi| {
             for (fi.frames[0..fi.count]) |frame_info| {
                 switch (frame_info) {
                     .stream => |s| {
                         if (self.streams.get(s.stream_id)) |st| {
-                            var buf: [MAX_PACKET_SIZE]u8 = undefined;
-                            const n = st.getSendData(s.offset, &buf);
+                            const n = st.getSendData(s.offset, &stream_retx_buf);
                             if (n > 0 or s.fin) {
                                 self.encryptAndEnqueueStreamFrame(
                                     s.stream_id,
                                     s.offset,
-                                    buf[0..n],
+                                    stream_retx_buf[0..n],
                                     s.fin,
                                 ) catch {};
                             }
@@ -822,7 +825,6 @@ pub const Connection = struct {
     }
 
     fn queueAck(self: *Connection, epoch: u8) !void {
-        var pkt: [MAX_PACKET_SIZE]u8 = undefined;
         var fpos: usize = 0;
         const ack_frame_data: frame.Frame = .{ .ack = .{
             .largest_acked = @intCast(self.hot.rx_pn[epoch]),
@@ -834,8 +836,8 @@ pub const Connection = struct {
             .ecn_ce = 0,
             .has_ecn = false,
         } };
-        fpos += frame.encodeFrame(pkt[fpos..], ack_frame_data);
-        try self.enqueueSend(pkt[0..fpos]);
+        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], ack_frame_data);
+        try self.enqueueSend(self.pkt_scratch[0..fpos]);
     }
 
     fn queuePing(self: *Connection) !void {
@@ -888,12 +890,11 @@ pub const Connection = struct {
     fn queueTlsOutput(self: *Connection, tls_data: []const u8) !void {
         // Queue TLS output as Initial + Handshake packets.
         // Phase 1 simplified: everything goes in one packet.
-        var pkt: [MAX_PACKET_SIZE]u8 = undefined;
         var fpos: usize = 0;
 
         const tls_offset = self.crypto_send_offset[0];
         const crypto_frame: frame.Frame = .{ .crypto = .{ .offset = @intCast(tls_offset), .data = tls_data } };
-        fpos += frame.encodeFrame(pkt[fpos..], crypto_frame);
+        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame);
 
         // Encrypt with server initial keys and emit as Initial packet
         const ik = self.initial_keys.server;
@@ -914,7 +915,7 @@ pub const Connection = struct {
 
         const ct_out_len = fpos + 16;
         if (hdr_len + ct_out_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ik, pn, out[0..hdr_len], pkt[0..fpos], out[hdr_len..][0..ct_out_len]);
+        crypto.encryptPayload(ik, pn, out[0..hdr_len], self.pkt_scratch[0..fpos], out[hdr_len..][0..ct_out_len]);
         const out_len = hdr_len + ct_out_len;
         try self.enqueueSend(out[0..out_len]);
 
