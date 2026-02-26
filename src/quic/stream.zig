@@ -132,6 +132,9 @@ pub const Stream = struct {
     /// Byte offset at which the remote sent FIN; null until FIN received.
     /// State transition is deferred until recv_offset reaches this value.
     fin_recv_offset: ?u64,
+    /// Last recv_max value advertised to the peer via MAX_STREAM_DATA.
+    /// When recv_max grows beyond this, a new MAX_STREAM_DATA frame is needed.
+    last_sent_max_stream_data: u64,
 
     pub fn init(id: u62) Stream {
         return .{
@@ -149,6 +152,7 @@ pub const Stream = struct {
             .pending_reset = null,
             .pending_stop = null,
             .fin_recv_offset = null,
+            .last_sent_max_stream_data = STREAM_BUF_SIZE,
         };
     }
 
@@ -157,10 +161,12 @@ pub const Stream = struct {
     }
 
     pub fn canSend(self: *const Stream, bytes: u64) bool {
-        return self.state != .half_closed_local and
-            self.state != .closed and
-            self.state != .reset and
-            self.send_offset + bytes <= self.send_max;
+        if (self.state == .half_closed_local or
+            self.state == .closed or
+            self.state == .reset) return false;
+        // Use checked addition to prevent wrap-around bypassing flow control.
+        const end = std.math.add(u64, self.send_offset, bytes) catch return false;
+        return end <= self.send_max;
     }
 
     /// Buffer incoming data. Returns error if exceeds receive window or buffer is full.
@@ -206,6 +212,12 @@ pub const Stream = struct {
             self.recv_max = self.recv_buf.rp + STREAM_BUF_SIZE;
         }
         return n;
+    }
+
+    /// True when recv_max has grown beyond what we last advertised to the peer.
+    /// The connection layer should send a MAX_STREAM_DATA frame when this returns true.
+    pub fn shouldSendMaxStreamData(self: *const Stream) bool {
+        return self.recv_max > self.last_sent_max_stream_data;
     }
 
     /// Record that we sent `bytes` (advances send_offset).
@@ -257,6 +269,11 @@ pub const Stream = struct {
         _ = error_code;
         // RFC 9000 §19.4: final_size must be >= bytes already received.
         if (final_size < self.recv_offset) return error.FinalSizeError;
+        // RFC 9000 §3.3: if the FIN offset was already established (stream in
+        // "Size Known" state), the reset final_size must agree with it exactly.
+        if (self.fin_recv_offset) |fro| {
+            if (@as(u64, final_size) != fro) return error.FinalSizeError;
+        }
         switch (self.state) {
             .open, .half_closed_remote => self.state = .reset,
             .half_closed_local => self.state = .closed,
@@ -771,4 +788,29 @@ test "stream: onAcked with non-consecutive offset is a no-op" {
     // send_acked = 0, send_offset = 8; ack for offset=4 (non-consecutive) → no-op
     s.onAcked(4, 4);
     try testing.expectEqual(@as(u64, 0), s.send_acked); // must not advance
+}
+
+// ---------------------------------------------------------------------------
+// New tests — MAX_STREAM_DATA signaling (Step 6)
+// ---------------------------------------------------------------------------
+
+test "stream: shouldSendMaxStreamData false initially" {
+    const testing = std.testing;
+    const s = Stream.init(0);
+    // last_sent_max_stream_data = recv_max = STREAM_BUF_SIZE at init
+    try testing.expect(!s.shouldSendMaxStreamData());
+}
+
+test "stream: shouldSendMaxStreamData true after read advances recv_max" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    // Receive some data then read it — recv_max grows
+    try s.receiveData(0, "hello world", false);
+    var buf: [16]u8 = undefined;
+    _ = s.read(&buf);
+    // recv_max = recv_buf.rp + STREAM_BUF_SIZE = 11 + 4096 > 4096 = last_sent
+    try testing.expect(s.shouldSendMaxStreamData());
+    // After acknowledging the new max, flag clears
+    s.last_sent_max_stream_data = s.recv_max;
+    try testing.expect(!s.shouldSendMaxStreamData());
 }

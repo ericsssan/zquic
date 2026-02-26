@@ -118,6 +118,12 @@ pub const AckResult = struct {
     newly_lost: u32 = 0,
     bytes_lost: u64 = 0,
     rtt_updated: bool = false,
+    /// Set when loss span across ack-eliciting packets > 3×PTO (RFC 9002 §6.1.2).
+    persistent_congestion: bool = false,
+    /// Sent timestamp of the earliest ack-eliciting packet declared lost this round.
+    earliest_lost_sent_ns: ?i64 = null,
+    /// Sent timestamp of the latest ack-eliciting packet declared lost this round.
+    latest_lost_sent_ns: ?i64 = null,
     lost_frames: [MAX_LOSS_EVENTS]SentFrameInfo = undefined,
     lost_frame_count: usize = 0,
     acked_frames: [MAX_LOSS_EVENTS]SentFrameInfo = undefined,
@@ -246,6 +252,15 @@ pub const SentPacketTable = struct {
                 if (result.lost_frame_count < MAX_LOSS_EVENTS) {
                     result.lost_frames[result.lost_frame_count] = self.frame_info[idx];
                     result.lost_frame_count += 1;
+                }
+                // Track earliest/latest sent_ns for persistent congestion detection.
+                if (slot.ack_eliciting) {
+                    if (result.earliest_lost_sent_ns == null or slot.sent_ns < result.earliest_lost_sent_ns.?) {
+                        result.earliest_lost_sent_ns = slot.sent_ns;
+                    }
+                    if (result.latest_lost_sent_ns == null or slot.sent_ns > result.latest_lost_sent_ns.?) {
+                        result.latest_lost_sent_ns = slot.sent_ns;
+                    }
                 }
             }
         }
@@ -384,11 +399,31 @@ pub const LossRecovery = struct {
             &self.bytes_in_flight,
         );
 
+        // 6. Persistent congestion detection (RFC 9002 §6.1.2).
+        // If the span between the earliest and latest ack-eliciting lost packets
+        // exceeds 3×PTO, mark as persistent congestion.
+        if (result.earliest_lost_sent_ns != null and result.latest_lost_sent_ns != null) {
+            const e = result.earliest_lost_sent_ns.?;
+            const l = result.latest_lost_sent_ns.?;
+            if (l >= e) {
+                const loss_span: u64 = @intCast(l - e);
+                const pc_duration = self.persistentCongestionDuration(max_ack_delay_ns);
+                if (loss_span > pc_duration) {
+                    result.persistent_congestion = true;
+                }
+            }
+        }
+
         // Note: last_ack_eliciting_ns is kept as-is (updated incrementally in
         // onPacketSent). A stale value causes PTO to fire slightly early, which
         // is safe — it just means an extra probe. This avoids an O(64) scan per ACK.
 
         return result;
+    }
+
+    /// Persistent congestion duration = ptoBase × 3 (RFC 9002 §6.1.2 multiplier).
+    pub fn persistentCongestionDuration(self: *const LossRecovery, max_ack_delay_ns: u64) u64 {
+        return self.rtt.ptoBase(max_ack_delay_ns) *| 3;
     }
 
     /// PTO deadline: null when nothing is in flight.
@@ -918,6 +953,56 @@ test "valid_per_epoch: detectLoss decrements on loss" {
     try testing.expectEqual(@as(u32, 1), result.newly_lost);
     // pn=1 lost → valid_per_epoch[0] decremented; pn=5 acked → also decremented
     try testing.expectEqual(@as(u16, 0), lr.sent.valid_per_epoch[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Persistent congestion tests (Step 7)
+// ---------------------------------------------------------------------------
+
+test "persistent_congestion: loss span > 3xPTO sets flag" {
+    // ptoBase with default RTT (K_INITIAL_RTT_NS=333ms, rtt_var=166.5ms, max_ack_delay=25ms):
+    //   var_term = max(4*166.5M, 1M) = 666M
+    //   ptoBase  = 333M + 666M + 25M = 1_024_000_000 ns
+    //   3×PTO    = 3_072_000_000 ns
+    // Send pn=1 at t=0, pn=2..4 at t=0, pn=5 at t=3_200_000_000.
+    // ACK pn=8 (not in table) → loss threshold triggers for pn=1..4 (1+3<=5 actually...).
+    // Use largest_acked=8 to trigger pkt-threshold loss on pn=1..5 (1+3<=8, 5+3<=8).
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // Send pn=1..4 at sent_ns=0 and pn=5 at sent_ns=3_200_000_000 (> 3×PTO)
+    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    lr.onPacketSent(2, 0, 1200, true, 0, .{});
+    lr.onPacketSent(3, 0, 1200, true, 0, .{});
+    lr.onPacketSent(4, 0, 1200, true, 0, .{});
+    lr.onPacketSent(5, 0, 1200, true, 3_200_000_000, .{});
+    lr.onPacketSent(8, 0, 1200, true, 3_200_000_000, .{}); // this gets acked
+
+    // ACK pn=8: pn 1..5 are lost (1+3<=8 through 5+3=8<=8)
+    const ranges = [_]AckedRange{.{ .low = 8, .high = 8 }};
+    const result = lr.onAckReceived(8, 0, &ranges, 0, 3_200_000_000, 25_000_000);
+
+    // earliest_lost_sent_ns=0, latest_lost_sent_ns=3_200_000_000 (pn=5)
+    // span=3_200_000_000 > 3_072_000_000 = 3×PTO → persistent congestion
+    try testing.expect(result.persistent_congestion);
+    try testing.expect(result.newly_lost >= 5);
+}
+
+test "persistent_congestion: loss span <= 3xPTO does not set flag" {
+    // All lost packets sent at the same time → span = 0 → no persistent congestion.
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    lr.onPacketSent(2, 0, 1200, true, 0, .{});
+    lr.onPacketSent(3, 0, 1200, true, 0, .{});
+    lr.onPacketSent(8, 0, 1200, true, 0, .{});
+
+    const ranges = [_]AckedRange{.{ .low = 8, .high = 8 }};
+    const result = lr.onAckReceived(8, 0, &ranges, 0, 0, 25_000_000);
+
+    try testing.expect(!result.persistent_congestion);
+    try testing.expect(result.newly_lost >= 3);
 }
 
 test "valid_per_epoch: lastAckElicitingNs returns null immediately when no valid slots" {

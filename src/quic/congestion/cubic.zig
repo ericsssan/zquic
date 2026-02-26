@@ -63,6 +63,15 @@ pub const Cubic = struct {
         }
     }
 
+    /// Called when persistent congestion is detected (RFC 9002 §6.1.2).
+    /// Collapses cwnd to the minimum (2 × MSS) and resets the CUBIC epoch.
+    pub fn onPersistentCongestion(self: *Cubic) void {
+        self.cwnd = 2 * MSS;
+        self.ssthresh = self.cwnd;
+        self.epoch_start_ns = null;
+        self.cwnd_remainder = 0;
+    }
+
     /// Called on packet loss (e.g., timeout or three duplicate ACKs).
     /// `now_ns` — current time in nanoseconds.
     pub fn onPacketLost(self: *Cubic, now_ns: i64) void {
@@ -291,6 +300,18 @@ test "cubic: initial ssthresh is max (slow start from scratch)" {
     try std.testing.expectEqual(std.math.maxInt(u64), c.ssthresh);
     // In slow start, cwnd < ssthresh always holds at initialization
     try std.testing.expect(c.cwnd < c.ssthresh);
+}
+
+test "cubic: onPersistentCongestion resets cwnd to 2*MSS" {
+    const testing = std.testing;
+    var c = Cubic.init();
+    c.cwnd = 100 * MSS;
+    c.ssthresh = 50 * MSS;
+    c.epoch_start_ns = 1_000_000_000;
+    c.onPersistentCongestion();
+    try testing.expectEqual(@as(u64, 2 * MSS), c.cwnd);
+    try testing.expectEqual(@as(u64, 2 * MSS), c.ssthresh);
+    try testing.expectEqual(@as(?i64, null), c.epoch_start_ns);
 }
 
 test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {

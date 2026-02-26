@@ -130,6 +130,9 @@ pub const Frame = union(enum) {
     path_response: PathResponseFrame,
     data_blocked: u62,
     stream_data_blocked: struct { stream_id: u62, max: u62 },
+    streams_blocked_bidi: u62,
+    streams_blocked_uni: u62,
+    new_token: []const u8,
 };
 
 // ---------------------------------------------------------------------------
@@ -355,6 +358,8 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             if (pos >= buf.len) return error.InvalidFrame;
             const cid_len = buf[pos];
             pos += 1;
+            // RFC 9000 §10.3.2: CID length must be 0–20 bytes.
+            if (cid_len > 20) return error.InvalidFrame;
             if (pos + cid_len + 16 > buf.len) return error.BufferTooShort;
             var f = NewConnectionIdFrame{
                 .sequence_number      = seq.value,
@@ -389,6 +394,26 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             return .{ .frame = .{ .path_response = f }, .consumed = pos };
         },
         0x1e => return .{ .frame = .handshake_done, .consumed = pos },
+        0x16 => {
+            const v = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += v.len;
+            return .{ .frame = .{ .streams_blocked_bidi = v.value }, .consumed = pos };
+        },
+        0x17 => {
+            const v = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += v.len;
+            return .{ .frame = .{ .streams_blocked_uni = v.value }, .consumed = pos };
+        },
+        0x07 => {
+            const tlen = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += tlen.len;
+            const tl: usize = @intCast(tlen.value);
+            if (tl > 256) return error.InvalidFrame;
+            if (pos + tl > buf.len) return error.BufferTooShort;
+            const token = buf[pos..][0..tl];
+            pos += tl;
+            return .{ .frame = .{ .new_token = token }, .consumed = pos };
+        },
         else => return error.UnknownFrame,
     }
 }
@@ -538,6 +563,23 @@ pub fn encodeFrame(buf: []u8, frame: Frame) usize {
             pos += 1;
             pos += varint.encode(buf[pos..], f.stream_id);
             pos += varint.encode(buf[pos..], f.max);
+        },
+        .streams_blocked_bidi => |v| {
+            buf[pos] = 0x16;
+            pos += 1;
+            pos += varint.encode(buf[pos..], v);
+        },
+        .streams_blocked_uni => |v| {
+            buf[pos] = 0x17;
+            pos += 1;
+            pos += varint.encode(buf[pos..], v);
+        },
+        .new_token => |tok| {
+            buf[pos] = 0x07;
+            pos += 1;
+            pos += varint.encode(buf[pos..], @intCast(tok.len));
+            @memcpy(buf[pos..][0..tok.len], tok);
+            pos += tok.len;
         },
     }
 
@@ -894,10 +936,72 @@ test "frame: parseFrame empty buffer returns BufferEmpty" {
     try std.testing.expectError(error.BufferEmpty, parseFrame(&.{}));
 }
 
-test "frame: parseFrame unknown byte frame type (0x07) returns UnknownFrame" {
-    // 0x07 is NEW_TOKEN, not implemented; falls to else → UnknownFrame.
-    // Note: 0x04 is RESET_STREAM and IS handled; choose a true gap.
-    const buf = [_]u8{0x07};
+test "frame: NEW_TOKEN encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    const token_data = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
+    const f: Frame = .{ .new_token = &token_data };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .new_token => |t| try testing.expectEqualSlices(u8, &token_data, t),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: NEW_TOKEN empty token round-trip" {
+    const testing = std.testing;
+    var buf: [8]u8 = undefined;
+    const f: Frame = .{ .new_token = &.{} };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .new_token => |t| try testing.expectEqual(@as(usize, 0), t.len),
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: NEW_TOKEN > 256 bytes returns InvalidFrame" {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x07; pos += 1; // NEW_TOKEN type
+    pos += varint.encode(buf[pos..], 257); // length > cap of 256
+    @memset(buf[pos..][0..257], 0xaa);
+    pos += 257;
+    try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
+}
+
+test "frame: STREAMS_BLOCKED_BIDI encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const f: Frame = .{ .streams_blocked_bidi = 10 };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .streams_blocked_bidi => |v| try testing.expectEqual(@as(u62, 10), v),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: STREAMS_BLOCKED_UNI encode/parse round-trip" {
+    const testing = std.testing;
+    var buf: [16]u8 = undefined;
+    const f: Frame = .{ .streams_blocked_uni = 5 };
+    const n = encodeFrame(&buf, f);
+    const result = try parseFrame(buf[0..n]);
+    switch (result.frame) {
+        .streams_blocked_uni => |v| try testing.expectEqual(@as(u62, 5), v),
+        else => return error.WrongFrameType,
+    }
+    try testing.expectEqual(n, result.consumed);
+}
+
+test "frame: parseFrame unknown byte frame type (0x1f) returns UnknownFrame" {
+    // 0x1f = 31, a valid 1-byte QUIC varint with no assigned frame type.
+    // Top two bits are 00 (single-byte varint), value=31; falls to else → UnknownFrame.
+    const buf = [_]u8{0x1f};
     try std.testing.expectError(error.UnknownFrame, parseFrame(&buf));
 }
 
