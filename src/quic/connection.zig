@@ -734,9 +734,8 @@ pub const Connection = struct {
             self.loss.resetPtoCount();
         }
 
-        // Each lost packet triggers a congestion event
-        var i: u32 = 0;
-        while (i < result.newly_lost) : (i += 1) {
+        // One congestion event per loss detection (RFC 9438 §5.6)
+        if (result.newly_lost > 0) {
             self.congestion.onPacketLost(self.current_time_ns);
         }
 
@@ -1772,4 +1771,41 @@ test "stream_reset: processFrames handles STOP_SENDING and pushes event" {
         },
         else => try testing.expect(false),
     }
+}
+
+test "loss: multi-packet loss triggers single congestion event" {
+    // Verify the fix for RFC 9438 §5.6: when N packets are lost in one ACK event,
+    // cwnd drops by exactly BETA_CUBIC once (not BETA_CUBIC^N).
+    // Setup: send 10 packets, ACK only pn=10. K_PACKET_THRESHOLD=3 means
+    // pn=1..7 are declared lost (7 losses in a single processAck call).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 1_000_000_000;
+
+    // Force CUBIC into congestion avoidance with a known large window.
+    conn.congestion.ssthresh = 0; // cwnd always > ssthresh=0 → CUBIC always used
+    conn.congestion.cwnd = 100 * 1200; // 120000 bytes (100 × MSS)
+    const initial_cwnd = conn.congestion.cwnd;
+
+    // Register 10 packets in epoch 0, all sent at t=0.
+    var pn: u64 = 1;
+    while (pn <= 10) : (pn += 1) {
+        conn.loss.onPacketSent(pn, 0, 1200, true, 0, .{});
+    }
+
+    // ACK only pn=10; pn=1..7 satisfy K_PACKET_THRESHOLD and are declared lost.
+    const ack = frame.AckFrame{
+        .largest_acked = 10,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    };
+    conn.processAck(ack, 0);
+
+    // After the fix: cwnd reduced exactly once → floor(120000 × 0.7) = 84000.
+    // If the bug (loop) were present: cwnd ≈ floor(120000 × 0.7^7) ≈ 9897.
+    const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(initial_cwnd)) * 0.7);
+    try testing.expectEqual(expected, conn.congestion.cwnd);
 }

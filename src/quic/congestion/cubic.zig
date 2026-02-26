@@ -28,6 +28,9 @@ pub const Cubic = struct {
     cwnd_at_epoch: f64,
     /// TCP-friendly estimated window (running accumulator per RFC 9438 §5.1).
     w_est: f64,
+    /// Fractional growth accumulator: prevents integer division from stalling cwnd
+    /// growth when (target - cwnd) * MSS < cwnd.
+    cwnd_remainder: u64,
 
     pub fn init() Cubic {
         return .{
@@ -38,6 +41,7 @@ pub const Cubic = struct {
             .k = 0,
             .cwnd_at_epoch = 0,
             .w_est = 0,
+            .cwnd_remainder = 0,
         };
     }
 
@@ -66,6 +70,7 @@ pub const Cubic = struct {
         self.cwnd = @intFromFloat(@as(f64, @floatFromInt(self.cwnd)) * BETA_CUBIC);
         if (self.cwnd < MSS) self.cwnd = MSS;
         self.ssthresh = self.cwnd;
+        self.cwnd_remainder = 0;
         self.epoch_start_ns = now_ns; // begin new epoch at loss time
         self.cwnd_at_epoch = @floatFromInt(self.cwnd);
         self.w_est = self.cwnd_at_epoch; // reset TCP-friendly estimate to post-loss cwnd
@@ -106,9 +111,12 @@ pub const Cubic = struct {
         const target_bytes: u64 = @intFromFloat(@max(target, 0));
 
         if (target_bytes > self.cwnd) {
-            // Increase towards target over one RTT
-            const inc = (target_bytes - self.cwnd) * MSS / self.cwnd;
-            self.cwnd += @max(inc, 1);
+            // Accumulate fractional growth to prevent integer division from stalling
+            // when (target - cwnd) * MSS < cwnd. The remainder carries across ACKs.
+            self.cwnd_remainder += (target_bytes - self.cwnd) * MSS;
+            const inc = self.cwnd_remainder / self.cwnd;
+            self.cwnd_remainder %= self.cwnd;
+            self.cwnd += inc;
         }
     }
 };
@@ -238,15 +246,44 @@ test "cubic: cubicWindow formula W_cubic(t)=C*(t-K)^3+W_max" {
     try std.testing.expectApproxEqAbs(expected, result, 1e-9);
 }
 
-test "cubic: second consecutive loss further reduces cwnd" {
+test "cubic: single loss event reduces cwnd by exactly BETA_CUBIC" {
+    // Multiple packets lost in one ACK event → onPacketLost called once (RFC 9438 §5.6).
+    // cwnd must drop by exactly BETA_CUBIC × initial, not BETA_CUBIC^N for N losses.
     const testing = std.testing;
     var c = Cubic.init();
-    c.cwnd = 100 * MSS;
+    c.cwnd = 100 * MSS; // 120000 bytes
+    const before = c.cwnd;
     c.onPacketLost(1_000_000_000);
-    const after_first = c.cwnd;
-    // Second loss: cwnd should be further reduced
-    c.onPacketLost(1_001_000_000);
-    try testing.expect(c.cwnd < after_first);
+    // Expected: floor(120000 * 0.7) = 84000
+    const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(before)) * BETA_CUBIC);
+    try testing.expectEqual(@max(expected, MSS), c.cwnd);
+}
+
+test "cubic: large window growth does not stall" {
+    // With cwnd=100*MSS, verify the remainder accumulator produces correct growth
+    // over 100 ACK events. Old code with forced @max(inc,1) could produce wrong
+    // increments; the accumulator follows the CUBIC formula faithfully.
+    const testing = std.testing;
+    var c = Cubic.init();
+    c.cwnd = 100 * MSS; // 120000 bytes
+    c.ssthresh = 0;     // force congestion avoidance (cwnd always >= ssthresh=0)
+    // Manually start CUBIC epoch so w_cubic is predictable.
+    // With w_max=cwnd=120000, k=0: w_cubic(t) = 0.4*t^3 + 120000.
+    c.epoch_start_ns = 0;
+    c.cwnd_at_epoch = @as(f64, @floatFromInt(c.cwnd));
+    c.w_max = @as(f64, @floatFromInt(c.cwnd));
+    c.k = 0;
+    c.w_est = @as(f64, @floatFromInt(c.cwnd));
+
+    const initial = c.cwnd;
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        // All ACKs at t=10s: w_cubic = 0.4*1000 + 120000 = 120400.
+        // target-cwnd ≈ 400, inc ≈ 4 bytes per ACK (well above 1).
+        c.onAckReceived(MSS, 100_000_000, 10_000_000_000);
+    }
+    // Over 100 ACKs the accumulator should yield total growth >> 100 bytes.
+    try testing.expect(c.cwnd > initial + 100);
 }
 
 test "cubic: initial ssthresh is max (slow start from scratch)" {

@@ -17,7 +17,7 @@ pub const K_TIME_THRESHOLD_NUM: u64 = 9; // 9/8 threshold (§6.1.2)
 pub const K_TIME_THRESHOLD_DEN: u64 = 8;
 pub const K_GRANULARITY_NS: u64 = 1_000_000; // 1ms minimum timer granularity
 pub const K_INITIAL_RTT_NS: u64 = 333_000_000; // 333ms per §5.3
-pub const MAX_SENT: usize = 64; // Ring buffer capacity
+pub const MAX_SENT: usize = 256; // Ring buffer capacity
 pub const MAX_FRAMES_PER_PACKET: usize = 4;
 pub const MAX_LOSS_EVENTS: usize = 16;
 
@@ -767,8 +767,8 @@ test "frame_info: MAX_LOSS_EVENTS caps lost_frames output" {
 }
 
 test "sent_table: power-of-two slot collision evicts correctly" {
-    // pn=0 and pn=64 map to the same slot (0 & 63 == 0, 64 & 63 == 0).
-    // Adding pn=64 must evict pn=0; get(0, 0) must then return null.
+    // pn=0 and pn=256 map to the same slot (0 & 255 == 0, 256 & 255 == 0).
+    // Adding pn=256 must evict pn=0; get(0, 0) must then return null.
     const testing = std.testing;
     var lr = LossRecovery.init();
 
@@ -777,7 +777,7 @@ test "sent_table: power-of-two slot collision evicts correctly" {
 
     lr.onPacketSent(MAX_SENT, 0, 1200, true, 2_000, .{}); // maps to slot 0, evicts pn=0
     try testing.expectEqual(@as(?SentPacket, null), lr.sent.get(0, 0)); // pn=0 gone
-    try testing.expect(lr.sent.get(MAX_SENT, 0) != null);              // pn=64 present
+    try testing.expect(lr.sent.get(MAX_SENT, 0) != null);              // pn=256 present
 }
 
 test "sent_table: epoch mismatch in same slot returns null" {
@@ -786,11 +786,11 @@ test "sent_table: epoch mismatch in same slot returns null" {
     var table = SentPacketTable.init();
     _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0,
                      .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
-    // pn=65 & 63 == 1, same slot, different epoch
-    _ = table.add(.{ .pn = 65, .sent_ns = 0, .size = 100, .epoch = 2,
+    // pn=257 & 255 == 1, same slot, different epoch
+    _ = table.add(.{ .pn = 257, .sent_ns = 0, .size = 100, .epoch = 2,
                      .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
     try testing.expectEqual(@as(?SentPacket, null), table.get(1, 0));  // evicted
-    try testing.expect(table.get(65, 2) != null);                       // present
+    try testing.expect(table.get(257, 2) != null);                      // present
 }
 
 test "frame_info: ring buffer eviction preserves new packet frame info" {
@@ -815,5 +815,24 @@ test "frame_info: ring buffer eviction preserves new packet frame info" {
     switch (removed.fi.frames[0]) {
         .handshake_done => {},
         else => try testing.expect(false),
+    }
+}
+
+test "sent_table: 128 concurrent unacked packets coexist without eviction" {
+    // Verify that 128 packets (half of MAX_SENT=256) can be tracked simultaneously
+    // without any eviction occurring due to slot collision.
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // Send 128 packets with distinct packet numbers 0..127
+    var pn: u64 = 0;
+    while (pn < 128) : (pn += 1) {
+        lr.onPacketSent(pn, 0, 1200, true, @as(i64, @intCast(pn)) * 1000, .{});
+    }
+
+    // All 128 must still be present (no eviction for pn < MAX_SENT/2)
+    pn = 0;
+    while (pn < 128) : (pn += 1) {
+        try testing.expect(lr.sent.get(pn, 0) != null);
     }
 }

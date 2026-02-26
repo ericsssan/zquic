@@ -165,7 +165,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             const count_vi = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += count_vi.len;
             const range_count: usize = @intCast(count_vi.value);
-            if (range_count > 256) return error.InvalidFrame;
+            if (range_count > 32) return error.InvalidFrame;
 
             var ack: AckFrame = .{
                 .largest_acked = la.value,
@@ -841,32 +841,44 @@ test "frame: STREAM_DATA_BLOCKED encode/parse round-trip" {
     try testing.expectEqual(n, result.consumed);
 }
 
-test "frame: ACK range_count > 256 returns InvalidFrame" {
-    // Build an ACK with range_count = 257 (one past the cap).
+test "frame: ACK range_count > 32 returns InvalidFrame" {
+    // Build an ACK with range_count = 257 (well above the cap of 32).
     // Use a 2-byte varint for range_count to fit > 63.
     var buf: [32]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 0x02; pos += 1; // ACK type
     pos += varint.encode(buf[pos..], 10);  // largest_acked
     pos += varint.encode(buf[pos..], 0);   // ack_delay
-    pos += varint.encode(buf[pos..], 257); // range_count > 256
+    pos += varint.encode(buf[pos..], 257); // range_count > 32
     pos += varint.encode(buf[pos..], 5);   // first ACK range
     // Do NOT add 257 additional range pairs — the cap fires before the loop.
     try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
-test "frame: ACK range_count exactly 256 is accepted" {
-    // 256 is the cap — must parse successfully (only > 256 is rejected).
-    var buf: [2048]u8 = undefined;
+test "frame: ACK range_count 33 returns InvalidFrame" {
+    // 33 is one past the storage cap of 32 — must be rejected.
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x02; pos += 1; // ACK type
+    pos += varint.encode(buf[pos..], 10);  // largest_acked
+    pos += varint.encode(buf[pos..], 0);   // ack_delay
+    pos += varint.encode(buf[pos..], 33);  // range_count = 33 (one past cap)
+    pos += varint.encode(buf[pos..], 5);   // first ACK range
+    try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
+}
+
+test "frame: ACK range_count exactly 32 is accepted" {
+    // 32 is the storage cap — must parse successfully (only > 32 is rejected).
+    var buf: [512]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 0x02; pos += 1;           // ACK type
-    pos += varint.encode(buf[pos..], 511); // largest_acked (needs room for 256 ranges)
+    pos += varint.encode(buf[pos..], 63); // largest_acked (needs room for 32 ranges)
     pos += varint.encode(buf[pos..], 0);   // ack_delay
-    pos += varint.encode(buf[pos..], 256); // range_count = 256
+    pos += varint.encode(buf[pos..], 32); // range_count = 32
     pos += varint.encode(buf[pos..], 0);   // first ACK range (ack_range=0)
-    // range_count=256 means 256 additional (gap, ack_range) pairs after the first ACK range.
+    // range_count=32 means 32 additional (gap, ack_range) pairs after the first ACK range.
     var i: usize = 0;
-    while (i < 256) : (i += 1) {
+    while (i < 32) : (i += 1) {
         pos += varint.encode(buf[pos..], 0); // gap
         pos += varint.encode(buf[pos..], 0); // ack_range
     }

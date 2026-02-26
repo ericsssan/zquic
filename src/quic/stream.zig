@@ -129,6 +129,9 @@ pub const Stream = struct {
     pending_reset: ?struct { error_code: u62, final_size: u62 },
     /// Pending STOP_SENDING error code (set when we want to stop receiving).
     pending_stop: ?u62,
+    /// Byte offset at which the remote sent FIN; null until FIN received.
+    /// State transition is deferred until recv_offset reaches this value.
+    fin_recv_offset: ?u64,
 
     pub fn init(id: u62) Stream {
         return .{
@@ -145,6 +148,7 @@ pub const Stream = struct {
             .fin_acked = false,
             .pending_reset = null,
             .pending_stop = null,
+            .fin_recv_offset = null,
         };
     }
 
@@ -161,8 +165,14 @@ pub const Stream = struct {
 
     /// Buffer incoming data. Returns error if exceeds receive window or buffer is full.
     pub fn receiveData(self: *Stream, offset: u64, data: []const u8, fin: bool) !void {
-        const end = std.math.add(u64, offset, data.len) catch return error.FlowControlViolation;
+        const end = std.math.add(u64, offset, data.len) catch return error.OffsetOverflow;
         if (end > self.recv_max) return error.FlowControlViolation;
+
+        // Record the final byte offset when FIN is received; defer state transition
+        // until recv_offset catches up (handles out-of-order FIN).
+        if (fin) {
+            self.fin_recv_offset = end;
+        }
 
         // Simple in-order delivery only for Phase 1
         if (offset == self.recv_offset) {
@@ -173,11 +183,15 @@ pub const Stream = struct {
             if (written < data.len) return error.BufferFull;
         }
 
-        if (fin) {
-            if (self.state == .half_closed_local) {
-                self.state = .closed;
-            } else {
-                self.state = .half_closed_remote;
+        // Transition state only when all bytes up to the FIN offset have arrived.
+        if (self.fin_recv_offset) |fro| {
+            if (self.recv_offset >= fro) {
+                if (self.state == .half_closed_local) {
+                    self.state = .closed;
+                } else {
+                    self.state = .half_closed_remote;
+                }
+                self.fin_recv_offset = null;
             }
         }
     }
@@ -577,11 +591,61 @@ test "stream_reset: onStopSendingReceived sets pending_reset" {
 }
 
 test "stream: receiveData overflow-safe offset + len check" {
-    // offset near u64 max: offset + data.len would overflow — must return FlowControlViolation
+    // offset near u64 max: offset + data.len would overflow — must return OffsetOverflow
     var s = Stream.init(0);
     s.recv_max = std.math.maxInt(u64);
     const err = s.receiveData(std.math.maxInt(u64) - 2, "hello", false);
-    try std.testing.expectError(error.FlowControlViolation, err);
+    try std.testing.expectError(error.OffsetOverflow, err);
+}
+
+test "stream: out-of-order FIN does not prematurely close" {
+    // FIN arrives with a future offset before the gap data arrives.
+    // Stream state must remain open until recv_offset catches up.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.recv_max = 1024;
+
+    // Send FIN at offset=10 with 5 bytes of data (bytes 10-14), but recv_offset=0.
+    // The data is out-of-order so it is silently dropped; only fin_recv_offset is recorded.
+    try s.receiveData(10, "hello", true);
+    try testing.expectEqual(StreamState.open, s.state);
+    try testing.expectEqual(@as(u64, 0), s.recv_offset);
+}
+
+test "stream: FIN applied when recv_offset catches up" {
+    // After the gap is filled, state must transition to half_closed_remote.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.recv_max = 1024;
+
+    // FIN at offset=5 (5 bytes total) arrives out of order first.
+    try s.receiveData(5, "world", true);
+    try testing.expectEqual(StreamState.open, s.state);
+
+    // Now the missing gap data arrives in order from offset=0.
+    try s.receiveData(0, "hello", false);
+    // recv_offset is now 10 (wrote "hello" at 0, then "world" was already at 5).
+    // But since data at offset=5 was dropped (out of order), we only have bytes 0-4.
+    // The state should still be open because recv_offset(5) == fin_recv_offset(10)? No.
+    // recv_offset = 5 after writing "hello"; fin_recv_offset = 10.
+    // 5 < 10, so state stays open.
+    try testing.expectEqual(StreamState.open, s.state);
+
+    // Send the remaining bytes in order to reach the FIN offset.
+    try s.receiveData(5, "world", false);
+    // recv_offset = 10 = fin_recv_offset; transition fires.
+    try testing.expectEqual(StreamState.half_closed_remote, s.state);
+}
+
+test "stream: in-order FIN still works" {
+    // When FIN arrives in order with data, state transitions immediately.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.recv_max = 1024;
+
+    try s.receiveData(0, "hello", true);
+    try testing.expectEqual(StreamState.half_closed_remote, s.state);
+    try testing.expectEqual(@as(u64, 5), s.recv_offset);
 }
 
 test "ringbuf: two-segment write and read crossing wrap boundary" {
