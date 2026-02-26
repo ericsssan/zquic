@@ -304,6 +304,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             const rlen = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += rlen.len;
             const rl: usize = @intCast(rlen.value);
+            if (rl > 256) return error.InvalidFrame; // cap reason string at 256 bytes
             if (pos + rl > buf.len) return error.BufferTooShort;
             const reason = buf[pos..][0..rl];
             pos += rl;
@@ -959,6 +960,35 @@ test "frame: STREAM without length field (0x08) consumes to buffer end" {
         else => return error.WrongFrameType,
     }
     try std.testing.expectEqual(pos, result.consumed);
+}
+
+test "frame: CONNECTION_CLOSE reason exactly 256 bytes is accepted" {
+    const testing = std.testing;
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x1c; pos += 1;                // CONNECTION_CLOSE (QUIC)
+    pos += varint.encode(buf[pos..], 0);       // error_code = 0
+    pos += varint.encode(buf[pos..], 0);       // frame_type = 0
+    pos += varint.encode(buf[pos..], 256);     // reason_len = 256 (at the cap)
+    @memset(buf[pos..][0..256], 0x61);         // 256 x 'a'
+    pos += 256;
+    const result = try parseFrame(buf[0..pos]);
+    switch (result.frame) {
+        .connection_close => |cc| try testing.expectEqual(@as(usize, 256), cc.reason.len),
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: CONNECTION_CLOSE reason 257 bytes returns InvalidFrame" {
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x1c; pos += 1;
+    pos += varint.encode(buf[pos..], 0);       // error_code
+    pos += varint.encode(buf[pos..], 0);       // frame_type
+    pos += varint.encode(buf[pos..], 257);     // reason_len = 257 (one past the cap)
+    @memset(buf[pos..][0..257], 0x62);
+    pos += 257;
+    try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
 test "frame: PATH_RESPONSE echoes PATH_CHALLENGE data" {

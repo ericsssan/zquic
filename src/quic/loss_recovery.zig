@@ -133,6 +133,10 @@ pub const RemovedPacket = struct {
 pub const SentPacketTable = struct {
     slots: [MAX_SENT]SentPacket,
     frame_info: [MAX_SENT]SentFrameInfo,
+    /// Count of valid (occupied) slots per epoch [Initial, Handshake, 1-RTT].
+    /// Enables early exit in detectLoss() and lastAckElicitingNs() once all
+    /// valid entries for an epoch have been visited.
+    valid_per_epoch: [3]u16,
 
     pub fn init() SentPacketTable {
         var t: SentPacketTable = undefined;
@@ -141,6 +145,7 @@ pub const SentPacketTable = struct {
                      .ack_eliciting = false, .in_flight = false, .valid = false };
         }
         for (&t.frame_info) |*fi| fi.* = .{};
+        t.valid_per_epoch = .{ 0, 0, 0 };
         return t;
     }
 
@@ -149,9 +154,15 @@ pub const SentPacketTable = struct {
     pub fn add(self: *SentPacketTable, pkt: SentPacket, fi: SentFrameInfo) ?SentPacket {
         const idx = pkt.pn & (MAX_SENT - 1);
         const evicted: ?SentPacket = if (self.slots[idx].valid) self.slots[idx] else null;
+        // Decrement evicted slot's epoch count before overwriting.
+        if (evicted) |ev| {
+            if (ev.epoch < 3) self.valid_per_epoch[ev.epoch] -|= 1;
+        }
         self.slots[idx] = pkt;
         self.slots[idx].valid = true;
         self.frame_info[idx] = fi;
+        // Increment count for the new packet's epoch.
+        if (pkt.epoch < 3) self.valid_per_epoch[pkt.epoch] += 1;
         return evicted;
     }
 
@@ -169,6 +180,7 @@ pub const SentPacketTable = struct {
         const slot = self.slots[idx];
         if (slot.valid and slot.pn == pn and slot.epoch == epoch) {
             self.slots[idx].valid = false;
+            if (epoch < 3) self.valid_per_epoch[epoch] -|= 1;
             return .{ .pkt = slot, .fi = self.frame_info[idx] };
         }
         return null;
@@ -193,7 +205,8 @@ pub const SentPacketTable = struct {
         }
     }
 
-    /// Scan all slots for packets in the given epoch that are now considered lost.  O(MAX_SENT).
+    /// Scan all slots for packets in the given epoch that are now considered lost.
+    /// Uses valid_per_epoch to exit early once all valid slots for this epoch are visited.
     pub fn detectLoss(
         self: *SentPacketTable,
         largest_acked: u64,
@@ -203,8 +216,14 @@ pub const SentPacketTable = struct {
         result: *AckResult,
         bif: *u64,
     ) void {
+        // Snapshot the count before the loop; we decrement valid_per_epoch as packets
+        // are declared lost, but to_find must not change so the early-exit stays correct.
+        const to_find: u16 = if (epoch < 3) self.valid_per_epoch[epoch] else 0;
+        var found: u16 = 0;
         for (&self.slots, 0..) |*slot, idx| {
+            if (found >= to_find) break; // early exit: all valid slots for this epoch visited
             if (!slot.valid or slot.epoch != epoch) continue; // per packet number space
+            found += 1;
 
             // Packet threshold: pn + K_PACKET_THRESHOLD <= largest_acked
             const pkt_threshold_lost = slot.pn + K_PACKET_THRESHOLD <= largest_acked;
@@ -218,6 +237,7 @@ pub const SentPacketTable = struct {
 
             if (pkt_threshold_lost or time_threshold_lost) {
                 slot.valid = false;
+                if (epoch < 3) self.valid_per_epoch[epoch] -|= 1;
                 result.newly_lost += 1;
                 result.bytes_lost += slot.size;
                 if (slot.in_flight) {
@@ -233,11 +253,20 @@ pub const SentPacketTable = struct {
 
     /// Return the sent_ns of the in-flight ack-eliciting packet with the highest pn,
     /// or null if none exist.  Used as the base for PTO timer calculation.
+    /// Uses valid_per_epoch to exit early once all valid slots across all epochs are visited.
     pub fn lastAckElicitingNs(self: *const SentPacketTable) ?i64 {
+        const to_find: u32 = @as(u32, self.valid_per_epoch[0]) +
+            self.valid_per_epoch[1] +
+            self.valid_per_epoch[2];
+        if (to_find == 0) return null;
+        var found: u32 = 0;
         var best_pn: u64 = 0;
         var best_ns: ?i64 = null;
         for (self.slots) |slot| {
-            if (slot.valid and slot.ack_eliciting and slot.in_flight) {
+            if (found >= to_find) break; // early exit: all valid slots visited
+            if (!slot.valid) continue;
+            found += 1;
+            if (slot.ack_eliciting and slot.in_flight) {
                 if (best_ns == null or slot.pn > best_pn) {
                     best_pn = slot.pn;
                     best_ns = slot.sent_ns;
@@ -835,4 +864,65 @@ test "sent_table: 128 concurrent unacked packets coexist without eviction" {
     while (pn < 128) : (pn += 1) {
         try testing.expect(lr.sent.get(pn, 0) != null);
     }
+}
+
+test "valid_per_epoch: add increments, remove decrements" {
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[0]);
+    try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[1]);
+    try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[2]);
+
+    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0,
+                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[0]);
+
+    _ = table.add(.{ .pn = 2, .sent_ns = 0, .size = 100, .epoch = 1,
+                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]);
+
+    _ = table.remove(1, 0);
+    try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[0]);
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]);
+}
+
+test "valid_per_epoch: eviction decrements old epoch, add increments new epoch" {
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    // Add pn=0 in epoch 0 (slot 0)
+    _ = table.add(.{ .pn = 0, .sent_ns = 0, .size = 100, .epoch = 0,
+                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[0]);
+
+    // Add pn=256 in epoch 1 (same slot 0, evicts epoch 0 packet)
+    _ = table.add(.{ .pn = MAX_SENT, .sent_ns = 0, .size = 100, .epoch = 1,
+                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[0]); // evicted
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]); // new packet
+}
+
+test "valid_per_epoch: detectLoss decrements on loss" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    lr.onPacketSent(1, 0, 100, true, 0, .{});
+    lr.onPacketSent(5, 0, 100, true, 0, .{});
+    try testing.expectEqual(@as(u16, 2), lr.sent.valid_per_epoch[0]);
+
+    // ACK pn=5, which triggers loss detection for pn=1 (pn+3 <= 5)
+    const ranges = [_]AckedRange{.{ .low = 5, .high = 5 }};
+    const result = lr.onAckReceived(5, 0, &ranges, 0, 0, 25_000_000);
+
+    try testing.expectEqual(@as(u32, 1), result.newly_lost);
+    // pn=1 lost → valid_per_epoch[0] decremented; pn=5 acked → also decremented
+    try testing.expectEqual(@as(u16, 0), lr.sent.valid_per_epoch[0]);
+}
+
+test "valid_per_epoch: lastAckElicitingNs returns null immediately when no valid slots" {
+    const testing = std.testing;
+    const table = SentPacketTable.init();
+    // valid_per_epoch all zeros → to_find == 0 → returns null without scanning
+    try testing.expectEqual(@as(?i64, null), table.lastAckElicitingNs());
 }

@@ -155,6 +155,9 @@ pub fn decode(buf: []const u8) !TransportParams {
         switch (id_vi.value) {
             TP_MAX_IDLE_TIMEOUT => {
                 const v = varint.decode(param_data) orelse return error.InvalidParams;
+                // Guard against u64 overflow when converting to nanoseconds (* 1_000_000).
+                // maxInt(u64) / 1_000_000 = 18_446_744_073_709.
+                if (v.value > 18_446_744_073_709) return error.InvalidParams;
                 params.max_idle_timeout_ms = v.value;
             },
             TP_STATELESS_RESET_TOKEN => {
@@ -493,4 +496,31 @@ test "transport_params: initial_source_connection_id round-trip" {
     try testing.expect(decoded.initial_source_connection_id != null);
     try testing.expectEqual(@as(u8, 8), decoded.initial_source_connection_id_len);
     try testing.expectEqualSlices(u8, isci[0..8], decoded.initial_source_connection_id.?[0..8]);
+}
+
+test "transport_params: max_idle_timeout exceeding ns overflow limit returns error" {
+    // Values > 18_446_744_073_709 ms would overflow u64 when converted to nanoseconds.
+    const testing = std.testing;
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_MAX_IDLE_TIMEOUT);
+    // 18_446_744_073_710 fits in u62 (< 2^62-1) but would overflow u64 in ns conversion.
+    const overflow_ms: u62 = 18_446_744_073_710;
+    const vlen: u62 = @intCast(varint.encodedLen(overflow_ms));
+    pos += varint.encode(buf[pos..], vlen);
+    pos += varint.encode(buf[pos..], overflow_ms);
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: max_idle_timeout within safe limit is accepted" {
+    const testing = std.testing;
+    var buf: [32]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_MAX_IDLE_TIMEOUT);
+    const safe_val: u62 = 3_600_000; // 1 hour in ms, well within the overflow limit
+    const vlen: u62 = @intCast(varint.encodedLen(safe_val));
+    pos += varint.encode(buf[pos..], vlen);
+    pos += varint.encode(buf[pos..], safe_val);
+    const decoded = try decode(buf[0..pos]);
+    try testing.expectEqual(@as(u64, 3_600_000), decoded.max_idle_timeout_ms);
 }

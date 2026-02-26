@@ -105,7 +105,11 @@ pub const ConnectionHot = struct {
     state: ConnState,
     /// Current crypto epoch (0=Initial, 1=Handshake, 2=1-RTT).
     epoch: u8,
-    _pad: [14]u8,
+    /// Whether we have seen at least one valid packet in each epoch.
+    /// Used for simplified PN replay protection: once true, packets with
+    /// pn <= rx_pn[epoch] are silently dropped (RFC 9000 §17 simplified).
+    rx_pn_valid: [3]bool,
+    _pad: [11]u8,
 
     comptime {
         std.debug.assert(@sizeOf(ConnectionHot) == 64);
@@ -241,7 +245,8 @@ pub const Connection = struct {
                 .tx_pn = [_]u64{0} ** 3,
                 .state = .idle,
                 .epoch = 0,
-                ._pad = [_]u8{0} ** 14,
+                .rx_pn_valid = .{ false, false, false },
+                ._pad = [_]u8{0} ** 11,
             },
             .local_cid = local_cid,
             .peer_cid = ConnectionId.zero,
@@ -515,6 +520,9 @@ pub const Connection = struct {
                     @as(u8, hdr.pn_len) * 8,
                 );
 
+                // Replay protection: drop packets whose PN we've already surpassed.
+                if (self.hot.rx_pn_valid[0] and pn <= self.hot.rx_pn[0]) return result.consumed;
+
                 // Build AAD = header bytes (before payload)
                 const payload_start = result.consumed - hdr.payload.len;
                 const aad = data[0..payload_start];
@@ -526,6 +534,7 @@ pub const Connection = struct {
                 try crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]);
 
                 if (pn > self.hot.rx_pn[0]) self.hot.rx_pn[0] = pn;
+                self.hot.rx_pn_valid[0] = true;
                 self.bytes_recv += result.consumed;
                 self.pkts_recv += 1;
 
@@ -543,6 +552,8 @@ pub const Connection = struct {
                     hdr.packet_number,
                     @as(u8, hdr.pn_len) * 8,
                 );
+                // Replay protection
+                if (self.hot.rx_pn_valid[1] and pn <= self.hot.rx_pn[1]) return result.consumed;
                 const payload_start = result.consumed - hdr.payload.len;
                 const aad = data[0..payload_start];
                 if (hdr.payload.len < 16) return error.PacketTooShort;
@@ -551,6 +562,7 @@ pub const Connection = struct {
                 if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 try crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]);
                 if (pn > self.hot.rx_pn[1]) self.hot.rx_pn[1] = pn;
+                self.hot.rx_pn_valid[1] = true;
                 try self.processFrames(plaintext[0..pt_len], 1, io);
                 return result.consumed;
             },
@@ -568,6 +580,8 @@ pub const Connection = struct {
             hdr.packet_number,
             @as(u8, hdr.pn_len) * 8,
         );
+        // Replay protection: silently drop packets with PN <= highest seen in this epoch.
+        if (self.hot.rx_pn_valid[2] and pn <= self.hot.rx_pn[2]) return data.len;
         const payload_start = result.consumed - hdr.payload.len;
         const aad = data[0..payload_start];
         if (hdr.payload.len < 16) return data.len;
@@ -576,6 +590,7 @@ pub const Connection = struct {
         if (pt_len > MAX_PACKET_SIZE) return data.len;
         crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch return data.len;
         if (pn > self.hot.rx_pn[2]) self.hot.rx_pn[2] = pn;
+        self.hot.rx_pn_valid[2] = true;
         self.bytes_recv += data.len;
         self.pkts_recv += 1;
         self.processFrames(plaintext[0..pt_len], 2, null) catch {};
@@ -1722,6 +1737,21 @@ test "connection: idle_timeout_i64 is zero when idle_timeout_ns is zero" {
     const io = std.testing.io;
     const conn = try Connection.accept(.{ .idle_timeout_ns = 0 }, io);
     try testing.expectEqual(@as(i64, 0), conn.idle_timeout_i64);
+}
+
+test "security: rx_pn_valid initializes to false for all epochs" {
+    // All three epochs must start with rx_pn_valid = false (no packet seen yet).
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection.accept(.{}, io);
+    try testing.expect(!conn.hot.rx_pn_valid[0]);
+    try testing.expect(!conn.hot.rx_pn_valid[1]);
+    try testing.expect(!conn.hot.rx_pn_valid[2]);
+}
+
+test "security: ConnectionHot size unchanged after adding rx_pn_valid" {
+    // Adding [3]bool + shrinking _pad by 3 must keep the struct at exactly 64 bytes.
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(ConnectionHot));
 }
 
 test "connection: nextTimeout returns null when all deadlines are null" {

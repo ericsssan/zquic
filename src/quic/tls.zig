@@ -121,6 +121,10 @@ pub const TlsServer = struct {
     // CRYPTO data accumulation buffers
     read_buf: [8192]u8,
     read_len: usize,
+    // Cumulative count of CRYPTO bytes received (across all processCrypto calls).
+    // Prevents an attacker from sending unlimited data in small chunks before the
+    // read_buf check fires.  Cap: 64 KB (generous for a single TLS handshake).
+    crypto_bytes_total: u32,
 
     pub fn init(io: std.Io) !TlsServer {
         const ecdh_kp = X25519.KeyPair.generate(io);
@@ -144,6 +148,7 @@ pub const TlsServer = struct {
             .peer_params = .{},
             .read_buf = undefined,
             .read_len = 0,
+            .crypto_bytes_total = 0,
         };
 
         self.cert_len = buildCertificate(
@@ -168,6 +173,18 @@ pub const TlsServer = struct {
         return self.state == .established;
     }
 
+    /// Zero all secret key material.  Call when the TlsServer is no longer needed.
+    /// Uses volatile writes via std.crypto.secureZero to prevent optimizer elision.
+    pub fn deinit(self: *TlsServer) void {
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.handshake_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.master_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.client_hs_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.server_hs_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.client_app_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.server_app_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.ecdh_kp.secret_key)));
+    }
+
     pub fn clientAppKeys(self: *const TlsServer) crypto.PacketKeys {
         return self.app_keys.client;
     }
@@ -184,6 +201,14 @@ pub const TlsServer = struct {
     /// Feed incoming CRYPTO frame bytes into the state machine.
     /// Returns the number of bytes written to `out` (to be sent as CRYPTO frames).
     pub fn processCrypto(self: *TlsServer, data: []const u8, out: []u8, io: std.Io) !usize {
+        // Cumulative CRYPTO cap: reject if the running total exceeds 64 KB.
+        // Prevents an attacker from evading the per-call read_buf check by sending
+        // many small CRYPTO frames (each processed then cleared from the buffer).
+        const incoming: u32 = @intCast(@min(data.len, std.math.maxInt(u32)));
+        const new_total = self.crypto_bytes_total +| incoming;
+        if (new_total > 65536) return error.CryptoDataTooLarge;
+        self.crypto_bytes_total = new_total;
+
         // Accumulate data
         if (self.read_len + data.len > self.read_buf.len) return error.BufferOverflow;
         @memcpy(self.read_buf[self.read_len..][0..data.len], data);
@@ -354,7 +379,7 @@ pub const TlsServer = struct {
         Hmac256.create(&expected_verify, &transcript_hash, &client_finished_key);
 
         const client_verify = data[4..][0..32];
-        if (!std.mem.eql(u8, &expected_verify, client_verify)) return false;
+        if (!std.crypto.timing_safe.eql([32]u8, expected_verify, client_verify.*)) return false;
 
         // Transcript now includes client Finished
         self.transcript.update(data[0 .. 4 + 32]);
@@ -932,4 +957,65 @@ test "tls: Finished message builds correctly" {
     try testing.expectEqual(@as(usize, 36), n);
     try testing.expectEqual(@as(u8, HS_FINISHED), buf[0]);
     try testing.expectEqualSlices(u8, &vd, buf[4..36]);
+}
+
+test "tls: deinit zeros all secret fields" {
+    const io = std.testing.io;
+    var server = try TlsServer.init(io);
+
+    // Run key schedule to populate secrets with non-zero values
+    const shared_secret = [_]u8{0x11} ** 32;
+    const server_random = [_]u8{0xbb} ** 32;
+    try server.runKeySchedule(shared_secret, &server_random);
+
+    // Verify at least one secret field is non-zero before deinit
+    var any_nonzero = false;
+    for (server.handshake_secret) |b| {
+        if (b != 0) { any_nonzero = true; break; }
+    }
+    try std.testing.expect(any_nonzero);
+
+    server.deinit();
+
+    // All secret fields must be zeroed after deinit
+    try std.testing.expectEqual([_]u8{0} ** 32, server.handshake_secret);
+    try std.testing.expectEqual([_]u8{0} ** 32, server.master_secret);
+    try std.testing.expectEqual([_]u8{0} ** 32, server.client_hs_secret);
+    try std.testing.expectEqual([_]u8{0} ** 32, server.server_hs_secret);
+    try std.testing.expectEqual([_]u8{0} ** 32, server.client_app_secret);
+    try std.testing.expectEqual([_]u8{0} ** 32, server.server_app_secret);
+    try std.testing.expectEqual([_]u8{0} ** 32, server.ecdh_kp.secret_key);
+}
+
+test "tls: cumulative CRYPTO cap rejects data exceeding 64KB total" {
+    const io = std.testing.io;
+    var server = try TlsServer.init(io);
+    var out: [8192]u8 = undefined;
+
+    // Pre-set counter to the limit
+    server.crypto_bytes_total = 65536;
+
+    // Any additional byte must be rejected
+    const one_byte = [_]u8{0x00};
+    try std.testing.expectError(error.CryptoDataTooLarge, server.processCrypto(&one_byte, &out, io));
+}
+
+test "tls: cumulative CRYPTO cap allows exactly 64KB total" {
+    const io = std.testing.io;
+    var server = try TlsServer.init(io);
+    var out: [8192]u8 = undefined;
+
+    // Pre-set counter so that one more byte brings total to exactly 65536
+    server.crypto_bytes_total = 65535;
+
+    // Exactly at the limit: should NOT return CryptoDataTooLarge.
+    // (It may return other errors from parsing, but not the cap error.)
+    const one_byte = [_]u8{0x00};
+    const result = server.processCrypto(&one_byte, &out, io);
+    // We expect a parse error (incomplete/invalid TLS data), but NOT CryptoDataTooLarge.
+    if (result) |_| {} else |err| {
+        try std.testing.expect(err != error.CryptoDataTooLarge);
+    }
+    // After the call, crypto_bytes_total should be 65536
+    try std.testing.expectEqual(@as(u32, 65536), server.crypto_bytes_total);
 }
