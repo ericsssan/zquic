@@ -692,6 +692,7 @@ pub const Connection = struct {
     }
 
     fn processAck(self: *Connection, ack: frame.AckFrame, epoch: u8) void {
+        const max_ack_delay_ns = self.cached_max_ack_delay_ns; // cached: used twice
         // Convert AckFrame ranges into loss_recovery.AckedRange slices.
         // ranges[0] has gap=0 (first ACK range); subsequent entries carry the gap
         // to the *next* range (stored in the following slot by the frame parser).
@@ -720,7 +721,7 @@ pub const Connection = struct {
             ranges_buf[0..range_count],
             epoch,
             self.current_time_ns,
-            self.cached_max_ack_delay_ns,
+            max_ack_delay_ns,
         );
 
         // Feed acknowledgement data to CUBIC
@@ -744,7 +745,7 @@ pub const Connection = struct {
         self.processLostFrames(result);
 
         // Refresh PTO timer after any ACK
-        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+        self.pto_deadline_ns = self.loss.ptoDeadline(max_ack_delay_ns);
     }
 
     // -----------------------------------------------------------------------

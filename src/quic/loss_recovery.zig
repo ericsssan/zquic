@@ -204,8 +204,7 @@ pub const SentPacketTable = struct {
         bif: *u64,
     ) void {
         for (&self.slots, 0..) |*slot, idx| {
-            if (!slot.valid) continue;
-            if (slot.epoch != epoch) continue; // loss detection is per packet number space
+            if (!slot.valid or slot.epoch != epoch) continue; // per packet number space
 
             // Packet threshold: pn + K_PACKET_THRESHOLD <= largest_acked
             const pkt_threshold_lost = slot.pn + K_PACKET_THRESHOLD <= largest_acked;

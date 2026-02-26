@@ -157,6 +157,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
         },
         0x01 => return .{ .frame = .ping, .consumed = pos },
         0x02, 0x03 => {
+            const has_ecn = frame_type_raw == 0x03; // hoisted: used twice below
             const la = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += la.len;
             const delay = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
@@ -174,7 +175,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
                 .ect0 = 0,
                 .ect1 = 0,
                 .ecn_ce = 0,
-                .has_ecn = frame_type_raw == 0x03,
+                .has_ecn = has_ecn,
             };
 
             // First ACK range
@@ -196,7 +197,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
                 }
             }
 
-            if (frame_type_raw == 0x03) {
+            if (has_ecn) {
                 const ect0 = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
                 pos += ect0.len;
                 const ect1 = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
