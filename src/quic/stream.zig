@@ -82,6 +82,22 @@ pub fn RingBuf(comptime cap: usize) type {
             return n;
         }
 
+        /// Write data at `rel_offset` from the read pointer without advancing `wp`.
+        /// Used by out-of-order reassembly; caller is responsible for advancing wp
+        /// once contiguous bytes are determined.
+        /// Returns the number of bytes actually written (capped by ring buffer window).
+        pub fn writeAt(self: *Self, rel_offset: usize, data: []const u8) usize {
+            if (rel_offset >= cap) return 0;
+            const available = cap - rel_offset;
+            const n = @min(data.len, available);
+            if (n == 0) return 0;
+            const start = (self.rp + rel_offset) & (cap - 1);
+            const first = @min(n, cap - start);
+            @memcpy(self.buf[start..][0..first], data[0..first]);
+            if (n > first) @memcpy(self.buf[0..n - first], data[first..n]);
+            return n;
+        }
+
         /// Read bytes at rel_offset from the read pointer without consuming.
         pub fn peek(self: *const Self, rel_offset: usize, out: []u8) usize {
             const avail = self.readable();
@@ -105,6 +121,119 @@ pub fn RingBuf(comptime cap: usize) type {
         }
     };
 }
+
+// ---------------------------------------------------------------------------
+// Out-of-order reassembly: gap tracking (RFC 9000 §2.2)
+// ---------------------------------------------------------------------------
+
+pub const MAX_GAPS: usize = 8;
+
+const Gap = struct {
+    start: u64,
+    end: u64,
+};
+
+/// Fixed-size sorted list of `[start, end)` byte ranges that have NOT yet been
+/// received.  When a range is received (`fill`), overlapping gaps are trimmed,
+/// split, or removed.  `contiguousFrom` returns how far from a base offset the
+/// data stream is contiguous (no gaps).
+pub const GapList = struct {
+    gaps: [MAX_GAPS]Gap,
+    count: usize,
+    /// Highest stream offset we know about (highest `end` seen via `fill`).
+    /// When `count == 0`, this is the contiguous frontier.
+    window_end: u64,
+
+    pub fn init(start: u64, end: u64) GapList {
+        var gl = GapList{
+            .gaps = undefined,
+            .count = 1,
+            .window_end = end,
+        };
+        gl.gaps[0] = .{ .start = start, .end = end };
+        return gl;
+    }
+
+    /// Mark `[offset, offset+len)` as received.
+    /// If `offset` is past the current window end, a gap for the hole is added.
+    pub fn fill(self: *GapList, offset: u64, len: usize) void {
+        if (len == 0) return;
+        const fstart = offset;
+        const fend = offset + @as(u64, len);
+
+        // If the new data starts beyond our tracked window, create a gap for the hole.
+        if (fstart > self.window_end) {
+            if (self.count < MAX_GAPS) {
+                self.gaps[self.count] = .{ .start = self.window_end, .end = fstart };
+                self.count += 1;
+            } else {
+                // Too many gaps to track the hole.  Don't advance window_end;
+                // the peer will retransmit to fill it.
+                return;
+            }
+        }
+
+        if (fend > self.window_end) self.window_end = fend;
+
+        // Remove/trim gaps overlapping [fstart, fend).
+        var i: usize = 0;
+        while (i < self.count) {
+            const g = &self.gaps[i];
+            // No overlap: gap is entirely before or after the fill range.
+            if (g.end <= fstart or g.start >= fend) {
+                i += 1;
+                continue;
+            }
+            if (fstart <= g.start and fend >= g.end) {
+                // Fill covers entire gap → remove it.
+                var j: usize = i;
+                while (j + 1 < self.count) : (j += 1) {
+                    self.gaps[j] = self.gaps[j + 1];
+                }
+                self.count -= 1;
+                // Don't increment i (now points to the next gap after removal).
+            } else if (fstart <= g.start and fend < g.end) {
+                // Fill trims the start of the gap.
+                g.start = fend;
+                i += 1;
+            } else if (fstart > g.start and fend >= g.end) {
+                // Fill trims the end of the gap.
+                g.end = fstart;
+                i += 1;
+            } else {
+                // fstart > g.start and fend < g.end → split gap into two.
+                if (self.count < MAX_GAPS) {
+                    // Shift gaps right to make room for the trailing fragment.
+                    var j: usize = self.count;
+                    while (j > i + 1) : (j -= 1) {
+                        self.gaps[j] = self.gaps[j - 1];
+                    }
+                    self.gaps[i + 1] = .{ .start = fend, .end = g.end };
+                    g.end = fstart;
+                    self.count += 1;
+                    i += 2;
+                } else {
+                    // Can't split: drop the trailing fragment (peer retransmits).
+                    g.end = fstart;
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Return the highest stream offset reachable from `base` without a gap.
+    /// - If a gap starts at `base`, returns `base` (no progress).
+    /// - If the first gap starts after `base`, returns that gap's start.
+    /// - If no gaps remain, returns `window_end` (all received).
+    pub fn contiguousFrom(self: *const GapList, base: u64) u64 {
+        if (self.count == 0) return self.window_end;
+        for (self.gaps[0..self.count]) |g| {
+            if (g.start <= base and base < g.end) return base; // gap at base
+            if (g.start > base) return g.start; // gap after base
+        }
+        return self.window_end; // all gaps are before base
+    }
+};
 
 pub const Stream = struct {
     id: u62,
@@ -135,6 +264,9 @@ pub const Stream = struct {
     /// Last recv_max value advertised to the peer via MAX_STREAM_DATA.
     /// When recv_max grows beyond this, a new MAX_STREAM_DATA frame is needed.
     last_sent_max_stream_data: u64,
+    /// Gap list for out-of-order reassembly (RFC 9000 §2.2).
+    /// Tracks missing byte ranges within the current receive window.
+    gap_list: GapList,
 
     pub fn init(id: u62) Stream {
         return .{
@@ -153,6 +285,7 @@ pub const Stream = struct {
             .pending_stop = null,
             .fin_recv_offset = null,
             .last_sent_max_stream_data = STREAM_BUF_SIZE,
+            .gap_list = GapList.init(0, STREAM_BUF_SIZE),
         };
     }
 
@@ -169,7 +302,9 @@ pub const Stream = struct {
         return end <= self.send_max;
     }
 
-    /// Buffer incoming data. Returns error if exceeds receive window or buffer is full.
+    /// Buffer incoming data. Supports out-of-order reassembly via the gap list.
+    /// Returns error if exceeds receive window, write overflows the ring buffer,
+    /// or offset + len overflows u64.
     pub fn receiveData(self: *Stream, offset: u64, data: []const u8, fin: bool) !void {
         const end = std.math.add(u64, offset, data.len) catch return error.OffsetOverflow;
         if (end > self.recv_max) return error.FlowControlViolation;
@@ -180,16 +315,49 @@ pub const Stream = struct {
             self.fin_recv_offset = end;
         }
 
-        // Simple in-order delivery only for Phase 1
-        if (offset == self.recv_offset) {
-            const written = self.recv_buf.write(data);
-            self.recv_offset += written;
-            // If the ring buffer was full and couldn't accept all data, report the error.
-            // The caller must drain the buffer before sending more data.
-            if (written < data.len) return error.BufferFull;
+        // Pure duplicate: all data already received.
+        if (end <= self.recv_offset) {
+            self.checkFinTransition();
+            return;
         }
 
-        // Transition state only when all bytes up to the FIN offset have arrived.
+        // Trim leading overlap with already-received bytes.
+        const effective_offset: u64 = if (offset < self.recv_offset) self.recv_offset else offset;
+        const trim: usize = @intCast(effective_offset - offset);
+        const effective_data = data[trim..];
+
+        // Guard: if fill() would bail early (gap list full + data beyond known
+        // window), the bytes would be written to the ring buffer but never
+        // tracked — permanently unreachable.  Reject up-front instead.
+        if (effective_offset > self.gap_list.window_end and
+            self.gap_list.count >= MAX_GAPS)
+        {
+            return error.BufferFull;
+        }
+
+        // Write data at the correct position in the ring buffer.
+        // rel = offset from rp (bytes the app has already consumed).
+        const rel: usize = @intCast(effective_offset - @as(u64, self.recv_buf.rp));
+        const written = self.recv_buf.writeAt(rel, effective_data);
+        if (written < effective_data.len) return error.BufferFull;
+
+        // Update the gap list to reflect the newly received range.
+        self.gap_list.fill(effective_offset, effective_data.len);
+
+        // Advance recv_offset to the new contiguous frontier and expose the
+        // newly contiguous bytes to the reader by advancing recv_buf.wp.
+        const new_recv_offset = self.gap_list.contiguousFrom(self.recv_offset);
+        if (new_recv_offset > self.recv_offset) {
+            const advance: usize = @intCast(new_recv_offset - self.recv_offset);
+            self.recv_buf.wp += advance;
+            self.recv_offset = new_recv_offset;
+        }
+
+        self.checkFinTransition();
+    }
+
+    /// Attempt to transition state when all bytes up to the FIN offset have arrived.
+    fn checkFinTransition(self: *Stream) void {
         if (self.fin_recv_offset) |fro| {
             if (self.recv_offset >= fro) {
                 if (self.state == .half_closed_local) {
@@ -420,19 +588,20 @@ test "stream: onSent advances send_offset" {
     try testing.expectEqual(@as(u64, 300), s.send_offset);
 }
 
-test "stream: out-of-order data is silently dropped" {
+test "stream: out-of-order receive and reassembly" {
     const testing = std.testing;
     var s = Stream.init(0);
-    // Data at offset 5 before offset 0 has been received — silently ignored
+    // Data at offset 5 arrives before offset 0 — buffered, not dropped.
     try s.receiveData(5, "world", false);
     var buf: [16]u8 = undefined;
     const n = s.read(&buf);
+    // No contiguous bytes yet (gap at [0, 5)).
     try testing.expectEqual(@as(usize, 0), n);
-    // In-order data at offset 0 is buffered normally
+    // Fill the gap: now [0, 10) is contiguous.
     try s.receiveData(0, "hello", false);
     const n2 = s.read(&buf);
-    try testing.expectEqual(@as(usize, 5), n2);
-    try testing.expectEqualSlices(u8, "hello", buf[0..n2]);
+    try testing.expectEqual(@as(usize, 10), n2);
+    try testing.expectEqualSlices(u8, "helloworld", buf[0..n2]);
 }
 
 test "stream: receiveData returns BufferFull when ring buffer is full" {
@@ -622,8 +791,8 @@ test "stream: out-of-order FIN does not prematurely close" {
     var s = Stream.init(0);
     s.recv_max = 1024;
 
-    // Send FIN at offset=10 with 5 bytes of data (bytes 10-14), but recv_offset=0.
-    // The data is out-of-order so it is silently dropped; only fin_recv_offset is recorded.
+    // FIN at offset=10 with 5 bytes of data (bytes 10-14), but recv_offset=0.
+    // Data is buffered; gap [0, 10) prevents recv_offset from advancing.
     try s.receiveData(10, "hello", true);
     try testing.expectEqual(StreamState.open, s.state);
     try testing.expectEqual(@as(u64, 0), s.recv_offset);
@@ -635,23 +804,21 @@ test "stream: FIN applied when recv_offset catches up" {
     var s = Stream.init(0);
     s.recv_max = 1024;
 
-    // FIN at offset=5 (5 bytes total) arrives out of order first.
+    // FIN at offset=5 (10 bytes total: "world" at [5,10)), arrives out of order first.
     try s.receiveData(5, "world", true);
-    try testing.expectEqual(StreamState.open, s.state);
+    try testing.expectEqual(StreamState.open, s.state); // gap [0,5) prevents advance
 
-    // Now the missing gap data arrives in order from offset=0.
+    // Fill the gap: [0,10) becomes fully contiguous.
     try s.receiveData(0, "hello", false);
-    // recv_offset is now 10 (wrote "hello" at 0, then "world" was already at 5).
-    // But since data at offset=5 was dropped (out of order), we only have bytes 0-4.
-    // The state should still be open because recv_offset(5) == fin_recv_offset(10)? No.
-    // recv_offset = 5 after writing "hello"; fin_recv_offset = 10.
-    // 5 < 10, so state stays open.
-    try testing.expectEqual(StreamState.open, s.state);
-
-    // Send the remaining bytes in order to reach the FIN offset.
-    try s.receiveData(5, "world", false);
-    // recv_offset = 10 = fin_recv_offset; transition fires.
+    // recv_offset jumps to 10 (= fin_recv_offset=10) → state transitions immediately.
     try testing.expectEqual(StreamState.half_closed_remote, s.state);
+    try testing.expectEqual(@as(u64, 10), s.recv_offset);
+
+    // All 10 bytes are now readable: "helloworld".
+    var buf: [16]u8 = undefined;
+    const n = s.read(&buf);
+    try testing.expectEqual(@as(usize, 10), n);
+    try testing.expectEqualSlices(u8, "helloworld", buf[0..n]);
 }
 
 test "stream: in-order FIN still works" {
@@ -723,13 +890,14 @@ test "stream_table: single-pass getOrCreate uses first empty slot" {
 }
 
 test "stream: receiveData exact-boundary: offset + len == u64 max is not overflow" {
-    // offset + len == u64 max exactly (no overflow) and <= recv_max → success
+    // offset + len == u64 max exactly (no overflow) — verified as OffsetOverflow-safe.
+    // Data is astronomically far from the ring buffer window → BufferFull (not OffsetOverflow).
     var s = Stream.init(0);
     s.recv_max = std.math.maxInt(u64);
     const offset: u64 = std.math.maxInt(u64) - 4;
     const data = [_]u8{ 1, 2, 3, 4 }; // len=4; offset+4 == u64 max (no overflow)
-    // Must succeed — no flow control violation and no overflow.
-    try s.receiveData(offset, &data, false);
+    // rel = offset - recv_buf.rp(0) = u64 max - 4 >> cap(4096) → writeAt returns 0 → BufferFull.
+    try std.testing.expectError(error.BufferFull, s.receiveData(offset, &data, false));
 }
 
 test "stream_reset: initiateReset sets pending and transitions state" {
@@ -813,4 +981,245 @@ test "stream: shouldSendMaxStreamData true after read advances recv_max" {
     // After acknowledging the new max, flag clears
     s.last_sent_max_stream_data = s.recv_max;
     try testing.expect(!s.shouldSendMaxStreamData());
+}
+
+// ---------------------------------------------------------------------------
+// New tests — Phase 4: writeAt, GapList, out-of-order reassembly
+// ---------------------------------------------------------------------------
+
+test "ringbuf: writeAt basic" {
+    const testing = std.testing;
+    var rb: RingBuf(16) = .{};
+    // Write 5 bytes at rel_offset=0 without advancing wp.
+    const n = rb.writeAt(0, "hello");
+    try testing.expectEqual(@as(usize, 5), n);
+    // wp was NOT advanced by writeAt; advance manually.
+    rb.wp += 5;
+    var buf: [8]u8 = undefined;
+    const r = rb.read(&buf);
+    try testing.expectEqual(@as(usize, 5), r);
+    try testing.expectEqualSlices(u8, "hello", buf[0..r]);
+}
+
+test "ringbuf: writeAt fills gap before existing data" {
+    const testing = std.testing;
+    var rb: RingBuf(16) = .{};
+    // Write "world" at rel_offset=5 first (out of order).
+    const n = rb.writeAt(5, "world");
+    try testing.expectEqual(@as(usize, 5), n);
+    // Then fill the gap at rel_offset=0.
+    const n2 = rb.writeAt(0, "hello");
+    try testing.expectEqual(@as(usize, 5), n2);
+    // Commit all 10 bytes.
+    rb.wp += 10;
+    var buf: [16]u8 = undefined;
+    const r = rb.read(&buf);
+    try testing.expectEqual(@as(usize, 10), r);
+    try testing.expectEqualSlices(u8, "helloworld", buf[0..r]);
+}
+
+test "ringbuf: writeAt with wrap" {
+    // Set up ring buffer at wrap point, then writeAt crosses the wrap boundary.
+    // After writing 12 and reading 10: rp=10, wp=12, readable=2 ("ab").
+    const testing = std.testing;
+    var rb: RingBuf(16) = .{};
+    _ = rb.write("0123456789ab"); // wp=12
+    var sink: [10]u8 = undefined;
+    _ = rb.read(&sink); // rp=10; consumed "0123456789"; "ab" at ring[10,11]
+
+    // Out-of-order data "UVWXYZ" at rel=2 from rp — crosses the ring wrap.
+    // Writes to ring positions: (10+2..10+7) & 15 = 12,13,14,15,0,1.
+    const n = rb.writeAt(2, "UVWXYZ");
+    try testing.expectEqual(@as(usize, 6), n);
+    // "ab" (rel=0,1) was already committed (wp=12); advance wp by 6 only.
+    rb.wp += 6; // wp=18, readable=8
+
+    var buf: [10]u8 = undefined;
+    const r = rb.read(&buf); // reads ring[10..17] → "abUVWXYZ"
+    try testing.expectEqual(@as(usize, 8), r);
+    try testing.expectEqualSlices(u8, "abUVWXYZ", buf[0..r]);
+}
+
+test "ringbuf: writeAt beyond cap returns 0" {
+    const testing = std.testing;
+    var rb: RingBuf(8) = .{};
+    // rel_offset >= cap → returns 0, nothing written.
+    const n = rb.writeAt(8, "data");
+    try testing.expectEqual(@as(usize, 0), n);
+    try testing.expectEqual(@as(usize, 0), rb.readable());
+}
+
+test "gap_list: init creates single gap" {
+    const testing = std.testing;
+    const gl = GapList.init(0, 4096);
+    try testing.expectEqual(@as(usize, 1), gl.count);
+    try testing.expectEqual(@as(u64, 0), gl.gaps[0].start);
+    try testing.expectEqual(@as(u64, 4096), gl.gaps[0].end);
+    try testing.expectEqual(@as(u64, 4096), gl.window_end);
+}
+
+test "gap_list: fill removes gap entirely" {
+    const testing = std.testing;
+    var gl = GapList.init(0, 100);
+    gl.fill(0, 100);
+    try testing.expectEqual(@as(usize, 0), gl.count);
+    // No gaps → contiguousFrom returns window_end.
+    try testing.expectEqual(@as(u64, 100), gl.contiguousFrom(0));
+}
+
+test "gap_list: fill trims gap start" {
+    const testing = std.testing;
+    var gl = GapList.init(0, 100);
+    // fill [0, 40) trims [0, 100) → [40, 100)
+    gl.fill(0, 40);
+    try testing.expectEqual(@as(usize, 1), gl.count);
+    try testing.expectEqual(@as(u64, 40), gl.gaps[0].start);
+    try testing.expectEqual(@as(u64, 100), gl.gaps[0].end);
+    try testing.expectEqual(@as(u64, 40), gl.contiguousFrom(0));
+}
+
+test "gap_list: fill trims gap end" {
+    const testing = std.testing;
+    var gl = GapList.init(0, 100);
+    // fill [60, 100) trims [0, 100) → [0, 60)
+    gl.fill(60, 40);
+    try testing.expectEqual(@as(usize, 1), gl.count);
+    try testing.expectEqual(@as(u64, 0), gl.gaps[0].start);
+    try testing.expectEqual(@as(u64, 60), gl.gaps[0].end);
+    // Gap starts at base → no progress.
+    try testing.expectEqual(@as(u64, 0), gl.contiguousFrom(0));
+}
+
+test "gap_list: fill splits gap" {
+    const testing = std.testing;
+    var gl = GapList.init(0, 100);
+    // fill [40, 60) splits [0, 100) → [0, 40) and [60, 100)
+    gl.fill(40, 20);
+    try testing.expectEqual(@as(usize, 2), gl.count);
+    try testing.expectEqual(@as(u64, 0), gl.gaps[0].start);
+    try testing.expectEqual(@as(u64, 40), gl.gaps[0].end);
+    try testing.expectEqual(@as(u64, 60), gl.gaps[1].start);
+    try testing.expectEqual(@as(u64, 100), gl.gaps[1].end);
+    try testing.expectEqual(@as(u64, 0), gl.contiguousFrom(0));
+}
+
+test "gap_list: fill overlap across multiple gaps" {
+    const testing = std.testing;
+    var gl = GapList.init(0, 100);
+    // Build gaps: fill [20,40) splits → [{0,20},{40,100}]; fill [60,80) splits → [{0,20},{40,60},{80,100}]
+    gl.fill(20, 20);
+    gl.fill(60, 20);
+    try testing.expectEqual(@as(usize, 3), gl.count);
+    // Now fill [15, 65): trims [0,20)→[0,15); removes [40,60); leaves [80,100).
+    gl.fill(15, 50);
+    try testing.expectEqual(@as(usize, 2), gl.count);
+    try testing.expectEqual(@as(u64, 0), gl.gaps[0].start);
+    try testing.expectEqual(@as(u64, 15), gl.gaps[0].end);
+    try testing.expectEqual(@as(u64, 80), gl.gaps[1].start);
+    try testing.expectEqual(@as(u64, 100), gl.gaps[1].end);
+}
+
+test "gap_list: contiguousFrom advances past filled gaps" {
+    const testing = std.testing;
+    var gl = GapList.init(0, 100);
+    // Split into gaps [0,30) and [60,100) via fill [30,60).
+    gl.fill(30, 30);
+    // Gap at base → no progress.
+    try testing.expectEqual(@as(u64, 0), gl.contiguousFrom(0));
+    // Fill [0,30): only [60,100) remains.
+    gl.fill(0, 30);
+    // First gap after base=0 starts at 60.
+    try testing.expectEqual(@as(u64, 60), gl.contiguousFrom(0));
+    // Fill [60,100): no gaps remain.
+    gl.fill(60, 40);
+    try testing.expectEqual(@as(u64, 100), gl.contiguousFrom(0));
+}
+
+test "gap_list: MAX_GAPS overflow drops tail fragment" {
+    const testing = std.testing;
+    var gl = GapList.init(0, 1000);
+    // Build MAX_GAPS=8 gaps by alternating filled/missing 50-byte segments.
+    gl.fill(0, 50);   // [{50,1000}]
+    gl.fill(100, 50); // [{50,100},{150,1000}]
+    gl.fill(200, 50); // 3 gaps
+    gl.fill(300, 50); // 4 gaps
+    gl.fill(400, 50); // 5 gaps
+    gl.fill(500, 50); // 6 gaps
+    gl.fill(600, 50); // 7 gaps
+    gl.fill(700, 50); // 8 gaps = MAX_GAPS; last gap is [{750,1000}]
+    try testing.expectEqual(MAX_GAPS, gl.count);
+    // Splitting [{750,1000}] at [800,850) would exceed MAX_GAPS → drop trailing fragment.
+    // Gap end is trimmed to fstart=800 instead of splitting.
+    gl.fill(800, 50);
+    try testing.expectEqual(MAX_GAPS, gl.count); // still 8, no overflow
+    try testing.expectEqual(@as(u64, 800), gl.gaps[MAX_GAPS - 1].end);
+}
+
+test "stream: overlapping segments are harmless" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    // Receive [0, 5) first.
+    try s.receiveData(0, "hello", false);
+    // Receive [3, 8): bytes [3,5) overlap, bytes [5,8) are new.
+    try s.receiveData(3, "loXYZ", false);
+    var buf: [16]u8 = undefined;
+    const n = s.read(&buf);
+    try testing.expectEqual(@as(usize, 8), n);
+    try testing.expectEqualSlices(u8, "helloXYZ", buf[0..n]);
+}
+
+test "stream: duplicate segment is harmless" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    try s.receiveData(0, "hello", false);
+    // Exact duplicate — should be a no-op.
+    try s.receiveData(0, "hello", false);
+    var buf: [16]u8 = undefined;
+    const n = s.read(&buf);
+    try testing.expectEqual(@as(usize, 5), n);
+    try testing.expectEqualSlices(u8, "hello", buf[0..n]);
+}
+
+test "stream: FIN with out-of-order data defers transition" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.recv_max = 1024;
+    // FIN with future data: bytes [10,15), fin_recv_offset=15.
+    try s.receiveData(10, "final", true);
+    // Gap [0,10) prevents recv_offset from advancing.
+    try testing.expectEqual(StreamState.open, s.state);
+    try testing.expectEqual(@as(u64, 0), s.recv_offset);
+    // Fill the gap: [0,15) is now fully contiguous.
+    try s.receiveData(0, "0123456789", false);
+    // recv_offset reaches 15 = fin_recv_offset → state transitions.
+    try testing.expectEqual(StreamState.half_closed_remote, s.state);
+    try testing.expectEqual(@as(u64, 15), s.recv_offset);
+}
+
+// BUG-2 regression: gap-list saturated + data beyond window_end must not
+// write to the ring buffer and leave unreachable (phantom) bytes.
+test "stream: gap-list saturated rejects data beyond window (no phantom write)" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    // Simulate the app consuming 1 000 bytes so rp > 0 and rel < cap.
+    s.recv_buf.rp = 1000;
+    s.recv_buf.wp = 1000;
+    s.recv_offset = 1000;
+    // Extend the flow-control window to permit data at offset 3 000.
+    s.recv_max = 1000 + STREAM_BUF_SIZE;
+    // Fill the gap list to capacity with 8 synthetic gaps all within [0, 1000).
+    s.gap_list.count = MAX_GAPS;
+    for (0..MAX_GAPS) |i| {
+        s.gap_list.gaps[i] = .{
+            .start = @as(u64, i) * 128,
+            .end   = @as(u64, i) * 128 + 64,
+        };
+    }
+    s.gap_list.window_end = 1000;
+    // offset=3000: rel = 3000-1000 = 2000 < 4096 (ring buffer slot valid),
+    // BUT fill() cannot record the hole [1000, 3000) — count == MAX_GAPS.
+    // The fix must reject up-front to prevent phantom bytes in the ring buffer.
+    try testing.expectError(error.BufferFull, s.receiveData(3000, "hello", false));
+    // Ring buffer must be completely untouched.
+    try testing.expectEqual(@as(usize, 0), s.recv_buf.readable());
 }

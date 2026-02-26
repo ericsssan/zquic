@@ -59,6 +59,8 @@ pub const Event = union(enum) {
     connection_closed: struct { error_code: u62, is_app: bool },
     connected,
     stop_sending: struct { stream_id: u62, error_code: u62 },
+    /// Peer changed source address; app can query `peer_addr` for the new path.
+    path_migrated,
 };
 
 const EventQueue = struct {
@@ -246,6 +248,25 @@ pub const Connection = struct {
     /// Outstanding PATH_CHALLENGE data we sent; null if none pending (RFC 9000 §9.2).
     pending_path_challenge: ?[8]u8,
 
+    // Key update state (RFC 9001 §6) ------------------------------------------
+
+    /// True once we have sent a key update and are waiting for the peer to ACK
+    /// with the new key_phase bit.
+    key_update_pending: bool,
+    /// Current key_phase bit used in Short Header TX/RX (RFC 9001 §6).
+    current_key_phase: bool,
+    /// Pre-computed next-generation app keys (ready to use on peer-initiated update).
+    next_app_keys: ?tls.AppKeys,
+    /// Next-generation client traffic secret (source for key derivation).
+    next_client_secret: [32]u8,
+    /// Next-generation server traffic secret.
+    next_server_secret: [32]u8,
+
+    // Path migration state (RFC 9000 §9) ----------------------------------------
+
+    /// True when the peer transport parameters include disable_active_migration.
+    peer_disable_migration: bool,
+
     // Pending retransmit flags
     pending_handshake_done: bool,
     pending_max_data: bool,
@@ -327,6 +348,12 @@ pub const Connection = struct {
             .bytes_unvalidated_recv = 0,
             .bytes_unvalidated_sent = 0,
             .pending_path_challenge = null,
+            .key_update_pending = false,
+            .current_key_phase = false,
+            .next_app_keys = null,
+            .next_client_secret = [_]u8{0} ** 32,
+            .next_server_secret = [_]u8{0} ** 32,
+            .peer_disable_migration = false,
             .pending_handshake_done = false,
             .pending_max_data = false,
             .pending_reset_count = 0,
@@ -345,8 +372,15 @@ pub const Connection = struct {
     /// `now_ns`  — current monotonic time in nanoseconds.
     /// `io`      — I/O handle (needed for TLS key generation).
     pub fn receive(self: *Connection, data: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
-        _ = src;
         self.current_time_ns = now_ns;
+
+        // Path migration detection (RFC 9000 §9): only in established state,
+        // and only when the peer has not disabled active migration.
+        if (self.hot.state == .established and !self.peer_addr.eql(src)) {
+            if (!self.peer_disable_migration) {
+                self.onPathMigration(src, io) catch {};
+            }
+        }
 
         // Closing: retransmit CONNECTION_CLOSE, do not process the datagram.
         if (self.hot.state == .closing) {
@@ -627,21 +661,41 @@ pub const Connection = struct {
         if (self.app_keys == null) return 0;
         const result = try packet.parseShortHeader(data, cid_mod.len);
         const hdr = result.header;
-        const keys = self.app_keys.?.client;
         const pn = packet.decodePacketNumber(
             self.hot.rx_pn[2],
             hdr.packet_number,
             @as(u8, hdr.pn_len) * 8,
         );
         // Replay protection: silently drop packets with PN <= highest seen in this epoch.
-        if (self.hot.rx_pn_valid[2] and pn <= self.hot.rx_pn[2]) return data.len;
+        if (self.hot.rx_pn_valid[2] and pn <= self.hot.rx_pn[2]) return result.consumed;
         const payload_start = result.consumed - hdr.payload.len;
         const aad = data[0..payload_start];
-        if (hdr.payload.len < 16) return data.len;
+        if (hdr.payload.len < 16) return result.consumed;
         const pt_len = hdr.payload.len - 16;
         var plaintext: [MAX_PACKET_SIZE]u8 = undefined;
-        if (pt_len > MAX_PACKET_SIZE) return data.len;
-        crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch return data.len;
+        if (pt_len > MAX_PACKET_SIZE) return result.consumed;
+
+        // Key phase handling (RFC 9001 §6): different phase bit indicates key update.
+        if (hdr.key_phase != self.current_key_phase) {
+            // Peer has initiated a key update. Try next-generation keys first.
+            var decrypted_with_next = false;
+            if (self.next_app_keys) |nk| {
+                if (crypto.decryptPayload(nk.client, pn, aad, hdr.payload, plaintext[0..pt_len])) |_| {
+                    decrypted_with_next = true;
+                } else |_| {}
+            }
+            if (decrypted_with_next) {
+                self.rotateKeys(); // promote next → current, derive new next
+            } else {
+                // Fallback: current keys (handles reordering during transition).
+                crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch return data.len;
+            }
+        } else {
+            // Same phase: use current keys; clear pending flag (peer ACKed our update).
+            crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch return data.len;
+            self.key_update_pending = false;
+        }
+
         if (pn > self.hot.rx_pn[2]) self.hot.rx_pn[2] = pn;
         self.hot.rx_pn_valid[2] = true;
         self.bytes_recv += data.len;
@@ -735,9 +789,9 @@ pub const Connection = struct {
                     if (self.pending_path_challenge) |challenge| {
                         if (std.mem.eql(u8, &pr.data, &challenge)) {
                             self.pending_path_challenge = null; // challenge satisfied
-                        } else {
-                            return error.ProtocolViolation; // data mismatch
+                            self.path_validated = true;
                         }
+                        // Mismatch: silently ignore (RFC 9000 §8.2.3).
                     }
                     // No pending challenge: silently ignore.
                 },
@@ -749,6 +803,16 @@ pub const Connection = struct {
                 },
                 .new_connection_id => |ncid| self.processNewConnectionId(ncid),
                 .retire_connection_id => {}, // silently consumed — single-CID server
+                // RFC 9000 §4.1: when the peer signals it is blocked on flow
+                // control, respond with updated credits on the next tick().
+                .data_blocked => self.pending_max_data = true,
+                .stream_data_blocked => |sdb| {
+                    if (self.streams.get(sdb.stream_id)) |st| {
+                        // Reset watermark so flushPendingMaxStreamData() sends
+                        // a fresh MAX_STREAM_DATA frame on the next tick().
+                        st.last_sent_max_stream_data = 0;
+                    }
+                },
                 else => {},
             }
         }
@@ -782,6 +846,14 @@ pub const Connection = struct {
             self.path_validated = true; // handshake completion validates the peer address
             self.events.push(.connected);
 
+            // Pre-compute next-generation app keys for key update support (RFC 9001 §6).
+            self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.client_app_secret);
+            self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.server_app_secret);
+            self.next_app_keys = tls.AppKeys{
+                .client = crypto.derivePacketKeys(self.next_client_secret),
+                .server = crypto.derivePacketKeys(self.next_server_secret),
+            };
+
             // Apply negotiated transport parameters.
             const params = self.tls_state.peerTransportParams();
             self.conn_flow.updateSendMax(params.initial_max_data);
@@ -793,6 +865,9 @@ pub const Connection = struct {
             const uni_limit = @min(params.initial_max_streams_uni, @as(u64, std.math.maxInt(u62)));
             self.peer_max_streams_bidi = @intCast(bidi_limit);
             self.peer_max_streams_uni = @intCast(uni_limit);
+
+            // Cache peer migration preference.
+            self.peer_disable_migration = params.disable_active_migration;
 
             try self.queueHandshakeDone();
         }
@@ -832,8 +907,13 @@ pub const Connection = struct {
         }
 
         // ack_delay field is in units of 2^ack_delay_exponent µs; convert to ns.
-        const ack_delay_ns: u64 = @as(u64, ack.ack_delay) *
-            (@as(u64, 1) << self.cached_ack_delay_exp) * 1000;
+        // Cap before multiplying: ack_delay is a peer-supplied u62 and
+        // ack_delay_exp reaches 20, so the raw product can overflow u64.
+        // Any delay that saturates u64 is effectively infinite — safe to clamp.
+        const ack_delay_shift: u64 = @as(u64, 1) << self.cached_ack_delay_exp;
+        const ack_delay_max_units: u64 = std.math.maxInt(u64) / (ack_delay_shift * 1000);
+        const ack_delay_ns: u64 = @min(@as(u64, ack.ack_delay), ack_delay_max_units) *
+            ack_delay_shift * 1000;
         const result = self.loss.onAckReceived(
             @as(u64, ack.largest_acked),
             ack_delay_ns,
@@ -985,7 +1065,7 @@ pub const Connection = struct {
             const n = frame.encodeFrame(&self.pkt_scratch, .ping);
             const pn = self.hot.tx_pn[2];
             self.hot.tx_pn[2] += 1;
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
             const ct_len = n + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
             crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..n], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1010,7 +1090,7 @@ pub const Connection = struct {
         if (self.app_keys) |ak| {
             const pn = self.hot.tx_pn[2];
             self.hot.tx_pn[2] += 1;
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
             const ct_len = pos + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
             crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1113,7 +1193,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1151,7 +1231,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
         const ct_len = self.closing_frame_len + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(
@@ -1181,7 +1261,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1211,7 +1291,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1250,7 +1330,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1271,7 +1351,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1325,7 +1405,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), false);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1350,6 +1430,65 @@ pub const Connection = struct {
                 self.queueMaxStreamData(st.id, new_max) catch {};
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Key update (RFC 9001 §6)
+    // -----------------------------------------------------------------------
+
+    /// Rotate application keys: promote next → current, flip key_phase bit,
+    /// derive the new next generation.  Called on peer-initiated key updates
+    /// (inside processShortHeaderPacket) and as part of initiateKeyUpdate.
+    fn rotateKeys(self: *Connection) void {
+        self.app_keys = self.next_app_keys;
+        self.current_key_phase = !self.current_key_phase;
+        self.key_update_pending = false;
+
+        // Derive next-next generation from the (now-current) secrets.
+        const new_client = crypto.deriveNextAppSecret(self.next_client_secret);
+        const new_server = crypto.deriveNextAppSecret(self.next_server_secret);
+
+        // Zero the outgoing secrets before overwriting (defence-in-depth).
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.next_client_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.next_server_secret)));
+
+        self.next_client_secret = new_client;
+        self.next_server_secret = new_server;
+        self.next_app_keys = tls.AppKeys{
+            .client = crypto.derivePacketKeys(self.next_client_secret),
+            .server = crypto.derivePacketKeys(self.next_server_secret),
+        };
+    }
+
+    /// Initiate a locally-triggered key update (RFC 9001 §6).
+    /// Returns error.NotEstablished if the handshake is not complete,
+    /// or error.KeyUpdatePending if a previous update has not been acknowledged.
+    pub fn initiateKeyUpdate(self: *Connection) !void {
+        if (self.app_keys == null) return error.NotEstablished;
+        if (self.key_update_pending) return error.KeyUpdatePending;
+        self.rotateKeys(); // flips phase, derives new next, clears pending
+        self.key_update_pending = true; // signal TX side to use new key_phase
+    }
+
+    // -----------------------------------------------------------------------
+    // Path migration (RFC 9000 §9)
+    // -----------------------------------------------------------------------
+
+    /// Handle a source address change: reset congestion, request path validation.
+    fn onPathMigration(self: *Connection, new_addr: SocketAddr, io: std.Io) !void {
+        // RFC 9000 §9.4: reset congestion controller on path change.
+        self.congestion = cubic_mod.Cubic.init();
+        // Re-arm amplification limit for the new unvalidated path.
+        self.path_validated = false;
+        self.bytes_unvalidated_recv = 0;
+        self.bytes_unvalidated_sent = 0;
+        // Immediately adopt new address (RFC 9000 §9.3.1).
+        self.peer_addr = new_addr;
+        // Send PATH_CHALLENGE to validate the new path.
+        var challenge: [8]u8 = undefined;
+        io.random(&challenge);
+        try self.sendPathChallenge(challenge);
+        self.events.push(.path_migrated);
     }
 };
 
@@ -2463,7 +2602,9 @@ test "security: PATH_RESPONSE matching pending challenge clears it" {
     try testing.expectEqual(@as(?[8]u8, null), conn.pending_path_challenge);
 }
 
-test "security: PATH_RESPONSE with wrong data returns ProtocolViolation" {
+test "connection: PATH_RESPONSE mismatch is silently ignored (RFC 9000 §8.2.3)" {
+    // A PATH_RESPONSE that does not match the pending challenge must be silently
+    // ignored — not treated as a protocol violation.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
@@ -2472,7 +2613,10 @@ test "security: PATH_RESPONSE with wrong data returns ProtocolViolation" {
     const wrong_data = [8]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
     var buf: [16]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .path_response = .{ .data = wrong_data } });
-    try testing.expectError(error.ProtocolViolation, conn.processFrames(buf[0..n], 2, null));
+    // Must NOT return an error.
+    try conn.processFrames(buf[0..n], 2, null);
+    // Challenge must still be pending (not cleared by the bad response).
+    try testing.expectEqual(conn.pending_path_challenge.?, [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 });
 }
 
 // SEC-010: RESET_STREAM final_size consistency
@@ -2519,6 +2663,57 @@ test "perf: flushPendingMaxStreamData not called when not established" {
     try testing.expect(st.shouldSendMaxStreamData()); // flag still set
 }
 
+// BUG-1 regression: ACK with maximum ack_delay must not overflow u64.
+test "connection: ACK with max ack_delay does not overflow" {
+    // ack_delay (u62) × 2^ack_delay_exp × 1000 previously overflowed u64.
+    // In debug/ReleaseSafe this panics; in ReleaseFast it silently corrupts RTT.
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    var buf: [64]u8 = undefined;
+    const ack_frm = frame.Frame{ .ack = .{
+        .largest_acked = 0,
+        .ack_delay     = std.math.maxInt(u62),
+        .ranges        = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .range_count   = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    }};
+    const n = frame.encodeFrame(&buf, ack_frm);
+    // Must complete without panic in any build mode.
+    try conn.processFrames(buf[0..n], 2, null);
+}
+
+// BUG-3 regression: DATA_BLOCKED / STREAM_DATA_BLOCKED must trigger credit updates.
+test "connection: DATA_BLOCKED triggers pending MAX_DATA update" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    try testing.expect(!conn.pending_max_data);
+    var buf: [8]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .data_blocked = 0 });
+    try conn.processFrames(buf[0..n], 2, null);
+    try testing.expect(conn.pending_max_data);
+}
+
+test "connection: STREAM_DATA_BLOCKED triggers MAX_STREAM_DATA update" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const st = conn.streams.getOrCreate(0).?;
+    st.recv_max = stream_mod.STREAM_BUF_SIZE;
+    // Mark "already sent" at current recv_max — no update should be pending yet.
+    st.last_sent_max_stream_data = st.recv_max;
+    try testing.expect(!st.shouldSendMaxStreamData());
+
+    var buf: [16]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream_data_blocked = .{
+        .stream_id = 0,
+        .max       = @intCast(st.recv_max),
+    }});
+    try conn.processFrames(buf[0..n], 2, null);
+    // last_sent_max_stream_data must have been zeroed → update now pending.
+    try testing.expect(st.shouldSendMaxStreamData());
+}
+
 // SEC-008 (frame.zig): CID length bounds test via frame encoding round-trip
 test "security: NEW_CONNECTION_ID parse rejects cid_len = 21" {
     // Verify the bounds check via the frame parser used in protocol flow.
@@ -2530,4 +2725,184 @@ test "security: NEW_CONNECTION_ID parse rejects cid_len = 21" {
     buf[0] = 0x18; buf[1] = 0x01; buf[2] = 0x00; buf[3] = 21;
     @memset(buf[4..][0..37], 0); // 21-byte cid + 16-byte token
     try testing.expectError(error.InvalidFrame, frame.parseFrame(buf[0..41]));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Key Update Tests (RFC 9001 §6)
+// ---------------------------------------------------------------------------
+
+test "connection: current_key_phase defaults false" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    try testing.expect(!conn.current_key_phase);
+}
+
+test "connection: key_update_pending defaults false" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    try testing.expect(!conn.key_update_pending);
+}
+
+test "connection: initiateKeyUpdate errors when not established" {
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    // app_keys == null → NotEstablished
+    try std.testing.expectError(error.NotEstablished, conn.initiateKeyUpdate());
+}
+
+test "connection: initiateKeyUpdate errors when key_update_pending" {
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.next_client_secret = [_]u8{0x33} ** 32;
+    conn.next_server_secret = [_]u8{0x44} ** 32;
+    conn.next_app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.key_update_pending = true;
+    try std.testing.expectError(error.KeyUpdatePending, conn.initiateKeyUpdate());
+}
+
+test "connection: initiateKeyUpdate flips key_phase and sets pending" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.next_client_secret = [_]u8{0x55} ** 32;
+    conn.next_server_secret = [_]u8{0x66} ** 32;
+    conn.next_app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    try testing.expect(!conn.current_key_phase);
+    try conn.initiateKeyUpdate();
+    try testing.expect(conn.current_key_phase); // flipped to true
+    try testing.expect(conn.key_update_pending); // pending set
+}
+
+test "connection: rotateKeys advances next-generation secrets" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const secret = [_]u8{0x77} ** 32;
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.next_client_secret = secret;
+    conn.next_server_secret = secret;
+    conn.next_app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    try conn.initiateKeyUpdate(); // internally calls rotateKeys()
+
+    // next_client_secret must now be derived from the (promoted) secret,
+    // which equals deriveNextAppSecret(secret) ≠ secret.
+    try testing.expect(!std.mem.eql(u8, &conn.next_client_secret, &secret));
+    const expected = crypto.deriveNextAppSecret(secret);
+    try testing.expectEqualSlices(u8, &expected, &conn.next_client_secret);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — Path Migration Tests (RFC 9000 §9)
+// ---------------------------------------------------------------------------
+
+test "connection: same address no migration" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    // peer_addr initialised to 0.0.0.0:0; receive from the same address.
+    const src = SocketAddr{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } };
+    try conn.receive(&[_]u8{}, src, 0, io);
+    // No migration event must have been pushed.
+    try testing.expect(conn.pollEvent() == null);
+}
+
+test "connection: different address triggers migration" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 4321 } };
+    try conn.receive(&[_]u8{}, new_src, 0, io);
+    // peer_addr must be updated to the new address.
+    try testing.expect(conn.peer_addr.eql(new_src));
+}
+
+test "connection: migration resets congestion" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    // Inflate the congestion window to a large value.
+    conn.congestion.cwnd = 999_999;
+    const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 5000 } };
+    try conn.receive(&[_]u8{}, new_src, 0, io);
+    // RFC 9000 §9.4: congestion controller reset on migration.
+    try testing.expectEqual(@as(u64, 10 * 1200), conn.congestion.cwnd);
+}
+
+test "connection: migration sets path_validated false" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.path_validated = true;
+    const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 2 }, .port = 5001 } };
+    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try testing.expect(!conn.path_validated);
+}
+
+test "connection: migration event pushed" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 3 }, .port = 5002 } };
+    try conn.receive(&[_]u8{}, new_src, 0, io);
+    const ev = conn.pollEvent();
+    try testing.expect(ev != null);
+    try testing.expect(std.meta.activeTag(ev.?) == .path_migrated);
+}
+
+test "connection: peer_disable_migration suppresses migration" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.peer_disable_migration = true;
+    const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 192, 168, 0, 1 }, .port = 8080 } };
+    try conn.receive(&[_]u8{}, new_src, 0, io);
+    // peer_addr must NOT be updated when migration is disabled.
+    const original = SocketAddr{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } };
+    try testing.expect(conn.peer_addr.eql(original));
+    // No migration event.
+    try testing.expect(conn.pollEvent() == null);
+}
+
+test "connection: migration only in established state" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    // state is .idle — migration check must not fire.
+    const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 1, 2, 3, 4 }, .port = 9000 } };
+    // Empty datagram; receive() returns without error (while loop body never runs).
+    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try testing.expect(conn.pollEvent() == null);
+}
+
+test "connection: PATH_RESPONSE after migration validates path" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    // Simulate post-migration state: challenge outstanding, path not yet validated.
+    const challenge_data = [8]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0x01, 0x02, 0x03, 0x04 };
+    conn.pending_path_challenge = challenge_data;
+    conn.path_validated = false;
+
+    var buf: [16]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .path_response = .{ .data = challenge_data } });
+    try conn.processFrames(buf[0..n], 2, null);
+
+    // Challenge cleared and path marked validated.
+    try testing.expectEqual(@as(?[8]u8, null), conn.pending_path_challenge);
+    try testing.expect(conn.path_validated);
 }

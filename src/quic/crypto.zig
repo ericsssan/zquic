@@ -103,6 +103,15 @@ pub fn derivePacketKeys(secret: [32]u8) PacketKeys {
     return keys;
 }
 
+/// Derive the next-generation application traffic secret for key update
+/// (RFC 9001 §6.1).  The label "quic ku" is used; `hkdfExpandLabel` prepends
+/// "tls13 " automatically.
+pub fn deriveNextAppSecret(current: [32]u8) [32]u8 {
+    var next: [32]u8 = undefined;
+    hkdfExpandLabel(&next, current, "quic ku", "");
+    return next;
+}
+
 /// Encrypt a QUIC packet payload in-place (RFC 9001 §5.3).
 ///
 /// `header` — the unprotected header bytes used as AAD.
@@ -344,4 +353,23 @@ test "crypto: nonce build" {
     };
     const testing = std.testing;
     try testing.expectEqualSlices(u8, &expected, &nonce);
+}
+
+test "crypto: deriveNextAppSecret is deterministic and differs from input" {
+    const testing = std.testing;
+    // Use the client initial secret as a stand-in for an app traffic secret.
+    const prk = HkdfSha256.extract(&initial_salt, &test_dcid);
+    var client_secret: [32]u8 = undefined;
+    hkdfExpandLabel(&client_secret, prk, "client in", "");
+
+    const next1 = deriveNextAppSecret(client_secret);
+    const next2 = deriveNextAppSecret(client_secret);
+
+    // Deterministic: two calls with the same input must produce the same output.
+    try testing.expectEqualSlices(u8, &next1, &next2);
+    // Output must differ from the input (KDF advances the secret).
+    try testing.expect(!std.mem.eql(u8, &next1, &client_secret));
+    // Chaining: deriving a second generation must also differ from the first.
+    const next3 = deriveNextAppSecret(next1);
+    try testing.expect(!std.mem.eql(u8, &next3, &next1));
 }
