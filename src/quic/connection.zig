@@ -932,13 +932,16 @@ pub const Connection = struct {
         // RFC 9000 §4.1: reject data that would exceed the connection receive window.
         if (!self.conn_flow.canReceive(@intCast(f.data.len))) return error.FlowControlViolation;
         const st = self.streams.getOrCreate(f.stream_id) orelse return error.TooManyStreams;
+        // Charge the connection window only after the stream successfully buffers the data.
+        // Charging before receiveData would permanently shrink recv_total on failure
+        // (e.g., FinalSizeError, BufferFull, stream-level FlowControlViolation).
+        try st.receiveData(f.offset, f.data, f.fin);
         self.conn_flow.onReceived(@intCast(f.data.len));
         // Grow connection receive window when 75% consumed (RFC 9000 §4.2).
         if (self.conn_flow.shouldSendMaxData()) {
             self.conn_flow.recv_max = self.conn_flow.nextMaxData();
             self.pending_max_data = true;
         }
-        try st.receiveData(f.offset, f.data, f.fin);
         // Notify the application; the echo behaviour from Phase 1 is removed.
         self.events.push(.{ .stream_data = .{ .stream_id = f.stream_id } });
     }
@@ -3483,4 +3486,36 @@ test "connection: STREAM on unidirectional stream exceeding local_max_streams_un
         .data = "bad",
     } });
     try testing.expectError(error.StreamLimitError, conn.processFrames(buf[0..n], 2, null));
+}
+
+test "connection: conn_flow.recv_total not charged when stream receiveData fails" {
+    // If the stream rejects data (e.g., FinalSizeError after FIN), the connection
+    // flow control counter must not be permanently incremented.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+
+    // Send FIN at offset 3 (final_size = 3).
+    var buf: [64]u8 = undefined;
+    var n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .fin = true,
+        .data = "abc",
+    } });
+    try conn.processFrames(buf[0..n], 2, null);
+    const recv_total_after_fin = conn.conn_flow.recv_total;
+
+    // Send data beyond the established final size — stream rejects it (FinalSizeError).
+    n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0,
+        .offset = 2,
+        .fin = false,
+        .data = "xyz", // end = 5 > final_size 3 → FinalSizeError
+    } });
+    // processFrames swallows 1-RTT errors via `catch {}`, so no error bubbles up.
+    conn.processFrames(buf[0..n], 2, null) catch {};
+    // recv_total must not have grown beyond what was committed by the accepted frame.
+    try testing.expectEqual(recv_total_after_fin, conn.conn_flow.recv_total);
 }
