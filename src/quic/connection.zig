@@ -238,6 +238,12 @@ pub const Connection = struct {
     local_max_streams_bidi: u62,
     local_max_streams_uni: u62,
 
+    // Per-stream flow control limits advertised by the peer (RFC 9000 §7.3, §18.2).
+    // initial_max_stream_data_bidi_local: the peer's send limit on bidi streams they initiate
+    // (= how many bytes we allow them to send on client-initiated bidi streams).
+    // Used to initialize stream.send_max when a new stream is created.
+    peer_max_stream_data_bidi_local: u64,
+
     // Peer connection ID table (NEW_CONNECTION_ID)
     peer_cid_table: [MAX_PEER_CIDS]PeerCidEntry,
     peer_cid_retire_prior: u62,
@@ -350,6 +356,7 @@ pub const Connection = struct {
             .peer_max_streams_uni = 0,
             .local_max_streams_bidi = 100, // matches TransportParams.default().initial_max_streams_bidi
             .local_max_streams_uni = 100,  // matches TransportParams.default().initial_max_streams_uni
+            .peer_max_stream_data_bidi_local = flow_control.DEFAULT_MAX_STREAM_DATA,
             .peer_cid_table = [_]PeerCidEntry{.{
                 .cid = .{},
                 .seq = 0,
@@ -930,6 +937,8 @@ pub const Connection = struct {
             self.conn_flow.updateSendMax(params.initial_max_data);
             self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
             self.cached_ack_delay_exp = @intCast(@min(params.ack_delay_exponent, 20));
+            // Cache per-stream send limits for use when opening new streams (RFC 9000 §7.3).
+            self.peer_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
 
             // Initialize peer stream limits from transport parameters.
             const bidi_limit = @min(params.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62)));
@@ -960,7 +969,15 @@ pub const Connection = struct {
         }
         // RFC 9000 §4.1: reject data that would exceed the connection receive window.
         if (!self.conn_flow.canReceive(@intCast(f.data.len))) return error.FlowControlViolation;
+        const is_new = self.streams.get(f.stream_id) == null;
         const st = self.streams.getOrCreate(f.stream_id) orelse return error.TooManyStreams;
+        // Apply the peer's per-stream send limit on first access (RFC 9000 §7.3).
+        // Stream.init() defaults send_max to STREAM_BUF_SIZE; override with the negotiated value
+        // so the server is not artificially throttled below the peer's advertised window.
+        // Only applies to bidirectional streams (bit 1 == 0) since we don't send on remote-initiated uni.
+        if (is_new and (f.stream_id >> 1) & 1 == 0) {
+            st.send_max = self.peer_max_stream_data_bidi_local;
+        }
         // Charge the connection window only after the stream successfully buffers the data.
         // Charging before receiveData would permanently shrink recv_total on failure
         // (e.g., FinalSizeError, BufferFull, stream-level FlowControlViolation).
@@ -3621,4 +3638,59 @@ test "connection: stateless reset ignores non-matching token" {
     var pkt: [32]u8 = undefined;
     @memset(&pkt, 0x00); // last 16 bytes are 0x00, not 0xcd
     try testing.expect(!conn.checkStatelessReset(&pkt));
+}
+
+test "connection: new bidi stream send_max set from peer_max_stream_data_bidi_local" {
+    // When a client-initiated bidirectional stream is created, its send_max must
+    // reflect the peer's advertised initial_max_stream_data_bidi_local, not the
+    // hardcoded STREAM_BUF_SIZE (RFC 9000 §7.3).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    // Simulate transport-param negotiation with a non-default value.
+    const custom_limit: u64 = 128 * 1024; // 128 KiB
+    conn.peer_max_stream_data_bidi_local = custom_limit;
+
+    // Feed a STREAM frame to create stream 0 (client-initiated bidi).
+    var buf: [64]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = "hello",
+    } });
+    try conn.processFrames(buf[0..n], 2, null);
+
+    const st = conn.streams.get(0).?;
+    try testing.expectEqual(custom_limit, st.send_max);
+}
+
+test "connection: new bidi stream send_max not reset on second STREAM frame" {
+    // A second STREAM frame on the same stream must not overwrite send_max that
+    // was already updated (e.g. by a MAX_STREAM_DATA frame from the peer).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.peer_max_stream_data_bidi_local = 128 * 1024;
+
+    var buf: [64]u8 = undefined;
+    // First frame: creates the stream, sets send_max = 128 KiB.
+    var n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0, .offset = 0, .fin = false, .data = "hello",
+    } });
+    try conn.processFrames(buf[0..n], 2, null);
+
+    // Simulate a MAX_STREAM_DATA update from the peer (e.g. 256 KiB).
+    const st = conn.streams.get(0).?;
+    st.send_max = 256 * 1024;
+
+    // Second STREAM frame on the same stream: send_max must remain 256 KiB.
+    n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0, .offset = 5, .fin = false, .data = "world",
+    } });
+    try conn.processFrames(buf[0..n], 2, null);
+
+    try testing.expectEqual(@as(u64, 256 * 1024), st.send_max);
 }

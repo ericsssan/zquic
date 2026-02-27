@@ -78,21 +78,23 @@ pub const RttEstimator = struct {
         }
 
         // EWMA: rtt_var = 3/4*rtt_var + 1/4*|srtt - adjusted|
+        // Use saturating arithmetic to prevent overflow with extreme RTT samples.
         const abs_diff = if (self.smoothed_rtt >= adjusted_rtt)
             self.smoothed_rtt - adjusted_rtt
         else
             adjusted_rtt - self.smoothed_rtt;
-        self.rtt_var = (3 * self.rtt_var + abs_diff) / 4;
+        self.rtt_var = (3 *| self.rtt_var +| abs_diff) / 4;
 
         // EWMA: smoothed_rtt = 7/8*smoothed_rtt + 1/8*adjusted
-        self.smoothed_rtt = (7 * self.smoothed_rtt + adjusted_rtt) / 8;
+        self.smoothed_rtt = (7 *| self.smoothed_rtt +| adjusted_rtt) / 8;
     }
 
     /// PTO base value (RFC 9002 §6.2.1):
     ///   smoothed_rtt + max(4*rtt_var, K_GRANULARITY_NS) + max_ack_delay_ns
+    /// Saturating arithmetic prevents overflow with extreme RTT values.
     pub fn ptoBase(self: *const RttEstimator, max_ack_delay_ns: u64) u64 {
-        const var_term = @max(4 * self.rtt_var, K_GRANULARITY_NS);
-        return self.smoothed_rtt + var_term + max_ack_delay_ns;
+        const var_term = @max(4 *| self.rtt_var, K_GRANULARITY_NS);
+        return self.smoothed_rtt +| var_term +| max_ack_delay_ns;
     }
 };
 
@@ -1010,4 +1012,26 @@ test "valid_per_epoch: lastAckElicitingNs returns null immediately when no valid
     const table = SentPacketTable.init();
     // valid_per_epoch all zeros → to_find == 0 → returns null without scanning
     try testing.expectEqual(@as(?i64, null), table.lastAckElicitingNs());
+}
+
+test "rtt: ptoBase saturates instead of overflowing with extreme rtt_var" {
+    // If rtt_var is near u64 max, 4*rtt_var would overflow without saturation.
+    // With *| the multiply saturates; +| prevents the sum from overflowing.
+    const testing = std.testing;
+    var rtt = RttEstimator{};
+    rtt.smoothed_rtt = std.math.maxInt(u64) / 2;
+    rtt.rtt_var = std.math.maxInt(u64) / 4 + 1; // 4 * this overflows u64 without saturation
+    const pto = rtt.ptoBase(0);
+    // With saturation: 4 *| rtt_var = maxInt(u64), then +| smoothed = maxInt(u64). Must not panic.
+    try testing.expectEqual(std.math.maxInt(u64), pto);
+}
+
+test "rtt: ptoBase saturates sum of smoothed + var_term + max_ack_delay" {
+    // Verify the three-term sum in ptoBase saturates rather than wrapping.
+    const testing = std.testing;
+    var rtt = RttEstimator{};
+    rtt.smoothed_rtt = std.math.maxInt(u64) - 1;
+    rtt.rtt_var = 1; // var_term = max(4, K_GRAN) — either way large
+    const pto = rtt.ptoBase(1_000_000); // +1ms would overflow without saturation
+    try testing.expectEqual(std.math.maxInt(u64), pto);
 }
