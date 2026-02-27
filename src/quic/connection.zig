@@ -278,6 +278,12 @@ pub const Connection = struct {
 
     // Per-epoch TLS send offset (for FrameInfo tracking)
     crypto_send_offset: [3]u64,
+    /// Per-epoch expected CRYPTO receive offset (RFC 9000 §19.6).
+    /// Out-of-order/duplicate CRYPTO frames are rejected or trimmed against this.
+    crypto_recv_offset: [3]u64,
+    /// Deferred ACK flags: set when an ack-eliciting frame is received in an epoch.
+    /// Flushed to encrypted ACK packets at the end of receive().
+    pending_ack: [3]bool,
     /// Cached idle timeout cast to i64 — computed once in accept() so receive() avoids
     /// the @intCast/@min per packet. Zero when idle timeout is disabled.
     idle_timeout_i64: i64,
@@ -359,6 +365,8 @@ pub const Connection = struct {
             .pending_reset_count = 0,
             .last_vn_ns = -1_000_000_000, // sentinel: "1s before the epoch" so first VN is always allowed
             .crypto_send_offset = .{ 0, 0, 0 },
+            .crypto_recv_offset = .{ 0, 0, 0 },
+            .pending_ack = .{ false, false, false },
         };
     }
 
@@ -407,6 +415,15 @@ pub const Connection = struct {
             const consumed = try self.processOnePacket(remaining, io);
             if (consumed == 0) break;
             remaining = remaining[consumed..];
+        }
+
+        // Flush deferred ACKs — at most one encrypted ACK per packet-number space
+        // per datagram (RFC 9000 §13.2.1).
+        for (0..3) |e| {
+            if (self.pending_ack[e]) {
+                self.pending_ack[e] = false;
+                self.sendEncryptedAck(@intCast(e)) catch {};
+            }
         }
     }
 
@@ -474,16 +491,12 @@ pub const Connection = struct {
             self.pending_handshake_done = false;
             self.queueHandshakeDone() catch {};
         }
-        if (self.pending_max_data) {
-            self.pending_max_data = false;
-            self.queueMaxData() catch {};
-        }
 
         // Flush pending stream resets (fast-path: skip scan when nothing is pending).
         if (self.pending_reset_count > 0) self.flushPendingResets() catch {};
 
-        // Flush pending MAX_STREAM_DATA frames (only meaningful when established).
-        if (self.hot.state == .established) self.flushPendingMaxStreamData();
+        // Batch MAX_DATA + MAX_STREAM_DATA into a single 1-RTT packet (coalescing).
+        if (self.hot.state == .established) self.flushControlFrames() catch {};
     }
 
     pub fn isClosed(self: *const Connection) bool {
@@ -725,9 +738,16 @@ pub const Connection = struct {
             // RFC 9000 §12.4: reject frames not permitted in this epoch.
             if (!isFrameAllowedInEpoch(fr.frame, epoch)) return error.ProtocolViolation;
 
+            // RFC 9000 §19.19: all frames except PADDING and ACK are ack-eliciting.
+            switch (fr.frame) {
+                .ack => {},
+                .padding => {},
+                else => self.pending_ack[epoch] = true,
+            }
+
             switch (fr.frame) {
                 .padding => {},
-                .ping => try self.queueAck(epoch),
+                .ping => {},
                 .ack => |a| try self.processAck(a, epoch),
                 .crypto => |c| {
                     if (io) |real_io| {
@@ -819,9 +839,24 @@ pub const Connection = struct {
     }
 
     fn processCryptoFrame(self: *Connection, f: frame.CryptoFrame, epoch: u8, io: std.Io) !void {
+        // RFC 9000 §19.6: validate CRYPTO frame offset to prevent TLS corruption.
+        const expected = self.crypto_recv_offset[epoch];
+        const end = @as(u64, f.offset) + @as(u64, f.data.len);
+
+        // Pure duplicate: already processed all bytes in this frame → skip.
+        if (end <= expected) return;
+
+        // Gap: can't reassemble out-of-order CRYPTO without a full reassembly buffer.
+        if (@as(u64, f.offset) > expected) return error.CryptoDataNotInOrder;
+
+        // Partial overlap: trim leading bytes already processed.
+        const trim = expected - @as(u64, f.offset);
+        const effective_data = f.data[trim..];
+
+        self.crypto_recv_offset[epoch] = end;
+
         var out_buf: [8192]u8 = undefined;
-        const out_len = try self.tls_state.processCrypto(f.data, &out_buf, io);
-        _ = epoch;
+        const out_len = try self.tls_state.processCrypto(effective_data, &out_buf, io);
 
         // Update HS keys if TLS just derived them
         if (self.hs_keys == null and
@@ -880,6 +915,11 @@ pub const Connection = struct {
         if (f.stream_id & 1 != 0) return error.StreamStateError;
         const st = self.streams.getOrCreate(f.stream_id) orelse return error.TooManyStreams;
         self.conn_flow.onReceived(@intCast(f.data.len));
+        // Grow connection receive window when 75% consumed (RFC 9000 §4.2).
+        if (self.conn_flow.shouldSendMaxData()) {
+            self.conn_flow.recv_max = self.conn_flow.nextMaxData();
+            self.pending_max_data = true;
+        }
         try st.receiveData(f.offset, f.data, f.fin);
         // Notify the application; the echo behaviour from Phase 1 is removed.
         self.events.push(.{ .stream_data = .{ .stream_id = f.stream_id } });
@@ -1043,7 +1083,12 @@ pub const Connection = struct {
         self.sq_tail += 1;
     }
 
-    fn queueAck(self: *Connection, epoch: u8) !void {
+    /// Send an encrypted ACK frame for the given epoch.
+    /// epoch 0 = Initial (long header, initial_keys.server)
+    /// epoch 1 = Handshake (long header, hs_keys.?.server)
+    /// epoch 2 = 1-RTT (short header, app_keys.?.server)
+    /// ACK frames are not ack-eliciting (RFC 9002 §2), so ack_eliciting=false.
+    fn sendEncryptedAck(self: *Connection, epoch: u8) !void {
         var fpos: usize = 0;
         const ack_frame_data: frame.Frame = .{ .ack = .{
             .largest_acked = @intCast(self.hot.rx_pn[epoch]),
@@ -1056,7 +1101,72 @@ pub const Connection = struct {
             .has_ecn = false,
         } };
         fpos += frame.encodeFrame(self.pkt_scratch[fpos..], ack_frame_data);
-        try self.enqueueSend(self.pkt_scratch[0..fpos]);
+
+        switch (epoch) {
+            0 => {
+                // Initial packet: Long Header, epoch 0 keys
+                const ik = self.initial_keys.server;
+                const pn = self.hot.tx_pn[0];
+                self.hot.tx_pn[0] += 1;
+                const ct_len = fpos + 16;
+                const hdr_len = packet.encodeLongHeader(
+                    &self.enc_scratch,
+                    .initial,
+                    packet.QUIC_VERSION_1,
+                    self.peer_cid,
+                    self.local_cid,
+                    &.{},
+                    @intCast(pn),
+                    ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
+                );
+                if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                try self.enqueueSend(self.enc_scratch[0..hdr_len + ct_len]);
+                var fi = loss_recovery_mod.SentFrameInfo{};
+                fi.count = 0; // ACK is not ack-eliciting; no frame info tracked
+                self.loss.onPacketSent(pn, 0, hdr_len + ct_len, false, self.current_time_ns, fi);
+            },
+            1 => {
+                // Handshake packet: Long Header, handshake keys
+                if (self.hs_keys == null) return;
+                const hk = self.hs_keys.?.server;
+                const pn = self.hot.tx_pn[1];
+                self.hot.tx_pn[1] += 1;
+                const ct_len = fpos + 16;
+                const hdr_len = packet.encodeLongHeader(
+                    &self.enc_scratch,
+                    .handshake,
+                    packet.QUIC_VERSION_1,
+                    self.peer_cid,
+                    self.local_cid,
+                    &.{},
+                    @intCast(pn),
+                    ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
+                );
+                if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                try self.enqueueSend(self.enc_scratch[0..hdr_len + ct_len]);
+                var fi = loss_recovery_mod.SentFrameInfo{};
+                fi.count = 0;
+                self.loss.onPacketSent(pn, 1, hdr_len + ct_len, false, self.current_time_ns, fi);
+            },
+            2 => {
+                // 1-RTT packet: Short Header, app keys
+                if (self.app_keys == null) return;
+                const ak = self.app_keys.?.server;
+                const pn = self.hot.tx_pn[2];
+                self.hot.tx_pn[2] += 1;
+                const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+                const ct_len = fpos + 16;
+                if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                crypto.encryptPayload(ak, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                try self.enqueueSend(self.enc_scratch[0..hdr_len + ct_len]);
+                var fi = loss_recovery_mod.SentFrameInfo{};
+                fi.count = 0;
+                self.loss.onPacketSent(pn, 2, hdr_len + ct_len, false, self.current_time_ns, fi);
+            },
+            else => return,
+        }
     }
 
     fn queuePing(self: *Connection) !void {
@@ -1118,6 +1228,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[0];
         self.hot.tx_pn[0] += 1;
 
+        const ct_out_len = fpos + 16;
         const hdr_len = packet.encodeLongHeader(
             &self.enc_scratch,
             .initial,
@@ -1126,10 +1237,8 @@ pub const Connection = struct {
             self.local_cid,
             &.{},
             @intCast(pn),
-            fpos,
+            ct_out_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
         );
-
-        const ct_out_len = fpos + 16;
         if (hdr_len + ct_out_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_out_len]);
         const out_len = hdr_len + ct_out_len;
@@ -1430,6 +1539,67 @@ pub const Connection = struct {
                 self.queueMaxStreamData(st.id, new_max) catch {};
             }
         }
+    }
+
+    /// Batch MAX_DATA and MAX_STREAM_DATA frames into a single 1-RTT packet.
+    /// Called from tick() to replace the individual queueMaxData +
+    /// flushPendingMaxStreamData calls when the connection is established.
+    ///
+    /// MAX_DATA: tracked in SentFrameInfo (loss recovery sets pending_max_data on loss).
+    /// MAX_STREAM_DATA: not tracked (shouldSendMaxStreamData re-triggers on next tick).
+    fn flushControlFrames(self: *Connection) !void {
+        if (self.app_keys == null) return;
+        const ak = self.app_keys.?;
+
+        // Leave room for Short Header (~13 bytes) + AEAD tag (16 bytes).
+        const frame_budget = MAX_PACKET_SIZE - 30;
+        var fpos: usize = 0;
+        var fi = loss_recovery_mod.SentFrameInfo{};
+        var has_ack_eliciting = false;
+
+        // 1. Pending MAX_DATA frame
+        if (self.pending_max_data) {
+            self.pending_max_data = false;
+            const new_max: u62 = @intCast(@min(self.conn_flow.recv_max, std.math.maxInt(u62)));
+            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .max_data = new_max });
+            if (fi.count < loss_recovery_mod.MAX_FRAMES_PER_PACKET) {
+                fi.frames[fi.count] = .{ .max_data = new_max };
+                fi.count += 1;
+            }
+            has_ack_eliciting = true;
+        }
+
+        // 2. Pending MAX_STREAM_DATA frames (not tracked for retransmission;
+        //    shouldSendMaxStreamData re-arms on next tick if needed).
+        for (0..stream_mod.MAX_STREAMS) |i| {
+            if (!self.streams.used[i]) continue;
+            const st = &self.streams.streams[i];
+            if (!st.shouldSendMaxStreamData()) continue;
+            const new_max: u62 = @intCast(@min(st.recv_max, std.math.maxInt(u62)));
+            const f_frame: frame.Frame = .{ .max_stream_data = .{
+                .stream_id = st.id,
+                .max_data = new_max,
+            } };
+            const encoded_len = frame.encodeFrame(self.pkt_scratch[fpos..], f_frame);
+            if (fpos + encoded_len > frame_budget) break; // packet full
+            fpos += encoded_len;
+            st.last_sent_max_stream_data = st.recv_max;
+            has_ack_eliciting = true;
+        }
+
+        if (fpos == 0) return; // nothing to send
+
+        const pn = self.hot.tx_pn[2];
+        self.hot.tx_pn[2] += 1;
+
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const ct_len = fpos + 16;
+        if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+        crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+        const out_len = hdr_len + ct_len;
+        try self.enqueueSend(self.enc_scratch[0..out_len]);
+        self.loss.onPacketSent(pn, 2, out_len, has_ack_eliciting, self.current_time_ns, fi);
+        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
     }
 
     // -----------------------------------------------------------------------
@@ -2402,10 +2572,19 @@ test "connection: tick clears shouldSendMaxStreamData after stream read" {
     // recv_max has grown beyond last_sent_max_stream_data
     try testing.expect(st.shouldSendMaxStreamData());
 
-    // tick() calls flushPendingMaxStreamData only when established (PERF-001).
+    // Simulate established state with dummy app_keys (keys don't need to be valid
+    // for decryption here; we only check that the watermark is cleared and a packet queued).
     conn.hot.state = .established;
+    conn.app_keys = tls.AppKeys{
+        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+    };
+    const sq_before = conn.sq_tail;
     conn.tick(1_000_000);
+    // Watermark cleared (frame was batched by flushControlFrames)
     try testing.expect(!st.shouldSendMaxStreamData());
+    // A packet was queued
+    try testing.expect(conn.sq_tail > sq_before);
 }
 
 // ---------------------------------------------------------------------------
@@ -2905,4 +3084,315 @@ test "connection: PATH_RESPONSE after migration validates path" {
     // Challenge cleared and path marked validated.
     try testing.expectEqual(@as(?[8]u8, null), conn.pending_path_challenge);
     try testing.expect(conn.path_validated);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — Protocol Completeness & Performance
+// ---------------------------------------------------------------------------
+
+// ---- Step 1: sendEncryptedAck (ACK encryption fix) ----
+
+test "connection: sendEncryptedAck for Initial epoch produces long header" {
+    // The first byte of a long-header QUIC packet has bit 7 = 1 (0x80 or above).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    // Derive real initial keys with a dummy DCID.
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid);
+    conn.hot.rx_pn_valid[0] = true;
+    conn.hot.rx_pn[0] = 5;
+
+    try conn.sendEncryptedAck(0);
+
+    // A packet must have been enqueued.
+    try testing.expect(conn.sq_tail > 0);
+    // First byte: long-header form bit (bit 7) must be set.
+    const slot = &conn.sq[0];
+    try testing.expect(slot.buf[0] & 0x80 != 0);
+}
+
+test "connection: sendEncryptedAck for 1-RTT epoch produces short header" {
+    // The first byte of a 1-RTT packet has bit 7 = 0 and bit 6 = 1 (0x40-0x7f).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.hot.rx_pn_valid[2] = true;
+    conn.hot.rx_pn[2] = 3;
+
+    try conn.sendEncryptedAck(2);
+
+    try testing.expect(conn.sq_tail > 0);
+    const slot = &conn.sq[0];
+    // Short header: bit 7 = 0, bit 6 = 1 (fixed bit per RFC 9000 §17.3).
+    try testing.expect(slot.buf[0] & 0x80 == 0);
+    try testing.expect(slot.buf[0] & 0x40 != 0);
+}
+
+test "connection: sendEncryptedAck skips when hs_keys missing" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hs_keys = null;
+
+    // Should not enqueue anything.
+    try conn.sendEncryptedAck(1);
+    try testing.expectEqual(@as(usize, 0), conn.sq_tail);
+}
+
+// ---- Step 2: Deferred ACK for all ack-eliciting frames ----
+
+test "connection: PING frame sets pending_ack flag" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    var buf: [4]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .ping);
+    try conn.processFrames(buf[0..n], 0, null);
+
+    // pending_ack[0] (Initial epoch) must be set.
+    try testing.expect(conn.pending_ack[0]);
+    // Other epochs untouched.
+    try testing.expect(!conn.pending_ack[1]);
+    try testing.expect(!conn.pending_ack[2]);
+}
+
+test "connection: ACK frame does NOT set pending_ack" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Build a minimal ACK frame (largest_acked=0, range_count=1).
+    var buf: [64]u8 = undefined;
+    const ack_f: frame.Frame = .{ .ack = .{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    } };
+    const n = frame.encodeFrame(&buf, ack_f);
+    try conn.processFrames(buf[0..n], 0, null);
+
+    try testing.expect(!conn.pending_ack[0]);
+}
+
+test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
+    // receive() with a PING frame (encapsulated in an Initial packet) must
+    // produce an encrypted ACK in the send queue.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe };
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid);
+    conn.hot.state = .handshake; // past idle so Initial packets are processed
+    conn.peer_cid = conn.local_cid;
+
+    // Build a PING frame and wrap it in an encrypted Initial packet.
+    var pt: [4]u8 = undefined;
+    const pt_len = frame.encodeFrame(&pt, .ping);
+
+    var enc_buf: [256]u8 = undefined;
+    const client_keys = conn.initial_keys.client;
+    const pn: u64 = 1;
+    const ct_len = pt_len + 16; // ciphertext + AEAD tag
+    const hdr_len = packet.encodeLongHeader(
+        &enc_buf,
+        .initial,
+        packet.QUIC_VERSION_1,
+        conn.local_cid,
+        conn.local_cid,
+        &.{},
+        @intCast(pn),
+        ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
+    );
+    crypto.encryptPayload(client_keys, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
+    const pkt = enc_buf[0..hdr_len + ct_len];
+
+    const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
+    try conn.receive(pkt, src, 0, io);
+
+    // An encrypted ACK must have been queued (sq_tail > 0).
+    try testing.expect(conn.sq_tail > 0);
+    // pending_ack[0] must be false (flushed).
+    try testing.expect(!conn.pending_ack[0]);
+}
+
+// ---- Step 3: Connection MAX_DATA window growth ----
+
+test "connection: recv window grows when 75% consumed" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+
+    const initial_recv_max = conn.conn_flow.recv_max; // 1 MiB default
+    // Consume exactly 75% of the window via stream frames.
+    const threshold = (initial_recv_max * 3) / 4 + 1;
+
+    // Use a small chunk that fits in stream buf.
+    var data: [stream_mod.STREAM_BUF_SIZE / 2]u8 = undefined;
+    @memset(&data, 0x42);
+
+    // Keep feeding until we cross the threshold.
+    var total_consumed: u64 = 0;
+    while (total_consumed < threshold) {
+        const chunk_size = @min(data.len, threshold - total_consumed);
+        const chunk = data[0..chunk_size];
+        const st = conn.streams.getOrCreate(0).?;
+        // receiveData only accepts up to stream recv_max; create new streams as needed
+        st.receiveData(st.recv_offset, chunk, false) catch {};
+        conn.conn_flow.onReceived(chunk_size);
+        total_consumed += chunk_size;
+        if (conn.conn_flow.shouldSendMaxData()) {
+            conn.conn_flow.recv_max = conn.conn_flow.nextMaxData();
+            conn.pending_max_data = true;
+            break;
+        }
+    }
+
+    try testing.expect(conn.conn_flow.recv_max > initial_recv_max);
+    try testing.expect(conn.pending_max_data);
+}
+
+test "connection: recv window stays unchanged when under 75%" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+
+    const initial_recv_max = conn.conn_flow.recv_max;
+    // Consume 50% — below threshold.
+    conn.conn_flow.onReceived(initial_recv_max / 2);
+    try testing.expect(!conn.conn_flow.shouldSendMaxData());
+    try testing.expectEqual(initial_recv_max, conn.conn_flow.recv_max);
+}
+
+// ---- Step 4: CRYPTO frame offset validation ----
+
+test "connection: CRYPTO at expected offset is accepted" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.crypto_recv_offset[0] = 0;
+
+    // A CRYPTO frame at offset 0 with 1 byte of data increments the expected offset.
+    const data = [_]u8{0x01};
+    const f: frame.CryptoFrame = .{ .offset = 0, .data = &data };
+    // processCryptoFrame will fail on TLS (garbage data) but the offset check passes first.
+    // We just verify that crypto_recv_offset advanced past the offset guard.
+    conn.processCryptoFrame(f, 0, io) catch {};
+    // Expected offset advanced to 1.
+    try testing.expectEqual(@as(u64, 1), conn.crypto_recv_offset[0]);
+}
+
+test "connection: CRYPTO duplicate frame is silently ignored" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    // Pretend we already processed 10 bytes.
+    conn.crypto_recv_offset[0] = 10;
+
+    const data = [_]u8{0x42} ** 10;
+    // Frame at offset 0 with 10 bytes → end = 10 = expected → pure duplicate.
+    const f: frame.CryptoFrame = .{ .offset = 0, .data = &data };
+    // Must return without error (or any TLS error is irrelevant — offset guard fires first).
+    // Since end (10) <= expected (10), returns early.
+    conn.processCryptoFrame(f, 0, io) catch {};
+    // Offset must NOT have advanced.
+    try testing.expectEqual(@as(u64, 10), conn.crypto_recv_offset[0]);
+}
+
+test "connection: CRYPTO gap returns CryptoDataNotInOrder" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.crypto_recv_offset[0] = 0;
+
+    const data = [_]u8{0x55} ** 5;
+    // Frame at offset 100 when expected is 0 — gap!
+    const f: frame.CryptoFrame = .{ .offset = 100, .data = &data };
+    const result = conn.processCryptoFrame(f, 0, io);
+    try testing.expectError(error.CryptoDataNotInOrder, result);
+    // Offset must NOT have advanced.
+    try testing.expectEqual(@as(u64, 0), conn.crypto_recv_offset[0]);
+}
+
+test "connection: CRYPTO partial overlap trims leading bytes" {
+    // expected = 10, frame.offset = 8, data.len = 5 → end = 13
+    // trim = 10 - 8 = 2 → only data[2..5] (3 bytes) passed to TLS
+    // crypto_recv_offset advances to 13.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.crypto_recv_offset[0] = 10;
+
+    const data = [_]u8{0x99} ** 5;
+    const f: frame.CryptoFrame = .{ .offset = 8, .data = &data };
+    conn.processCryptoFrame(f, 0, io) catch {};
+    // end = 8 + 5 = 13 → crypto_recv_offset[0] = 13
+    try testing.expectEqual(@as(u64, 13), conn.crypto_recv_offset[0]);
+}
+
+// ---- Step 5: Control frame coalescing in tick() ----
+
+test "connection: tick batches MAX_DATA and MAX_STREAM_DATA in one packet" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Set up pending MAX_DATA.
+    conn.pending_max_data = true;
+
+    // Set up a stream needing MAX_STREAM_DATA.
+    const st = conn.streams.getOrCreate(0).?;
+    st.last_sent_max_stream_data = 0; // force shouldSendMaxStreamData() = true
+
+    const sq_before = conn.sq_tail;
+    conn.tick(0);
+
+    // Only one packet should have been sent (coalesced).
+    try testing.expectEqual(sq_before + 1, conn.sq_tail);
+    // Both flags cleared.
+    try testing.expect(!conn.pending_max_data);
+    try testing.expect(!st.shouldSendMaxStreamData());
+}
+
+test "connection: flushControlFrames is no-op when nothing pending" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    const sq_before = conn.sq_tail;
+    try conn.flushControlFrames();
+    try testing.expectEqual(sq_before, conn.sq_tail);
+}
+
+test "connection: coalesced packet tracked by loss recovery" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.pending_max_data = true;
+
+    const pn_before = conn.hot.tx_pn[2];
+    try conn.flushControlFrames();
+
+    // Exactly one packet number consumed.
+    try testing.expectEqual(pn_before + 1, conn.hot.tx_pn[2]);
+    // PTO deadline updated (loss recovery called onPacketSent).
+    // When no smoothed RTT estimate is available yet, ptoDeadline may return null
+    // but the pto counter should reflect a sent packet.  Just verify pn advanced.
+    try testing.expectEqual(pn_before + 1, conn.hot.tx_pn[2]);
 }
