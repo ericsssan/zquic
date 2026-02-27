@@ -309,10 +309,32 @@ pub const Stream = struct {
         const end = std.math.add(u64, offset, data.len) catch return error.OffsetOverflow;
         if (end > self.recv_max) return error.FlowControlViolation;
 
+        // RFC 9000 §3.3: once the final size is known, data at or beyond it is an error.
+        // Case A: FIN received but not all preceding data yet (fin_recv_offset still set).
+        if (self.fin_recv_offset) |fro| {
+            if (end > fro) return error.FinalSizeError;
+        }
+        // Case B: All data delivered and state transitioned (fin_recv_offset cleared).
+        // In half_closed_remote/closed, recv_offset == the final size.
+        if (self.state == .half_closed_remote or self.state == .closed) {
+            if (end > self.recv_offset) return error.FinalSizeError;
+        }
+
         // Record the final byte offset when FIN is received; defer state transition
         // until recv_offset catches up (handles out-of-order FIN).
         if (fin) {
-            self.fin_recv_offset = end;
+            if (self.fin_recv_offset) |existing| {
+                // RFC 9000 §3.3: final size must not change once established.
+                if (existing != end) return error.FinalSizeError;
+            } else if (self.state == .half_closed_remote or self.state == .closed) {
+                // FIN already processed: retransmitted FIN must match recv_offset (final size).
+                if (end != self.recv_offset) return error.FinalSizeError;
+                // Exact retransmission — fall through to duplicate detection.
+            } else {
+                // If bytes we already received are beyond this FIN, that's also an error.
+                if (self.recv_offset > end) return error.FinalSizeError;
+                self.fin_recv_offset = end;
+            }
         }
 
         // Pure duplicate: all data already received.
@@ -1222,4 +1244,39 @@ test "stream: gap-list saturated rejects data beyond window (no phantom write)" 
     try testing.expectError(error.BufferFull, s.receiveData(3000, "hello", false));
     // Ring buffer must be completely untouched.
     try testing.expectEqual(@as(usize, 0), s.recv_buf.readable());
+}
+
+// ---------------------------------------------------------------------------
+// RFC 9000 §3.3 final-size enforcement tests
+// ---------------------------------------------------------------------------
+
+test "stream: conflicting FIN offsets return FinalSizeError" {
+    // FIN at offset 10 (final_size=10) arrives first, then a second FIN at 20.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.recv_max = 1024;
+    try s.receiveData(0, "hello", true); // FIN → final_size = 5
+    // Second FIN with different final size must be rejected.
+    try testing.expectError(error.FinalSizeError, s.receiveData(0, "hello world", true));
+}
+
+test "stream: duplicate FIN at same offset is silently accepted" {
+    // Retransmitted FIN with the same final offset must not be an error.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.recv_max = 1024;
+    try s.receiveData(0, "hello", true); // FIN → final_size = 5
+    // Exact retransmission: same data, same FIN offset.
+    try s.receiveData(0, "hello", true); // must succeed
+    _ = testing;
+}
+
+test "stream: data beyond established final size returns FinalSizeError" {
+    // FIN received at offset 5 (final_size=5). Later data arrives beyond that.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    s.recv_max = 1024;
+    try s.receiveData(0, "hello", true); // final_size = 5
+    // Data frame ending at offset 7 violates the known final size.
+    try testing.expectError(error.FinalSizeError, s.receiveData(3, "xyz", false));
 }
