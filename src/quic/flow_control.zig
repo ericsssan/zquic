@@ -28,6 +28,11 @@ pub const FlowController = struct {
         return self.send_total + bytes <= self.send_max;
     }
 
+    /// True when receiving `bytes` more bytes would not exceed the receive window.
+    pub fn canReceive(self: *const FlowController, bytes: u64) bool {
+        return self.recv_total + bytes <= self.recv_max;
+    }
+
     /// Record that we sent `bytes`.
     pub fn onSent(self: *FlowController, bytes: u64) void {
         self.send_total += bytes;
@@ -162,6 +167,17 @@ test "flow_control: shouldSendMaxData large-number overflow safety" {
     var fc2 = FlowController.init(max, max);
     fc2.recv_total = max * 3 / 4; // truncated floor: just below 75%
     try testing.expect(!fc2.shouldSendMaxData());
+}
+
+test "flow_control: canReceive respects window" {
+    const testing = std.testing;
+    var fc = FlowController.init(1_000, 500);
+    try testing.expect(fc.canReceive(1000));
+    try testing.expect(!fc.canReceive(1001));
+
+    fc.onReceived(400);
+    try testing.expect(fc.canReceive(600));
+    try testing.expect(!fc.canReceive(601));
 }
 
 test "flow_control: updateSendMax ignores shrink" {

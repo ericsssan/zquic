@@ -233,6 +233,11 @@ pub const Connection = struct {
     peer_max_streams_bidi: u62,
     peer_max_streams_uni: u62,
 
+    // Local stream limits: how many client-initiated streams we allow the peer to open.
+    // Initialized from TransportParams defaults; must match what we advertise in TLS.
+    local_max_streams_bidi: u62,
+    local_max_streams_uni: u62,
+
     // Peer connection ID table (NEW_CONNECTION_ID)
     peer_cid_table: [MAX_PEER_CIDS]PeerCidEntry,
     peer_cid_retire_prior: u62,
@@ -343,6 +348,8 @@ pub const Connection = struct {
             .enc_scratch = undefined,
             .peer_max_streams_bidi = 0,
             .peer_max_streams_uni = 0,
+            .local_max_streams_bidi = 100, // matches TransportParams.default().initial_max_streams_bidi
+            .local_max_streams_uni = 100,  // matches TransportParams.default().initial_max_streams_uni
             .peer_cid_table = [_]PeerCidEntry{.{
                 .cid = .{},
                 .seq = 0,
@@ -913,6 +920,17 @@ pub const Connection = struct {
         if (self.hot.state != .established) return error.ProtocolViolation;
         // Server must only receive client-initiated streams (bit 0 = 0).
         if (f.stream_id & 1 != 0) return error.StreamStateError;
+        // RFC 9000 §4.6: reject streams that exceed the advertised stream limit.
+        const stream_num = f.stream_id >> 2;
+        if ((f.stream_id >> 1) & 1 == 0) {
+            // Client-initiated bidirectional (type bits = 0b00)
+            if (stream_num >= self.local_max_streams_bidi) return error.StreamLimitError;
+        } else {
+            // Client-initiated unidirectional (type bits = 0b10)
+            if (stream_num >= self.local_max_streams_uni) return error.StreamLimitError;
+        }
+        // RFC 9000 §4.1: reject data that would exceed the connection receive window.
+        if (!self.conn_flow.canReceive(@intCast(f.data.len))) return error.FlowControlViolation;
         const st = self.streams.getOrCreate(f.stream_id) orelse return error.TooManyStreams;
         self.conn_flow.onReceived(@intCast(f.data.len));
         // Grow connection receive window when 75% consumed (RFC 9000 §4.2).
@@ -1383,32 +1401,6 @@ pub const Connection = struct {
             .error_code = error_code,
             .final_size = final_size,
         } };
-        fi.count = 1;
-        self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
-        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
-    }
-
-    /// Queue a MAX_DATA frame advertising the current connection receive window.
-    fn queueMaxData(self: *Connection) !void {
-        if (self.app_keys == null) return;
-        const ak = self.app_keys.?;
-
-        const new_max: u62 = @intCast(@min(self.conn_flow.recv_max, std.math.maxInt(u62)));
-        var fpos: usize = 0;
-        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .max_data = new_max });
-
-        const pn = self.hot.tx_pn[2];
-        self.hot.tx_pn[2] += 1;
-
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
-        const ct_len = fpos + 16;
-        if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-        const out_len = hdr_len + ct_len;
-        try self.enqueueSend(self.enc_scratch[0..out_len]);
-
-        var fi = loss_recovery_mod.SentFrameInfo{};
-        fi.frames[0] = .{ .max_data = new_max };
         fi.count = 1;
         self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
@@ -3395,4 +3387,100 @@ test "connection: coalesced packet tracked by loss recovery" {
     // When no smoothed RTT estimate is available yet, ptoDeadline may return null
     // but the pto counter should reflect a sent packet.  Just verify pn advanced.
     try testing.expectEqual(pn_before + 1, conn.hot.tx_pn[2]);
+}
+
+// ---------------------------------------------------------------------------
+// RFC enforcement tests: flow control and stream limits
+// ---------------------------------------------------------------------------
+
+test "connection: STREAM data within connection recv window is accepted" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+
+    var buf: [64]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = "hello",
+    } });
+    // Should succeed: 5 bytes is well within the 1 MiB default window.
+    try conn.processFrames(buf[0..n], 2, null);
+    try testing.expectEqual(@as(u64, 5), conn.conn_flow.recv_total);
+}
+
+test "connection: STREAM data exceeding connection recv window returns FlowControlViolation" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    // Artificially shrink the connection receive window to 4 bytes.
+    conn.conn_flow.recv_max = 4;
+
+    var buf: [64]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = "hello", // 5 bytes > window of 4
+    } });
+    try testing.expectError(error.FlowControlViolation, conn.processFrames(buf[0..n], 2, null));
+    // recv_total must not have been incremented.
+    try testing.expectEqual(@as(u64, 0), conn.conn_flow.recv_total);
+}
+
+test "connection: STREAM on bidirectional stream within local_max_streams_bidi is accepted" {
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+
+    // Stream 0 is client-initiated bidi stream #0 — always within any sane limit.
+    var buf: [64]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0, // stream #0 bidi
+        .offset = 0,
+        .fin = false,
+        .data = "ok",
+    } });
+    try conn.processFrames(buf[0..n], 2, null);
+}
+
+test "connection: STREAM on bidirectional stream exceeding local_max_streams_bidi returns StreamLimitError" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    // Lower the limit to 2 bidirectional streams.
+    conn.local_max_streams_bidi = 2;
+
+    // Stream #2 (stream_id = 8) is the third bidi stream — exceeds limit of 2.
+    var buf: [64]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 8, // stream_num = 8>>2 = 2 >= local_max_streams_bidi (2)
+        .offset = 0,
+        .fin = false,
+        .data = "bad",
+    } });
+    try testing.expectError(error.StreamLimitError, conn.processFrames(buf[0..n], 2, null));
+}
+
+test "connection: STREAM on unidirectional stream exceeding local_max_streams_uni returns StreamLimitError" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    // Lower the limit to 1 unidirectional stream.
+    conn.local_max_streams_uni = 1;
+
+    // Stream #1 uni (stream_id = 6, bits = 0b10) — stream_num = 1 >= limit (1).
+    var buf: [64]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 6, // stream_num = 6>>2 = 1 >= local_max_streams_uni (1)
+        .offset = 0,
+        .fin = false,
+        .data = "bad",
+    } });
+    try testing.expectError(error.StreamLimitError, conn.processFrames(buf[0..n], 2, null));
 }
