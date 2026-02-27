@@ -708,11 +708,25 @@ pub const Connection = struct {
                 self.rotateKeys(); // promote next → current, derive new next
             } else {
                 // Fallback: current keys (handles reordering during transition).
-                crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch return data.len;
+                crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
+                    // RFC 9000 §10.3: decryption failure → check for stateless reset.
+                    if (self.checkStatelessReset(data)) {
+                        self.hot.state = .closed;
+                        self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                    }
+                    return data.len;
+                };
             }
         } else {
             // Same phase: use current keys; clear pending flag (peer ACKed our update).
-            crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch return data.len;
+            crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
+                // RFC 9000 §10.3: decryption failure → check for stateless reset.
+                if (self.checkStatelessReset(data)) {
+                    self.hot.state = .closed;
+                    self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                }
+                return data.len;
+            };
             self.key_update_pending = false;
         }
 
@@ -722,6 +736,21 @@ pub const Connection = struct {
         self.pkts_recv += 1;
         self.processFrames(plaintext[0..pt_len], 2, null) catch {};
         return data.len;
+    }
+
+    /// RFC 9000 §10.3: check if the last 16 bytes of a received packet match any
+    /// known peer stateless reset token.  Called after decryption failure to detect
+    /// an incoming stateless reset.  Returns true if the connection should close.
+    fn checkStatelessReset(self: *Connection, raw_packet: []const u8) bool {
+        // RFC 9000 §10.3: a stateless reset is at least 21 bytes
+        // (1 fixed-bit header + 4 bytes min body + 16-byte token).
+        if (raw_packet.len < 21) return false;
+        const token = raw_packet[raw_packet.len - 16 ..][0..16];
+        for (&self.peer_cid_table) |*entry| {
+            if (!entry.valid) continue;
+            if (std.crypto.timing_safe.eql([16]u8, entry.reset_token, token.*)) return true;
+        }
+        return false;
     }
 
     /// Returns true when `f` is permitted inside a packet in the given epoch.
@@ -1085,6 +1114,11 @@ pub const Connection = struct {
         // Use monotonic head/tail subtraction (not modular comparison) to correctly
         // detect full queue regardless of wrap-around.
         if (self.sq_tail - self.sq_head >= SEND_QUEUE_DEPTH) return error.SendQueueFull;
+
+        // RFC 9000 §10.1.2: restart idle timer when sending a packet.
+        if (self.idle_timeout_i64 > 0) {
+            self.idle_deadline_ns = self.current_time_ns +| self.idle_timeout_i64;
+        }
 
         // Amplification limit: must not send more than 3× received before path
         // validation.  Only enforced once we have received at least one datagram
@@ -3518,4 +3552,73 @@ test "connection: conn_flow.recv_total not charged when stream receiveData fails
     conn.processFrames(buf[0..n], 2, null) catch {};
     // recv_total must not have grown beyond what was committed by the accepted frame.
     try testing.expectEqual(recv_total_after_fin, conn.conn_flow.recv_total);
+}
+
+// ---------------------------------------------------------------------------
+// Idle timeout + stateless reset tests
+// ---------------------------------------------------------------------------
+
+test "connection: enqueueSend refreshes idle deadline" {
+    // RFC 9000 §10.1.2: idle timer must restart when a packet is sent.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000; // 1s
+    conn.idle_timeout_i64 = 30_000_000_000; // 30s
+    conn.idle_deadline_ns = 1; // stale deadline from before
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.queuePing() catch {};
+
+    // enqueueSend should have refreshed the deadline to current_time_ns + idle_timeout_i64.
+    try testing.expectEqual(@as(?i64, 31_000_000_000), conn.idle_deadline_ns);
+}
+
+test "connection: stateless reset closes connection when token matches" {
+    // RFC 9000 §10.3: receiving a packet whose last 16 bytes match a known peer
+    // reset token must silently close the connection.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Install a known reset token in the peer CID table.
+    const token = [_]u8{0xde} ** 16;
+    conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
+
+    // Build a minimal fake "packet" of ≥21 bytes whose last 16 bytes are the token.
+    var fake_pkt: [32]u8 = undefined;
+    @memset(&fake_pkt, 0x42);
+    @memcpy(fake_pkt[16..32], &token);
+
+    // checkStatelessReset must match.
+    try testing.expect(conn.checkStatelessReset(&fake_pkt));
+}
+
+test "connection: stateless reset ignores short packet" {
+    // Packets shorter than 21 bytes cannot be stateless resets (RFC 9000 §10.3).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const token = [_]u8{0xab} ** 16;
+    conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
+
+    var short_pkt: [20]u8 = undefined;
+    @memset(&short_pkt, 0);
+    @memcpy(short_pkt[4..20], &token);
+    try testing.expect(!conn.checkStatelessReset(&short_pkt));
+}
+
+test "connection: stateless reset ignores non-matching token" {
+    // A packet whose last 16 bytes do NOT match any stored token must not close.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const token = [_]u8{0xcd} ** 16;
+    conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
+
+    var pkt: [32]u8 = undefined;
+    @memset(&pkt, 0x00); // last 16 bytes are 0x00, not 0xcd
+    try testing.expect(!conn.checkStatelessReset(&pkt));
 }
