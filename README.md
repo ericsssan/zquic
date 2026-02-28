@@ -105,8 +105,6 @@ pub const ConnectionHot = struct {
 - 0-RTT session resumption — low-latency reconnects
 
 ### Later
-- io_uring backend + GSO/GRO — I/O performance for production deployments
-- SIMD/AES-NI optimizations — extreme throughput
 - Security audit — comprehensive crypto/timing/input validation review
 
 ## Test Coverage
