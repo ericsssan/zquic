@@ -122,7 +122,7 @@ pub const Cubic = struct {
         if (target_bytes > self.cwnd) {
             // Accumulate fractional growth to prevent integer division from stalling
             // when (target - cwnd) * MSS < cwnd. The remainder carries across ACKs.
-            self.cwnd_remainder += (target_bytes - self.cwnd) * MSS;
+            self.cwnd_remainder +|= (target_bytes - self.cwnd) *| MSS;
             const inc = self.cwnd_remainder / self.cwnd;
             self.cwnd_remainder %= self.cwnd;
             self.cwnd += inc;
@@ -225,10 +225,9 @@ test "cubic: w_est accumulates across ACKs in CUBIC phase" {
     const testing = std.testing;
     var c = Cubic.init();
     c.cwnd = 50 * MSS;
-    c.onPacketLost(0); // enter CUBIC phase
-    const w_est_after_loss = c.w_est; // reset to cwnd at loss
+    c.onPacketLost(0);
+    const w_est_after_loss = c.w_est;
 
-    // w_est should grow with each ACK
     c.onAckReceived(MSS, 50_000_000, 100_000_000);
     try testing.expect(c.w_est > w_est_after_loss);
 }
@@ -237,19 +236,14 @@ test "cubic: non-monotonic clock (negative t_ns) is a no-op" {
     const testing = std.testing;
     var c = Cubic.init();
     c.cwnd = 50 * MSS;
-    c.onPacketLost(1_000_000_000); // epoch_start_ns = 1s
+    c.onPacketLost(1_000_000_000);
     const cwnd_before = c.cwnd;
 
-    // Call with now_ns < epoch_start_ns (clock went backward)
-    c.onAckReceived(MSS, 50_000_000, 500_000_000); // 500ms < 1000ms
-    // cwnd must not change (early return due to negative t_ns)
+    c.onAckReceived(MSS, 50_000_000, 500_000_000);
     try testing.expectEqual(cwnd_before, c.cwnd);
 }
 
 test "cubic: cubicWindow formula W_cubic(t)=C*(t-K)^3+W_max" {
-    // cubicWindow(t, k, w_max) = C*(t-k)^3 + w_max
-    // With C=0.4, t=2.0, k=1.0, w_max=10.0:
-    //   W_cubic = 0.4 * (2-1)^3 + 10 = 0.4 * 1 + 10 = 10.4
     const result = cubicWindow(2.0, 1.0, 10.0);
     const expected: f64 = C * (2.0 - 1.0) * (2.0 - 1.0) * (2.0 - 1.0) + 10.0;
     try std.testing.expectApproxEqAbs(expected, result, 1e-9);
@@ -269,15 +263,11 @@ test "cubic: single loss event reduces cwnd by exactly BETA_CUBIC" {
 }
 
 test "cubic: large window growth does not stall" {
-    // With cwnd=100*MSS, verify the remainder accumulator produces correct growth
-    // over 100 ACK events. Old code with forced @max(inc,1) could produce wrong
-    // increments; the accumulator follows the CUBIC formula faithfully.
+    // Regression: cwnd_remainder accumulator must produce growth over many ACKs.
     const testing = std.testing;
     var c = Cubic.init();
-    c.cwnd = 100 * MSS; // 120000 bytes
-    c.ssthresh = 0;     // force congestion avoidance (cwnd always >= ssthresh=0)
-    // Manually start CUBIC epoch so w_cubic is predictable.
-    // With w_max=cwnd=120000, k=0: w_cubic(t) = 0.4*t^3 + 120000.
+    c.cwnd = 100 * MSS;
+    c.ssthresh = 0;
     c.epoch_start_ns = 0;
     c.cwnd_at_epoch = @as(f64, @floatFromInt(c.cwnd));
     c.w_max = @as(f64, @floatFromInt(c.cwnd));
@@ -287,11 +277,8 @@ test "cubic: large window growth does not stall" {
     const initial = c.cwnd;
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
-        // All ACKs at t=10s: w_cubic = 0.4*1000 + 120000 = 120400.
-        // target-cwnd ≈ 400, inc ≈ 4 bytes per ACK (well above 1).
         c.onAckReceived(MSS, 100_000_000, 10_000_000_000);
     }
-    // Over 100 ACKs the accumulator should yield total growth >> 100 bytes.
     try testing.expect(c.cwnd > initial + 100);
 }
 
@@ -323,4 +310,23 @@ test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {
     try testing.expectEqual(@as(u64, 8400), c.cwnd);
     try testing.expectEqual(c.cwnd, c.ssthresh);
     try testing.expectEqual(@as(f64, 12000.0), c.w_max);
+}
+
+test "cubic: cwnd_remainder uses saturating arithmetic on extreme target" {
+    // Regression: (target - cwnd) * MSS can overflow u64 for pathological targets.
+    // Force extreme values: t=400,000s → cubicWindow ≈ 2.56e16, overflow without *|
+    const testing = std.testing;
+    var c = Cubic.init();
+    c.ssthresh = MSS;
+    c.cwnd = MSS;
+    c.w_max = 1.0;
+    c.w_est = 0.0;
+    c.k = 0.0;
+    c.epoch_start_ns = 0;
+    c.cwnd_at_epoch = @floatFromInt(c.cwnd);
+
+    c.onAckReceived(1, 10_000_000, 400_000 * 1_000_000_000);
+
+    try testing.expect(c.cwnd >= MSS);
+    try testing.expect(c.cwnd > MSS);
 }

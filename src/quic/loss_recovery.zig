@@ -631,16 +631,12 @@ test "pto: deadline is clamped at 2^20 backoff" {
 }
 
 test "rtt: ack_delay exceeding sample_ns does not underflow adjusted_rtt" {
-    // If ack_delay > sample_ns, the guard `adjusted_rtt >= delay` prevents underflow.
-    // Result: adjusted_rtt stays at sample_ns (50ns), smoothed_rtt converges safely.
     const testing = std.testing;
     var rtt = RttEstimator{};
-    rtt.update(100_000_000, 0, 25_000_000); // first sample: 100ms
-    // Now min_rtt=100ms, sample=50ms < min_rtt: no delay adjustment attempted.
-    // The `sample_ns > self.min_rtt` guard is false → adjusted_rtt = sample_ns = 50ms
-    rtt.update(50_000_000, 200_000_000, 25_000_000); // ack_delay=200ms >> sample=50ms
-    try testing.expect(rtt.smoothed_rtt > 0); // must not crash or produce 0
-    try testing.expect(rtt.min_rtt <= 50_000_000); // min_rtt updated to new low
+    rtt.update(100_000_000, 0, 25_000_000);
+    rtt.update(50_000_000, 200_000_000, 25_000_000);
+    try testing.expect(rtt.smoothed_rtt > 0);
+    try testing.expect(rtt.min_rtt <= 50_000_000);
 }
 
 test "loss_recovery: onAckReceived with empty ranges slice is safe" {
@@ -962,30 +958,21 @@ test "valid_per_epoch: detectLoss decrements on loss" {
 // ---------------------------------------------------------------------------
 
 test "persistent_congestion: loss span > 3xPTO sets flag" {
-    // ptoBase with default RTT (K_INITIAL_RTT_NS=333ms, rtt_var=166.5ms, max_ack_delay=25ms):
-    //   var_term = max(4*166.5M, 1M) = 666M
-    //   ptoBase  = 333M + 666M + 25M = 1_024_000_000 ns
-    //   3×PTO    = 3_072_000_000 ns
-    // Send pn=1 at t=0, pn=2..4 at t=0, pn=5 at t=3_200_000_000.
-    // ACK pn=8 (not in table) → loss threshold triggers for pn=1..4 (1+3<=5 actually...).
-    // Use largest_acked=8 to trigger pkt-threshold loss on pn=1..5 (1+3<=8, 5+3<=8).
+    // Send pn=1..4 at t=0, pn=5 at t=3.2s (> 3×PTO with default RTT).
+    // ACK pn=8 → pn=1..5 are lost with span = 3.2s > 3×PTO.
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    // Send pn=1..4 at sent_ns=0 and pn=5 at sent_ns=3_200_000_000 (> 3×PTO)
     lr.onPacketSent(1, 0, 1200, true, 0, .{});
     lr.onPacketSent(2, 0, 1200, true, 0, .{});
     lr.onPacketSent(3, 0, 1200, true, 0, .{});
     lr.onPacketSent(4, 0, 1200, true, 0, .{});
     lr.onPacketSent(5, 0, 1200, true, 3_200_000_000, .{});
-    lr.onPacketSent(8, 0, 1200, true, 3_200_000_000, .{}); // this gets acked
+    lr.onPacketSent(8, 0, 1200, true, 3_200_000_000, .{});
 
-    // ACK pn=8: pn 1..5 are lost (1+3<=8 through 5+3=8<=8)
     const ranges = [_]AckedRange{.{ .low = 8, .high = 8 }};
     const result = lr.onAckReceived(8, 0, &ranges, 0, 3_200_000_000, 25_000_000);
 
-    // earliest_lost_sent_ns=0, latest_lost_sent_ns=3_200_000_000 (pn=5)
-    // span=3_200_000_000 > 3_072_000_000 = 3×PTO → persistent congestion
     try testing.expect(result.persistent_congestion);
     try testing.expect(result.newly_lost >= 5);
 }

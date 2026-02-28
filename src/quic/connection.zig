@@ -278,6 +278,21 @@ pub const Connection = struct {
     /// True when the peer transport parameters include disable_active_migration.
     peer_disable_migration: bool,
 
+    // Path MTU Discovery (RFC 9000 §14) -----------------------------------------
+
+    /// Current discovered path MTU (bytes). Starts at QUIC minimum (1200).
+    /// Increased when probes are successfully ACKed, decreased on loss.
+    path_mtu: u16 = 1200,
+    /// In-flight PMTUD probe state (null if no probe active).
+    pmtud_probing: ?struct {
+        target_size: u16,    // size we're probing
+        packet_number: u64,  // packet number of the probe
+        epoch: u2,           // encryption epoch (0=Initial, 1=Handshake, 2=1-RTT)
+        sent_ns: i64,        // when we sent the probe
+    } = null,
+    /// Deadline for the next PMTUD probe (nanoseconds). Initially 0 (inactive).
+    pmtud_next_probe_ns: i64 = 0,
+
     // Pending retransmit flags
     pending_handshake_done: bool,
     pending_max_data: bool,
@@ -354,8 +369,8 @@ pub const Connection = struct {
             .enc_scratch = undefined,
             .peer_max_streams_bidi = 0,
             .peer_max_streams_uni = 0,
-            .local_max_streams_bidi = 100, // matches TransportParams.default().initial_max_streams_bidi
-            .local_max_streams_uni = 100,  // matches TransportParams.default().initial_max_streams_uni
+            .local_max_streams_bidi = stream_mod.MAX_STREAMS / 2, // 32 bidi + 32 uni = 64 = MAX_STREAMS
+            .local_max_streams_uni = stream_mod.MAX_STREAMS / 2,
             .peer_max_stream_data_bidi_local = flow_control.DEFAULT_MAX_STREAM_DATA,
             .peer_cid_table = [_]PeerCidEntry{.{
                 .cid = .{},
@@ -496,6 +511,32 @@ pub const Connection = struct {
                     self.loss.onPtoFired();
                     self.queuePing() catch {};
                     self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                }
+            }
+        }
+
+        // PMTUD: periodically probe for larger MTU (RFC 9000 §14).
+        // Start probing after handshake completes; probe every 10 seconds.
+        if (self.hot.state == .established and self.app_keys != null) {
+            if (self.pmtud_probing == null and now_ns >= self.pmtud_next_probe_ns) {
+                const next_size = self.getNextPmtudSize();
+                if (next_size > self.path_mtu) {
+                    if (self.queuePmtudProbe(next_size)) {
+                        self.pmtud_next_probe_ns = now_ns + 10_000_000_000;
+                    } else |err| {
+                        if (err == error.PacketTooLarge) {
+                            self.path_mtu = (1200 + next_size) / 2;
+                        }
+                        self.pmtud_next_probe_ns = now_ns + 1_000_000_000;
+                    }
+                }
+            }
+            if (self.pmtud_probing) |probe| {
+                const pto_ns = self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns);
+                if (now_ns - probe.sent_ns > 3 * pto_ns) {
+                    self.path_mtu = (1200 + probe.target_size) / 2;
+                    self.pmtud_probing = null;
+                    self.pmtud_next_probe_ns = now_ns + 1_000_000_000;
                 }
             }
         }
@@ -801,7 +842,9 @@ pub const Connection = struct {
                 .max_data => |v| self.conn_flow.updateSendMax(v),
                 .max_stream_data => |f| {
                     if (self.streams.get(f.stream_id)) |st| {
-                        st.send_max = @intCast(f.max_data);
+                        // RFC 9000 §4.2: flow control limits are monotonically increasing.
+                        const new_max: u64 = f.max_data;
+                        if (new_max > st.send_max) st.send_max = new_max;
                     }
                 },
                 .handshake_done => {
@@ -828,7 +871,17 @@ pub const Connection = struct {
                 },
                 .reset_stream => |rs| {
                     if (self.streams.get(rs.stream_id)) |st| {
+                        const prev_recv = st.recv_offset;
                         st.onResetReceived(rs.error_code, rs.final_size) catch {};
+                        // RFC 9000 §4.5: bytes promised by the sender (up to final_size)
+                        // must be charged against the connection-level flow control window
+                        // even if they were never received.  Bytes already received via
+                        // STREAM frames were charged in processStreamFrame; only the gap
+                        // between what we received and the stream's final_size is new.
+                        const final: u64 = rs.final_size;
+                        if (final > prev_recv) {
+                            self.conn_flow.onReceived(final - prev_recv);
+                        }
                     }
                     self.events.push(.{ .stream_reset = .{
                         .stream_id = rs.stream_id,
@@ -1029,6 +1082,20 @@ pub const Connection = struct {
             self.current_time_ns,
             max_ack_delay_ns,
         );
+
+        // PMTUD: detect if a probe was successfully ACKed.
+        // Loss detection relies on 3×PTO timeout in tick(), which is safer than inferring from largest_acked.
+        if (self.pmtud_probing) |probe| {
+            for (ranges_buf[0..range_count]) |range| {
+                if (probe.packet_number >= range.low and probe.packet_number <= range.high) {
+                    // Probe was ACKed! Increase path_mtu for next probe.
+                    self.path_mtu = probe.target_size;
+                    self.pmtud_probing = null;
+                    self.pmtud_next_probe_ns = self.current_time_ns + 10_000_000_000; // probe next size in 10s
+                    break;
+                }
+            }
+        }
 
         // Feed acknowledgement data to CUBIC
         if (result.newly_acked > 0) {
@@ -1265,6 +1332,75 @@ pub const Connection = struct {
         }
     }
 
+    /// Queue a PMTUD probe: a PING frame padded to target_size.
+    /// Only works in 1-RTT (post-handshake); pre-handshake probes are not supported.
+    /// Determine the next MTU size to probe. Probes: 1200 → 1500 → 2048 → 4096 → MAX_PACKET_SIZE.
+    fn getNextPmtudSize(self: *const Connection) u16 {
+        return switch (self.path_mtu) {
+            0...1199 => 1200,
+            1200...1499 => 1500,
+            1500...2047 => 2048,
+            2048...4095 => 4096,
+            else => @min(@as(u16, 65535), self.path_mtu *| 2), // exponential growth beyond 4096
+        };
+    }
+
+    fn queuePmtudProbe(self: *Connection, target_size: u16) !void {
+        if (self.app_keys == null) return error.InvalidState; // probes only in 1-RTT
+        if (target_size < 1200 or target_size > 65535) return error.InvalidSize; // invalid size, skip probe
+        if (target_size > MAX_PACKET_SIZE) return error.PacketTooLarge; // probe can't fit in send buffer
+
+        var pos: usize = 0;
+        pos += frame.encodeFrame(self.pkt_scratch[pos..], .ping);
+
+        // Short Header: 1 byte flag + 8 byte CID + 4 byte PN = 13 bytes
+        // Plaintext + 16 (AEAD tag) + 13 (hdr) must equal target_size
+        const short_hdr_len = 13;
+        const max_plaintext = if (target_size > short_hdr_len + 16)
+            target_size - short_hdr_len - 16
+        else
+            @as(usize, 1);
+
+        const padding_needed = if (max_plaintext > pos)
+            max_plaintext - pos
+        else
+            @as(usize, 0);
+
+        if (padding_needed > 0) {
+            pos += frame.encodeFrame(self.pkt_scratch[pos..], .{ .padding = padding_needed });
+        }
+
+        // Encrypt and send
+        const ak = self.app_keys orelse return error.InvalidState;
+        const pn = self.hot.tx_pn[2];
+        self.hot.tx_pn[2] += 1;
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const ct_len = pos + 16;
+
+        // Verify target size is exactly achievable
+        if (hdr_len + ct_len != target_size) {
+            return error.SizeMismatch; // Probe must be exact size to be meaningful
+        }
+
+        crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
+        const out_len = hdr_len + ct_len;
+        try self.enqueueSend(self.enc_scratch[0..out_len]);
+
+        // Track the probe
+        self.pmtud_probing = .{
+            .target_size = target_size,
+            .packet_number = pn,
+            .epoch = 2, // 1-RTT
+            .sent_ns = self.current_time_ns,
+        };
+
+        // Mark as ack-eliciting and track for loss recovery
+        var fi = loss_recovery_mod.SentFrameInfo{};
+        fi.frames[0] = .ping;
+        fi.count = 1;
+        self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
+    }
+
     fn queueHandshakeDone(self: *Connection) !void {
         var pos: usize = 0;
         pos += frame.encodeFrame(self.pkt_scratch[pos..], .handshake_done);
@@ -1463,7 +1599,7 @@ pub const Connection = struct {
     /// Scan all streams for pending_reset and queue a RESET_STREAM frame for each.
     fn flushPendingResets(self: *Connection) !void {
         for (0..stream_mod.MAX_STREAMS) |i| {
-            if (!self.streams.used[i]) continue;
+            if (!self.streams.occupied(i)) continue;
             const st = &self.streams.streams[i];
             if (st.pending_reset) |pr| {
                 st.pending_reset = null;
@@ -1577,7 +1713,7 @@ pub const Connection = struct {
     /// Scan all streams and send MAX_STREAM_DATA frames for any whose recv window grew.
     fn flushPendingMaxStreamData(self: *Connection) void {
         for (0..stream_mod.MAX_STREAMS) |i| {
-            if (!self.streams.used[i]) continue;
+            if (!self.streams.occupied(i)) continue;
             const st = &self.streams.streams[i];
             if (st.shouldSendMaxStreamData()) {
                 const new_max: u62 = @intCast(@min(st.recv_max, std.math.maxInt(u62)));
@@ -1618,7 +1754,7 @@ pub const Connection = struct {
         // 2. Pending MAX_STREAM_DATA frames (not tracked for retransmission;
         //    shouldSendMaxStreamData re-arms on next tick if needed).
         for (0..stream_mod.MAX_STREAMS) |i| {
-            if (!self.streams.used[i]) continue;
+            if (!self.streams.occupied(i)) continue;
             const st = &self.streams.streams[i];
             if (!st.shouldSendMaxStreamData()) continue;
             const new_max: u62 = @intCast(@min(st.recv_max, std.math.maxInt(u62)));
@@ -1656,6 +1792,11 @@ pub const Connection = struct {
     /// derive the new next generation.  Called on peer-initiated key updates
     /// (inside processShortHeaderPacket) and as part of initiateKeyUpdate.
     fn rotateKeys(self: *Connection) void {
+        // Zero the outgoing application keys before replacing them (RFC 9001 §6,
+        // defence-in-depth: previous-epoch key material must not linger in memory).
+        if (self.app_keys) |*old| {
+            std.crypto.secureZero(u8, @as(*volatile [@sizeOf(tls.AppKeys)]u8, @ptrCast(old)));
+        }
         self.app_keys = self.next_app_keys;
         self.current_key_phase = !self.current_key_phase;
         self.key_update_pending = false;
@@ -1877,19 +2018,14 @@ test "connection: send queue full returns SendQueueFull error" {
 }
 
 test "connection: processAck uses packet epoch not connection epoch" {
-    // Verify that processAck is called with the epoch from processFrames,
-    // not self.hot.epoch. We do this by tracking bytes_in_flight:
-    // send a packet in epoch 0 and ACK it via an ACK frame in epoch 0.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
     conn.current_time_ns = 0;
 
-    // Record a sent packet in epoch 0
     conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
 
-    // Build an ACK frame acknowledging pn=1
     const ack = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
@@ -1897,10 +2033,8 @@ test "connection: processAck uses packet epoch not connection epoch" {
         .range_count = 1,
         .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
     };
-    // Call processAck with epoch=0 (the epoch the ACK was received in)
     try conn.processAck(ack, 0);
 
-    // bytes_in_flight must be reduced (ACK was processed with correct epoch)
     try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
 }
 
@@ -2278,9 +2412,6 @@ test "security: processAck malformed gap returns InvalidFrame" {
 }
 
 test "security: VN rate limit suppresses second response within 1s" {
-    // First unknown-version packet at t=0 → VN sent.
-    // Second at t=500ms (< 1s) → no VN.
-    // Third at t=1001ms (≥ 1s) → VN sent again.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
@@ -2292,27 +2423,21 @@ test "security: VN rate limit suppresses second response within 1s" {
     pkt[14] = 8; @memset(pkt[15..23], 0xbb);
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
 
-    // t=0: first packet → VN response queued
     conn.receive(&pkt, src, 0, io) catch {};
     var out: [64]u8 = undefined;
-    try testing.expect(conn.send(&out) > 0); // VN sent
+    try testing.expect(conn.send(&out) > 0);
 
-    // t=500ms: second packet → rate-limited, no VN
     conn.receive(&pkt, src, 500_000_000, io) catch {};
-    try testing.expectEqual(@as(usize, 0), conn.send(&out)); // suppressed
+    try testing.expectEqual(@as(usize, 0), conn.send(&out));
 
-    // t=1001ms: third packet → 1s elapsed, VN allowed again
     conn.receive(&pkt, src, 1_001_000_000, io) catch {};
-    try testing.expect(conn.send(&out) > 0); // VN sent again
+    try testing.expect(conn.send(&out) > 0);
 }
 
 test "event_queue: wraparound maintains FIFO order" {
-    // Push/pop 20 events total (> EVENT_QUEUE_DEPTH=16) in batches so head and
-    // tail wrap around the ring buffer. Verify FIFO order is preserved.
     const testing = std.testing;
     var q = EventQueue{};
 
-    // Fill and drain twice to force head/tail past the buffer boundary.
     var round: usize = 0;
     while (round < 2) : (round += 1) {
         var i: usize = 0;
@@ -2446,8 +2571,6 @@ test "loss: multi-packet loss triggers single congestion event" {
     };
     try conn.processAck(ack, 0);
 
-    // After the fix: cwnd reduced exactly once → floor(120000 × 0.7) = 84000.
-    // If the bug (loop) were present: cwnd ≈ floor(120000 × 0.7^7) ≈ 9897.
     const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(initial_cwnd)) * 0.7);
     try testing.expectEqual(expected, conn.congestion.cwnd);
 }
@@ -3368,9 +3491,6 @@ test "connection: CRYPTO gap returns CryptoDataNotInOrder" {
 }
 
 test "connection: CRYPTO partial overlap trims leading bytes" {
-    // expected = 10, frame.offset = 8, data.len = 5 → end = 13
-    // trim = 10 - 8 = 2 → only data[2..5] (3 bytes) passed to TLS
-    // crypto_recv_offset advances to 13.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
@@ -3379,7 +3499,7 @@ test "connection: CRYPTO partial overlap trims leading bytes" {
     const data = [_]u8{0x99} ** 5;
     const f: frame.CryptoFrame = .{ .offset = 8, .data = &data };
     conn.processCryptoFrame(f, 0, io) catch {};
-    // end = 8 + 5 = 13 → crypto_recv_offset[0] = 13
+
     try testing.expectEqual(@as(u64, 13), conn.crypto_recv_offset[0]);
 }
 
@@ -3693,4 +3813,511 @@ test "connection: new bidi stream send_max not reset on second STREAM frame" {
     try conn.processFrames(buf[0..n], 2, null);
 
     try testing.expectEqual(@as(u64, 256 * 1024), st.send_max);
+}
+
+test "connection: MAX_STREAM_DATA cannot decrease send_max (RFC 9000 §4.2)" {
+    // A peer that sends a MAX_STREAM_DATA with a lower value than previously
+    // advertised must be silently ignored — flow control limits are monotonically
+    // increasing (RFC 9000 §4.2).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.peer_max_stream_data_bidi_local = 64 * 1024;
+
+    // Create stream 0.
+    var buf: [64]u8 = undefined;
+    const n = frame.encodeFrame(&buf, .{ .stream = .{
+        .stream_id = 0, .offset = 0, .fin = false, .data = "hi",
+    } });
+    try conn.processFrames(buf[0..n], 2, null);
+
+    // Raise send_max to 256 KiB.
+    const st = conn.streams.get(0).?;
+    st.send_max = 256 * 1024;
+
+    // Feed MAX_STREAM_DATA with a smaller value (128 KiB).
+    var msd_buf: [32]u8 = undefined;
+    const msd_n = frame.encodeFrame(&msd_buf, .{ .max_stream_data = .{
+        .stream_id = 0,
+        .max_data = 128 * 1024,
+    } });
+    try conn.processFrames(msd_buf[0..msd_n], 2, null);
+
+    // send_max must remain at 256 KiB — the peer cannot decrease our window.
+    try testing.expectEqual(@as(u64, 256 * 1024), st.send_max);
+}
+
+test "connection: RESET_STREAM charges gap bytes to connection flow control (RFC 9000 §4.5)" {
+    // When a RESET_STREAM is received, the gap between bytes already received
+    // and the stream's final_size must be charged to the connection-level
+    // flow control window (RFC 9000 §4.5).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.peer_max_stream_data_bidi_local = stream_mod.STREAM_BUF_SIZE;
+
+    // Create stream 0 and receive 100 bytes (charges 100 to conn_flow.recv_total).
+    const data = [_]u8{'x'} ** 100;
+    var data_buf: [200]u8 = undefined;
+    const dn = frame.encodeFrame(&data_buf, .{ .stream = .{
+        .stream_id = 0, .offset = 0, .fin = false, .data = &data,
+    } });
+    try conn.processFrames(data_buf[0..dn], 2, null);
+    const recv_after_data = conn.conn_flow.recv_total;
+    try testing.expectEqual(@as(u64, 100), recv_after_data);
+
+    // Now receive RESET_STREAM with final_size = 500 (gap = 400 bytes).
+    var rst_buf: [32]u8 = undefined;
+    const rn = frame.encodeFrame(&rst_buf, .{ .reset_stream = .{
+        .stream_id = 0,
+        .error_code = 0,
+        .final_size = 500,
+    } });
+    try conn.processFrames(rst_buf[0..rn], 2, null);
+
+    // The connection flow control must now reflect the full 500 bytes.
+    try testing.expectEqual(@as(u64, 500), conn.conn_flow.recv_total);
+}
+
+// ============================================================================
+// PMTUD (Path MTU Discovery) Regression Tests
+// ============================================================================
+
+test "PMTUD: getNextPmtudSize probe sequence" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Test initial sequence: 1200 → 1500 → 2048 → 4096
+    conn.path_mtu = 1200;
+    try testing.expectEqual(@as(u16, 1500), conn.getNextPmtudSize());
+
+    conn.path_mtu = 1500;
+    try testing.expectEqual(@as(u16, 2048), conn.getNextPmtudSize());
+
+    conn.path_mtu = 2048;
+    try testing.expectEqual(@as(u16, 4096), conn.getNextPmtudSize());
+
+    // Test exponential growth beyond 4096 (the critical fix)
+    conn.path_mtu = 4096;
+    try testing.expectEqual(@as(u16, 8192), conn.getNextPmtudSize());
+
+    conn.path_mtu = 8192;
+    try testing.expectEqual(@as(u16, 16384), conn.getNextPmtudSize());
+
+    // Test saturation at 65535 (max u16)
+    conn.path_mtu = 32768;
+    try testing.expectEqual(@as(u16, 65535), conn.getNextPmtudSize());
+
+    conn.path_mtu = 65535;
+    try testing.expectEqual(@as(u16, 65535), conn.getNextPmtudSize());
+}
+
+test "PMTUD: queuePmtudProbe succeeds when conditions are met" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    // Setup 1-RTT keys (required for probing)
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Attempt to queue a probe at valid size (within MAX_PACKET_SIZE=1350)
+    try conn.queuePmtudProbe(1300);
+
+    // Verify probe is tracked
+    try testing.expect(conn.pmtud_probing != null);
+    try testing.expectEqual(@as(u16, 1300), conn.pmtud_probing.?.target_size);
+    try testing.expectEqual(@as(u64, 0), conn.pmtud_probing.?.packet_number); // first pn
+    try testing.expectEqual(@as(u2, 2), conn.pmtud_probing.?.epoch); // 1-RTT
+    try testing.expectEqual(@as(i64, 1_000_000_000), conn.pmtud_probing.?.sent_ns);
+}
+
+test "PMTUD: queuePmtudProbe rejects invalid sizes" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Reject too-small size (< 1200)
+    try testing.expectError(error.InvalidSize, conn.queuePmtudProbe(1199));
+    try testing.expectError(error.InvalidSize, conn.queuePmtudProbe(0));
+
+    // Verify max valid size within send buffer (1350) is allowed
+    try conn.queuePmtudProbe(1350);
+
+    // Sizes beyond MAX_PACKET_SIZE are rejected
+    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1351));
+}
+
+test "PMTUD: queuePmtudProbe rejects when no 1-RTT keys" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    // No app_keys set
+
+    // Reject because we're not in 1-RTT
+    try testing.expectError(error.InvalidState, conn.queuePmtudProbe(1500));
+}
+
+test "PMTUD: queuePmtudProbe initiates and stores probe info" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Manually initiate a probe at valid size
+    try conn.queuePmtudProbe(1300);
+
+    // Verify probe was started with correct target and timestamp
+    try testing.expect(conn.pmtud_probing != null);
+    try testing.expectEqual(@as(u16, 1300), conn.pmtud_probing.?.target_size);
+    try testing.expectEqual(conn.current_time_ns, conn.pmtud_probing.?.sent_ns);
+}
+
+test "PMTUD: probe timeout detected at 3×PTO without ACK" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1300;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.cached_max_ack_delay_ns = 25_000_000; // 25ms
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Manually initiate probe at valid size
+    try conn.queuePmtudProbe(1300);
+
+    // Calculate PTO (initial RTT is 1 second by default)
+    const pto_ns = conn.loss.rtt.ptoBase(conn.cached_max_ack_delay_ns); // ~1s + margin
+
+    // Fast forward past 3×PTO
+    conn.tick(conn.current_time_ns + @as(i64, @intCast(pto_ns * 3)) + 1_000_000);
+
+    // Verify probe was cleared and MTU backed off via binary search: (1200 + 1300) / 2 = 1250
+    try testing.expectEqual(@as(u16, 1250), conn.path_mtu);
+    try testing.expect(conn.pmtud_probing == null);
+}
+
+test "PMTUD: ACK detection marks probe as successful" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Manually initiate probe at valid size
+    try conn.queuePmtudProbe(1300);
+    const probe_pn = conn.pmtud_probing.?.packet_number;
+
+    // Simulate receiving an ACK that includes the probe packet number
+    var ack_buf: [64]u8 = undefined;
+    const ack_len = frame.encodeFrame(&ack_buf, .{
+        .ack = .{
+            .largest_acked = @intCast(probe_pn),
+            .ack_delay = 0,
+            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+            .range_count = 1,
+            .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        },
+    });
+
+    try conn.processFrames(ack_buf[0..ack_len], 2, null);
+
+    // Verify probe was marked successful and path_mtu updated to probed size
+    try testing.expectEqual(@as(u16, 1300), conn.path_mtu);
+    try testing.expect(conn.pmtud_probing == null);
+}
+
+test "PMTUD: does not backoff on ACK with gap containing probe" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.pmtud_next_probe_ns = 0;
+    conn.cached_max_ack_delay_ns = 25_000_000;
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Initiate probe at valid size
+    try conn.queuePmtudProbe(1300);
+    const probe_pn = conn.pmtud_probing.?.packet_number;
+
+    // Send another packet to have something larger to ACK
+    conn.queuePing() catch {}; // pn = probe_pn + 1
+
+    // ACK packet after probe but not the probe itself (probe is in the gap)
+    var ack_buf: [64]u8 = undefined;
+    const ack_len = frame.encodeFrame(&ack_buf, .{
+        .ack = .{
+            .largest_acked = @intCast(probe_pn + 1),
+            .ack_delay = 0,
+            .ranges = [_]frame.AckRange{.{ .gap = 1, .ack_range = 0 }} ** 32,
+            .range_count = 1,
+            .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        },
+    });
+
+    const initial_mtu = conn.path_mtu;
+    try conn.processFrames(ack_buf[0..ack_len], 2, null);
+
+    // Verify probe is still in flight (not incorrectly marked as lost)
+    // Path MTU should NOT have changed
+    try testing.expectEqual(initial_mtu, conn.path_mtu);
+    try testing.expect(conn.pmtud_probing != null);
+}
+
+
+
+
+test "PMTUD: does not backoff on ACK with unreachable packet" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.pmtud_next_probe_ns = 0;
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Queue a small probe manually
+    try conn.queuePmtudProbe(1300);
+    const probe_pn = conn.pmtud_probing.?.packet_number;
+
+    // ACK a different packet (not the probe)
+    var ack_buf: [64]u8 = undefined;
+    const ack_len = frame.encodeFrame(&ack_buf, .{
+        .ack = .{
+            .largest_acked = @intCast(probe_pn + 5), // ACK packet after probe
+            .ack_delay = 0,
+            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+            .range_count = 1,
+            .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        },
+    });
+
+    const initial_mtu = conn.path_mtu;
+    try conn.processFrames(ack_buf[0..ack_len], 2, null);
+
+    // Probe should still be in flight (no false loss detection)
+    try testing.expect(conn.pmtud_probing != null);
+    try testing.expectEqual(initial_mtu, conn.path_mtu);
+}
+
+test "PMTUD: probe disabled during handshake" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.pmtud_next_probe_ns = 0;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    // No app_keys, not established
+    try testing.expectEqual(.idle, conn.hot.state);
+    try testing.expect(conn.app_keys == null);
+
+    conn.tick(conn.current_time_ns);
+
+    // No probe should be initiated
+    try testing.expect(conn.pmtud_probing == null);
+    try testing.expectEqual(@as(u16, 1200), conn.path_mtu);
+}
+
+test "PMTUD: state machine: probe can only be initiated when none in flight" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.pmtud_next_probe_ns = 0;
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Initiate probe manually
+    try conn.queuePmtudProbe(1300);
+    try testing.expect(conn.pmtud_probing != null);
+    const first_pn = conn.pmtud_probing.?.packet_number;
+
+    // Manually reset deadline; should not initiate new probe while one is in flight
+    conn.pmtud_next_probe_ns = 0;
+    conn.tick(conn.current_time_ns + 1_000_000);
+
+    // Still only same probe in flight
+    try testing.expect(conn.pmtud_probing != null);
+    try testing.expectEqual(first_pn, conn.pmtud_probing.?.packet_number);
+}
+
+test "PMTUD: respects 1-second retry interval after failure" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.cached_max_ack_delay_ns = 25_000_000;
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Initiate and timeout probe manually
+    try conn.queuePmtudProbe(1300);
+    const pto_ns = conn.loss.rtt.ptoBase(conn.cached_max_ack_delay_ns);
+    conn.tick(conn.current_time_ns + @as(i64, @intCast(pto_ns * 3)) + 1_000_000);
+
+    // Should not initiate new probe before 1 second
+    const timeout_time = conn.current_time_ns;
+    conn.tick(timeout_time + 500_000_000); // 0.5s later
+    try testing.expect(conn.pmtud_probing == null);
+    // Deadline should be set to 1s out from timeout_time
+    try testing.expect(conn.pmtud_next_probe_ns >= timeout_time + 1_000_000_000);
+}
+
+test "PMTUD: probe packet is marked ack-eliciting" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    // Queue probe at realistic size (< MAX_PACKET_SIZE)
+    try conn.queuePmtudProbe(1300);
+
+    // Verify it was registered in loss recovery as ack-eliciting
+    // (The onPacketSent call in queuePmtudProbe passes true for ack_eliciting)
+    try testing.expect(conn.pmtud_probing != null);
+    const pn = conn.pmtud_probing.?.packet_number;
+
+    // Look up in loss recovery to verify it was tracked
+    const sent_pkt = conn.loss.sent.get(pn, 2); // epoch 2 = 1-RTT
+    try testing.expect(sent_pkt != null);
+}
+
+test "PMTUD: doesn't probe if already at maximum" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 65535;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.pmtud_next_probe_ns = 0;
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    conn.tick(conn.current_time_ns);
+
+    // No probe should be initiated (next_size == path_mtu)
+    try testing.expect(conn.pmtud_probing == null);
+}
+
+test "PMTUD: backoff on PacketTooLarge error" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.pmtud_next_probe_ns = 0;
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    conn.tick(conn.current_time_ns);
+
+    try testing.expectEqual(@as(u16, 1350), conn.path_mtu);
+    try testing.expect(conn.pmtud_probing == null);
+}
+
+test "PMTUD: converges when probe size exceeds MAX_PACKET_SIZE" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.current_time_ns = 1_000_000_000;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.pmtud_next_probe_ns = 0;
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    for (0..5) |i| {
+        conn.tick(conn.current_time_ns + @as(i64, @intCast(i)) * 1_500_000_000);
+    }
+
+    try testing.expect(conn.path_mtu < 1400);
+}
+
+test "PMTUD: short header padding calculation is correct" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.path_mtu = 1200;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    try conn.queuePmtudProbe(1300);
+    try testing.expectEqual(@as(u16, 1300), conn.pmtud_probing.?.target_size);
+}
+
+test "PMTUD: rejects probe size above MAX_PACKET_SIZE" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+
+    try conn.queuePmtudProbe(1350);
+    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1351));
 }

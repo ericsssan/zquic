@@ -6,7 +6,13 @@
 
 const std = @import("std");
 
-pub const MAX_STREAMS: usize = 4;
+/// Maximum number of concurrent streams per connection.
+/// Must be a power of two (used as hash table capacity).
+/// In production, increase this and heap-allocate Connection via Pool(Connection, N).
+pub const MAX_STREAMS: usize = 64;
+comptime {
+    std.debug.assert(MAX_STREAMS > 0 and (MAX_STREAMS & (MAX_STREAMS - 1)) == 0);
+}
 pub const STREAM_BUF_SIZE: usize = 4096;
 
 pub const StreamState = enum(u8) {
@@ -494,44 +500,99 @@ pub const Stream = struct {
 };
 
 // ---------------------------------------------------------------------------
-// Stream table
+// Stream table — open-addressing hash map, O(1) amortised lookup.
 // ---------------------------------------------------------------------------
 
+const SlotState = enum(u8) { empty, occupied, tombstone };
+
+/// Pre-allocated hash table for concurrent streams on a single connection.
+/// Uses linear probing with tombstone deletion; capacity is MAX_STREAMS.
+/// Hash: id & (MAX_STREAMS - 1) — works well because QUIC stream IDs increment
+/// by 4 (bits 0-1 encode direction/kind), so consecutive IDs map to distinct slots.
+/// No allocator needed: all memory is inline in the Connection struct.
 pub const StreamTable = struct {
     streams: [MAX_STREAMS]Stream = undefined,
-    used: [MAX_STREAMS]bool = [_]bool{false} ** MAX_STREAMS,
+    ids:     [MAX_STREAMS]u62 = undefined,
+    states:  [MAX_STREAMS]SlotState = [_]SlotState{.empty} ** MAX_STREAMS,
+    count:   usize = 0,
 
-    /// Open or retrieve a stream by ID. Returns null if capacity exceeded.
+    /// Return true if slot i holds a live stream.
+    pub fn occupied(self: *const StreamTable, i: usize) bool {
+        return self.states[i] == .occupied;
+    }
+
+    /// Open or retrieve a stream by ID.
+    /// Returns null only when all MAX_STREAMS slots are simultaneously active.
     pub fn getOrCreate(self: *StreamTable, id: u62) ?*Stream {
-        // Single pass: find existing stream OR record first free slot.
-        var empty: ?usize = null;
-        for (0..MAX_STREAMS) |i| {
-            if (self.used[i]) {
-                if (self.streams[i].id == id) return &self.streams[i];
-            } else if (empty == null) {
-                empty = i;
+        if (self.count >= MAX_STREAMS) return null;
+        const mask = MAX_STREAMS - 1;
+        const start: usize = @as(usize, @intCast(id)) & mask;
+        var first_tombstone: ?usize = null;
+        var probe: usize = 0;
+        while (probe < MAX_STREAMS) : (probe += 1) {
+            const i = (start + probe) & mask;
+            switch (self.states[i]) {
+                .occupied => {
+                    if (self.ids[i] == id) return &self.streams[i];
+                },
+                .tombstone => {
+                    if (first_tombstone == null) first_tombstone = i;
+                },
+                .empty => {
+                    // ID not present; insert at first tombstone (recycling) or here.
+                    const slot = first_tombstone orelse i;
+                    self.ids[slot] = id;
+                    self.streams[slot] = Stream.init(id);
+                    self.states[slot] = .occupied;
+                    self.count += 1;
+                    return &self.streams[slot];
+                },
             }
         }
-        const i = empty orelse return null;
-        self.streams[i] = Stream.init(id);
-        self.used[i] = true;
-        return &self.streams[i];
+        // No empty slot — table is tombstone-saturated but count < MAX_STREAMS.
+        if (first_tombstone) |slot| {
+            self.ids[slot] = id;
+            self.streams[slot] = Stream.init(id);
+            self.states[slot] = .occupied;
+            self.count += 1;
+            return &self.streams[slot];
+        }
+        return null;
     }
 
     pub fn get(self: *StreamTable, id: u62) ?*Stream {
-        for (0..MAX_STREAMS) |i| {
-            if (self.used[i] and self.streams[i].id == id) {
-                return &self.streams[i];
+        const mask = MAX_STREAMS - 1;
+        const start: usize = @as(usize, @intCast(id)) & mask;
+        var probe: usize = 0;
+        while (probe < MAX_STREAMS) : (probe += 1) {
+            const i = (start + probe) & mask;
+            switch (self.states[i]) {
+                .occupied => {
+                    if (self.ids[i] == id) return &self.streams[i];
+                },
+                .tombstone => {}, // keep probing
+                .empty => return null, // id cannot be past an empty slot
             }
         }
         return null;
     }
 
     pub fn close(self: *StreamTable, id: u62) void {
-        for (0..MAX_STREAMS) |i| {
-            if (self.used[i] and self.streams[i].id == id) {
-                self.used[i] = false;
-                return;
+        const mask = MAX_STREAMS - 1;
+        const start: usize = @as(usize, @intCast(id)) & mask;
+        var probe: usize = 0;
+        while (probe < MAX_STREAMS) : (probe += 1) {
+            const i = (start + probe) & mask;
+            switch (self.states[i]) {
+                .occupied => {
+                    if (self.ids[i] == id) {
+                        self.states[i] = .tombstone;
+                        self.count -= 1;
+                        return;
+                    }
+                },
+                .tombstone => {}, // keep probing
+                .empty => return, // not found
             }
         }
     }
@@ -855,26 +916,22 @@ test "stream: in-order FIN still works" {
 }
 
 test "ringbuf: two-segment write and read crossing wrap boundary" {
-    // Write 6 bytes to advance wp to 6, read 5 to advance rp to 5.
-    // Then write 4 bytes: splits across the wrap (bytes at [6,7] and [0,1]).
-    // Read all 5 remaining bytes: also crosses the wrap.
     const testing = std.testing;
     var rb: RingBuf(8) = .{};
-    _ = rb.write("abcdef");    // wp=6, rp=0
+    _ = rb.write("abcdef");
     var sink: [5]u8 = undefined;
-    _ = rb.read(&sink);        // rp=5, consumed "abcde"
+    _ = rb.read(&sink);
 
-    const written = rb.write("WXYZ"); // 4 bytes; start=6, first=2, second=2
+    const written = rb.write("WXYZ");
     try testing.expectEqual(@as(usize, 4), written);
 
     var out: [5]u8 = undefined;
-    const n = rb.read(&out);   // readable=5 ("f","W","X","Y","Z")
+    const n = rb.read(&out);
     try testing.expectEqual(@as(usize, 5), n);
     try testing.expectEqualSlices(u8, "fWXYZ", out[0..n]);
 }
 
 test "ringbuf: two-segment peek crossing wrap boundary" {
-    // Same setup as above; peek must not advance rp.
     const testing = std.testing;
     var rb: RingBuf(8) = .{};
     _ = rb.write("abcdef");
@@ -883,7 +940,7 @@ test "ringbuf: two-segment peek crossing wrap boundary" {
     _ = rb.write("WXYZ");
 
     var p1: [3]u8 = undefined;
-    const n1 = rb.peek(0, &p1); // should yield "fWX"
+    const n1 = rb.peek(0, &p1);
     try testing.expectEqual(@as(usize, 3), n1);
     try testing.expectEqualSlices(u8, "fWX", p1[0..n1]);
 
@@ -896,19 +953,58 @@ test "ringbuf: two-segment peek crossing wrap boundary" {
     try testing.expectEqual(@as(usize, 5), rb.readable());
 }
 
-test "stream_table: single-pass getOrCreate uses first empty slot" {
-    // Verify that with holes in the table the first free index is chosen.
+test "stream_table: getOrCreate after close still finds correct stream" {
+    // Verify that a stream closed (tombstone) does not block retrieval of others.
     const testing = std.testing;
     var table: StreamTable = .{};
-    _ = table.getOrCreate(10); // occupies slot 0
-    _ = table.getOrCreate(20); // occupies slot 1
-    _ = table.getOrCreate(30); // occupies slot 2
-    table.close(20);           // frees slot 1
+    _ = table.getOrCreate(10);
+    _ = table.getOrCreate(20);
+    _ = table.getOrCreate(30);
+    table.close(20); // tombstone at 20's slot
 
-    // getOrCreate for a new ID should land in slot 1 (lowest free).
+    // New ID must be created successfully and be retrievable.
     const s = table.getOrCreate(99).?;
     try testing.expectEqual(@as(u62, 99), s.id);
-    try testing.expectEqual(&table.streams[1], s);
+    const s2 = table.get(99).?;
+    try testing.expectEqual(@as(u62, 99), s2.id);
+    // Previous streams still accessible.
+    try testing.expect(table.get(10) != null);
+    try testing.expect(table.get(30) != null);
+    // Closed stream is gone.
+    try testing.expect(table.get(20) == null);
+}
+
+test "stream_table: tombstone slot is recycled on insert" {
+    // Tombstone recycling: inserting an id that hashes to the same bucket as a
+    // tombstone should reuse that tombstone slot rather than a later empty slot.
+    const testing = std.testing;
+    var table: StreamTable = .{};
+    // id=0 and id=64 both hash to slot 0 (0 & 63 == 0, 64 & 63 == 0).
+    _ = table.getOrCreate(0);  // slot 0
+    _ = table.getOrCreate(64); // slot 1 (probe past occupied slot 0)
+    table.close(0);            // slot 0 becomes tombstone; count=1
+    // id=128 also hashes to slot 0: probe 0 (tombstone → record), 1 (id=64≠128), 2 (empty).
+    // Insert at first tombstone (slot 0), not slot 2.
+    const s = table.getOrCreate(128).?;
+    try testing.expectEqual(@as(u62, 128), s.id);
+    try testing.expectEqual(&table.streams[0], s);
+    try testing.expectEqual(@as(usize, 2), table.count);
+}
+
+test "stream_table: reuse after cycling MAX_STREAMS streams" {
+    // Open and close MAX_STREAMS streams one at a time; table must stay usable.
+    var table: StreamTable = .{};
+    var i: u62 = 0;
+    while (i < MAX_STREAMS) : (i += 1) {
+        const s = table.getOrCreate(i * 4).?;
+        _ = s;
+        table.close(i * 4);
+    }
+    try std.testing.expectEqual(@as(usize, 0), table.count);
+    // Table has tombstones but no occupied slots; must accept a new stream.
+    const s = table.getOrCreate(9999).?;
+    try std.testing.expectEqual(@as(u62, 9999), s.id);
+    try std.testing.expectEqual(@as(usize, 1), table.count);
 }
 
 test "stream: receiveData exact-boundary: offset + len == u64 max is not overflow" {
@@ -1026,13 +1122,10 @@ test "ringbuf: writeAt basic" {
 test "ringbuf: writeAt fills gap before existing data" {
     const testing = std.testing;
     var rb: RingBuf(16) = .{};
-    // Write "world" at rel_offset=5 first (out of order).
     const n = rb.writeAt(5, "world");
     try testing.expectEqual(@as(usize, 5), n);
-    // Then fill the gap at rel_offset=0.
     const n2 = rb.writeAt(0, "hello");
     try testing.expectEqual(@as(usize, 5), n2);
-    // Commit all 10 bytes.
     rb.wp += 10;
     var buf: [16]u8 = undefined;
     const r = rb.read(&buf);
@@ -1041,23 +1134,17 @@ test "ringbuf: writeAt fills gap before existing data" {
 }
 
 test "ringbuf: writeAt with wrap" {
-    // Set up ring buffer at wrap point, then writeAt crosses the wrap boundary.
-    // After writing 12 and reading 10: rp=10, wp=12, readable=2 ("ab").
     const testing = std.testing;
     var rb: RingBuf(16) = .{};
-    _ = rb.write("0123456789ab"); // wp=12
+    _ = rb.write("0123456789ab");
     var sink: [10]u8 = undefined;
-    _ = rb.read(&sink); // rp=10; consumed "0123456789"; "ab" at ring[10,11]
-
-    // Out-of-order data "UVWXYZ" at rel=2 from rp — crosses the ring wrap.
-    // Writes to ring positions: (10+2..10+7) & 15 = 12,13,14,15,0,1.
+    _ = rb.read(&sink);
     const n = rb.writeAt(2, "UVWXYZ");
     try testing.expectEqual(@as(usize, 6), n);
-    // "ab" (rel=0,1) was already committed (wp=12); advance wp by 6 only.
-    rb.wp += 6; // wp=18, readable=8
+    rb.wp += 6;
 
     var buf: [10]u8 = undefined;
-    const r = rb.read(&buf); // reads ring[10..17] → "abUVWXYZ"
+    const r = rb.read(&buf);
     try testing.expectEqual(@as(usize, 8), r);
     try testing.expectEqualSlices(u8, "abUVWXYZ", buf[0..r]);
 }
@@ -1065,7 +1152,6 @@ test "ringbuf: writeAt with wrap" {
 test "ringbuf: writeAt beyond cap returns 0" {
     const testing = std.testing;
     var rb: RingBuf(8) = .{};
-    // rel_offset >= cap → returns 0, nothing written.
     const n = rb.writeAt(8, "data");
     try testing.expectEqual(@as(usize, 0), n);
     try testing.expectEqual(@as(usize, 0), rb.readable());
@@ -1092,7 +1178,6 @@ test "gap_list: fill removes gap entirely" {
 test "gap_list: fill trims gap start" {
     const testing = std.testing;
     var gl = GapList.init(0, 100);
-    // fill [0, 40) trims [0, 100) → [40, 100)
     gl.fill(0, 40);
     try testing.expectEqual(@as(usize, 1), gl.count);
     try testing.expectEqual(@as(u64, 40), gl.gaps[0].start);
@@ -1103,19 +1188,16 @@ test "gap_list: fill trims gap start" {
 test "gap_list: fill trims gap end" {
     const testing = std.testing;
     var gl = GapList.init(0, 100);
-    // fill [60, 100) trims [0, 100) → [0, 60)
     gl.fill(60, 40);
     try testing.expectEqual(@as(usize, 1), gl.count);
     try testing.expectEqual(@as(u64, 0), gl.gaps[0].start);
     try testing.expectEqual(@as(u64, 60), gl.gaps[0].end);
-    // Gap starts at base → no progress.
     try testing.expectEqual(@as(u64, 0), gl.contiguousFrom(0));
 }
 
 test "gap_list: fill splits gap" {
     const testing = std.testing;
     var gl = GapList.init(0, 100);
-    // fill [40, 60) splits [0, 100) → [0, 40) and [60, 100)
     gl.fill(40, 20);
     try testing.expectEqual(@as(usize, 2), gl.count);
     try testing.expectEqual(@as(u64, 0), gl.gaps[0].start);
@@ -1128,11 +1210,9 @@ test "gap_list: fill splits gap" {
 test "gap_list: fill overlap across multiple gaps" {
     const testing = std.testing;
     var gl = GapList.init(0, 100);
-    // Build gaps: fill [20,40) splits → [{0,20},{40,100}]; fill [60,80) splits → [{0,20},{40,60},{80,100}]
     gl.fill(20, 20);
     gl.fill(60, 20);
     try testing.expectEqual(@as(usize, 3), gl.count);
-    // Now fill [15, 65): trims [0,20)→[0,15); removes [40,60); leaves [80,100).
     gl.fill(15, 50);
     try testing.expectEqual(@as(usize, 2), gl.count);
     try testing.expectEqual(@as(u64, 0), gl.gaps[0].start);
@@ -1144,15 +1224,10 @@ test "gap_list: fill overlap across multiple gaps" {
 test "gap_list: contiguousFrom advances past filled gaps" {
     const testing = std.testing;
     var gl = GapList.init(0, 100);
-    // Split into gaps [0,30) and [60,100) via fill [30,60).
     gl.fill(30, 30);
-    // Gap at base → no progress.
     try testing.expectEqual(@as(u64, 0), gl.contiguousFrom(0));
-    // Fill [0,30): only [60,100) remains.
     gl.fill(0, 30);
-    // First gap after base=0 starts at 60.
     try testing.expectEqual(@as(u64, 60), gl.contiguousFrom(0));
-    // Fill [60,100): no gaps remain.
     gl.fill(60, 40);
     try testing.expectEqual(@as(u64, 100), gl.contiguousFrom(0));
 }
@@ -1160,17 +1235,15 @@ test "gap_list: contiguousFrom advances past filled gaps" {
 test "gap_list: MAX_GAPS overflow drops tail fragment" {
     const testing = std.testing;
     var gl = GapList.init(0, 1000);
-    // Build MAX_GAPS=8 gaps by alternating filled/missing 50-byte segments.
-    gl.fill(0, 50);   // [{50,1000}]
-    gl.fill(100, 50); // [{50,100},{150,1000}]
-    gl.fill(200, 50); // 3 gaps
-    gl.fill(300, 50); // 4 gaps
-    gl.fill(400, 50); // 5 gaps
-    gl.fill(500, 50); // 6 gaps
-    gl.fill(600, 50); // 7 gaps
-    gl.fill(700, 50); // 8 gaps = MAX_GAPS; last gap is [{750,1000}]
+    gl.fill(0, 50);
+    gl.fill(100, 50);
+    gl.fill(200, 50);
+    gl.fill(300, 50);
+    gl.fill(400, 50);
+    gl.fill(500, 50);
+    gl.fill(600, 50);
+    gl.fill(700, 50);
     try testing.expectEqual(MAX_GAPS, gl.count);
-    // Splitting [{750,1000}] at [800,850) would exceed MAX_GAPS → drop trailing fragment.
     // Gap end is trimmed to fstart=800 instead of splitting.
     gl.fill(800, 50);
     try testing.expectEqual(MAX_GAPS, gl.count); // still 8, no overflow
@@ -1180,9 +1253,7 @@ test "gap_list: MAX_GAPS overflow drops tail fragment" {
 test "stream: overlapping segments are harmless" {
     const testing = std.testing;
     var s = Stream.init(0);
-    // Receive [0, 5) first.
     try s.receiveData(0, "hello", false);
-    // Receive [3, 8): bytes [3,5) overlap, bytes [5,8) are new.
     try s.receiveData(3, "loXYZ", false);
     var buf: [16]u8 = undefined;
     const n = s.read(&buf);
@@ -1206,14 +1277,11 @@ test "stream: FIN with out-of-order data defers transition" {
     const testing = std.testing;
     var s = Stream.init(0);
     s.recv_max = 1024;
-    // FIN with future data: bytes [10,15), fin_recv_offset=15.
     try s.receiveData(10, "final", true);
-    // Gap [0,10) prevents recv_offset from advancing.
     try testing.expectEqual(StreamState.open, s.state);
     try testing.expectEqual(@as(u64, 0), s.recv_offset);
-    // Fill the gap: [0,15) is now fully contiguous.
+
     try s.receiveData(0, "0123456789", false);
-    // recv_offset reaches 15 = fin_recv_offset → state transitions.
     try testing.expectEqual(StreamState.half_closed_remote, s.state);
     try testing.expectEqual(@as(u64, 15), s.recv_offset);
 }
