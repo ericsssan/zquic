@@ -69,7 +69,7 @@ pub fn RingBuf(comptime cap: usize) type {
             const first = @min(n, cap - start);
             @memcpy(self.buf[start..][0..first], data[0..first]);
             if (n > first) {
-                @memcpy(self.buf[0..n - first], data[first..n]);
+                @memcpy(self.buf[0 .. n - first], data[first..n]);
             }
             self.wp += n;
             return n;
@@ -82,7 +82,7 @@ pub fn RingBuf(comptime cap: usize) type {
             const first = @min(n, cap - start);
             @memcpy(out[0..first], self.buf[start..][0..first]);
             if (n > first) {
-                @memcpy(out[first..n], self.buf[0..n - first]);
+                @memcpy(out[first..n], self.buf[0 .. n - first]);
             }
             self.rp += n;
             return n;
@@ -100,7 +100,7 @@ pub fn RingBuf(comptime cap: usize) type {
             const start = (self.rp + rel_offset) & (cap - 1);
             const first = @min(n, cap - start);
             @memcpy(self.buf[start..][0..first], data[0..first]);
-            if (n > first) @memcpy(self.buf[0..n - first], data[first..n]);
+            if (n > first) @memcpy(self.buf[0 .. n - first], data[first..n]);
             return n;
         }
 
@@ -114,7 +114,7 @@ pub fn RingBuf(comptime cap: usize) type {
             const first = @min(n, cap - start);
             @memcpy(out[0..first], self.buf[start..][0..first]);
             if (n > first) {
-                @memcpy(out[first..n], self.buf[0..n - first]);
+                @memcpy(out[first..n], self.buf[0 .. n - first]);
             }
             return n;
         }
@@ -512,9 +512,9 @@ const SlotState = enum(u8) { empty, occupied, tombstone };
 /// No allocator needed: all memory is inline in the Connection struct.
 pub const StreamTable = struct {
     streams: [MAX_STREAMS]Stream = undefined,
-    ids:     [MAX_STREAMS]u62 = undefined,
-    states:  [MAX_STREAMS]SlotState = [_]SlotState{.empty} ** MAX_STREAMS,
-    count:   usize = 0,
+    ids: [MAX_STREAMS]u62 = undefined,
+    states: [MAX_STREAMS]SlotState = [_]SlotState{.empty} ** MAX_STREAMS,
+    count: usize = 0,
 
     /// Return true if slot i holds a live stream.
     pub fn occupied(self: *const StreamTable, i: usize) bool {
@@ -652,13 +652,13 @@ test "stream: streamDir and streamKind decode ID bits" {
     const testing = std.testing;
     // ID bit 0: 0=client, 1=server.  Bit 1: 0=bidi, 1=uni.
     try testing.expectEqual(StreamDir.client_initiated, streamDir(0)); // 0b00
-    try testing.expectEqual(StreamKind.bidirectional,   streamKind(0));
+    try testing.expectEqual(StreamKind.bidirectional, streamKind(0));
     try testing.expectEqual(StreamDir.server_initiated, streamDir(1)); // 0b01
-    try testing.expectEqual(StreamKind.bidirectional,   streamKind(1));
+    try testing.expectEqual(StreamKind.bidirectional, streamKind(1));
     try testing.expectEqual(StreamDir.client_initiated, streamDir(2)); // 0b10
-    try testing.expectEqual(StreamKind.unidirectional,  streamKind(2));
+    try testing.expectEqual(StreamKind.unidirectional, streamKind(2));
     try testing.expectEqual(StreamDir.server_initiated, streamDir(3)); // 0b11
-    try testing.expectEqual(StreamKind.unidirectional,  streamKind(3));
+    try testing.expectEqual(StreamKind.unidirectional, streamKind(3));
 }
 
 test "stream: onSent advances send_offset" {
@@ -980,9 +980,9 @@ test "stream_table: tombstone slot is recycled on insert" {
     const testing = std.testing;
     var table: StreamTable = .{};
     // id=0 and id=64 both hash to slot 0 (0 & 63 == 0, 64 & 63 == 0).
-    _ = table.getOrCreate(0);  // slot 0
+    _ = table.getOrCreate(0); // slot 0
     _ = table.getOrCreate(64); // slot 1 (probe past occupied slot 0)
-    table.close(0);            // slot 0 becomes tombstone; count=1
+    table.close(0); // slot 0 becomes tombstone; count=1
     // id=128 also hashes to slot 0: probe 0 (tombstone → record), 1 (id=64≠128), 2 (empty).
     // Insert at first tombstone (slot 0), not slot 2.
     const s = table.getOrCreate(128).?;
@@ -1302,7 +1302,7 @@ test "stream: gap-list saturated rejects data beyond window (no phantom write)" 
     for (0..MAX_GAPS) |i| {
         s.gap_list.gaps[i] = .{
             .start = @as(u64, i) * 128,
-            .end   = @as(u64, i) * 128 + 64,
+            .end = @as(u64, i) * 128 + 64,
         };
     }
     s.gap_list.window_end = 1000;
@@ -1330,13 +1330,11 @@ test "stream: conflicting FIN offsets return FinalSizeError" {
 
 test "stream: duplicate FIN at same offset is silently accepted" {
     // Retransmitted FIN with the same final offset must not be an error.
-    const testing = std.testing;
     var s = Stream.init(0);
     s.recv_max = 1024;
     try s.receiveData(0, "hello", true); // FIN → final_size = 5
     // Exact retransmission: same data, same FIN offset.
     try s.receiveData(0, "hello", true); // must succeed
-    _ = testing;
 }
 
 test "stream: data beyond established final size returns FinalSizeError" {

@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // Public module: consumers import this as @import("zquic")
-    _ = b.addModule("zquic", .{
+    const zquic_mod = b.addModule("zquic", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -21,6 +21,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(lib);
+
+    // Interop server
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("tools/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_mod.addImport("zquic", zquic_mod);
+    const server = b.addExecutable(.{
+        .name = "server",
+        .root_module = server_mod,
+    });
+    b.installArtifact(server);
+    const run_server = b.addRunArtifact(server);
+    if (b.args) |args| run_server.addArgs(args);
+    const server_step = b.step("run-server", "Run interop server (default port 4433)");
+    server_step.dependOn(&run_server.step);
 
     // Per-module unit tests
     const test_step = b.step("test", "Run unit tests");

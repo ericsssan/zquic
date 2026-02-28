@@ -98,7 +98,7 @@ test "flow_control: shouldSendMaxData threshold" {
 test "flow_control: updateRecvMax ignores shrink" {
     const testing = std.testing;
     var fc = FlowController.init(1_000, 500);
-    fc.updateRecvMax(500);  // smaller → ignored
+    fc.updateRecvMax(500); // smaller → ignored
     try testing.expectEqual(@as(u64, 1_000), fc.recv_max);
     fc.updateRecvMax(2_000);
     try testing.expectEqual(@as(u64, 2_000), fc.recv_max);

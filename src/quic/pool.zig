@@ -151,7 +151,7 @@ test "pool: owns tracks allocation state across acquire/release cycles" {
 
     pool.release(a);
     try testing.expect(!pool.owns(a)); // released: not owned
-    try testing.expect(pool.owns(b));  // still acquired: owned
+    try testing.expect(pool.owns(b)); // still acquired: owned
 
     const c = pool.acquire().?; // reuses a's slot
     try testing.expect(pool.owns(c)); // acquired again: owned

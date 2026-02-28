@@ -309,10 +309,10 @@ pub fn encodeVersionNegotiation(
 /// Returns the number of bytes written.
 pub fn encodeRetry(
     buf: []u8,
-    dcid: ConnectionId,    // client's src CID → send back as DCID
-    scid: ConnectionId,    // new server CID used in Retry
-    token: []const u8,     // opaque address-validation token
-    odcid: ConnectionId,   // original DCID (for Integrity Tag pseudo-header)
+    dcid: ConnectionId, // client's src CID → send back as DCID
+    scid: ConnectionId, // new server CID used in Retry
+    token: []const u8, // opaque address-validation token
+    odcid: ConnectionId, // original DCID (for Integrity Tag pseudo-header)
 ) usize {
     var pos: usize = 0;
 
@@ -494,10 +494,10 @@ test "packet: encodeVersionNegotiation structure" {
 test "packet: longHeaderType extracts all four packet types" {
     // First byte layout: 1 (long) | 1 (fixed) | type[1:0] | reserved | pn_len
     // Bits 5-4 encode the PacketType.
-    try std.testing.expectEqual(PacketType.initial,  longHeaderType(0xC0)); // type=0b00
+    try std.testing.expectEqual(PacketType.initial, longHeaderType(0xC0)); // type=0b00
     try std.testing.expectEqual(PacketType.zero_rtt, longHeaderType(0xD0)); // type=0b01
-    try std.testing.expectEqual(PacketType.handshake,longHeaderType(0xE0)); // type=0b10
-    try std.testing.expectEqual(PacketType.retry,    longHeaderType(0xF0)); // type=0b11
+    try std.testing.expectEqual(PacketType.handshake, longHeaderType(0xE0)); // type=0b10
+    try std.testing.expectEqual(PacketType.retry, longHeaderType(0xF0)); // type=0b11
 }
 
 test "packet: decodePacketNumber wrap-around" {

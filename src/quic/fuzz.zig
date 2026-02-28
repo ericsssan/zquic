@@ -85,9 +85,9 @@ fn fuzzRttUpdate(_: void, input: []const u8) anyerror!void {
     var i: usize = 0;
     while (i + 3 <= input.len) : (i += 3) {
         // Scale bytes to milliseconds to exercise meaningful RTT ranges.
-        const sample_ns   = @as(u64, input[i])   * 1_000_000;
-        const ack_delay   = @as(u64, input[i+1]) * 1_000_000;
-        const max_delay   = @as(u64, input[i+2]) * 1_000_000 + 1; // +1 to avoid zero
+        const sample_ns = @as(u64, input[i]) * 1_000_000;
+        const ack_delay = @as(u64, input[i + 1]) * 1_000_000;
+        const max_delay = @as(u64, input[i + 2]) * 1_000_000 + 1; // +1 to avoid zero
         rtt.update(sample_ns, ack_delay, max_delay);
         // smoothed_rtt and rtt_var must always remain positive after initialization.
         if (rtt.initialized) {

@@ -330,7 +330,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             pos += fs.len;
             return .{
                 .frame = .{ .reset_stream = .{
-                    .stream_id  = sid.value,
+                    .stream_id = sid.value,
                     .error_code = ec.value,
                     .final_size = fs.value,
                 } },
@@ -344,7 +344,7 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             pos += ec.len;
             return .{
                 .frame = .{ .stop_sending = .{
-                    .stream_id  = sid.value,
+                    .stream_id = sid.value,
                     .error_code = ec.value,
                 } },
                 .consumed = pos,
@@ -362,10 +362,10 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             if (cid_len > 20) return error.InvalidFrame;
             if (pos + cid_len + 16 > buf.len) return error.BufferTooShort;
             var f = NewConnectionIdFrame{
-                .sequence_number      = seq.value,
-                .retire_prior_to      = rpt.value,
-                .cid                  = undefined,
-                .cid_len              = cid_len,
+                .sequence_number = seq.value,
+                .retire_prior_to = rpt.value,
+                .cid = undefined,
+                .cid_len = cid_len,
                 .stateless_reset_token = undefined,
             };
             @memcpy(f.cid[0..cid_len], buf[pos..][0..cid_len]);
@@ -686,8 +686,8 @@ test "frame: RESET_STREAM encode/parse round-trip" {
     const result = try parseFrame(buf[0..n]);
     switch (result.frame) {
         .reset_stream => |r| {
-            try testing.expectEqual(@as(u62, 3),    r.stream_id);
-            try testing.expectEqual(@as(u62, 7),    r.error_code);
+            try testing.expectEqual(@as(u62, 3), r.stream_id);
+            try testing.expectEqual(@as(u62, 7), r.error_code);
             try testing.expectEqual(@as(u62, 1024), r.final_size);
         },
         else => return error.WrongFrameType,
@@ -718,10 +718,10 @@ test "frame: NEW_CONNECTION_ID encode/parse round-trip" {
     var cid_bytes: [20]u8 = undefined;
     @memset(&cid_bytes, 0xaa);
     const f: Frame = .{ .new_connection_id = .{
-        .sequence_number      = 2,
-        .retire_prior_to      = 1,
-        .cid                  = cid_bytes,
-        .cid_len              = 8,
+        .sequence_number = 2,
+        .retire_prior_to = 1,
+        .cid = cid_bytes,
+        .cid_len = 8,
         .stateless_reset_token = tok,
     } };
     const n = encodeFrame(&buf, f);
@@ -730,7 +730,7 @@ test "frame: NEW_CONNECTION_ID encode/parse round-trip" {
         .new_connection_id => |nc| {
             try testing.expectEqual(@as(u62, 2), nc.sequence_number);
             try testing.expectEqual(@as(u62, 1), nc.retire_prior_to);
-            try testing.expectEqual(@as(u8, 8),  nc.cid_len);
+            try testing.expectEqual(@as(u8, 8), nc.cid_len);
             try testing.expectEqualSlices(u8, &tok, &nc.stateless_reset_token);
             try testing.expectEqualSlices(u8, cid_bytes[0..8], nc.cid[0..8]);
         },
@@ -807,7 +807,10 @@ test "frame: ACK with multiple ranges encode/parse round-trip" {
         .ack_delay = 5,
         .ranges = ranges,
         .range_count = 2,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
     const n = encodeFrame(&buf, .{ .ack = ack });
     const result = try parseFrame(buf[0..n]);
@@ -889,11 +892,12 @@ test "frame: ACK range_count > 32 returns InvalidFrame" {
     // Use a 2-byte varint for range_count to fit > 63.
     var buf: [32]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x02; pos += 1; // ACK type
-    pos += varint.encode(buf[pos..], 10);  // largest_acked
-    pos += varint.encode(buf[pos..], 0);   // ack_delay
+    buf[pos] = 0x02;
+    pos += 1; // ACK type
+    pos += varint.encode(buf[pos..], 10); // largest_acked
+    pos += varint.encode(buf[pos..], 0); // ack_delay
     pos += varint.encode(buf[pos..], 257); // range_count > 32
-    pos += varint.encode(buf[pos..], 5);   // first ACK range
+    pos += varint.encode(buf[pos..], 5); // first ACK range
     // Do NOT add 257 additional range pairs — the cap fires before the loop.
     try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
@@ -902,11 +906,12 @@ test "frame: ACK range_count 33 returns InvalidFrame" {
     // 33 is one past the storage cap of 32 — must be rejected.
     var buf: [32]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x02; pos += 1; // ACK type
-    pos += varint.encode(buf[pos..], 10);  // largest_acked
-    pos += varint.encode(buf[pos..], 0);   // ack_delay
-    pos += varint.encode(buf[pos..], 33);  // range_count = 33 (one past cap)
-    pos += varint.encode(buf[pos..], 5);   // first ACK range
+    buf[pos] = 0x02;
+    pos += 1; // ACK type
+    pos += varint.encode(buf[pos..], 10); // largest_acked
+    pos += varint.encode(buf[pos..], 0); // ack_delay
+    pos += varint.encode(buf[pos..], 33); // range_count = 33 (one past cap)
+    pos += varint.encode(buf[pos..], 5); // first ACK range
     try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
@@ -914,11 +919,12 @@ test "frame: ACK range_count exactly 32 is accepted" {
     // 32 is the storage cap — must parse successfully (only > 32 is rejected).
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x02; pos += 1;           // ACK type
+    buf[pos] = 0x02;
+    pos += 1; // ACK type
     pos += varint.encode(buf[pos..], 63); // largest_acked (needs room for 32 ranges)
-    pos += varint.encode(buf[pos..], 0);   // ack_delay
+    pos += varint.encode(buf[pos..], 0); // ack_delay
     pos += varint.encode(buf[pos..], 32); // range_count = 32
-    pos += varint.encode(buf[pos..], 0);   // first ACK range (ack_range=0)
+    pos += varint.encode(buf[pos..], 0); // first ACK range (ack_range=0)
     // range_count=32 means 32 additional (gap, ack_range) pairs after the first ACK range.
     var i: usize = 0;
     while (i < 32) : (i += 1) {
@@ -965,7 +971,8 @@ test "frame: NEW_TOKEN empty token round-trip" {
 test "frame: NEW_TOKEN > 256 bytes returns InvalidFrame" {
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x07; pos += 1; // NEW_TOKEN type
+    buf[pos] = 0x07;
+    pos += 1; // NEW_TOKEN type
     pos += varint.encode(buf[pos..], 257); // length > cap of 256
     @memset(buf[pos..][0..257], 0xaa);
     pos += 257;
@@ -1024,14 +1031,15 @@ test "frame: PADDING consecutive zero bytes counts all" {
 test "frame: ACK_ECN (0x03) with ECN counts parses has_ecn=true" {
     var buf: [32]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x03; pos += 1;           // ACK_ECN type
+    buf[pos] = 0x03;
+    pos += 1; // ACK_ECN type
     pos += varint.encode(buf[pos..], 10); // largest_acked
-    pos += varint.encode(buf[pos..], 0);  // ack_delay
-    pos += varint.encode(buf[pos..], 0);  // range_count = 0
-    pos += varint.encode(buf[pos..], 5);  // first ACK range
-    pos += varint.encode(buf[pos..], 7);  // ECT0
-    pos += varint.encode(buf[pos..], 3);  // ECT1
-    pos += varint.encode(buf[pos..], 1);  // ECN_CE
+    pos += varint.encode(buf[pos..], 0); // ack_delay
+    pos += varint.encode(buf[pos..], 0); // range_count = 0
+    pos += varint.encode(buf[pos..], 5); // first ACK range
+    pos += varint.encode(buf[pos..], 7); // ECT0
+    pos += varint.encode(buf[pos..], 3); // ECT1
+    pos += varint.encode(buf[pos..], 1); // ECN_CE
     const result = try parseFrame(buf[0..pos]);
     switch (result.frame) {
         .ack => |a| {
@@ -1048,7 +1056,8 @@ test "frame: STREAM without length field (0x08) consumes to buffer end" {
     // Type 0x08: no offset bit, no length bit, no FIN bit
     var buf: [12]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x08; pos += 1;           // STREAM, no flags
+    buf[pos] = 0x08;
+    pos += 1; // STREAM, no flags
     pos += varint.encode(buf[pos..], 42); // stream_id = 42
     const payload = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
     @memcpy(buf[pos..][0..payload.len], &payload);
@@ -1070,11 +1079,12 @@ test "frame: CONNECTION_CLOSE reason exactly 256 bytes is accepted" {
     const testing = std.testing;
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x1c; pos += 1;                // CONNECTION_CLOSE (QUIC)
-    pos += varint.encode(buf[pos..], 0);       // error_code = 0
-    pos += varint.encode(buf[pos..], 0);       // frame_type = 0
-    pos += varint.encode(buf[pos..], 256);     // reason_len = 256 (at the cap)
-    @memset(buf[pos..][0..256], 0x61);         // 256 x 'a'
+    buf[pos] = 0x1c;
+    pos += 1; // CONNECTION_CLOSE (QUIC)
+    pos += varint.encode(buf[pos..], 0); // error_code = 0
+    pos += varint.encode(buf[pos..], 0); // frame_type = 0
+    pos += varint.encode(buf[pos..], 256); // reason_len = 256 (at the cap)
+    @memset(buf[pos..][0..256], 0x61); // 256 x 'a'
     pos += 256;
     const result = try parseFrame(buf[0..pos]);
     switch (result.frame) {
@@ -1086,10 +1096,11 @@ test "frame: CONNECTION_CLOSE reason exactly 256 bytes is accepted" {
 test "frame: CONNECTION_CLOSE reason 257 bytes returns InvalidFrame" {
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
-    buf[pos] = 0x1c; pos += 1;
-    pos += varint.encode(buf[pos..], 0);       // error_code
-    pos += varint.encode(buf[pos..], 0);       // frame_type
-    pos += varint.encode(buf[pos..], 257);     // reason_len = 257 (one past the cap)
+    buf[pos] = 0x1c;
+    pos += 1;
+    pos += varint.encode(buf[pos..], 0); // error_code
+    pos += varint.encode(buf[pos..], 0); // frame_type
+    pos += varint.encode(buf[pos..], 257); // reason_len = 257 (one past the cap)
     @memset(buf[pos..][0..257], 0x62);
     pos += 257;
     try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
@@ -1154,7 +1165,9 @@ test "frame: ACK (0x02) without ECN has_ecn=false" {
         .ack_delay = 0,
         .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 10 }} ++ [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
         .has_ecn = false,
     } };
 

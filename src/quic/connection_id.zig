@@ -74,7 +74,10 @@ test "connection_id: generate randomises the non-thread bytes" {
     // (std.testing.io fills with deterministic non-zero data)
     var any_nonzero = false;
     for (cid.bytes[1..]) |b| {
-        if (b != 0) { any_nonzero = true; break; }
+        if (b != 0) {
+            any_nonzero = true;
+            break;
+        }
     }
     try testing.expect(any_nonzero);
 }

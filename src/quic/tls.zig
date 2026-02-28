@@ -600,20 +600,23 @@ fn parseClientHello(data: []const u8) !ClientHelloData {
 
     while (pos + 4 <= ext_end) {
         const ext_type = std.mem.readInt(u16, data[pos..][0..2], .big);
-        const ext_len = std.mem.readInt(u16, data[pos + 2..][0..2], .big);
+        const ext_len = std.mem.readInt(u16, data[pos + 2 ..][0..2], .big);
         pos += 4;
         if (pos + ext_len > ext_end) return error.TooShort;
         const ext_data = data[pos..][0..ext_len];
 
         if (ext_type == EXT_KEY_SHARE) {
             // KeyShareClientHello: u16 length + list of KeyShareEntry
-            if (ext_data.len < 2) { pos += ext_len; continue; }
+            if (ext_data.len < 2) {
+                pos += ext_len;
+                continue;
+            }
             const ks_list_len = std.mem.readInt(u16, ext_data[0..2], .big);
             var ksp: usize = 2;
             const ks_end = 2 + ks_list_len;
             while (ksp + 4 <= @min(ks_end, ext_data.len)) {
                 const group = std.mem.readInt(u16, ext_data[ksp..][0..2], .big);
-                const key_len = std.mem.readInt(u16, ext_data[ksp + 2..][0..2], .big);
+                const key_len = std.mem.readInt(u16, ext_data[ksp + 2 ..][0..2], .big);
                 ksp += 4;
                 if (group == GROUP_X25519 and key_len == 32 and ksp + 32 <= ext_data.len) {
                     @memcpy(&ch.client_x25519_pub, ext_data[ksp..][0..32]);
@@ -669,7 +672,7 @@ fn writeDerLen(buf: []u8, pos: *usize, len: usize) void {
         pos.* += 2;
     } else {
         buf[pos.*] = 0x82;
-        std.mem.writeInt(u16, buf[pos.* + 1..][0..2], @intCast(len), .big);
+        std.mem.writeInt(u16, buf[pos.* + 1 ..][0..2], @intCast(len), .big);
         pos.* += 3;
     }
 }
@@ -686,11 +689,13 @@ fn buildCertificate(pub_key: [32]u8, sig: *const [64]u8, buf: []u8) usize {
     var pos: usize = 0;
 
     // Certificate SEQUENCE
-    buf[pos] = 0x30; pos += 1;
+    buf[pos] = 0x30;
+    pos += 1;
     writeDerLen(buf, &pos, cert_body_len);
 
     // TBSCertificate SEQUENCE
-    buf[pos] = 0x30; pos += 1;
+    buf[pos] = 0x30;
+    pos += 1;
     writeDerLen(buf, &pos, tbs_body_len);
 
     // version [0] EXPLICIT INTEGER v3: a0 03 02 01 02
@@ -711,8 +716,8 @@ fn buildCertificate(pub_key: [32]u8, sig: *const [64]u8, buf: []u8) usize {
     // issuer Name CN=zquic
     const name = [_]u8{
         0x30, 0x10, 0x31, 0x0e, 0x30, 0x0c,
-        0x06, 0x03, 0x55, 0x04, 0x03,
-        0x0c, 0x05, 0x7a, 0x71, 0x75, 0x69, 0x63,
+        0x06, 0x03, 0x55, 0x04, 0x03, 0x0c,
+        0x05, 0x7a, 0x71, 0x75, 0x69, 0x63,
     };
     @memcpy(buf[pos..][0..18], &name);
     pos += 18;
@@ -720,10 +725,23 @@ fn buildCertificate(pub_key: [32]u8, sig: *const [64]u8, buf: []u8) usize {
     // validity (2024-01-01 to 2034-01-01)
     const validity = [_]u8{
         0x30, 0x22,
-        0x18, 0x0f, 0x32, 0x30, 0x32, 0x34, 0x30, 0x31, 0x30, 0x31,
-        0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a,
-        0x18, 0x0f, 0x32, 0x30, 0x33, 0x34, 0x30, 0x31, 0x30, 0x31,
-        0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a,
+        0x18, 0x0f,
+        0x32, 0x30,
+        0x32, 0x34,
+        0x30, 0x31,
+        0x30, 0x31,
+        0x30, 0x30,
+        0x30, 0x30,
+        0x30, 0x30,
+        0x5a, 0x18,
+        0x0f, 0x32,
+        0x30, 0x33,
+        0x34, 0x30,
+        0x31, 0x30,
+        0x31, 0x30,
+        0x30, 0x30,
+        0x30, 0x30,
+        0x30, 0x5a,
     };
     @memcpy(buf[pos..][0..36], &validity);
     pos += 36;
@@ -748,9 +766,12 @@ fn buildCertificate(pub_key: [32]u8, sig: *const [64]u8, buf: []u8) usize {
     pos += 7;
 
     // signature BIT STRING: 03 41 00 + 64 bytes
-    buf[pos] = 0x03; pos += 1;
-    buf[pos] = 0x41; pos += 1;
-    buf[pos] = 0x00; pos += 1; // no unused bits
+    buf[pos] = 0x03;
+    pos += 1;
+    buf[pos] = 0x41;
+    pos += 1;
+    buf[pos] = 0x00;
+    pos += 1; // no unused bits
     @memcpy(buf[pos..][0..64], sig);
     pos += 64;
 
@@ -844,7 +865,10 @@ test "tls: key schedule produces handshake keys" {
     // Verify handshake keys are non-zero
     var all_zero = true;
     for (server.handshake_keys.server.key) |b| {
-        if (b != 0) { all_zero = false; break; }
+        if (b != 0) {
+            all_zero = false;
+            break;
+        }
     }
     try std.testing.expect(!all_zero);
 }
@@ -853,12 +877,9 @@ test "tls: TlsServer init generates distinct keys" {
     const io = std.testing.io;
     const a = try TlsServer.init(io);
     const b = try TlsServer.init(io);
-    // Public keys should differ (both are randomly generated)
-    const testing = std.testing;
-    // Verify they're not identical (probabilistically impossible to collide)
-    _ = a;
-    _ = b;
-    try testing.expect(true); // init didn't panic
+    // Public keys must differ; random key collision is astronomically improbable.
+    try std.testing.expect(!std.mem.eql(u8, &a.ecdh_kp.public_key, &b.ecdh_kp.public_key));
+    try std.testing.expect(!std.mem.eql(u8, &a.sign_kp.public_key.bytes, &b.sign_kp.public_key.bytes));
 }
 
 test "tls: EncryptedExtensions contains QUIC transport params extension" {
@@ -871,8 +892,7 @@ test "tls: EncryptedExtensions contains QUIC transport params extension" {
     // Body must be non-trivial (has transport params).
     try testing.expect(n > 6);
     // Extension type at bytes 6-7 must be 0x0039.
-    try testing.expectEqual(@as(u16, EXT_QUIC_TRANSPORT_PARAMS),
-        std.mem.readInt(u16, buf[6..8], .big));
+    try testing.expectEqual(@as(u16, EXT_QUIC_TRANSPORT_PARAMS), std.mem.readInt(u16, buf[6..8], .big));
 }
 
 test "tls: EncryptedExtensions transport params round-trip" {
@@ -880,9 +900,9 @@ test "tls: EncryptedExtensions transport params round-trip" {
     var buf: [256]u8 = undefined;
 
     const sent = transport_params.TransportParams{
-        .initial_max_data           = 4 * 1024 * 1024,
-        .initial_max_streams_bidi   = 50,
-        .disable_active_migration   = true,
+        .initial_max_data = 4 * 1024 * 1024,
+        .initial_max_streams_bidi = 50,
+        .disable_active_migration = true,
     };
     const n = buildEncryptedExtensions(&buf, sent);
 
@@ -890,10 +910,11 @@ test "tls: EncryptedExtensions transport params round-trip" {
     const ext_data_len = std.mem.readInt(u16, buf[8..10], .big);
     const decoded = try transport_params.decode(buf[10..][0..ext_data_len]);
 
-    try testing.expectEqual(sent.initial_max_data,         decoded.initial_max_data);
+    // n must cover the header + extension region we read from.
+    try testing.expect(n >= 10 + ext_data_len);
+    try testing.expectEqual(sent.initial_max_data, decoded.initial_max_data);
     try testing.expectEqual(sent.initial_max_streams_bidi, decoded.initial_max_streams_bidi);
     try testing.expect(decoded.disable_active_migration);
-    _ = n;
 }
 
 test "tls: peer transport params default when no extension" {
@@ -937,7 +958,7 @@ test "tls: transcript is non-empty after ClientHello processing" {
     var server_empty = try TlsServer.init(io);
 
     // Manually hash something into server_with_ch's transcript (simulating a CH)
-    const fake_ch = [_]u8{0x01, 0x00, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef};
+    const fake_ch = [_]u8{ 0x01, 0x00, 0x00, 0x04, 0xde, 0xad, 0xbe, 0xef };
     server_with_ch.transcript.update(&fake_ch);
 
     // Run key schedule on both
@@ -947,9 +968,7 @@ test "tls: transcript is non-empty after ClientHello processing" {
     try server_empty.runKeySchedule(shared, &rand);
 
     // Keys must differ because transcripts differ
-    try std.testing.expect(!std.mem.eql(u8,
-        &server_with_ch.handshake_keys.server.key,
-        &server_empty.handshake_keys.server.key));
+    try std.testing.expect(!std.mem.eql(u8, &server_with_ch.handshake_keys.server.key, &server_empty.handshake_keys.server.key));
 }
 
 test "tls: Finished message builds correctly" {
@@ -974,7 +993,10 @@ test "tls: deinit zeros all secret fields" {
     // Verify at least one secret field is non-zero before deinit
     var any_nonzero = false;
     for (server.handshake_secret) |b| {
-        if (b != 0) { any_nonzero = true; break; }
+        if (b != 0) {
+            any_nonzero = true;
+            break;
+        }
     }
     try std.testing.expect(any_nonzero);
 

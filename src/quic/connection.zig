@@ -21,7 +21,6 @@ const cid_mod = @import("connection_id.zig");
 const stream_mod = @import("stream.zig");
 const flow_control = @import("flow_control.zig");
 const cubic_mod = @import("congestion/cubic.zig");
-const pool_mod = @import("pool.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 
 const ConnectionId = cid_mod.ConnectionId;
@@ -294,10 +293,10 @@ pub const Connection = struct {
     path_mtu: u16 = 1200,
     /// In-flight PMTUD probe state (null if no probe active).
     pmtud_probing: ?struct {
-        target_size: u16,    // size we're probing
-        packet_number: u64,  // packet number of the probe
-        epoch: u2,           // encryption epoch (0=Initial, 1=Handshake, 2=1-RTT)
-        sent_ns: i64,        // when we sent the probe
+        target_size: u16, // size we're probing
+        packet_number: u64, // packet number of the probe
+        epoch: u2, // encryption epoch (0=Initial, 1=Handshake, 2=1-RTT)
+        sent_ns: i64, // when we sent the probe
     } = null,
     /// Deadline for the next PMTUD probe (nanoseconds). Initially 0 (inactive).
     pmtud_next_probe_ns: i64 = 0,
@@ -496,8 +495,8 @@ pub const Connection = struct {
     /// Returns the nanosecond deadline when `tick()` must be called,
     /// or null if no timer is active.
     pub fn nextTimeout(self: *const Connection) ?i64 {
-        const idle  = self.idle_deadline_ns  orelse std.math.maxInt(i64);
-        const pto   = self.pto_deadline_ns   orelse std.math.maxInt(i64);
+        const idle = self.idle_deadline_ns orelse std.math.maxInt(i64);
+        const pto = self.pto_deadline_ns orelse std.math.maxInt(i64);
         const drain = self.drain_deadline_ns orelse std.math.maxInt(i64);
         const m = @min(@min(idle, pto), drain);
         return if (m == std.math.maxInt(i64)) null else m;
@@ -1324,7 +1323,7 @@ pub const Connection = struct {
                 );
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                try self.enqueueSend(self.enc_scratch[0..hdr_len + ct_len]);
+                try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.count = 0; // ACK is not ack-eliciting; no frame info tracked
                 self.loss.onPacketSent(pn, 0, hdr_len + ct_len, false, self.current_time_ns, fi);
@@ -1348,7 +1347,7 @@ pub const Connection = struct {
                 );
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                try self.enqueueSend(self.enc_scratch[0..hdr_len + ct_len]);
+                try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.count = 0;
                 self.loss.onPacketSent(pn, 1, hdr_len + ct_len, false, self.current_time_ns, fi);
@@ -1363,7 +1362,7 @@ pub const Connection = struct {
                 const ct_len = fpos + 16;
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(ak, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                try self.enqueueSend(self.enc_scratch[0..hdr_len + ct_len]);
+                try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.count = 0;
                 self.loss.onPacketSent(pn, 2, hdr_len + ct_len, false, self.current_time_ns, fi);
@@ -1722,7 +1721,7 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-        try self.enqueueSend(self.enc_scratch[0..hdr_len + ct_len]);
+        try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
         // Store challenge so incoming PATH_RESPONSE can be validated.
         self.pending_path_challenge = data;
     }
@@ -2098,7 +2097,7 @@ test "connection: send returns 0 when queue empty" {
 test "connection: enqueue and drain send queue" {
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
-    const data = [_]u8{0xde, 0xad, 0xbe, 0xef};
+    const data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     try conn.enqueueSend(&data);
 
     var out: [8]u8 = undefined;
@@ -2250,7 +2249,10 @@ test "connection: processAck uses packet epoch not connection epoch" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
     try conn.processAck(ack, 0);
 
@@ -2583,12 +2585,14 @@ test "security: processStreamFrame rejects server-initiated stream ID" {
     conn.hot.state = .established; // SEC-004: state guard passes; stream-ID guard fires
 
     var buf: [32]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 1, // bit 0 = 1 → server-initiated, invalid for received frames
-        .offset = 0,
-        .fin = false,
-        .data = "hi",
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .stream = .{
+            .stream_id = 1, // bit 0 = 1 → server-initiated, invalid for received frames
+            .offset = 0,
+            .fin = false,
+            .data = "hi",
+        },
+    });
     try testing.expectError(error.StreamStateError, conn.processFrames(buf[0..n], 2, null));
 }
 
@@ -2602,9 +2606,12 @@ test "security: processAck malformed ack_range returns InvalidFrame" {
         .largest_acked = 2,
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 10 }} // 10 > largest_acked=2
-                ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
     try testing.expectError(error.InvalidFrame, conn.processAck(ack, 0));
 }
@@ -2625,7 +2632,10 @@ test "security: processAck malformed gap returns InvalidFrame" {
         .ack_delay = 0,
         .ranges = ranges,
         .range_count = 2,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
     try testing.expectError(error.InvalidFrame, conn.processAck(ack, 0));
 }
@@ -2638,8 +2648,10 @@ test "security: VN rate limit suppresses second response within 1s" {
     var pkt: [32]u8 = undefined;
     pkt[0] = 0xc0;
     std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big);
-    pkt[5] = 8; @memset(pkt[6..14], 0xaa);
-    pkt[14] = 8; @memset(pkt[15..23], 0xbb);
+    pkt[5] = 8;
+    @memset(pkt[6..14], 0xaa);
+    pkt[14] = 8;
+    @memset(pkt[15..23], 0xbb);
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
 
     conn.receive(&pkt, src, 0, io) catch {};
@@ -2786,7 +2798,10 @@ test "loss: multi-packet loss triggers single congestion event" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
     try conn.processAck(ack, 0);
 
@@ -2903,7 +2918,10 @@ test "connection: NEW_CONNECTION_ID stores CID entry" {
 
     var found = false;
     for (conn.peer_cid_table) |entry| {
-        if (entry.valid and entry.seq == 1) { found = true; break; }
+        if (entry.valid and entry.seq == 1) {
+            found = true;
+            break;
+        }
     }
     try testing.expect(found);
 }
@@ -2913,16 +2931,21 @@ test "connection: NEW_CONNECTION_ID retire_prior_to invalidates old CIDs" {
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
 
-    var cid0: [20]u8 = undefined; @memset(&cid0, 0xaa);
-    var cid1: [20]u8 = undefined; @memset(&cid1, 0xcc);
-    var tok0: [16]u8 = undefined; @memset(&tok0, 0xbb);
-    var tok1: [16]u8 = undefined; @memset(&tok1, 0xdd);
+    var cid0: [20]u8 = undefined;
+    @memset(&cid0, 0xaa);
+    var cid1: [20]u8 = undefined;
+    @memset(&cid1, 0xcc);
+    var tok0: [16]u8 = undefined;
+    @memset(&tok0, 0xbb);
+    var tok1: [16]u8 = undefined;
+    @memset(&tok1, 0xdd);
 
     var buf: [64]u8 = undefined;
     var n = frame.encodeFrame(&buf, .{ .new_connection_id = .{
         .sequence_number = 0,
         .retire_prior_to = 0,
-        .cid = cid0, .cid_len = 8,
+        .cid = cid0,
+        .cid_len = 8,
         .stateless_reset_token = tok0,
     } });
     conn.processFrames(buf[0..n], 2, null) catch {};
@@ -2931,14 +2954,18 @@ test "connection: NEW_CONNECTION_ID retire_prior_to invalidates old CIDs" {
     n = frame.encodeFrame(&buf, .{ .new_connection_id = .{
         .sequence_number = 1,
         .retire_prior_to = 1,
-        .cid = cid1, .cid_len = 8,
+        .cid = cid1,
+        .cid_len = 8,
         .stateless_reset_token = tok1,
     } });
     conn.processFrames(buf[0..n], 2, null) catch {};
 
     var found_old = false;
     for (conn.peer_cid_table) |entry| {
-        if (entry.valid and entry.seq == 0) { found_old = true; break; }
+        if (entry.valid and entry.seq == 0) {
+            found_old = true;
+            break;
+        }
     }
     try testing.expect(!found_old);
 }
@@ -3003,7 +3030,10 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
     conn.current_time_ns = 3_200_000_000;
     try conn.processAck(ack, 0);
@@ -3070,11 +3100,13 @@ test "security: amplification limit lifted after path_validated" {
     var conn = try Connection.accept(.{}, io);
 
     conn.bytes_unvalidated_recv = 1; // very small budget
-    conn.path_validated = true;      // validated → no limit
+    conn.path_validated = true; // validated → no limit
 
     // Even though budget is tiny, sends are allowed once validated.
     try conn.enqueueSend(&[_]u8{0x01} ** 100);
-    try testing.expect(true); // no error
+    // Verify the send queue actually accepted the bytes.
+    var out: [MAX_PACKET_SIZE]u8 = undefined;
+    try testing.expect(conn.send(&out) > 0);
 }
 
 // SEC-006: Frame-type per epoch enforcement
@@ -3086,7 +3118,10 @@ test "security: STREAM frame in Initial epoch returns ProtocolViolation" {
 
     var buf: [32]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 0, .offset = 0, .fin = false, .data = "hi",
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = "hi",
     } });
     // Feed as epoch 0 (Initial) — STREAM is not allowed there.
     try testing.expectError(error.ProtocolViolation, conn.processFrames(buf[0..n], 0, null));
@@ -3111,7 +3146,10 @@ test "security: ACK frame in epoch 0 is allowed" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     } };
     var buf: [64]u8 = undefined;
     const n = frame.encodeFrame(&buf, ack_frame_data);
@@ -3140,13 +3178,17 @@ test "security: NEW_CONNECTION_ID with cid_len > 20 returns InvalidFrame" {
     var buf: [64]u8 = undefined;
     var pos: usize = 0;
     // Frame type 0x18
-    buf[pos] = 0x18; pos += 1;
+    buf[pos] = 0x18;
+    pos += 1;
     // sequence_number = 1 (varint)
-    buf[pos] = 0x01; pos += 1;
+    buf[pos] = 0x01;
+    pos += 1;
     // retire_prior_to = 0 (varint)
-    buf[pos] = 0x00; pos += 1;
+    buf[pos] = 0x00;
+    pos += 1;
     // cid_len = 21 (too large)
-    buf[pos] = 21; pos += 1;
+    buf[pos] = 21;
+    pos += 1;
     // cid data (21 bytes) + reset_token (16 bytes) — pad with zeros
     @memset(buf[pos..][0..37], 0xab);
     pos += 37;
@@ -3239,11 +3281,14 @@ test "connection: ACK with max ack_delay does not overflow" {
     var buf: [64]u8 = undefined;
     const ack_frm = frame.Frame{ .ack = .{
         .largest_acked = 0,
-        .ack_delay     = std.math.maxInt(u62),
-        .ranges        = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
-        .range_count   = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
-    }};
+        .ack_delay = std.math.maxInt(u62),
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .range_count = 1,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
+    } };
     const n = frame.encodeFrame(&buf, ack_frm);
     // Must complete without panic in any build mode.
     try conn.processFrames(buf[0..n], 2, null);
@@ -3274,8 +3319,8 @@ test "connection: STREAM_DATA_BLOCKED triggers MAX_STREAM_DATA update" {
     var buf: [16]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .stream_data_blocked = .{
         .stream_id = 0,
-        .max       = @intCast(st.recv_max),
-    }});
+        .max = @intCast(st.recv_max),
+    } });
     try conn.processFrames(buf[0..n], 2, null);
     // last_sent_max_stream_data must have been zeroed → update now pending.
     try testing.expect(st.shouldSendMaxStreamData());
@@ -3289,7 +3334,10 @@ test "security: NEW_CONNECTION_ID parse rejects cid_len = 21" {
     const testing = std.testing;
     var buf: [64]u8 = undefined;
     // 0x18 | seq=1 | rpt=0 | cid_len=21 | 21 bytes cid | 16 bytes token
-    buf[0] = 0x18; buf[1] = 0x01; buf[2] = 0x00; buf[3] = 21;
+    buf[0] = 0x18;
+    buf[1] = 0x01;
+    buf[2] = 0x00;
+    buf[3] = 21;
     @memset(buf[4..][0..37], 0); // 21-byte cid + 16-byte token
     try testing.expectError(error.InvalidFrame, frame.parseFrame(buf[0..41]));
 }
@@ -3560,7 +3608,10 @@ test "connection: ACK frame does NOT set pending_ack" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     } };
     const n = frame.encodeFrame(&buf, ack_f);
     try conn.processFrames(buf[0..n], 0, null);
@@ -3598,7 +3649,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
         ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
     );
     crypto.encryptPayload(client_keys, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
-    const pkt = enc_buf[0..hdr_len + ct_len];
+    const pkt = enc_buf[0 .. hdr_len + ct_len];
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
     try conn.receive(pkt, src, 0, io);
@@ -3813,12 +3864,14 @@ test "connection: STREAM data exceeding connection recv window returns FlowContr
     conn.conn_flow.recv_max = 4;
 
     var buf: [64]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 0,
-        .offset = 0,
-        .fin = false,
-        .data = "hello", // 5 bytes > window of 4
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .stream = .{
+            .stream_id = 0,
+            .offset = 0,
+            .fin = false,
+            .data = "hello", // 5 bytes > window of 4
+        },
+    });
     try testing.expectError(error.FlowControlViolation, conn.processFrames(buf[0..n], 2, null));
     // recv_total must not have been incremented.
     try testing.expectEqual(@as(u64, 0), conn.conn_flow.recv_total);
@@ -3831,12 +3884,14 @@ test "connection: STREAM on bidirectional stream within local_max_streams_bidi i
 
     // Stream 0 is client-initiated bidi stream #0 — always within any sane limit.
     var buf: [64]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 0, // stream #0 bidi
-        .offset = 0,
-        .fin = false,
-        .data = "ok",
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .stream = .{
+            .stream_id = 0, // stream #0 bidi
+            .offset = 0,
+            .fin = false,
+            .data = "ok",
+        },
+    });
     try conn.processFrames(buf[0..n], 2, null);
 }
 
@@ -3850,12 +3905,14 @@ test "connection: STREAM on bidirectional stream exceeding local_max_streams_bid
 
     // Stream #2 (stream_id = 8) is the third bidi stream — exceeds limit of 2.
     var buf: [64]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 8, // stream_num = 8>>2 = 2 >= local_max_streams_bidi (2)
-        .offset = 0,
-        .fin = false,
-        .data = "bad",
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .stream = .{
+            .stream_id = 8, // stream_num = 8>>2 = 2 >= local_max_streams_bidi (2)
+            .offset = 0,
+            .fin = false,
+            .data = "bad",
+        },
+    });
     try testing.expectError(error.StreamLimitError, conn.processFrames(buf[0..n], 2, null));
 }
 
@@ -3869,12 +3926,14 @@ test "connection: STREAM on unidirectional stream exceeding local_max_streams_un
 
     // Stream #1 uni (stream_id = 6, bits = 0b10) — stream_num = 1 >= limit (1).
     var buf: [64]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 6, // stream_num = 6>>2 = 1 >= local_max_streams_uni (1)
-        .offset = 0,
-        .fin = false,
-        .data = "bad",
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .stream = .{
+            .stream_id = 6, // stream_num = 6>>2 = 1 >= local_max_streams_uni (1)
+            .offset = 0,
+            .fin = false,
+            .data = "bad",
+        },
+    });
     try testing.expectError(error.StreamLimitError, conn.processFrames(buf[0..n], 2, null));
 }
 
@@ -3898,12 +3957,14 @@ test "connection: conn_flow.recv_total not charged when stream receiveData fails
     const recv_total_after_fin = conn.conn_flow.recv_total;
 
     // Send data beyond the established final size — stream rejects it (FinalSizeError).
-    n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 0,
-        .offset = 2,
-        .fin = false,
-        .data = "xyz", // end = 5 > final_size 3 → FinalSizeError
-    } });
+    n = frame.encodeFrame(&buf, .{
+        .stream = .{
+            .stream_id = 0,
+            .offset = 2,
+            .fin = false,
+            .data = "xyz", // end = 5 > final_size 3 → FinalSizeError
+        },
+    });
     // processFrames swallows 1-RTT errors via `catch {}`, so no error bubbles up.
     conn.processFrames(buf[0..n], 2, null) catch {};
     // recv_total must not have grown beyond what was committed by the accepted frame.
@@ -4017,7 +4078,10 @@ test "connection: new bidi stream send_max not reset on second STREAM frame" {
     var buf: [64]u8 = undefined;
     // First frame: creates the stream, sets send_max = 128 KiB.
     var n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 0, .offset = 0, .fin = false, .data = "hello",
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = "hello",
     } });
     try conn.processFrames(buf[0..n], 2, null);
 
@@ -4027,7 +4091,10 @@ test "connection: new bidi stream send_max not reset on second STREAM frame" {
 
     // Second STREAM frame on the same stream: send_max must remain 256 KiB.
     n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 0, .offset = 5, .fin = false, .data = "world",
+        .stream_id = 0,
+        .offset = 5,
+        .fin = false,
+        .data = "world",
     } });
     try conn.processFrames(buf[0..n], 2, null);
 
@@ -4047,7 +4114,10 @@ test "connection: MAX_STREAM_DATA cannot decrease send_max (RFC 9000 §4.2)" {
     // Create stream 0.
     var buf: [64]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .stream = .{
-        .stream_id = 0, .offset = 0, .fin = false, .data = "hi",
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = "hi",
     } });
     try conn.processFrames(buf[0..n], 2, null);
 
@@ -4081,7 +4151,10 @@ test "connection: RESET_STREAM charges gap bytes to connection flow control (RFC
     const data = [_]u8{'x'} ** 100;
     var data_buf: [200]u8 = undefined;
     const dn = frame.encodeFrame(&data_buf, .{ .stream = .{
-        .stream_id = 0, .offset = 0, .fin = false, .data = &data,
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = &data,
     } });
     try conn.processFrames(data_buf[0..dn], 2, null);
     const recv_after_data = conn.conn_flow.recv_total;
@@ -4263,7 +4336,10 @@ test "PMTUD: ACK detection marks probe as successful" {
             .ack_delay = 0,
             .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
             .range_count = 1,
-            .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+            .ect0 = 0,
+            .ect1 = 0,
+            .ecn_ce = 0,
+            .has_ecn = false,
         },
     });
 
@@ -4303,7 +4379,10 @@ test "PMTUD: does not backoff on ACK with gap containing probe" {
             .ack_delay = 0,
             .ranges = [_]frame.AckRange{.{ .gap = 1, .ack_range = 0 }} ** 32,
             .range_count = 1,
-            .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+            .ect0 = 0,
+            .ect1 = 0,
+            .ecn_ce = 0,
+            .has_ecn = false,
         },
     });
 
@@ -4315,9 +4394,6 @@ test "PMTUD: does not backoff on ACK with gap containing probe" {
     try testing.expectEqual(initial_mtu, conn.path_mtu);
     try testing.expect(conn.pmtud_probing != null);
 }
-
-
-
 
 test "PMTUD: does not backoff on ACK with unreachable packet" {
     const testing = std.testing;
@@ -4344,7 +4420,10 @@ test "PMTUD: does not backoff on ACK with unreachable packet" {
             .ack_delay = 0,
             .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
             .range_count = 1,
-            .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+            .ect0 = 0,
+            .ect1 = 0,
+            .ecn_ce = 0,
+            .has_ecn = false,
         },
     });
 
@@ -4692,27 +4771,27 @@ test "token: truncated token is rejected" {
 test "retry: transport params wiring with original_dcid and retry_scid" {
     const testing = std.testing;
     const io = std.testing.io;
-    
+
     // Create a connection with address validation enabled
     var conn = try Connection.accept(.{ .validate_addr = true }, io);
-    
+
     // Simulate receiving a Retry token (generate one to test the full flow)
     const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
     const original_dcid = ConnectionId.generate(0, io);
     const now_ns: i64 = 1_000_000_000;
-    
+
     const token = conn.generateToken(src, original_dcid, now_ns, io);
-    
+
     // Validate the token (simulating receiving an Initial with this token)
     const validated_dcid = conn.validateToken(&token, src, now_ns);
     try testing.expectEqual(original_dcid, validated_dcid);
-    
+
     // Set the original_dcid in the connection (would normally happen during Initial processing)
     conn.original_dcid = validated_dcid;
-    
+
     // Set a retry_scid (would be generated when sending the Retry)
     conn.retry_scid = ConnectionId.generate(1, io);
-    
+
     // Now verify that transport params can be built with these values
     var test_params = transport_params.TransportParams{};
     if (conn.original_dcid) |odcid| {
@@ -4721,11 +4800,11 @@ test "retry: transport params wiring with original_dcid and retry_scid" {
             test_params.retry_source_connection_id = scid;
         }
     }
-    
+
     // Verify the params were set correctly
     try testing.expectEqual(original_dcid, test_params.original_destination_connection_id);
     try testing.expectEqual(conn.retry_scid, test_params.retry_source_connection_id);
-    
+
     // Test encoding/decoding the params with the new fields
     var encoded_buf: [256]u8 = undefined;
     const encoded_len = transport_params.encode(test_params, &encoded_buf);
@@ -4935,7 +5014,10 @@ test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 1, .has_ecn = true,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 1,
+        .has_ecn = true,
     };
     try conn.processAck(ack, 2);
 
@@ -4964,14 +5046,20 @@ test "ecn: CE count non-increase is ignored (monotonic guard)" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 5, .has_ecn = true, // CE=5, no increase
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 5,
+        .has_ecn = true, // CE=5, no increase
     };
     const ack_plain = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
 
     try conn_ecn.processAck(ack_ecn, 2);
@@ -5001,14 +5089,20 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 10, .ect1 = 5, .ecn_ce = 0, .has_ecn = true, // CE=0, no increase from 0
+        .ect0 = 10,
+        .ect1 = 5,
+        .ecn_ce = 0,
+        .has_ecn = true, // CE=0, no increase from 0
     };
     const ack_plain = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
 
     try conn_ecn.processAck(ack_ecn, 2);
@@ -5034,7 +5128,10 @@ test "ecn: has_ecn=false ACK does not touch ecn_ce_seen" {
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
         .range_count = 1,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     };
     try conn.processAck(ack, 2);
 

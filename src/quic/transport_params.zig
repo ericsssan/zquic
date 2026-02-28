@@ -34,27 +34,27 @@ const TP_RETRY_SOURCE_CONNECTION_ID: u62 = 0x10;
 // ---------------------------------------------------------------------------
 
 pub const TransportParams = struct {
-    max_idle_timeout_ms:                 u64     = 30_000,
-    max_udp_payload_size:                u64     = 65527,
-    initial_max_data:                    u64     = 1024 * 1024,
-    initial_max_stream_data_bidi_local:  u64     = 256 * 1024,
-    initial_max_stream_data_bidi_remote: u64     = 256 * 1024,
-    initial_max_stream_data_uni:         u64     = 256 * 1024,
-    initial_max_streams_bidi:            u64     = 32,
-    initial_max_streams_uni:             u64     = 32,
-    ack_delay_exponent:                  u64     = 3,
-    max_ack_delay_ms:                    u64     = 25,
-    active_connection_id_limit:          u64     = 2,
-    disable_active_migration:            bool    = false,
-    stateless_reset_token:               ?[16]u8 = null,
-    initial_source_connection_id:        ?[20]u8 = null,
-    initial_source_connection_id_len:    u8      = 0,
+    max_idle_timeout_ms: u64 = 30_000,
+    max_udp_payload_size: u64 = 65527,
+    initial_max_data: u64 = 1024 * 1024,
+    initial_max_stream_data_bidi_local: u64 = 256 * 1024,
+    initial_max_stream_data_bidi_remote: u64 = 256 * 1024,
+    initial_max_stream_data_uni: u64 = 256 * 1024,
+    initial_max_streams_bidi: u64 = 32,
+    initial_max_streams_uni: u64 = 32,
+    ack_delay_exponent: u64 = 3,
+    max_ack_delay_ms: u64 = 25,
+    active_connection_id_limit: u64 = 2,
+    disable_active_migration: bool = false,
+    stateless_reset_token: ?[16]u8 = null,
+    initial_source_connection_id: ?[20]u8 = null,
+    initial_source_connection_id_len: u8 = 0,
     /// Original destination CID from the Initial packet (sent after Retry).
     /// RFC 9000 §18.2 parameter 0x00.
-    original_destination_connection_id:  ?ConnectionId = null,
+    original_destination_connection_id: ?ConnectionId = null,
     /// Retry source CID from the Retry packet we sent.
     /// RFC 9000 §18.2 parameter 0x10.
-    retry_source_connection_id:          ?ConnectionId = null,
+    retry_source_connection_id: ?ConnectionId = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -78,28 +78,17 @@ pub fn encode(params: TransportParams, buf: []u8) usize {
     var pos: usize = 0;
 
     // Mandatory varint-valued parameters.
-    pos += writeVarintParam(buf[pos..], TP_MAX_IDLE_TIMEOUT,
-        @intCast(params.max_idle_timeout_ms));
-    pos += writeVarintParam(buf[pos..], TP_MAX_UDP_PAYLOAD_SIZE,
-        @intCast(params.max_udp_payload_size));
-    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_DATA,
-        @intCast(params.initial_max_data));
-    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
-        @intCast(params.initial_max_stream_data_bidi_local));
-    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
-        @intCast(params.initial_max_stream_data_bidi_remote));
-    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAM_DATA_UNI,
-        @intCast(params.initial_max_stream_data_uni));
-    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAMS_BIDI,
-        @intCast(params.initial_max_streams_bidi));
-    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAMS_UNI,
-        @intCast(params.initial_max_streams_uni));
-    pos += writeVarintParam(buf[pos..], TP_ACK_DELAY_EXPONENT,
-        @intCast(params.ack_delay_exponent));
-    pos += writeVarintParam(buf[pos..], TP_MAX_ACK_DELAY,
-        @intCast(params.max_ack_delay_ms));
-    pos += writeVarintParam(buf[pos..], TP_ACTIVE_CONNECTION_ID_LIMIT,
-        @intCast(params.active_connection_id_limit));
+    pos += writeVarintParam(buf[pos..], TP_MAX_IDLE_TIMEOUT, @intCast(params.max_idle_timeout_ms));
+    pos += writeVarintParam(buf[pos..], TP_MAX_UDP_PAYLOAD_SIZE, @intCast(params.max_udp_payload_size));
+    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_DATA, @intCast(params.initial_max_data));
+    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAM_DATA_BIDI_LOCAL, @intCast(params.initial_max_stream_data_bidi_local));
+    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAM_DATA_BIDI_REMOTE, @intCast(params.initial_max_stream_data_bidi_remote));
+    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAM_DATA_UNI, @intCast(params.initial_max_stream_data_uni));
+    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAMS_BIDI, @intCast(params.initial_max_streams_bidi));
+    pos += writeVarintParam(buf[pos..], TP_INITIAL_MAX_STREAMS_UNI, @intCast(params.initial_max_streams_uni));
+    pos += writeVarintParam(buf[pos..], TP_ACK_DELAY_EXPONENT, @intCast(params.ack_delay_exponent));
+    pos += writeVarintParam(buf[pos..], TP_MAX_ACK_DELAY, @intCast(params.max_ack_delay_ms));
+    pos += writeVarintParam(buf[pos..], TP_ACTIVE_CONNECTION_ID_LIMIT, @intCast(params.active_connection_id_limit));
 
     // Optional / flag parameters.
     if (params.stateless_reset_token) |tok| {
@@ -281,21 +270,21 @@ test "transport_params: round-trip encode/decode with non-default values" {
     const testing = std.testing;
 
     const original = TransportParams{
-        .max_idle_timeout_ms                 = 60_000,
-        .max_udp_payload_size                = 1350,
-        .initial_max_data                    = 2 * 1024 * 1024,
-        .initial_max_stream_data_bidi_local  = 512 * 1024,
+        .max_idle_timeout_ms = 60_000,
+        .max_udp_payload_size = 1350,
+        .initial_max_data = 2 * 1024 * 1024,
+        .initial_max_stream_data_bidi_local = 512 * 1024,
         .initial_max_stream_data_bidi_remote = 512 * 1024,
-        .initial_max_stream_data_uni         = 128 * 1024,
-        .initial_max_streams_bidi            = 200,
-        .initial_max_streams_uni             = 50,
-        .ack_delay_exponent                  = 5,
-        .max_ack_delay_ms                    = 50,
-        .active_connection_id_limit          = 8,
-        .disable_active_migration            = true,
-        .stateless_reset_token               = [_]u8{0xab} ** 16,
-        .initial_source_connection_id        = null,
-        .initial_source_connection_id_len    = 0,
+        .initial_max_stream_data_uni = 128 * 1024,
+        .initial_max_streams_bidi = 200,
+        .initial_max_streams_uni = 50,
+        .ack_delay_exponent = 5,
+        .max_ack_delay_ms = 50,
+        .active_connection_id_limit = 8,
+        .disable_active_migration = true,
+        .stateless_reset_token = [_]u8{0xab} ** 16,
+        .initial_source_connection_id = null,
+        .initial_source_connection_id_len = 0,
     };
 
     var buf: [512]u8 = undefined;
@@ -303,18 +292,18 @@ test "transport_params: round-trip encode/decode with non-default values" {
 
     const decoded = try decode(buf[0..n]);
 
-    try testing.expectEqual(original.max_idle_timeout_ms,                 decoded.max_idle_timeout_ms);
-    try testing.expectEqual(original.max_udp_payload_size,                decoded.max_udp_payload_size);
-    try testing.expectEqual(original.initial_max_data,                    decoded.initial_max_data);
-    try testing.expectEqual(original.initial_max_stream_data_bidi_local,  decoded.initial_max_stream_data_bidi_local);
+    try testing.expectEqual(original.max_idle_timeout_ms, decoded.max_idle_timeout_ms);
+    try testing.expectEqual(original.max_udp_payload_size, decoded.max_udp_payload_size);
+    try testing.expectEqual(original.initial_max_data, decoded.initial_max_data);
+    try testing.expectEqual(original.initial_max_stream_data_bidi_local, decoded.initial_max_stream_data_bidi_local);
     try testing.expectEqual(original.initial_max_stream_data_bidi_remote, decoded.initial_max_stream_data_bidi_remote);
-    try testing.expectEqual(original.initial_max_stream_data_uni,         decoded.initial_max_stream_data_uni);
-    try testing.expectEqual(original.initial_max_streams_bidi,            decoded.initial_max_streams_bidi);
-    try testing.expectEqual(original.initial_max_streams_uni,             decoded.initial_max_streams_uni);
-    try testing.expectEqual(original.ack_delay_exponent,                  decoded.ack_delay_exponent);
-    try testing.expectEqual(original.max_ack_delay_ms,                    decoded.max_ack_delay_ms);
-    try testing.expectEqual(original.active_connection_id_limit,          decoded.active_connection_id_limit);
-    try testing.expectEqual(original.disable_active_migration,            decoded.disable_active_migration);
+    try testing.expectEqual(original.initial_max_stream_data_uni, decoded.initial_max_stream_data_uni);
+    try testing.expectEqual(original.initial_max_streams_bidi, decoded.initial_max_streams_bidi);
+    try testing.expectEqual(original.initial_max_streams_uni, decoded.initial_max_streams_uni);
+    try testing.expectEqual(original.ack_delay_exponent, decoded.ack_delay_exponent);
+    try testing.expectEqual(original.max_ack_delay_ms, decoded.max_ack_delay_ms);
+    try testing.expectEqual(original.active_connection_id_limit, decoded.active_connection_id_limit);
+    try testing.expectEqual(original.disable_active_migration, decoded.disable_active_migration);
     try testing.expectEqualSlices(u8, &original.stateless_reset_token.?, &decoded.stateless_reset_token.?);
 }
 
@@ -342,8 +331,8 @@ test "transport_params: empty input decodes to defaults" {
     const defaults = TransportParams{};
     const decoded = try decode(&.{});
 
-    try testing.expectEqual(defaults.max_idle_timeout_ms,    decoded.max_idle_timeout_ms);
-    try testing.expectEqual(defaults.initial_max_data,       decoded.initial_max_data);
+    try testing.expectEqual(defaults.max_idle_timeout_ms, decoded.max_idle_timeout_ms);
+    try testing.expectEqual(defaults.initial_max_data, decoded.initial_max_data);
     try testing.expectEqual(defaults.initial_max_streams_bidi, decoded.initial_max_streams_bidi);
     try testing.expect(decoded.stateless_reset_token == null);
     try testing.expect(!decoded.disable_active_migration);
@@ -363,7 +352,9 @@ test "transport_params: unknown parameter IDs are skipped" {
     // 0x55 unknown param with 3-byte payload
     pos += varint.encode(buf[pos..], 0x55);
     pos += varint.encode(buf[pos..], 3);
-    buf[pos] = 0xde; buf[pos+1] = 0xad; buf[pos+2] = 0xbe;
+    buf[pos] = 0xde;
+    buf[pos + 1] = 0xad;
+    buf[pos + 2] = 0xbe;
     pos += 3;
 
     // 0x08 initial_max_streams_bidi = 7
@@ -374,7 +365,7 @@ test "transport_params: unknown parameter IDs are skipped" {
     const decoded = try decode(buf[0..pos]);
     // Known params are decoded correctly.
     try testing.expectEqual(@as(u64, 999), decoded.initial_max_data);
-    try testing.expectEqual(@as(u64, 7),   decoded.initial_max_streams_bidi);
+    try testing.expectEqual(@as(u64, 7), decoded.initial_max_streams_bidi);
     // Unknown param did not corrupt state.
     try testing.expect(decoded.stateless_reset_token == null);
 }
@@ -419,11 +410,13 @@ test "transport_params: unknown IDs are not subject to duplicate check" {
     // Two unknown params with the same ID — silently skipped (no error)
     pos += varint.encode(buf[pos..], 0x55);
     pos += varint.encode(buf[pos..], 1);
-    buf[pos] = 0xaa; pos += 1;
+    buf[pos] = 0xaa;
+    pos += 1;
 
     pos += varint.encode(buf[pos..], 0x55); // duplicate unknown ID: allowed
     pos += varint.encode(buf[pos..], 1);
-    buf[pos] = 0xbb; pos += 1;
+    buf[pos] = 0xbb;
+    pos += 1;
 
     const decoded = try decode(buf[0..pos]);
     // Defaults should remain
@@ -519,9 +512,10 @@ test "transport_params: exactly 64 params is accepted" {
         pos += varint.encode(buf[pos..], 0x55 + @as(u62, @intCast(i)) * 2);
         pos += varint.encode(buf[pos..], 0); // zero-length unknown param
     }
-    // Must not error — 64 is exactly at the limit
-    _ = try decode(buf[0..pos]);
-    try testing.expect(true); // reached here without error
+    // Must not error — 64 is exactly at the limit; unknown params leave known defaults intact.
+    const params = try decode(buf[0..pos]);
+    const defaults: TransportParams = .{};
+    try testing.expectEqual(defaults.initial_max_data, params.initial_max_data);
 }
 
 test "transport_params: initial_source_connection_id round-trip" {
@@ -531,7 +525,7 @@ test "transport_params: initial_source_connection_id round-trip" {
     var isci: [20]u8 = undefined;
     @memset(&isci, 0xcc);
     const params = TransportParams{
-        .initial_source_connection_id     = isci,
+        .initial_source_connection_id = isci,
         .initial_source_connection_id_len = 8,
     };
     const n = encode(params, &buf);

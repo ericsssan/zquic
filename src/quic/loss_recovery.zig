@@ -151,8 +151,7 @@ pub const SentPacketTable = struct {
     pub fn init() SentPacketTable {
         var t: SentPacketTable = undefined;
         for (&t.slots) |*s| {
-            s.* = .{ .pn = 0, .sent_ns = 0, .size = 0, .epoch = 0,
-                     .ack_eliciting = false, .in_flight = false, .valid = false };
+            s.* = .{ .pn = 0, .sent_ns = 0, .size = 0, .epoch = 0, .ack_eliciting = false, .in_flight = false, .valid = false };
         }
         for (&t.frame_info) |*fi| fi.* = .{};
         t.valid_per_epoch = .{ 0, 0, 0 };
@@ -842,20 +841,18 @@ test "sent_table: power-of-two slot collision evicts correctly" {
 
     lr.onPacketSent(MAX_SENT, 0, 1200, true, 2_000, .{}); // maps to slot 0, evicts pn=0
     try testing.expectEqual(@as(?SentPacket, null), lr.sent.get(0, 0)); // pn=0 gone
-    try testing.expect(lr.sent.get(MAX_SENT, 0) != null);              // pn=256 present
+    try testing.expect(lr.sent.get(MAX_SENT, 0) != null); // pn=256 present
 }
 
 test "sent_table: epoch mismatch in same slot returns null" {
     // Two packets with different epochs that land in the same slot.
     const testing = std.testing;
     var table = SentPacketTable.init();
-    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0,
-                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
     // pn=257 & 255 == 1, same slot, different epoch
-    _ = table.add(.{ .pn = 257, .sent_ns = 0, .size = 100, .epoch = 2,
-                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
-    try testing.expectEqual(@as(?SentPacket, null), table.get(1, 0));  // evicted
-    try testing.expect(table.get(257, 2) != null);                      // present
+    _ = table.add(.{ .pn = 257, .sent_ns = 0, .size = 100, .epoch = 2, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(?SentPacket, null), table.get(1, 0)); // evicted
+    try testing.expect(table.get(257, 2) != null); // present
 }
 
 test "frame_info: ring buffer eviction preserves new packet frame info" {
@@ -910,12 +907,10 @@ test "valid_per_epoch: add increments, remove decrements" {
     try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[1]);
     try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[2]);
 
-    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0,
-                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
     try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[0]);
 
-    _ = table.add(.{ .pn = 2, .sent_ns = 0, .size = 100, .epoch = 1,
-                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = 2, .sent_ns = 0, .size = 100, .epoch = 1, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
     try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]);
 
     _ = table.remove(1, 0);
@@ -928,13 +923,11 @@ test "valid_per_epoch: eviction decrements old epoch, add increments new epoch" 
     var table = SentPacketTable.init();
 
     // Add pn=0 in epoch 0 (slot 0)
-    _ = table.add(.{ .pn = 0, .sent_ns = 0, .size = 100, .epoch = 0,
-                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = 0, .sent_ns = 0, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
     try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[0]);
 
     // Add pn=256 in epoch 1 (same slot 0, evicts epoch 0 packet)
-    _ = table.add(.{ .pn = MAX_SENT, .sent_ns = 0, .size = 100, .epoch = 1,
-                     .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = MAX_SENT, .sent_ns = 0, .size = 100, .epoch = 1, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
     try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[0]); // evicted
     try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]); // new packet
 }
