@@ -122,6 +122,8 @@ pub const AckResult = struct {
     rtt_updated: bool = false,
     /// Set when loss span across ack-eliciting packets > 3×PTO (RFC 9002 §6.1.2).
     persistent_congestion: bool = false,
+    /// Sent timestamp of the largest-acked packet (for ECN congestion reaction).
+    largest_acked_sent_ns: ?i64 = null,
     /// Sent timestamp of the earliest ack-eliciting packet declared lost this round.
     earliest_lost_sent_ns: ?i64 = null,
     /// Sent timestamp of the latest ack-eliciting packet declared lost this round.
@@ -369,6 +371,7 @@ pub const LossRecovery = struct {
 
         // 2. RTT sample: use the largest-acked packet if it's ack-eliciting
         if (self.sent.get(largest_acked, epoch)) |pkt| {
+            result.largest_acked_sent_ns = pkt.sent_ns;
             if (pkt.ack_eliciting) {
                 const sample: u64 = if (now_ns >= pkt.sent_ns)
                     @intCast(now_ns - pkt.sent_ns)

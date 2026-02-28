@@ -15,6 +15,7 @@ const crypto = @import("crypto.zig");
 const packet = @import("packet.zig");
 const frame = @import("frame.zig");
 const tls = @import("tls.zig");
+const transport_params = @import("transport_params.zig");
 const varint = @import("varint.zig");
 const cid_mod = @import("connection_id.zig");
 const stream_mod = @import("stream.zig");
@@ -61,6 +62,8 @@ pub const Event = union(enum) {
     stop_sending: struct { stream_id: u62, error_code: u62 },
     /// Peer changed source address; app can query `peer_addr` for the new path.
     path_migrated,
+    /// A Retry packet was sent; caller should drain send buf, then discard this connection object.
+    retry_sent,
 };
 
 const EventQueue = struct {
@@ -143,6 +146,12 @@ pub const Config = struct {
     initial_max_stream_data: u64 = flow_control.DEFAULT_MAX_STREAM_DATA,
     /// Maximum idle timeout in nanoseconds (0 = disabled).
     idle_timeout_ns: u64 = 30_000_000_000, // 30s
+    /// Enable address validation with Retry tokens (RFC 9000 §8.1).
+    validate_addr: bool = false,
+    /// 32-byte secret for token derivation via HKDF-Expand.
+    token_secret: [32]u8 = [_]u8{0} ** 32,
+    /// Token validity window in nanoseconds (default 5 minutes).
+    token_validity_ns: i64 = 5 * 60 * std.time.ns_per_s,
 };
 
 // ---------------------------------------------------------------------------
@@ -293,6 +302,19 @@ pub const Connection = struct {
     /// Deadline for the next PMTUD probe (nanoseconds). Initially 0 (inactive).
     pmtud_next_probe_ns: i64 = 0,
 
+    // ECN state (RFC 9000 §12.1, RFC 9002 §B.1) ------------------------------------
+
+    /// Monotonically increasing ECN CE count seen per epoch [Initial, Handshake, 1-RTT].
+    /// When a peer ACK reports a higher CE count, we treat it as a congestion event.
+    ecn_ce_seen: [3]u62,
+
+    // Retry token state (RFC 9000 §8.1) ------------------------------------------
+
+    /// Connection ID we chose for Retry packet (null if no Retry sent).
+    retry_scid: ?ConnectionId = null,
+    /// Original DCID from validated Retry token (null if no token validation).
+    original_dcid: ?ConnectionId = null,
+
     // Pending retransmit flags
     pending_handshake_done: bool,
     pending_max_data: bool,
@@ -396,6 +418,7 @@ pub const Connection = struct {
             .crypto_send_offset = .{ 0, 0, 0 },
             .crypto_recv_offset = .{ 0, 0, 0 },
             .pending_ack = .{ false, false, false },
+            .ecn_ce_seen = .{ 0, 0, 0 },
         };
     }
 
@@ -441,7 +464,7 @@ pub const Connection = struct {
         // Process all coalesced packets in the datagram
         var remaining = data;
         while (remaining.len > 0) {
-            const consumed = try self.processOnePacket(remaining, io);
+            const consumed = try self.processOnePacket(remaining, src, io);
             if (consumed == 0) break;
             remaining = remaining[consumed..];
         }
@@ -626,17 +649,17 @@ pub const Connection = struct {
     // Internal packet processing
     // -----------------------------------------------------------------------
 
-    fn processOnePacket(self: *Connection, data: []const u8, io: std.Io) !usize {
+    fn processOnePacket(self: *Connection, data: []const u8, src: SocketAddr, io: std.Io) !usize {
         if (data.len == 0) return 0;
 
         if (packet.isLongHeader(data[0])) {
-            return self.processLongHeaderPacket(data, io);
+            return self.processLongHeaderPacket(data, src, io);
         } else {
             return self.processShortHeaderPacket(data);
         }
     }
 
-    fn processLongHeaderPacket(self: *Connection, data: []const u8, io: std.Io) !usize {
+    fn processLongHeaderPacket(self: *Connection, data: []const u8, src: SocketAddr, io: std.Io) !usize {
         // RFC 9000 §6: Version negotiation.
         // Check the version field before full parsing — VN packets (version 0) have
         // a different wire format that parseLongHeader cannot handle.
@@ -665,6 +688,22 @@ pub const Connection = struct {
                     self.peer_cid = hdr.src_cid;
                     self.initial_keys = crypto.deriveInitialKeys(&hdr.dest_cid.bytes);
                     self.hot.state = .handshake;
+                }
+
+                // Address validation via Retry (RFC 9000 §8.1).
+                // Only on the first Initial (original_dcid == null); retransmitted
+                // Initials after a valid token skip re-validation.
+                if (self.config.validate_addr and self.original_dcid == null) {
+                    if (hdr.token.len == 0) {
+                        // No token: send Retry and stop processing this datagram.
+                        try self.sendRetry(hdr, src, self.current_time_ns, io);
+                        return result.consumed;
+                    }
+                    if (self.validateToken(hdr.token, src, self.current_time_ns)) |odcid| {
+                        self.original_dcid = odcid;
+                    } else {
+                        return error.InvalidToken;
+                    }
                 }
 
                 // Decrypt the Initial packet
@@ -951,6 +990,19 @@ pub const Connection = struct {
 
         self.crypto_recv_offset[epoch] = end;
 
+        // Before processing ClientHello, set our transport parameters for EncryptedExtensions.
+        // This includes original_dcid if address validation with Retry was used.
+        if (self.tls_state.state == .wait_client_hello) {
+            var our_params = transport_params.TransportParams{};
+            if (self.original_dcid) |odcid| {
+                our_params.original_destination_connection_id = odcid;
+                if (self.retry_scid) |scid| {
+                    our_params.retry_source_connection_id = scid;
+                }
+            }
+            self.tls_state.our_transport_params = our_params;
+        }
+
         var out_buf: [8192]u8 = undefined;
         const out_len = try self.tls_state.processCrypto(effective_data, &out_buf, io);
 
@@ -1115,6 +1167,18 @@ pub const Connection = struct {
         // Persistent congestion: collapse cwnd when loss span > 3×PTO (RFC 9002 §6.1.2)
         if (result.persistent_congestion) {
             self.congestion.onPersistentCongestion();
+        }
+
+        // ECN: react to CE mark increases (RFC 9002 §B.1).
+        // A rising CE count means the network is signalling congestion without drops.
+        if (ack.has_ecn) {
+            const ce: u62 = @intCast(@min(ack.ecn_ce, std.math.maxInt(u62)));
+            if (ce > self.ecn_ce_seen[epoch]) {
+                self.ecn_ce_seen[epoch] = ce;
+                if (result.largest_acked_sent_ns) |_| {
+                    self.congestion.onPacketLost(self.current_time_ns);
+                }
+            }
         }
 
         // Process acked / lost frames for retransmission.
@@ -1486,6 +1550,18 @@ pub const Connection = struct {
         try self.enqueueSend(vn_buf[0..n]);
     }
 
+    /// Build and enqueue a Retry packet (RFC 9000 §8.1).
+    /// Generates a fresh address-validation token, picks a new SCID, and pushes
+    /// `retry_sent` so the caller knows to drain and discard this connection.
+    fn sendRetry(self: *Connection, hdr: packet.LongHeader, src: SocketAddr, now_ns: i64, io: std.Io) !void {
+        const token = self.generateToken(src, hdr.dest_cid, now_ns, io);
+        self.retry_scid = ConnectionId.generate(0, io);
+        var buf: [256]u8 = undefined;
+        const n = packet.encodeRetry(&buf, hdr.src_cid, self.retry_scid.?, &token, hdr.dest_cid);
+        try self.enqueueSend(buf[0..n]);
+        self.events.push(.retry_sent);
+    }
+
     /// Low-level: encrypt and enqueue a STREAM frame at an explicit offset.
     /// Does NOT advance stream.send_offset (caller is responsible for that).
     fn encryptAndEnqueueStreamFrame(
@@ -1846,6 +1922,149 @@ pub const Connection = struct {
         io.random(&challenge);
         try self.sendPathChallenge(challenge);
         self.events.push(.path_migrated);
+    }
+
+    /// Helper: normalize address to IPv6 for token hashing.
+    fn normalizeAddressToIPv6(src: SocketAddr) [16]u8 {
+        var ipv6: [16]u8 = [_]u8{0} ** 16;
+        switch (src) {
+            .v4 => |v4| {
+                ipv6[10] = 0xff;
+                ipv6[11] = 0xff;
+                @memcpy(ipv6[12..16], &v4.addr);
+            },
+            .v6 => |v6| {
+                @memcpy(ipv6[0..16], &v6.addr);
+            },
+        }
+        return ipv6;
+    }
+
+    /// Generate a stateless Retry token (62 bytes).
+    /// Format: [12]u8 nonce || [34]u8 AES-128-GCM(plaintext) || [16]u8 tag
+    /// Plaintext: [16]u8 IPv6-normalized address || [2]u8 port || [8]u8 timestamp || [8]u8 ODCID
+    fn generateToken(self: *const Connection, src: SocketAddr, odcid: ConnectionId, now_ns: i64, io: std.Io) [62]u8 {
+        // Normalize address to IPv6 for consistent handling
+        const addr_ipv6 = normalizeAddressToIPv6(src);
+
+        // Build plaintext (34 bytes)
+        var plaintext: [34]u8 = undefined;
+        var pos: usize = 0;
+
+        // Address (16 bytes)
+        @memcpy(plaintext[pos..][0..16], &addr_ipv6);
+        pos += 16;
+
+        // Port (2 bytes, big-endian)
+        const port: u16 = switch (src) {
+            .v4 => |v4| v4.port,
+            .v6 => |v6| v6.port,
+        };
+        std.mem.writeInt(u16, plaintext[pos..][0..2], port, .big);
+        pos += 2;
+
+        // Timestamp (8 bytes, unsigned, saturating)
+        const now_u64: u64 = @intCast(@max(now_ns, 0));
+        std.mem.writeInt(u64, plaintext[pos..][0..8], now_u64, .little);
+        pos += 8;
+
+        // Original DCID (8 bytes)
+        @memcpy(plaintext[pos..][0..8], &odcid.bytes);
+        pos += 8;
+
+        // Generate random nonce
+        var token: [62]u8 = undefined;
+        var nonce: [12]u8 = undefined;
+        io.random(&nonce);
+
+        // Derive token key from secret via HKDF-Expand
+        var token_key: [16]u8 = undefined;
+        const label = "zquic retry token key";
+        std.crypto.kdf.hkdf.HkdfSha256.expand(&token_key, label, self.config.token_secret);
+
+        // Encrypt plaintext with AES-128-GCM
+        var ciphertext: [34]u8 = undefined;
+        var tag: [16]u8 = undefined;
+        std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&ciphertext, &tag, &plaintext, &.{}, nonce, token_key);
+
+        // Assemble token: nonce || ciphertext || tag
+        @memcpy(token[0..12], &nonce);
+        @memcpy(token[12..46], &ciphertext);
+        @memcpy(token[46..62], &tag);
+
+        return token;
+    }
+
+    /// Validate a token from an Initial packet.
+    /// Returns the original DCID on success, null on validation failure.
+    fn validateToken(self: *const Connection, token: []const u8, src: SocketAddr, now_ns: i64) ?ConnectionId {
+        // Token must be exactly 62 bytes
+        if (token.len != 62) return null;
+
+        // Extract components
+        const nonce = token[0..12];
+        const ciphertext = token[12..46];
+        const tag_in = token[46..62];
+
+        // Derive token key
+        var token_key: [16]u8 = undefined;
+        const label = "zquic retry token key";
+        std.crypto.kdf.hkdf.HkdfSha256.expand(&token_key, label, self.config.token_secret);
+
+        // Decrypt with AES-128-GCM
+        var plaintext: [34]u8 = undefined;
+        var tag_arr: [16]u8 = undefined;
+        @memcpy(&tag_arr, tag_in);
+
+        var nonce_arr: [12]u8 = undefined;
+        @memcpy(&nonce_arr, nonce);
+
+        std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(
+            &plaintext,
+            ciphertext[0..34],
+            tag_arr,
+            &.{},
+            nonce_arr,
+            token_key,
+        ) catch return null;
+
+        // Extract fields from plaintext
+        var pos: usize = 0;
+
+        // Address (16 bytes, must match normalized version)
+        const addr_ipv6_stored = plaintext[pos..][0..16];
+        const addr_ipv6_current = normalizeAddressToIPv6(src);
+        if (!std.mem.eql(u8, addr_ipv6_stored, &addr_ipv6_current)) return null;
+        pos += 16;
+
+        // Port (2 bytes, must match)
+        const port_stored = std.mem.readInt(u16, plaintext[pos..][0..2], .big);
+        const port_current: u16 = switch (src) {
+            .v4 => |v4| v4.port,
+            .v6 => |v6| v6.port,
+        };
+        if (port_stored != port_current) return null;
+        pos += 2;
+
+        // Timestamp validation
+        const issued_at_u64 = std.mem.readInt(u64, plaintext[pos..][0..8], .little);
+        pos += 8;
+
+        const now_u64: u64 = @intCast(@max(now_ns, 0));
+
+        // Reject tokens from the future (clock skew)
+        if (issued_at_u64 > now_u64) return null;
+
+        // Reject expired tokens
+        const elapsed_u64 = now_u64 - issued_at_u64;
+        const validity_u64: u64 = @intCast(@max(self.config.token_validity_ns, 0));
+        if (elapsed_u64 > validity_u64) return null;
+
+        // Extract original DCID (8 bytes)
+        var odcid: ConnectionId = undefined;
+        @memcpy(&odcid.bytes, plaintext[pos..][0..8]);
+
+        return odcid;
     }
 };
 
@@ -4320,4 +4539,505 @@ test "PMTUD: rejects probe size above MAX_PACKET_SIZE" {
 
     try conn.queuePmtudProbe(1350);
     try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1351));
+}
+
+test "token: valid token can be generated and validated" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Set token secret
+    const secret = [_]u8{0xaa} ** 32;
+    conn.config.token_secret = secret;
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
+    const odcid = ConnectionId.generate(0, io);
+    const now_ns: i64 = 1_000_000_000;
+
+    // Generate token
+    const token = conn.generateToken(src, odcid, now_ns, io);
+    try testing.expectEqual(@as(usize, 62), token.len);
+
+    // Validate token immediately (should succeed)
+    const result = conn.validateToken(&token, src, now_ns);
+    try testing.expectEqual(odcid, result);
+}
+
+test "token: expired token is rejected" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const secret = [_]u8{0xbb} ** 32;
+    conn.config.token_secret = secret;
+    conn.config.token_validity_ns = 60 * std.time.ns_per_s; // 60 seconds
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
+    const odcid = ConnectionId.generate(0, io);
+    const now_ns: i64 = 1_000_000_000;
+
+    // Generate token
+    const token = conn.generateToken(src, odcid, now_ns, io);
+
+    // Validate after token has expired (120 seconds later)
+    const result = conn.validateToken(&token, src, now_ns + 120 * std.time.ns_per_s);
+    try testing.expectEqual(@as(?ConnectionId, null), result);
+}
+
+test "token: future-dated token is rejected (clock skew)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const secret = [_]u8{0xcc} ** 32;
+    conn.config.token_secret = secret;
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
+    const odcid = ConnectionId.generate(0, io);
+    const now_ns: i64 = 1_000_000_000;
+
+    // Generate token "from the future"
+    const future_ts = now_ns + 60 * std.time.ns_per_s;
+    const token = conn.generateToken(src, odcid, future_ts, io);
+
+    // Try to validate with an earlier timestamp
+    const result = conn.validateToken(&token, src, now_ns);
+    try testing.expectEqual(@as(?ConnectionId, null), result);
+}
+
+test "token: different source address causes validation failure" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const secret = [_]u8{0xdd} ** 32;
+    conn.config.token_secret = secret;
+
+    const src1: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
+    const src2: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 101 }, .port = 1234 } };
+    const odcid = ConnectionId.generate(0, io);
+    const now_ns: i64 = 1_000_000_000;
+
+    // Generate token for src1
+    const token = conn.generateToken(src1, odcid, now_ns, io);
+
+    // Try to validate with src2 (should fail)
+    const result = conn.validateToken(&token, src2, now_ns);
+    try testing.expectEqual(@as(?ConnectionId, null), result);
+}
+
+test "token: tampered token (corrupted AEAD tag) is rejected" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const secret = [_]u8{0xee} ** 32;
+    conn.config.token_secret = secret;
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
+    const odcid = ConnectionId.generate(0, io);
+    const now_ns: i64 = 1_000_000_000;
+
+    // Generate token
+    var token = conn.generateToken(src, odcid, now_ns, io);
+
+    // Corrupt the AEAD tag (last 16 bytes)
+    token[61] ^= 0xff; // flip bits in last byte of tag
+
+    // Validation should fail
+    const result = conn.validateToken(&token, src, now_ns);
+    try testing.expectEqual(@as(?ConnectionId, null), result);
+}
+
+test "token: IPv6 source address validation" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const secret = [_]u8{0xff} ** 32;
+    conn.config.token_secret = secret;
+
+    const src: SocketAddr = .{ .v6 = .{ .addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 1234 } };
+    const odcid = ConnectionId.generate(0, io);
+    const now_ns: i64 = 1_000_000_000;
+
+    // Generate token with IPv6 source
+    const token = conn.generateToken(src, odcid, now_ns, io);
+    try testing.expectEqual(@as(usize, 62), token.len);
+
+    // Validate with same IPv6 source (should succeed)
+    const result = conn.validateToken(&token, src, now_ns);
+    try testing.expectEqual(odcid, result);
+}
+
+test "token: truncated token is rejected" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const secret = [_]u8{0x99} ** 32;
+    conn.config.token_secret = secret;
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
+    const now_ns: i64 = 1_000_000_000;
+
+    // Create truncated token (too short)
+    const truncated: [30]u8 = [_]u8{0} ** 30;
+
+    // Validation should fail
+    const result = conn.validateToken(&truncated, src, now_ns);
+    try testing.expectEqual(@as(?ConnectionId, null), result);
+}
+
+test "retry: transport params wiring with original_dcid and retry_scid" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    
+    // Create a connection with address validation enabled
+    var conn = try Connection.accept(.{ .validate_addr = true }, io);
+    
+    // Simulate receiving a Retry token (generate one to test the full flow)
+    const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
+    const original_dcid = ConnectionId.generate(0, io);
+    const now_ns: i64 = 1_000_000_000;
+    
+    const token = conn.generateToken(src, original_dcid, now_ns, io);
+    
+    // Validate the token (simulating receiving an Initial with this token)
+    const validated_dcid = conn.validateToken(&token, src, now_ns);
+    try testing.expectEqual(original_dcid, validated_dcid);
+    
+    // Set the original_dcid in the connection (would normally happen during Initial processing)
+    conn.original_dcid = validated_dcid;
+    
+    // Set a retry_scid (would be generated when sending the Retry)
+    conn.retry_scid = ConnectionId.generate(1, io);
+    
+    // Now verify that transport params can be built with these values
+    var test_params = transport_params.TransportParams{};
+    if (conn.original_dcid) |odcid| {
+        test_params.original_destination_connection_id = odcid;
+        if (conn.retry_scid) |scid| {
+            test_params.retry_source_connection_id = scid;
+        }
+    }
+    
+    // Verify the params were set correctly
+    try testing.expectEqual(original_dcid, test_params.original_destination_connection_id);
+    try testing.expectEqual(conn.retry_scid, test_params.retry_source_connection_id);
+    
+    // Test encoding/decoding the params with the new fields
+    var encoded_buf: [256]u8 = undefined;
+    const encoded_len = transport_params.encode(test_params, &encoded_buf);
+    try testing.expect(encoded_len > 0);
+
+    // Decode and verify
+    const decoded = try transport_params.decode(encoded_buf[0..encoded_len]);
+    try testing.expectEqual(test_params.original_destination_connection_id, decoded.original_destination_connection_id);
+    try testing.expectEqual(test_params.retry_source_connection_id, decoded.retry_source_connection_id);
+}
+
+// ---------------------------------------------------------------------------
+// Retry flow integration tests (RFC 9000 §8.1)
+// ---------------------------------------------------------------------------
+
+/// Build an encrypted Initial packet with an optional token.
+/// Returns the encrypted packet bytes and the initial keys derived from `dcid_bytes`.
+fn buildInitialPacket(
+    buf: []u8,
+    dcid_bytes: [8]u8,
+    scid_bytes: [8]u8,
+    token: []const u8,
+    pn: u64,
+) struct { keys: crypto.InitialKeys, pkt_len: usize } {
+    const dcid = ConnectionId{ .bytes = dcid_bytes };
+    const scid = ConnectionId{ .bytes = scid_bytes };
+    const keys = crypto.deriveInitialKeys(&dcid_bytes);
+
+    // PING frame as a minimal payload
+    var pt: [4]u8 = undefined;
+    const pt_len = frame.encodeFrame(&pt, .ping);
+    const ct_len = pt_len + 16;
+
+    const hdr_len = packet.encodeLongHeader(
+        buf,
+        .initial,
+        packet.QUIC_VERSION_1,
+        dcid,
+        scid,
+        token,
+        @intCast(pn),
+        ct_len,
+    );
+    crypto.encryptPayload(keys.client, pn, buf[0..hdr_len], pt[0..pt_len], buf[hdr_len..][0..ct_len]);
+    return .{ .keys = keys, .pkt_len = hdr_len + ct_len };
+}
+
+test "retry: validate_addr=false: tokenless Initial proceeds without Retry" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io);
+
+    // No retry_sent event
+    var got_retry = false;
+    while (conn.events.pop()) |ev| {
+        if (ev == .retry_sent) got_retry = true;
+    }
+    try testing.expect(!got_retry);
+}
+
+test "retry: validate_addr=true, no token: retry_sent event and Retry packet queued" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{ .validate_addr = true }, io);
+
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io);
+
+    // retry_sent event must be present
+    var got_retry = false;
+    while (conn.events.pop()) |ev| {
+        if (ev == .retry_sent) got_retry = true;
+    }
+    try testing.expect(got_retry);
+
+    // A Retry packet must be in the send queue
+    var out: [256]u8 = undefined;
+    const n = conn.send(&out);
+    try testing.expect(n > 0);
+    // Retry first byte is 0xf0
+    try testing.expectEqual(@as(u8, 0xf0), out[0]);
+}
+
+test "retry: validate_addr=true, valid token: original_dcid stored, handshake proceeds" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const secret = [_]u8{0xAB} ** 32;
+    var conn = try Connection.accept(.{ .validate_addr = true, .token_secret = secret }, io);
+
+    const dcid_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid_bytes = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 4321 } };
+    const now_ns: i64 = 2_000_000_000;
+
+    // Generate a valid token for this src + dcid
+    const odcid = ConnectionId{ .bytes = dcid_bytes };
+    const token = conn.generateToken(src, odcid, now_ns, io);
+
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
+    try conn.receive(buf[0..r.pkt_len], src, now_ns, io);
+
+    // original_dcid must be set (no retry sent)
+    try testing.expect(conn.original_dcid != null);
+    var got_retry = false;
+    while (conn.events.pop()) |ev| {
+        if (ev == .retry_sent) got_retry = true;
+    }
+    try testing.expect(!got_retry);
+}
+
+test "retry: validate_addr=true, expired token: error.InvalidToken" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const secret = [_]u8{0xCD} ** 32;
+    var conn = try Connection.accept(.{
+        .validate_addr = true,
+        .token_secret = secret,
+        .token_validity_ns = 60 * std.time.ns_per_s, // 1 minute
+    }, io);
+
+    const dcid_bytes = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
+    const scid_bytes = [_]u8{ 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99 };
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 2 }, .port = 1111 } };
+    const issued_ns: i64 = 1_000_000_000;
+    const now_ns: i64 = issued_ns + 120 * std.time.ns_per_s; // 2 minutes later → expired
+
+    const odcid = ConnectionId{ .bytes = dcid_bytes };
+    const token = conn.generateToken(src, odcid, issued_ns, io);
+
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
+    try testing.expectError(error.InvalidToken, conn.receive(buf[0..r.pkt_len], src, now_ns, io));
+}
+
+test "retry: validate_addr=true, tampered token: error.InvalidToken" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const secret = [_]u8{0xEF} ** 32;
+    var conn = try Connection.accept(.{ .validate_addr = true, .token_secret = secret }, io);
+
+    const dcid_bytes = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
+    const scid_bytes = [_]u8{ 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 192, 168, 1, 1 }, .port = 8080 } };
+    const now_ns: i64 = 3_000_000_000;
+
+    const odcid = ConnectionId{ .bytes = dcid_bytes };
+    var token = conn.generateToken(src, odcid, now_ns, io);
+    token[5] ^= 0xFF; // tamper with ciphertext byte
+
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
+    try testing.expectError(error.InvalidToken, conn.receive(buf[0..r.pkt_len], src, now_ns, io));
+}
+
+test "retry: validate_addr=true, wrong-address token: error.InvalidToken" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const secret = [_]u8{0x12} ** 32;
+    var conn = try Connection.accept(.{ .validate_addr = true, .token_secret = secret }, io);
+
+    const dcid_bytes = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
+    const scid_bytes = [_]u8{ 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x00 };
+    const src1: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 10 }, .port = 2222 } };
+    const src2: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 20 }, .port = 2222 } };
+    const now_ns: i64 = 4_000_000_000;
+
+    const odcid = ConnectionId{ .bytes = dcid_bytes };
+    const token = conn.generateToken(src1, odcid, now_ns, io); // token bound to src1
+
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
+    // Present with src2 — address mismatch must fail
+    try testing.expectError(error.InvalidToken, conn.receive(buf[0..r.pkt_len], src2, now_ns, io));
+}
+
+// ---------------------------------------------------------------------------
+// ECN integration tests (RFC 9000 §12.1, RFC 9002 §B.1)
+// ---------------------------------------------------------------------------
+
+test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 1_000_000_000;
+
+    // Record a sent packet so largest_acked_sent_ns is populated
+    conn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+
+    const initial_cwnd = conn.congestion.cwnd;
+
+    const ack = frame.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 1, .has_ecn = true,
+    };
+    try conn.processAck(ack, 2);
+
+    // CE count recorded
+    try testing.expectEqual(@as(u62, 1), conn.ecn_ce_seen[2]);
+    // cwnd must have been reduced (congestion event)
+    try testing.expect(conn.congestion.cwnd < initial_cwnd);
+}
+
+test "ecn: CE count non-increase is ignored (monotonic guard)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+
+    // Run two connections side by side: one with stale CE (non-increasing), one without ECN.
+    var conn_ecn = try Connection.accept(.{}, io);
+    conn_ecn.current_time_ns = 1_000_000_000;
+    conn_ecn.ecn_ce_seen[2] = 5; // already seen 5
+    conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+
+    var conn_plain = try Connection.accept(.{}, io);
+    conn_plain.current_time_ns = 1_000_000_000;
+    conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+
+    const ack_ecn = frame.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 5, .has_ecn = true, // CE=5, no increase
+    };
+    const ack_plain = frame.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    };
+
+    try conn_ecn.processAck(ack_ecn, 2);
+    try conn_plain.processAck(ack_plain, 2);
+
+    // CE count must still be 5 (not updated)
+    try testing.expectEqual(@as(u62, 5), conn_ecn.ecn_ce_seen[2]);
+    // cwnd must match the plain case (no congestion triggered)
+    try testing.expectEqual(conn_plain.congestion.cwnd, conn_ecn.congestion.cwnd);
+}
+
+test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+
+    // Two connections: one ACK with has_ecn=true but CE=0, one plain ACK without ECN.
+    var conn_ecn = try Connection.accept(.{}, io);
+    conn_ecn.current_time_ns = 1_000_000_000;
+    conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+
+    var conn_plain = try Connection.accept(.{}, io);
+    conn_plain.current_time_ns = 1_000_000_000;
+    conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+
+    const ack_ecn = frame.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 10, .ect1 = 5, .ecn_ce = 0, .has_ecn = true, // CE=0, no increase from 0
+    };
+    const ack_plain = frame.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    };
+
+    try conn_ecn.processAck(ack_ecn, 2);
+    try conn_plain.processAck(ack_plain, 2);
+
+    // ecn_ce_seen stays 0 — CE count was 0 and did not increase
+    try testing.expectEqual(@as(u62, 0), conn_ecn.ecn_ce_seen[2]);
+    // cwnd matches plain (no congestion event from CE=0)
+    try testing.expectEqual(conn_plain.congestion.cwnd, conn_ecn.congestion.cwnd);
+}
+
+test "ecn: has_ecn=false ACK does not touch ecn_ce_seen" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 1_000_000_000;
+    conn.ecn_ce_seen[2] = 99; // pre-set to a non-zero value
+
+    conn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+
+    const ack = frame.AckFrame{
+        .largest_acked = 1,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+    };
+    try conn.processAck(ack, 2);
+
+    // ecn_ce_seen unchanged
+    try testing.expectEqual(@as(u62, 99), conn.ecn_ce_seen[2]);
 }

@@ -1115,3 +1115,56 @@ test "frame: PATH_RESPONSE echoes PATH_CHALLENGE data" {
         else => return error.WrongFrameType,
     }
 }
+
+test "frame: ACK_ECN (0x03) encode/decode round-trip preserves ECN counts" {
+    const testing = std.testing;
+    const ack_frame = Frame{ .ack = AckFrame{
+        .largest_acked = 42,
+        .ack_delay = 10,
+        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 42 }} ++ [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 100,
+        .ect1 = 200,
+        .ecn_ce = 5,
+        .has_ecn = true,
+    } };
+
+    var buf: [64]u8 = undefined;
+    const n = encodeFrame(&buf, ack_frame);
+    // Type byte must be 0x03 for ACK_ECN
+    try testing.expectEqual(@as(u8, 0x03), buf[0]);
+
+    const parsed = try parseFrame(buf[0..n]);
+    switch (parsed.frame) {
+        .ack => |a| {
+            try testing.expect(a.has_ecn);
+            try testing.expectEqual(@as(u62, 42), a.largest_acked);
+            try testing.expectEqual(@as(u62, 100), a.ect0);
+            try testing.expectEqual(@as(u62, 200), a.ect1);
+            try testing.expectEqual(@as(u62, 5), a.ecn_ce);
+        },
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: ACK (0x02) without ECN has_ecn=false" {
+    const testing = std.testing;
+    const ack_frame = Frame{ .ack = AckFrame{
+        .largest_acked = 10,
+        .ack_delay = 0,
+        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 10 }} ++ [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .range_count = 1,
+        .ect0 = 0, .ect1 = 0, .ecn_ce = 0,
+        .has_ecn = false,
+    } };
+
+    var buf: [32]u8 = undefined;
+    const n = encodeFrame(&buf, ack_frame);
+    try testing.expectEqual(@as(u8, 0x02), buf[0]);
+
+    const parsed = try parseFrame(buf[0..n]);
+    switch (parsed.frame) {
+        .ack => |a| try testing.expect(!a.has_ecn),
+        else => return error.WrongFrameType,
+    }
+}

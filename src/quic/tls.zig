@@ -118,6 +118,9 @@ pub const TlsServer = struct {
     // Negotiated transport parameters received from the peer.
     peer_params: transport_params.TransportParams,
 
+    // Our transport parameters to send in EncryptedExtensions (set by Connection).
+    our_transport_params: transport_params.TransportParams = .{},
+
     // CRYPTO data accumulation buffers
     read_buf: [8192]u8,
     read_len: usize,
@@ -274,8 +277,8 @@ pub const TlsServer = struct {
         const ee_start = pos;
 
         // EncryptedExtensions (with QUIC transport parameters).
-        // Server advertises default params; the peer's params are in self.peer_params.
-        pos += buildEncryptedExtensions(out[pos..], transport_params.TransportParams{});
+        // Use our_transport_params which may include original_dcid/retry_scid if set by Connection.
+        pos += buildEncryptedExtensions(out[pos..], self.our_transport_params);
 
         // Certificate
         pos += self.buildCertificateMessage(out[pos..]);

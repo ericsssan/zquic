@@ -296,6 +296,86 @@ pub fn encodeVersionNegotiation(
     return pos;
 }
 
+/// Encode a Retry packet (RFC 9000 §17.2.5).
+///
+/// Retry wire format: 0xf0 | version (4) | DCID_len(1) + DCID(8) | SCID_len(1) + SCID(8) | token(N) | integrity_tag(16)
+/// No packet number, no length prefix, no AEAD payload — completely different from Long Header.
+///
+/// `dcid` is the client's source CID from the Initial packet (echoed back as DCID in Retry).
+/// `scid` is a new server CID used in the Retry packet.
+/// `token` is the opaque address-validation token.
+/// `odcid` is the original DCID from the Initial packet (used for Integrity Tag computation).
+///
+/// Returns the number of bytes written.
+pub fn encodeRetry(
+    buf: []u8,
+    dcid: ConnectionId,    // client's src CID → send back as DCID
+    scid: ConnectionId,    // new server CID used in Retry
+    token: []const u8,     // opaque address-validation token
+    odcid: ConnectionId,   // original DCID (for Integrity Tag pseudo-header)
+) usize {
+    var pos: usize = 0;
+
+    // First byte: 1 (long) | 1 (fixed) | retry (0b11 = 0x30) | reserved (2) | pn_len (2)
+    buf[pos] = 0xf0;
+    pos += 1;
+
+    // Version (4 bytes)
+    std.mem.writeInt(u32, buf[pos..][0..4], QUIC_VERSION_1, .big);
+    pos += 4;
+
+    // DCID (client's source CID from Initial)
+    buf[pos] = cid.len;
+    pos += 1;
+    @memcpy(buf[pos..][0..cid.len], &dcid.bytes);
+    pos += cid.len;
+
+    // SCID (new server CID)
+    buf[pos] = cid.len;
+    pos += 1;
+    @memcpy(buf[pos..][0..cid.len], &scid.bytes);
+    pos += cid.len;
+
+    // Token (variable length)
+    pos += varint.encode(buf[pos..], @intCast(token.len));
+    @memcpy(buf[pos..][0..token.len], token);
+    pos += token.len;
+
+    // Retry Integrity Tag (RFC 9001 §5.8)
+    // Fixed key and nonce for all servers (QUIC v1 test vectors)
+    const integrity_key = [_]u8{
+        0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+        0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+    };
+    const integrity_nonce = [_]u8{
+        0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
+        0xa1, 0x8b, 0x0d, 0x12,
+    };
+
+    // Pseudo-header for AAD: [odcid.len] ++ odcid.bytes ++ retry_packet_without_tag
+    var aad_buf: [256]u8 = undefined;
+    var aad_len: usize = 0;
+    aad_buf[aad_len] = cid.len;
+    aad_len += 1;
+    @memcpy(aad_buf[aad_len..][0..cid.len], &odcid.bytes);
+    aad_len += cid.len;
+    @memcpy(aad_buf[aad_len..][0..pos], buf[0..pos]);
+    aad_len += pos;
+
+    const aad = aad_buf[0..aad_len];
+
+    // Encrypt empty plaintext to get the tag
+    // Aes128Gcm.encrypt(ciphertext, tag, plaintext, ad, nonce, key)
+    var tag: [16]u8 = undefined;
+    std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&.{}, &tag, &.{}, aad, integrity_nonce, integrity_key);
+
+    // Append integrity tag to buffer
+    @memcpy(buf[pos..][0..16], &tag);
+    pos += 16;
+
+    return pos;
+}
+
 /// Decode a full packet number from a truncated value per RFC 9000 §A.3.
 pub fn decodePacketNumber(largest_acked: u64, truncated: u32, pn_bits: u8) u64 {
     const expected: u64 = largest_acked + 1;
@@ -441,4 +521,55 @@ test "packet: parseLongHeader with non-empty Initial token" {
     try testing.expectEqual(PacketType.initial, result.header.packet_type);
     try testing.expectEqualSlices(u8, &tok, result.header.token);
     try testing.expectEqual(@as(u32, 99), result.header.packet_number);
+}
+
+test "packet: encodeRetry structure" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
+    const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
+    const token = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+
+    const n = encodeRetry(&buf, dcid, scid, &token, odcid);
+
+    // Verify first byte is 0xf0 (Retry packet)
+    try testing.expectEqual(@as(u8, 0xf0), buf[0]);
+
+    // Verify version is QUIC v1
+    try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[1..5], .big));
+
+    // Verify DCID length and content
+    try testing.expectEqual(@as(u8, cid.len), buf[5]);
+    try testing.expectEqualSlices(u8, &dcid.bytes, buf[6..14]);
+
+    // Verify SCID length and content
+    try testing.expectEqual(@as(u8, cid.len), buf[14]);
+    try testing.expectEqualSlices(u8, &scid.bytes, buf[15..23]);
+
+    // Verify token length and content
+    var pos: usize = 23;
+    const token_len_vi = varint.decode(buf[pos..]) orelse return error.InvalidFormat;
+    try testing.expectEqual(@as(u62, 4), token_len_vi.value);
+    pos += token_len_vi.len;
+    try testing.expectEqualSlices(u8, &token, buf[pos..][0..4]);
+    pos += 4;
+
+    // Verify integrity tag is 16 bytes at the end
+    try testing.expectEqual(@as(usize, 16), n - pos);
+}
+
+test "packet: encodeRetry integrity tag is 16 bytes" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
+    const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
+    const token = [_]u8{0xAA} ** 62; // max size token
+
+    const n = encodeRetry(&buf, dcid, scid, &token, odcid);
+
+    // Expected: 1 + 4 + 1 + 8 + 1 + 8 + varint(62) + 62 + 16
+    // varint(62) = 1 byte, so total = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 62 + 16 = 102
+    try testing.expectEqual(@as(usize, 102), n);
 }
