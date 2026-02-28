@@ -1,8 +1,40 @@
-//! PEM → DER decoder and PKCS#8 Ed25519 seed extractor.
+//! PEM → DER decoder and PKCS#8 private-key extractor.
 //!
+//! Supports Ed25519 and P-256 ECDSA (prime256v1) private keys.
 //! Pure functions, no allocator, no I/O dependencies.
 
 const std = @import("std");
+
+/// Private-key algorithm detected from PKCS#8 DER.
+pub const KeyAlgorithm = enum { ed25519, p256 };
+
+/// Parsed private key: algorithm tag + 32-byte raw key material.
+/// For Ed25519 this is the seed; for P-256 this is the private scalar.
+pub const KeyMaterial = struct {
+    algorithm: KeyAlgorithm,
+    seed: [32]u8,
+};
+
+// prime256v1 OID bytes inside a PKCS#8 AlgorithmIdentifier:
+// OBJECT IDENTIFIER 1.2.840.10045.3.1.7
+const P256_OID = [_]u8{ 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07 };
+
+/// Detect key algorithm and extract the 32-byte private key from PKCS#8 DER.
+/// Works for both Ed25519 (seed) and P-256 (private scalar).
+/// Both formats store the key as an inner OCTET STRING with tag 0x04 length 0x20.
+pub fn parsePrivateKey(der: []const u8) !KeyMaterial {
+    // Detect P-256 by looking for the prime256v1 OID in the DER.
+    const algorithm: KeyAlgorithm = blk: {
+        var i: usize = 0;
+        while (i + P256_OID.len <= der.len) : (i += 1) {
+            if (std.mem.eql(u8, der[i..][0..P256_OID.len], &P256_OID)) break :blk .p256;
+        }
+        break :blk .ed25519;
+    };
+    // Both Ed25519 and P-256 PKCS#8 store the 32-byte key as 0x04 0x20 <key>.
+    const seed = try pkcs8Ed25519Seed(der);
+    return .{ .algorithm = algorithm, .seed = seed };
+}
 
 /// Decode the first PEM block between "-----BEGIN ..." and "-----END ...".
 /// Returns number of DER bytes written into `out`.

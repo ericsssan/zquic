@@ -155,8 +155,10 @@ pub const Config = struct {
     alpn: []const u8 = "",
     /// Pre-loaded DER certificate (null = use ephemeral self-signed).
     cert_der: ?[]const u8 = null,
-    /// Ed25519 seed corresponding to cert_der.
+    /// 32-byte private key material for cert_der: Ed25519 seed or P-256 scalar.
     cert_seed: ?[32]u8 = null,
+    /// Key algorithm for cert_der (ignored when cert_der is null).
+    cert_key_algorithm: tls.KeyAlgorithm = .ed25519,
 };
 
 // ---------------------------------------------------------------------------
@@ -347,7 +349,7 @@ pub const Connection = struct {
     /// datagram to start the handshake.
     pub fn accept(config: Config, io: std.Io) !Connection {
         var tls_server = if (config.cert_der) |der|
-            try tls.TlsServer.initFromCert(der, config.cert_seed.?, io)
+            try tls.TlsServer.initFromCert(der, config.cert_seed.?, config.cert_key_algorithm, io)
         else
             try tls.TlsServer.init(io);
         if (config.alpn.len > 0) {

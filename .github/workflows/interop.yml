@@ -12,7 +12,7 @@ jobs:
   interop:
     name: quic-interop-runner
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     # When triggered by Docker workflow, only run if the image built successfully.
     if: >
       github.event_name != 'workflow_run' ||
@@ -39,12 +39,11 @@ jobs:
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
 
-      - name: Run interop tests (zquic server × ngtcp2 client)
+      - name: Run interop tests (zquic server × all clients)
         run: |
           cd runner
           python3 run.py \
             --server zquic \
-            --client ngtcp2 \
             --test handshake,transfer,retry,keyupdate,v2 \
             --log-dir logs \
             --json results.json \

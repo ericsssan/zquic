@@ -24,6 +24,15 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 const Hmac256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
+const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+
+/// Private-key algorithm used for CertificateVerify.
+pub const KeyAlgorithm = enum { ed25519, p256 };
+
+const SignKey = union(KeyAlgorithm) {
+    ed25519: Ed25519.KeyPair,
+    p256: EcdsaP256Sha256.KeyPair,
+};
 
 // ---------------------------------------------------------------------------
 // TLS constants
@@ -93,10 +102,10 @@ pub const TlsServer = struct {
 
     // Our X25519 key pair (ephemeral per-connection)
     ecdh_kp: X25519.KeyPair,
-    // Our Ed25519 signing key pair
-    sign_kp: Ed25519.KeyPair,
+    // Our signing key (Ed25519 or P-256 ECDSA depending on certificate)
+    sign_key: SignKey,
     // DER-encoded certificate (self-signed or external)
-    cert_buf: [2048]u8,
+    cert_buf: [4096]u8,
     cert_len: usize,
 
     // Handshake transcript hash state
@@ -152,7 +161,7 @@ pub const TlsServer = struct {
         var self: TlsServer = .{
             .state = .wait_client_hello,
             .ecdh_kp = ecdh_kp,
-            .sign_kp = sign_kp,
+            .sign_key = .{ .ed25519 = sign_kp },
             .cert_buf = undefined,
             .cert_len = 0,
             .transcript = Sha256.init(.{}),
@@ -188,16 +197,23 @@ pub const TlsServer = struct {
         return self;
     }
 
-    /// Initialize TlsServer with a caller-provided DER certificate and Ed25519 seed.
+    /// Initialize TlsServer with a caller-provided DER certificate and private key.
+    /// `seed` is the 32-byte Ed25519 seed or P-256 private scalar depending on `algorithm`.
     /// Use when loading certs from disk (e.g. interop runner /certs/).
-    pub fn initFromCert(cert_der: []const u8, seed: [32]u8, io: std.Io) !TlsServer {
-        if (cert_der.len > 2048) return error.CertTooLarge;
+    pub fn initFromCert(cert_der: []const u8, seed: [32]u8, algorithm: KeyAlgorithm, io: std.Io) !TlsServer {
+        if (cert_der.len > 4096) return error.CertTooLarge;
         const ecdh_kp = X25519.KeyPair.generate(io);
-        const sign_kp = try Ed25519.KeyPair.generateDeterministic(seed);
+        const sign_key: SignKey = switch (algorithm) {
+            .ed25519 => .{ .ed25519 = try Ed25519.KeyPair.generateDeterministic(seed) },
+            .p256 => blk: {
+                const sk = EcdsaP256Sha256.SecretKey{ .bytes = seed };
+                break :blk .{ .p256 = try EcdsaP256Sha256.KeyPair.fromSecretKey(sk) };
+            },
+        };
         var self: TlsServer = .{
             .state = .wait_client_hello,
             .ecdh_kp = ecdh_kp,
-            .sign_kp = sign_kp,
+            .sign_key = sign_key,
             .cert_buf = undefined,
             .cert_len = cert_der.len,
             .transcript = Sha256.init(.{}),
@@ -232,6 +248,10 @@ pub const TlsServer = struct {
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.client_app_secret)));
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.server_app_secret)));
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.ecdh_kp.secret_key)));
+        switch (self.sign_key) {
+            .ed25519 => |*kp| std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&kp.secret_key))),
+            .p256 => |*kp| std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&kp.secret_key.bytes))),
+        }
     }
 
     pub fn clientAppKeys(self: *const TlsServer) crypto.PacketKeys {
@@ -580,20 +600,37 @@ pub const TlsServer = struct {
         to_sign[97] = 0x00;
         @memcpy(to_sign[98..130], transcript_hash);
 
-        const sig = try self.sign_kp.sign(&to_sign, null);
-        const sig_bytes = sig.toBytes();
-
         var pos: usize = 4; // handshake header placeholder
 
-        // SignatureScheme: Ed25519 = 0x0807
-        std.mem.writeInt(u16, out[pos..][0..2], 0x0807, .big);
-        pos += 2;
+        switch (self.sign_key) {
+            .ed25519 => |kp| {
+                const sig = try kp.sign(&to_sign, null);
+                const sig_bytes = sig.toBytes(); // 64 bytes fixed
 
-        // Signature length + bytes
-        std.mem.writeInt(u16, out[pos..][0..2], @intCast(sig_bytes.len), .big);
-        pos += 2;
-        @memcpy(out[pos..][0..sig_bytes.len], &sig_bytes);
-        pos += sig_bytes.len;
+                // SignatureScheme: Ed25519 = 0x0807
+                std.mem.writeInt(u16, out[pos..][0..2], 0x0807, .big);
+                pos += 2;
+                std.mem.writeInt(u16, out[pos..][0..2], @intCast(sig_bytes.len), .big);
+                pos += 2;
+                @memcpy(out[pos..][0..sig_bytes.len], &sig_bytes);
+                pos += sig_bytes.len;
+            },
+            .p256 => |kp| {
+                const sig = try kp.sign(&to_sign, null);
+                // TLS 1.3 uses DER-encoded ECDSA signature (RFC 8446 §4.2.3).
+                // P-256 DER max = 72 bytes (EcdsaP256Sha256.Signature.der_encoded_length_max).
+                var der_buf: [EcdsaP256Sha256.Signature.der_encoded_length_max]u8 = undefined;
+                const der_sig = sig.toDer(&der_buf);
+
+                // SignatureScheme: ecdsa_secp256r1_sha256 = 0x0403
+                std.mem.writeInt(u16, out[pos..][0..2], 0x0403, .big);
+                pos += 2;
+                std.mem.writeInt(u16, out[pos..][0..2], @intCast(der_sig.len), .big);
+                pos += 2;
+                @memcpy(out[pos..][0..der_sig.len], der_sig);
+                pos += der_sig.len;
+            },
+        }
 
         // Fill handshake header
         out[0] = HS_CERTIFICATE_VERIFY;
@@ -604,7 +641,7 @@ pub const TlsServer = struct {
 
         return pos;
     }
-};
+}; // end TlsServer
 
 // ---------------------------------------------------------------------------
 // Parsing helpers
@@ -975,7 +1012,7 @@ test "tls: TlsServer init generates distinct keys" {
     const b = try TlsServer.init(io);
     // Public keys must differ; random key collision is astronomically improbable.
     try std.testing.expect(!std.mem.eql(u8, &a.ecdh_kp.public_key, &b.ecdh_kp.public_key));
-    try std.testing.expect(!std.mem.eql(u8, &a.sign_kp.public_key.bytes, &b.sign_kp.public_key.bytes));
+    try std.testing.expect(!std.mem.eql(u8, &a.sign_key.ed25519.public_key.bytes, &b.sign_key.ed25519.public_key.bytes));
 }
 
 test "tls: EncryptedExtensions contains QUIC transport params extension" {
@@ -1269,4 +1306,52 @@ test "tls: ALPN: mismatch returns AlpnMismatch" {
         }
     }
     try testing.expect(!matched);
+}
+
+test "tls: P-256 initFromCert stores p256 key variant" {
+    const io = std.testing.io;
+    var base = try TlsServer.init(io);
+    const cert_der = base.cert_buf[0..base.cert_len];
+    // Private scalar = 1 is the smallest valid P-256 scalar.
+    var seed: [32]u8 = [_]u8{0} ** 32;
+    seed[31] = 1;
+    const server = try TlsServer.initFromCert(cert_der, seed, .p256, io);
+    try std.testing.expect(server.sign_key == .p256);
+}
+
+test "tls: P-256 buildCertificateVerify produces DER ECDSA signature" {
+    const io = std.testing.io;
+    var base = try TlsServer.init(io);
+    const cert_der = base.cert_buf[0..base.cert_len];
+    var seed: [32]u8 = [_]u8{0} ** 32;
+    seed[31] = 1;
+    var server = try TlsServer.initFromCert(cert_der, seed, .p256, io);
+
+    var out: [512]u8 = undefined;
+    const transcript_hash = [_]u8{0xab} ** 32;
+    const n = try server.buildCertificateVerify(&out, &transcript_hash);
+
+    // HandshakeType = 15 (CertificateVerify)
+    try std.testing.expectEqual(@as(u8, 15), out[0]);
+    const body_len = (@as(usize, out[1]) << 16) | (@as(usize, out[2]) << 8) | out[3];
+    try std.testing.expectEqual(n - 4, body_len);
+    // SignatureScheme = 0x0403 (ecdsa_secp256r1_sha256)
+    const scheme = (@as(u16, out[4]) << 8) | out[5];
+    try std.testing.expectEqual(@as(u16, 0x0403), scheme);
+    // DER signature length must be in valid range for P-256 (8..72 bytes)
+    const sig_len = (@as(usize, out[6]) << 8) | out[7];
+    try std.testing.expect(sig_len >= 8 and sig_len <= 72);
+    // DER SEQUENCE tag
+    try std.testing.expectEqual(@as(u8, 0x30), out[8]);
+}
+
+test "tls: P-256 deinit zeros secret key bytes" {
+    const io = std.testing.io;
+    var base = try TlsServer.init(io);
+    const cert_der = base.cert_buf[0..base.cert_len];
+    var seed: [32]u8 = [_]u8{0} ** 32;
+    seed[31] = 1;
+    var server = try TlsServer.initFromCert(cert_der, seed, .p256, io);
+    server.deinit();
+    try std.testing.expectEqual([_]u8{0} ** 32, server.sign_key.p256.secret_key.bytes);
 }
