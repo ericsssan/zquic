@@ -9,6 +9,7 @@ const cid = @import("connection_id.zig");
 const ConnectionId = cid.ConnectionId;
 
 pub const QUIC_VERSION_1: u32 = 0x0000_0001;
+pub const QUIC_VERSION_2: u32 = 0x6b33_43cf;
 
 // ---------------------------------------------------------------------------
 // Packet type classification
@@ -27,8 +28,14 @@ pub fn isLongHeader(first_byte: u8) bool {
 }
 
 /// Extract the PacketType from a Long Header first byte.
-pub fn longHeaderType(first_byte: u8) PacketType {
-    return @enumFromInt((first_byte >> 4) & 0x03);
+/// v1 and v2 encode the same four types with different 2-bit patterns in bits 5–4
+/// (RFC 9369 §3.1): v2 rotates v1's encoding by +1, so we rotate back by -1 (i.e., +3 mod 4).
+pub fn longHeaderType(first_byte: u8, version: u32) PacketType {
+    const raw: u8 = (first_byte >> 4) & 0x03;
+    if (version == QUIC_VERSION_2) {
+        return @enumFromInt((raw + 3) % 4);
+    }
+    return @enumFromInt(raw);
 }
 
 // ---------------------------------------------------------------------------
@@ -70,8 +77,8 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     const dcid_len = buf[pos];
     pos += 1;
     if (pos + dcid_len > buf.len) return error.PacketTooShort;
-    // For QUIC v1, CID length must match our fixed 8-byte CID format.
-    if (version == QUIC_VERSION_1 and dcid_len != cid.len) return error.UnsupportedCidLength;
+    // For known QUIC versions, CID length must match our fixed 8-byte CID format.
+    if ((version == QUIC_VERSION_1 or version == QUIC_VERSION_2) and dcid_len != cid.len) return error.UnsupportedCidLength;
     var dest_cid: ConnectionId = .{};
     if (dcid_len > 0) @memcpy(&dest_cid.bytes, buf[pos..][0..dcid_len]);
     pos += dcid_len;
@@ -81,13 +88,13 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     const scid_len = buf[pos];
     pos += 1;
     if (pos + scid_len > buf.len) return error.PacketTooShort;
-    // For QUIC v1, CID length must match our fixed 8-byte CID format.
-    if (version == QUIC_VERSION_1 and scid_len != cid.len) return error.UnsupportedCidLength;
+    // For known QUIC versions, CID length must match our fixed 8-byte CID format.
+    if ((version == QUIC_VERSION_1 or version == QUIC_VERSION_2) and scid_len != cid.len) return error.UnsupportedCidLength;
     var src_cid: ConnectionId = .{};
     if (scid_len > 0) @memcpy(&src_cid.bytes, buf[pos..][0..scid_len]);
     pos += scid_len;
 
-    const pkt_type = longHeaderType(first_byte);
+    const pkt_type = longHeaderType(first_byte, version);
 
     // Token (Initial only)
     var token: []const u8 = &.{};
@@ -152,7 +159,12 @@ pub fn encodeLongHeader(
     var pos: usize = 0;
 
     // First byte: 1 (long) | 1 (fixed) | type (2) | reserved (2) | pn_len-1 (2)
-    buf[pos] = 0xc0 | (@as(u8, @intFromEnum(pkt_type)) << 4) | (pn_len - 1);
+    // v2 rotates the 2-bit type encoding by +1 mod 4 (RFC 9369 §3.1).
+    const raw_type: u8 = if (version == QUIC_VERSION_2)
+        (@as(u8, @intFromEnum(pkt_type)) + 1) % 4
+    else
+        @as(u8, @intFromEnum(pkt_type));
+    buf[pos] = 0xc0 | (raw_type << 4) | (pn_len - 1);
     pos += 1;
 
     std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
@@ -289,8 +301,10 @@ pub fn encodeVersionNegotiation(
     @memcpy(buf[pos..][0..cid.len], &scid.bytes);
     pos += cid.len;
 
-    // Supported Versions: QUIC version 1.
+    // Supported Versions: QUIC v1 and v2.
     std.mem.writeInt(u32, buf[pos..][0..4], QUIC_VERSION_1, .big);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], QUIC_VERSION_2, .big);
     pos += 4;
 
     return pos;
@@ -313,15 +327,18 @@ pub fn encodeRetry(
     scid: ConnectionId, // new server CID used in Retry
     token: []const u8, // opaque address-validation token
     odcid: ConnectionId, // original DCID (for Integrity Tag pseudo-header)
+    version: u32,
 ) usize {
     var pos: usize = 0;
 
-    // First byte: 1 (long) | 1 (fixed) | retry (0b11 = 0x30) | reserved (2) | pn_len (2)
-    buf[pos] = 0xf0;
+    // First byte: 1 (long) | 1 (fixed) | retry type bits | reserved | 0
+    // v1: Retry raw bits = 0b11 → 0xf0; v2: Retry raw bits = 0b00 → 0xc0 (RFC 9369 §3.1).
+    const retry_raw: u8 = if (version == QUIC_VERSION_2) 0b00 else 0b11;
+    buf[pos] = 0xc0 | (retry_raw << 4);
     pos += 1;
 
     // Version (4 bytes)
-    std.mem.writeInt(u32, buf[pos..][0..4], QUIC_VERSION_1, .big);
+    std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
     pos += 4;
 
     // DCID (client's source CID from Initial)
@@ -341,16 +358,28 @@ pub fn encodeRetry(
     @memcpy(buf[pos..][0..token.len], token);
     pos += token.len;
 
-    // Retry Integrity Tag (RFC 9001 §5.8)
-    // Fixed key and nonce for all servers (QUIC v1 test vectors)
-    const integrity_key = [_]u8{
-        0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
-        0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
-    };
-    const integrity_nonce = [_]u8{
-        0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
-        0xa1, 0x8b, 0x0d, 0x12,
-    };
+    // Retry Integrity Tag (RFC 9001 §5.8, RFC 9369 §4.2.1)
+    // Fixed key and nonce differ between v1 and v2.
+    const integrity_key = if (version == QUIC_VERSION_2)
+        [_]u8{
+            0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2,
+            0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92,
+        }
+    else
+        [_]u8{
+            0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+            0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+        };
+    const integrity_nonce = if (version == QUIC_VERSION_2)
+        [_]u8{
+            0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99,
+            0x90, 0xef, 0xfd, 0x52,
+        }
+    else
+        [_]u8{
+            0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
+            0xa1, 0x8b, 0x0d, 0x12,
+        };
 
     // Pseudo-header for AAD: [odcid.len] ++ odcid.bytes ++ retry_packet_without_tag
     var aad_buf: [256]u8 = undefined;
@@ -470,8 +499,8 @@ test "packet: encodeVersionNegotiation structure" {
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
     const n = encodeVersionNegotiation(&buf, dcid, scid);
 
-    // Exact wire size: 1 + 4 + 1 + 8 + 1 + 8 + 4 = 27 bytes.
-    try testing.expectEqual(@as(usize, 27), n);
+    // Exact wire size: 1 + 4 + 1 + 8 + 1 + 8 + 4 + 4 = 31 bytes (v1 + v2).
+    try testing.expectEqual(@as(usize, 31), n);
 
     // Long header bit must be set.
     try testing.expect(buf[0] & 0x80 != 0);
@@ -487,17 +516,18 @@ test "packet: encodeVersionNegotiation structure" {
     try testing.expectEqual(@as(u8, cid.len), buf[14]);
     try testing.expectEqualSlices(u8, &scid.bytes, buf[15..23]);
 
-    // Supported version: QUIC v1.
+    // Supported versions: QUIC v1 then v2.
     try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[23..27], .big));
+    try testing.expectEqual(QUIC_VERSION_2, std.mem.readInt(u32, buf[27..31], .big));
 }
 
 test "packet: longHeaderType extracts all four packet types" {
     // First byte layout: 1 (long) | 1 (fixed) | type[1:0] | reserved | pn_len
     // Bits 5-4 encode the PacketType.
-    try std.testing.expectEqual(PacketType.initial, longHeaderType(0xC0)); // type=0b00
-    try std.testing.expectEqual(PacketType.zero_rtt, longHeaderType(0xD0)); // type=0b01
-    try std.testing.expectEqual(PacketType.handshake, longHeaderType(0xE0)); // type=0b10
-    try std.testing.expectEqual(PacketType.retry, longHeaderType(0xF0)); // type=0b11
+    try std.testing.expectEqual(PacketType.initial, longHeaderType(0xC0, QUIC_VERSION_1)); // type=0b00
+    try std.testing.expectEqual(PacketType.zero_rtt, longHeaderType(0xD0, QUIC_VERSION_1)); // type=0b01
+    try std.testing.expectEqual(PacketType.handshake, longHeaderType(0xE0, QUIC_VERSION_1)); // type=0b10
+    try std.testing.expectEqual(PacketType.retry, longHeaderType(0xF0, QUIC_VERSION_1)); // type=0b11
 }
 
 test "packet: decodePacketNumber wrap-around" {
@@ -531,9 +561,9 @@ test "packet: encodeRetry structure" {
     const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
     const token = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
 
-    const n = encodeRetry(&buf, dcid, scid, &token, odcid);
+    const n = encodeRetry(&buf, dcid, scid, &token, odcid, QUIC_VERSION_1);
 
-    // Verify first byte is 0xf0 (Retry packet)
+    // Verify first byte is 0xf0 (Retry packet, v1: raw type bits 0b11)
     try testing.expectEqual(@as(u8, 0xf0), buf[0]);
 
     // Verify version is QUIC v1
@@ -567,9 +597,51 @@ test "packet: encodeRetry integrity tag is 16 bytes" {
     const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
     const token = [_]u8{0xAA} ** 62; // max size token
 
-    const n = encodeRetry(&buf, dcid, scid, &token, odcid);
+    const n = encodeRetry(&buf, dcid, scid, &token, odcid, QUIC_VERSION_1);
 
     // Expected: 1 + 4 + 1 + 8 + 1 + 8 + varint(62) + 62 + 16
     // varint(62) = 1 byte, so total = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 62 + 16 = 102
     try testing.expectEqual(@as(usize, 102), n);
+}
+
+test "packet: longHeaderType v2 rotates packet type bits" {
+    // v2 raw bits are shifted by +1 relative to v1 (RFC 9369 §3.1).
+    // raw 0b01 → Initial (v2), raw 0b10 → 0-RTT (v2), etc.
+    try std.testing.expectEqual(PacketType.initial, longHeaderType(0xD0, QUIC_VERSION_2)); // raw 0b01
+    try std.testing.expectEqual(PacketType.zero_rtt, longHeaderType(0xE0, QUIC_VERSION_2)); // raw 0b10
+    try std.testing.expectEqual(PacketType.handshake, longHeaderType(0xF0, QUIC_VERSION_2)); // raw 0b11
+    try std.testing.expectEqual(PacketType.retry, longHeaderType(0xC0, QUIC_VERSION_2)); // raw 0b00
+}
+
+test "packet: encodeLongHeader v2 encodes Initial with raw bits 0b01" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
+
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_2, dcid, scid, &.{}, 1, 20);
+    @memset(buf[hdr_len..][0..20], 0xab);
+
+    // First byte bits 5–4 must be 0b01 (v2 Initial raw bits).
+    try testing.expectEqual(@as(u8, 0b01), (buf[0] >> 4) & 0x03);
+    // Version field must be QUIC v2.
+    try testing.expectEqual(QUIC_VERSION_2, std.mem.readInt(u32, buf[1..5], .big));
+
+    // Round-trip: parseLongHeader must decode it as Initial.
+    const result = try parseLongHeader(buf[0 .. hdr_len + 20]);
+    try testing.expectEqual(PacketType.initial, result.header.packet_type);
+    try testing.expectEqual(QUIC_VERSION_2, result.header.version);
+}
+
+test "packet: encodeVersionNegotiation lists v1 and v2" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
+    const n = encodeVersionNegotiation(&buf, dcid, scid);
+
+    // Wire size: 1 + 4 + 1 + 8 + 1 + 8 + 4 (v1) + 4 (v2) = 31 bytes.
+    try testing.expectEqual(@as(usize, 31), n);
+    try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[23..27], .big));
+    try testing.expectEqual(QUIC_VERSION_2, std.mem.readInt(u32, buf[27..31], .big));
 }

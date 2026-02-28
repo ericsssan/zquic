@@ -7,6 +7,7 @@
 //!   - AES-128-ECB header protection (§5.4)
 
 const std = @import("std");
+const packet = @import("packet.zig");
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes128 = std.crypto.core.aes.Aes128;
@@ -26,10 +27,17 @@ pub const InitialKeys = struct {
 };
 
 /// QUIC v1 initial salt (RFC 9001 §5.2).
-const initial_salt = [_]u8{
+const initial_salt_v1 = [_]u8{
     0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3,
     0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad,
     0xcc, 0xbb, 0x7f, 0x0a,
+};
+
+/// QUIC v2 initial salt (RFC 9369 §3.3).
+const initial_salt_v2 = [_]u8{
+    0x0d, 0xed, 0xe3, 0xde, 0xf7, 0x00, 0xa6, 0xdb,
+    0x81, 0x93, 0x81, 0xbe, 0x6e, 0x26, 0x9d, 0xcb,
+    0xf9, 0xbd, 0x2e, 0xd9,
 };
 
 /// Build an HkdfLabel byte string as specified in RFC 8446 §7.1.
@@ -79,9 +87,10 @@ pub fn hkdfExpandLabel(
 }
 
 /// Derive both client and server Initial keys from the destination CID
-/// of the client's first Initial packet (RFC 9001 §5.2).
-pub fn deriveInitialKeys(dcid: []const u8) InitialKeys {
-    const prk = HkdfSha256.extract(&initial_salt, dcid);
+/// of the client's first Initial packet (RFC 9001 §5.2, RFC 9369 §3.3).
+pub fn deriveInitialKeys(dcid: []const u8, version: u32) InitialKeys {
+    const salt = if (version == packet.QUIC_VERSION_2) &initial_salt_v2 else &initial_salt_v1;
+    const prk = HkdfSha256.extract(salt, dcid);
 
     var client_secret: [32]u8 = undefined;
     var server_secret: [32]u8 = undefined;
@@ -89,26 +98,26 @@ pub fn deriveInitialKeys(dcid: []const u8) InitialKeys {
     hkdfExpandLabel(&server_secret, prk, "server in", "");
 
     return .{
-        .client = derivePacketKeys(client_secret),
-        .server = derivePacketKeys(server_secret),
+        .client = derivePacketKeys(client_secret, version),
+        .server = derivePacketKeys(server_secret, version),
     };
 }
 
-/// Derive key/iv/hp from a traffic secret.
-pub fn derivePacketKeys(secret: [32]u8) PacketKeys {
+/// Derive key/iv/hp from a traffic secret (RFC 9001 §5.1, RFC 9369 §3.2).
+pub fn derivePacketKeys(secret: [32]u8, version: u32) PacketKeys {
     var keys: PacketKeys = undefined;
-    hkdfExpandLabel(&keys.key, secret, "quic key", "");
-    hkdfExpandLabel(&keys.iv, secret, "quic iv", "");
-    hkdfExpandLabel(&keys.hp, secret, "quic hp", "");
+    const is_v2 = version == packet.QUIC_VERSION_2;
+    hkdfExpandLabel(&keys.key, secret, if (is_v2) "quicv2 key" else "quic key", "");
+    hkdfExpandLabel(&keys.iv, secret, if (is_v2) "quicv2 iv" else "quic iv", "");
+    hkdfExpandLabel(&keys.hp, secret, if (is_v2) "quicv2 hp" else "quic hp", "");
     return keys;
 }
 
 /// Derive the next-generation application traffic secret for key update
-/// (RFC 9001 §6.1).  The label "quic ku" is used; `hkdfExpandLabel` prepends
-/// "tls13 " automatically.
-pub fn deriveNextAppSecret(current: [32]u8) [32]u8 {
+/// (RFC 9001 §6.1, RFC 9369 §3.2).  Labels differ between v1 and v2.
+pub fn deriveNextAppSecret(current: [32]u8, version: u32) [32]u8 {
     var next: [32]u8 = undefined;
-    hkdfExpandLabel(&next, current, "quic ku", "");
+    hkdfExpandLabel(&next, current, if (version == packet.QUIC_VERSION_2) "quicv2 ku" else "quic ku", "");
     return next;
 }
 
@@ -225,7 +234,7 @@ test "crypto: RFC 9001 A — client initial secret" {
         0x2d, 0x6b, 0x7d, 0xb6, 0x78, 0x81, 0x28, 0x9a,
         0xf4, 0x00, 0x8f, 0x1f, 0x6c, 0x35, 0x7a, 0xea,
     };
-    const prk = HkdfSha256.extract(&initial_salt, &test_dcid);
+    const prk = HkdfSha256.extract(&initial_salt_v1, &test_dcid);
     var client_secret: [32]u8 = undefined;
     hkdfExpandLabel(&client_secret, prk, "client in", "");
     try testing.expectEqualSlices(u8, &expected_secret, &client_secret);
@@ -233,7 +242,7 @@ test "crypto: RFC 9001 A — client initial secret" {
 
 test "crypto: RFC 9001 A — client key/iv/hp" {
     const testing = std.testing;
-    const keys = deriveInitialKeys(&test_dcid);
+    const keys = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1);
 
     const expected_key = [_]u8{
         0x1f, 0x36, 0x96, 0x13, 0xdd, 0x76, 0xd5, 0x46,
@@ -255,7 +264,7 @@ test "crypto: RFC 9001 A — client key/iv/hp" {
 
 test "crypto: RFC 9001 A — server key/iv/hp" {
     const testing = std.testing;
-    const keys = deriveInitialKeys(&test_dcid);
+    const keys = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1);
 
     const expected_key = [_]u8{
         0xcf, 0x3a, 0x53, 0x31, 0x65, 0x3c, 0x36, 0x4c,
@@ -277,7 +286,7 @@ test "crypto: RFC 9001 A — server key/iv/hp" {
 
 test "crypto: encrypt-decrypt round-trip" {
     const testing = std.testing;
-    const keys = deriveInitialKeys(&test_dcid);
+    const keys = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1);
     const ck = keys.client;
 
     const pn: u64 = 2;
@@ -293,14 +302,14 @@ test "crypto: encrypt-decrypt round-trip" {
 }
 
 test "crypto: decryptPayload short buffer (< tag_length) returns TooShort" {
-    const ck = deriveInitialKeys(&test_dcid).client;
+    const ck = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1).client;
     const short: [15]u8 = .{0} ** 15; // one byte short of the 16-byte tag
     var out: [0]u8 = .{};
     try std.testing.expectError(error.TooShort, decryptPayload(ck, 0, &.{}, &short, &out));
 }
 
 test "crypto: decryptPayload with corrupted authentication tag returns error" {
-    const ck = deriveInitialKeys(&test_dcid).client;
+    const ck = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1).client;
     const pn: u64 = 7;
     const header = [_]u8{0xC3}; // arbitrary header byte
     const plaintext = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
@@ -355,18 +364,41 @@ test "crypto: nonce build" {
 test "crypto: deriveNextAppSecret is deterministic and differs from input" {
     const testing = std.testing;
     // Use the client initial secret as a stand-in for an app traffic secret.
-    const prk = HkdfSha256.extract(&initial_salt, &test_dcid);
+    const prk = HkdfSha256.extract(&initial_salt_v1, &test_dcid);
     var client_secret: [32]u8 = undefined;
     hkdfExpandLabel(&client_secret, prk, "client in", "");
 
-    const next1 = deriveNextAppSecret(client_secret);
-    const next2 = deriveNextAppSecret(client_secret);
+    const next1 = deriveNextAppSecret(client_secret, packet.QUIC_VERSION_1);
+    const next2 = deriveNextAppSecret(client_secret, packet.QUIC_VERSION_1);
 
     // Deterministic: two calls with the same input must produce the same output.
     try testing.expectEqualSlices(u8, &next1, &next2);
     // Output must differ from the input (KDF advances the secret).
     try testing.expect(!std.mem.eql(u8, &next1, &client_secret));
     // Chaining: deriving a second generation must also differ from the first.
-    const next3 = deriveNextAppSecret(next1);
+    const next3 = deriveNextAppSecret(next1, packet.QUIC_VERSION_1);
     try testing.expect(!std.mem.eql(u8, &next3, &next1));
+}
+
+test "crypto: v2 initial keys differ from v1 for same DCID" {
+    const testing = std.testing;
+    const keys_v1 = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1);
+    const keys_v2 = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_2);
+    // v2 uses a different salt and labels, so keys must differ.
+    try testing.expect(!std.mem.eql(u8, &keys_v1.client.key, &keys_v2.client.key));
+    try testing.expect(!std.mem.eql(u8, &keys_v1.client.iv, &keys_v2.client.iv));
+    try testing.expect(!std.mem.eql(u8, &keys_v1.server.key, &keys_v2.server.key));
+}
+
+test "crypto: v2 derivePacketKeys uses quicv2 labels" {
+    const testing = std.testing;
+    // Same secret, different version → different keys.
+    const prk = HkdfSha256.extract(&initial_salt_v1, &test_dcid);
+    var secret: [32]u8 = undefined;
+    hkdfExpandLabel(&secret, prk, "client in", "");
+    const k_v1 = derivePacketKeys(secret, packet.QUIC_VERSION_1);
+    const k_v2 = derivePacketKeys(secret, packet.QUIC_VERSION_2);
+    try testing.expect(!std.mem.eql(u8, &k_v1.key, &k_v2.key));
+    try testing.expect(!std.mem.eql(u8, &k_v1.iv, &k_v2.iv));
+    try testing.expect(!std.mem.eql(u8, &k_v1.hp, &k_v2.hp));
 }

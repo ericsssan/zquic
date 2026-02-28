@@ -187,6 +187,8 @@ pub const Connection = struct {
     // Crypto
     initial_keys: crypto.InitialKeys,
     tls_state: tls.TlsServer,
+    /// QUIC version negotiated for this connection (v1 or v2).
+    quic_version: u32,
 
     // Per-epoch packet keys (null until negotiated)
     hs_keys: ?tls.HandshakeKeys,
@@ -373,6 +375,7 @@ pub const Connection = struct {
             .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
             .initial_keys = undefined,
             .tls_state = tls_server,
+            .quic_version = packet.QUIC_VERSION_1,
             .hs_keys = null,
             .app_keys = null,
             .streams = .{},
@@ -678,7 +681,7 @@ pub const Connection = struct {
         // a different wire format that parseLongHeader cannot handle.
         if (data.len >= 5) {
             const ver = std.mem.readInt(u32, data[1..5], .big);
-            if (ver != packet.QUIC_VERSION_1) {
+            if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2) {
                 if (ver != 0) {
                     // Rate-limit VN responses to 1 per second to prevent amplification.
                     if (self.current_time_ns - self.last_vn_ns >= 1_000_000_000) {
@@ -696,10 +699,12 @@ pub const Connection = struct {
 
         switch (hdr.packet_type) {
             .initial => {
-                // On first Initial, record peer CID and derive initial keys
+                // On first Initial, record peer CID, negotiate version, and derive initial keys.
                 if (self.hot.state == .idle) {
                     self.peer_cid = hdr.src_cid;
-                    self.initial_keys = crypto.deriveInitialKeys(&hdr.dest_cid.bytes);
+                    self.quic_version = hdr.version;
+                    self.tls_state.quic_version = hdr.version;
+                    self.initial_keys = crypto.deriveInitialKeys(&hdr.dest_cid.bytes, hdr.version);
                     self.hot.state = .handshake;
                 }
 
@@ -1043,11 +1048,11 @@ pub const Connection = struct {
             self.events.push(.connected);
 
             // Pre-compute next-generation app keys for key update support (RFC 9001 §6).
-            self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.client_app_secret);
-            self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.server_app_secret);
+            self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.client_app_secret, self.quic_version);
+            self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.server_app_secret, self.quic_version);
             self.next_app_keys = tls.AppKeys{
-                .client = crypto.derivePacketKeys(self.next_client_secret),
-                .server = crypto.derivePacketKeys(self.next_server_secret),
+                .client = crypto.derivePacketKeys(self.next_client_secret, self.quic_version),
+                .server = crypto.derivePacketKeys(self.next_server_secret, self.quic_version),
             };
 
             // Apply negotiated transport parameters.
@@ -1328,7 +1333,7 @@ pub const Connection = struct {
                 const hdr_len = packet.encodeLongHeader(
                     &self.enc_scratch,
                     .initial,
-                    packet.QUIC_VERSION_1,
+                    self.quic_version,
                     self.peer_cid,
                     self.local_cid,
                     &.{},
@@ -1352,7 +1357,7 @@ pub const Connection = struct {
                 const hdr_len = packet.encodeLongHeader(
                     &self.enc_scratch,
                     .handshake,
-                    packet.QUIC_VERSION_1,
+                    self.quic_version,
                     self.peer_cid,
                     self.local_cid,
                     &.{},
@@ -1517,7 +1522,7 @@ pub const Connection = struct {
         const hdr_len = packet.encodeLongHeader(
             &self.enc_scratch,
             .initial,
-            packet.QUIC_VERSION_1,
+            self.quic_version,
             self.peer_cid,
             self.local_cid,
             &.{},
@@ -1570,7 +1575,7 @@ pub const Connection = struct {
         const token = self.generateToken(src, hdr.dest_cid, now_ns, io);
         self.retry_scid = ConnectionId.generate(0, io);
         var buf: [256]u8 = undefined;
-        const n = packet.encodeRetry(&buf, hdr.src_cid, self.retry_scid.?, &token, hdr.dest_cid);
+        const n = packet.encodeRetry(&buf, hdr.src_cid, self.retry_scid.?, &token, hdr.dest_cid, self.quic_version);
         try self.enqueueSend(buf[0..n]);
         self.events.push(.retry_sent);
     }
@@ -1891,8 +1896,8 @@ pub const Connection = struct {
         self.key_update_pending = false;
 
         // Derive next-next generation from the (now-current) secrets.
-        const new_client = crypto.deriveNextAppSecret(self.next_client_secret);
-        const new_server = crypto.deriveNextAppSecret(self.next_server_secret);
+        const new_client = crypto.deriveNextAppSecret(self.next_client_secret, self.quic_version);
+        const new_server = crypto.deriveNextAppSecret(self.next_server_secret, self.quic_version);
 
         // Zero the outgoing secrets before overwriting (defence-in-depth).
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.next_client_secret)));
@@ -1901,8 +1906,8 @@ pub const Connection = struct {
         self.next_client_secret = new_client;
         self.next_server_secret = new_server;
         self.next_app_keys = tls.AppKeys{
-            .client = crypto.derivePacketKeys(self.next_client_secret),
-            .server = crypto.derivePacketKeys(self.next_server_secret),
+            .client = crypto.derivePacketKeys(self.next_client_secret, self.quic_version),
+            .server = crypto.derivePacketKeys(self.next_server_secret, self.quic_version),
         };
     }
 
@@ -3425,7 +3430,7 @@ test "connection: rotateKeys advances next-generation secrets" {
     // next_client_secret must now be derived from the (promoted) secret,
     // which equals deriveNextAppSecret(secret) ≠ secret.
     try testing.expect(!std.mem.eql(u8, &conn.next_client_secret, &secret));
-    const expected = crypto.deriveNextAppSecret(secret);
+    const expected = crypto.deriveNextAppSecret(secret, packet.QUIC_VERSION_1);
     try testing.expectEqualSlices(u8, &expected, &conn.next_client_secret);
 }
 
@@ -3549,7 +3554,7 @@ test "connection: sendEncryptedAck for Initial epoch produces long header" {
     var conn = try Connection.accept(.{}, io);
     // Derive real initial keys with a dummy DCID.
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
-    conn.initial_keys = crypto.deriveInitialKeys(&dcid);
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
     conn.hot.rx_pn_valid[0] = true;
     conn.hot.rx_pn[0] = 5;
 
@@ -3640,7 +3645,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
     const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe };
-    conn.initial_keys = crypto.deriveInitialKeys(&dcid);
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
     conn.hot.state = .handshake; // past idle so Initial packets are processed
     conn.peer_cid = conn.local_cid;
 
@@ -4845,7 +4850,7 @@ fn buildInitialPacket(
 ) struct { keys: crypto.InitialKeys, pkt_len: usize } {
     const dcid = ConnectionId{ .bytes = dcid_bytes };
     const scid = ConnectionId{ .bytes = scid_bytes };
-    const keys = crypto.deriveInitialKeys(&dcid_bytes);
+    const keys = crypto.deriveInitialKeys(&dcid_bytes, packet.QUIC_VERSION_1);
 
     // PING frame as a minimal payload
     var pt: [4]u8 = undefined;
@@ -5151,4 +5156,57 @@ test "ecn: has_ecn=false ACK does not touch ecn_ce_seen" {
 
     // ecn_ce_seen unchanged
     try testing.expectEqual(@as(u62, 99), conn.ecn_ce_seen[2]);
+}
+
+test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
+    // A v2 Initial must be accepted (not dropped as unknown version).
+    const testing = std.testing;
+    const io = std.testing.io;
+
+    var conn = try Connection.accept(.{}, io);
+    conn.current_time_ns = 0;
+
+    // Build a minimal v2 Initial packet encrypted with v2 initial keys.
+    const dcid_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid_bytes = [_]u8{ 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    const dcid = ConnectionId{ .bytes = dcid_bytes };
+    const scid = ConnectionId{ .bytes = scid_bytes };
+    const keys = crypto.deriveInitialKeys(&dcid_bytes, packet.QUIC_VERSION_2);
+
+    const pt = [_]u8{ 0x00 }; // PADDING frame — minimal valid payload
+    const pt_len = pt.len;
+    const ct_len = pt_len + 16;
+    var enc_buf: [512]u8 = undefined;
+    const hdr_len = packet.encodeLongHeader(
+        &enc_buf,
+        .initial,
+        packet.QUIC_VERSION_2,
+        dcid,
+        scid,
+        &.{},
+        0,
+        ct_len,
+    );
+    crypto.encryptPayload(keys.client, 0, enc_buf[0..hdr_len], &pt, enc_buf[hdr_len..][0..ct_len]);
+    const total = hdr_len + ct_len;
+    crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len + 4 ..][0..16]);
+
+    const result = conn.receive(enc_buf[0..total], .{ .v4 = .{ .addr = .{0} ** 4, .port = 1234 } }, 0, io);
+    _ = result catch {};
+
+    // Connection must have recorded quic_version = QUIC_VERSION_2 (not dropped as unknown).
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn.quic_version);
+}
+
+test "connection: v2 quic_version propagated to initial key derivation" {
+    // On a v2 connection, initial keys must be v2 keys (different from v1).
+    const testing = std.testing;
+    const dcid_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+
+    const k_v1 = crypto.deriveInitialKeys(&dcid_bytes, packet.QUIC_VERSION_1);
+    const k_v2 = crypto.deriveInitialKeys(&dcid_bytes, packet.QUIC_VERSION_2);
+
+    // v2 initial keys must differ from v1.
+    try testing.expect(!std.mem.eql(u8, &k_v1.client.key, &k_v2.client.key));
+    try testing.expect(!std.mem.eql(u8, &k_v1.server.key, &k_v2.server.key));
 }

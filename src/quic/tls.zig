@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
+const packet_mod = @import("packet.zig");
 const transport_params = @import("transport_params.zig");
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
@@ -124,6 +125,10 @@ pub const TlsServer = struct {
 
     // Our transport parameters to send in EncryptedExtensions (set by Connection).
     our_transport_params: transport_params.TransportParams = .{},
+
+    // QUIC version negotiated for this connection (set by Connection after accept).
+    // Determines which key derivation labels to use (RFC 9001 vs RFC 9369).
+    quic_version: u32 = packet_mod.QUIC_VERSION_1,
 
     // ALPN negotiation (RFC 7301 / TLS ext 0x0010).
     // required_alpn_len == 0 means no ALPN check.
@@ -396,8 +401,8 @@ pub const TlsServer = struct {
 
         // Derive handshake-epoch QUIC packet keys
         self.handshake_keys = .{
-            .client = crypto.derivePacketKeys(self.client_hs_secret),
-            .server = crypto.derivePacketKeys(self.server_hs_secret),
+            .client = crypto.derivePacketKeys(self.client_hs_secret, self.quic_version),
+            .server = crypto.derivePacketKeys(self.server_hs_secret, self.quic_version),
         };
 
         // Master Secret
@@ -412,8 +417,8 @@ pub const TlsServer = struct {
         deriveSecret(&self.server_app_secret, self.master_secret, "s ap traffic", transcript_hash);
 
         self.app_keys = .{
-            .client = crypto.derivePacketKeys(self.client_app_secret),
-            .server = crypto.derivePacketKeys(self.server_app_secret),
+            .client = crypto.derivePacketKeys(self.client_app_secret, self.quic_version),
+            .server = crypto.derivePacketKeys(self.server_app_secret, self.quic_version),
         };
     }
 
