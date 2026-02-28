@@ -56,6 +56,7 @@ pub fn build(b: *std.Build) void {
         "src/quic/tls.zig",
         "src/quic/connection.zig",
         "src/quic/fuzz.zig",
+        "tools/pem.zig",
     };
 
     for (test_files) |path| {

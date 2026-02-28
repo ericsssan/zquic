@@ -151,6 +151,12 @@ pub const Config = struct {
     token_secret: [32]u8 = [_]u8{0} ** 32,
     /// Token validity window in nanoseconds (default 5 minutes).
     token_validity_ns: i64 = 5 * 60 * std.time.ns_per_s,
+    /// ALPN protocol to require. Static/caller-owned slice; "" = no ALPN check.
+    alpn: []const u8 = "",
+    /// Pre-loaded DER certificate (null = use ephemeral self-signed).
+    cert_der: ?[]const u8 = null,
+    /// Ed25519 seed corresponding to cert_der.
+    cert_seed: ?[32]u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -338,7 +344,15 @@ pub const Connection = struct {
     /// Create a server-side connection.  Call `receive()` with the first
     /// datagram to start the handshake.
     pub fn accept(config: Config, io: std.Io) !Connection {
-        const tls_server = try tls.TlsServer.init(io);
+        var tls_server = if (config.cert_der) |der|
+            try tls.TlsServer.initFromCert(der, config.cert_seed.?, io)
+        else
+            try tls.TlsServer.init(io);
+        if (config.alpn.len > 0) {
+            const n = @min(config.alpn.len, 32);
+            @memcpy(tls_server.required_alpn[0..n], config.alpn[0..n]);
+            tls_server.required_alpn_len = @intCast(n);
+        }
         const local_cid = ConnectionId.generate(0, io);
         const idle_timeout_i64: i64 = if (config.idle_timeout_ns > 0)
             @intCast(@min(config.idle_timeout_ns, @as(u64, std.math.maxInt(i64))))
