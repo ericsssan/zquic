@@ -2,13 +2,13 @@
 
 A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no threads, no allocator in the hot path. The library is a state machine you drive; you own the I/O.
 
-> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9438 fully implemented. 794 tests passing. Ready for interop testing and performance optimization.
+> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9438 fully implemented. 848 tests passing. Ready for interop testing and performance optimization.
 
 ## Features
 
 - **RFC 9000** — packet encoding/decoding, frame types, stream multiplexing, flow control, connection state machine, path migration, stateless reset, retry tokens, connection migration, PMTUD
 - **RFC 9001** — TLS 1.3 handshake (server-side, sans-I/O), AES-128-GCM payload encryption, header protection, key updates, initial/handshake/1-RTT keys
-- **RFC 9002** — RTT estimation, PTO-based loss detection, ACK-based loss detection, persistent congestion, key update integration
+- **RFC 9002** — RTT estimation, PTO-based loss detection, ACK-based loss detection, persistent congestion, ECN CE reaction
 - **RFC 9438** — CUBIC congestion control with saturation arithmetic, overflow guards
 - **Zero dependencies** — all crypto via `std.crypto`, no external libraries
 - **No allocator in hot path** — O(1) pool allocator, fixed-capacity buffers
@@ -24,7 +24,7 @@ A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no 
 
 ```sh
 zig build                          # build library
-zig build test --summary all       # run all 794 tests
+zig build test --summary all       # run all 848 tests
 ```
 
 ## Usage
@@ -92,40 +92,37 @@ pub const ConnectionHot = struct {
 };
 ```
 
-## Task List & Roadmap
+## Roadmap
 
 ### Completed ✅
-- **#12** Stream table redesign: pre-allocated hash pool
-- **#13** PMTUD (Path MTU Discovery) - RFC 9000 §14
+- Stream table redesign: pre-allocated O(1) hash pool, 64 streams
+- PMTUD (Path MTU Discovery) — RFC 9000 §14
+- Retry tokens + address validation — RFC 9000 §8.1
+- ECN (Explicit Congestion Notification) — RFC 9000 §12.1, RFC 9002 §B.1
 
-### High Priority - Next (Blocking Production)
-- **#14** Micro-optimization for performance and efficiency — benchmark suite, profile hot paths, eliminate bottlenecks in packet processing, frame encoding/decoding, and crypto operations
-- **#15** Interop testing via quic-interop-runner — validate against Chrome/ngtcp2/quic-go
-- **#16** ECN (Explicit Congestion Notification) — ~200 LOC, direct congestion improvement
+### Next
+- Interop testing via quic-interop-runner — validate against Chrome/ngtcp2/quic-go
+- TlsClient + cert validation callback — enables client connections
+- 0-RTT session resumption — low-latency reconnects
 
-### Medium Priority
-- **#17** TlsClient + cert validation callback — enables client connections
-- **#18** Retry packets + connection rate limiting — DoS mitigation
-- **#19** 0-RTT session resumption — low-latency reconnects
-
-### Lower Priority (Post-Functional)
-- **#20** Security audit — comprehensive crypto/timing/input validation review
-- **#21** SIMD/AES-NI/huge-pages/CID BPF optimizations — extreme performance polish
+### Later
+- io_uring backend + GSO/GRO — I/O performance for production deployments
+- SIMD/AES-NI optimizations — extreme throughput
+- Security audit — comprehensive crypto/timing/input validation review
 
 ## Test Coverage
 
-- **794 tests passing** across all modules
+- **848 tests passing** across all modules
 - RFC test vectors verified (RFC 9001 Appendix A crypto vectors)
 - Fuzz targets for frame round-trip, GapList, stream send buffer, loss recovery, RTT estimation
 - Regression tests for all major bugs fixed
 
 ## Known Limitations
 
-- **TLS server-only** — TlsClient not yet implemented (see #17)
+- **TLS server-only** — TlsClient not yet implemented
 - **No HTTP/3** — this is a QUIC transport library only
-- **No 0-RTT yet** — PSK and session resumption pending (see #19)
-- **No Retry tokens yet** — address validation with Retry pending (see #18)
-- **MAX_STREAMS=4** (configurable) — hash pool redesign planned (completed but not integrated into stream table yet)
+- **No 0-RTT yet** — PSK and session resumption pending
+- **MAX_STREAMS=64** — configurable, pre-allocated hash pool
 
 ## Design Notes
 
