@@ -2,13 +2,14 @@
 
 A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no threads, no allocator in the hot path. The library is a state machine you drive; you own the I/O.
 
-> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9438 fully implemented. 848 tests passing. Ready for interop testing and performance optimization.
+> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9369, 9438 fully implemented. 918 tests passing. Ready for interop testing and performance optimization.
 
 ## Features
 
 - **RFC 9000** — packet encoding/decoding, frame types, stream multiplexing, flow control, connection state machine, path migration, stateless reset, retry tokens, connection migration, PMTUD
 - **RFC 9001** — TLS 1.3 handshake (server-side, sans-I/O), AES-128-GCM payload encryption, header protection, key updates, initial/handshake/1-RTT keys
 - **RFC 9002** — RTT estimation, PTO-based loss detection, ACK-based loss detection, persistent congestion, ECN CE reaction
+- **RFC 9369** — QUIC v2 (`0x6b3343cf`): v2 initial salt, `quicv2 *` key-derivation labels, long-header type-bit rotation, v2 Retry integrity tag
 - **RFC 9438** — CUBIC congestion control with saturation arithmetic, overflow guards
 - **Zero dependencies** — all crypto via `std.crypto`, no external libraries
 - **No allocator in hot path** — O(1) pool allocator, fixed-capacity buffers
@@ -24,7 +25,7 @@ A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no 
 
 ```sh
 zig build                          # build library
-zig build test --summary all       # run all 848 tests
+zig build test --summary all       # run all 918 tests
 ```
 
 ## Usage
@@ -63,10 +64,10 @@ src/
   root.zig                      # public API re-exports
   quic/
     varint.zig                  # RFC 9000 §16 — variable-length integers
-    packet.zig                  # RFC 9000 §17 — long/short header encode/decode
+    packet.zig                  # RFC 9000 §17, RFC 9369 §3 — long/short header encode/decode (v1+v2)
     frame.zig                   # RFC 9000 §19 — STREAM, ACK, CRYPTO, etc.
     connection_id.zig           # 8-byte CID generation & pool
-    crypto.zig                  # RFC 9001 §5  — key derivation, AES-128-GCM, header protection
+    crypto.zig                  # RFC 9001 §5, RFC 9369 §3 — key derivation (v1+v2), AES-128-GCM, header protection
     tls.zig                     # RFC 9001 §4  — TLS 1.3 server handshake, transcript, secrets
     transport_params.zig        # RFC 9000 §18 — transport parameter encoding/decoding
     connection.zig              # RFC 9000 §8  — connection state machine, frame processing
@@ -99,9 +100,10 @@ pub const ConnectionHot = struct {
 - PMTUD (Path MTU Discovery) — RFC 9000 §14
 - Retry tokens + address validation — RFC 9000 §8.1
 - ECN (Explicit Congestion Notification) — RFC 9000 §12.1, RFC 9002 §B.1
+- QUIC v2 — RFC 9369 (v2 salt, labels, header type rotation, Retry integrity tag)
 
 ### Next
-- Interop testing via quic-interop-runner — run our server against Chrome/ngtcp2/quic-go
+- Interop testing via quic-interop-runner — run our server against Chrome/ngtcp2/quic-go (v1 + v2)
 - 0-RTT session resumption — low-latency reconnects
 
 ### Later
@@ -109,7 +111,7 @@ pub const ConnectionHot = struct {
 
 ## Test Coverage
 
-- **848 tests passing** across all modules
+- **918 tests passing** across all modules
 - RFC test vectors verified (RFC 9001 Appendix A crypto vectors)
 - Fuzz targets for frame round-trip, GapList, stream send buffer, loss recovery, RTT estimation
 - Regression tests for all major bugs fixed
