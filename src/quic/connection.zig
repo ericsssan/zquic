@@ -5173,7 +5173,7 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
     const scid = ConnectionId{ .bytes = scid_bytes };
     const keys = crypto.deriveInitialKeys(&dcid_bytes, packet.QUIC_VERSION_2);
 
-    const pt = [_]u8{ 0x00 }; // PADDING frame — minimal valid payload
+    const pt = [_]u8{0x00}; // PADDING frame — minimal valid payload
     const pt_len = pt.len;
     const ct_len = pt_len + 16;
     var enc_buf: [512]u8 = undefined;

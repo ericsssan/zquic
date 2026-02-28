@@ -339,8 +339,7 @@ pub const TlsServer = struct {
 
         // EncryptedExtensions (with QUIC transport parameters and negotiated ALPN).
         // Use our_transport_params which may include original_dcid/retry_scid if set by Connection.
-        pos += buildEncryptedExtensions(out[pos..], self.our_transport_params,
-            self.negotiated_alpn[0..self.negotiated_alpn_len]);
+        pos += buildEncryptedExtensions(out[pos..], self.our_transport_params, self.negotiated_alpn[0..self.negotiated_alpn_len]);
 
         // Certificate
         pos += self.buildCertificateMessage(out[pos..]);
@@ -693,12 +692,16 @@ fn parseClientHello(data: []const u8) !ClientHelloData {
         }
 
         if (ext_type == EXT_ALPN) {
-            if (ext_data.len < 2) { pos += ext_len; continue; }
+            if (ext_data.len < 2) {
+                pos += ext_len;
+                continue;
+            }
             const list_len = std.mem.readInt(u16, ext_data[0..2], .big);
             var p: usize = 2;
             const list_end = @min(2 + list_len, ext_data.len);
             while (p < list_end and ch.alpn_count < 4) {
-                const name_len = ext_data[p]; p += 1;
+                const name_len = ext_data[p];
+                p += 1;
                 if (p + name_len > list_end) break;
                 if (name_len > 0 and name_len <= 32) {
                     @memcpy(ch.alpn_names[ch.alpn_count][0..name_len], ext_data[p..][0..name_len]);
