@@ -1,0 +1,74 @@
+name: Interop
+
+on:
+  schedule:
+    - cron: '0 3 * * *' # 03:00 UTC daily
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Docker]
+    types: [completed]
+
+jobs:
+  interop:
+    name: quic-interop-runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # When triggered by Docker workflow, only run if the image built successfully.
+    if: >
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    steps:
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tshark jq python3-pip
+
+      - name: Clone quic-interop-runner
+        run: git clone --depth 1 https://github.com/quic-interop/quic-interop-runner runner
+
+      - name: Install Python dependencies
+        run: pip3 install -r runner/requirements.txt
+
+      - name: Register zquic in implementations.json
+        run: |
+          cd runner
+          jq '. + {"zquic": {"image": "ghcr.io/${{ github.repository_owner }}/zquic", "url": "https://github.com/${{ github.repository }}", "role": "server"}}' \
+            implementations.json > tmp.json && mv tmp.json implementations.json
+
+      - name: Pull zquic image
+        run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
+
+      - name: Run interop tests (zquic server × ngtcp2 client)
+        run: |
+          cd runner
+          python3 run.py \
+            --server zquic \
+            --client ngtcp2 \
+            --test handshake,transfer,retry,keyupdate,v2 \
+            --log-dir logs \
+            --json results.json \
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest \
+            || true   # runner exits non-zero on any failure; we check below
+
+      - name: Check results
+        run: |
+          cd runner
+          echo "=== Results ==="
+          jq -r '.results | flatten | .[] | "\(.name): \(.result)"' results.json
+
+          failures=$(jq -c '.results | flatten | .[] | select(.result == "failed")' results.json)
+          if [ -n "$failures" ]; then
+            echo "::error::Interop failures detected:"
+            echo "$failures"
+            exit 1
+          fi
+          echo "All interop tests passed."
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-logs
+          path: runner/logs/
+          retention-days: 7
