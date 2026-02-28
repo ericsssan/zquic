@@ -101,8 +101,7 @@ pub const ConnectionHot = struct {
 - ECN (Explicit Congestion Notification) — RFC 9000 §12.1, RFC 9002 §B.1
 
 ### Next
-- Interop testing via quic-interop-runner — validate against Chrome/ngtcp2/quic-go
-- TlsClient + cert validation callback — enables client connections
+- Interop testing via quic-interop-runner — run our server against Chrome/ngtcp2/quic-go
 - 0-RTT session resumption — low-latency reconnects
 
 ### Later
@@ -119,7 +118,7 @@ pub const ConnectionHot = struct {
 
 ## Known Limitations
 
-- **TLS server-only** — TlsClient not yet implemented
+- **TLS server-only** — by design; interop is tested by running our server against ngtcp2/quic-go/Chrome
 - **No HTTP/3** — this is a QUIC transport library only
 - **No 0-RTT yet** — PSK and session resumption pending
 - **MAX_STREAMS=64** — configurable, pre-allocated hash pool
