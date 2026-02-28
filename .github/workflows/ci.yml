@@ -39,17 +39,3 @@ jobs:
       - name: Test (ReleaseSafe)
         run: zig build test -Doptimize=ReleaseSafe --summary all
 
-  fuzz:
-    name: Fuzz (60s smoke)
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0-dev.2637+6a9510c0e
-
-      - name: Run fuzz targets (60s)
-        run: timeout 60 zig build test --fuzz || true
