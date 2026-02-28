@@ -6,20 +6,50 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
-    name: Tests
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig (master)
-        run: |
-          ZIG_URL=$(curl -s https://ziglang.org/download/index.json \
-            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['master']['x86_64-linux']['tarball'])")
-          mkdir -p /opt/zig
-          curl -L "$ZIG_URL" | tar -xJ -C /opt/zig --strip-components=1
-          echo "/opt/zig" >> $GITHUB_PATH
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0-dev.2637+6a9510c0e
 
-      - name: Run tests
+      - name: Check formatting
+        run: zig fmt --check src/ tools/
+
+      - name: Build library + server
+        run: zig build
+
+      - name: Test (Debug)
         run: zig build test --summary all
+
+      - name: Test (ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe --summary all
+
+  fuzz:
+    name: Fuzz (60s smoke)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0-dev.2637+6a9510c0e
+
+      - name: Run fuzz targets (60s)
+        run: timeout 60 zig build test --fuzz || true
