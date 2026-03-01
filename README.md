@@ -2,12 +2,12 @@
 
 A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no threads, no allocator in the hot path. The library is a state machine you drive; you own the I/O.
 
-> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9369, 9438 fully implemented. 918 tests passing. Ready for interop testing and performance optimization.
+> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9369, 9438 fully implemented. 924 tests passing. Interop server built and wired into quic-interop-runner CI.
 
 ## Features
 
 - **RFC 9000** — packet encoding/decoding, frame types, stream multiplexing, flow control, connection state machine, path migration, stateless reset, retry tokens, connection migration, PMTUD
-- **RFC 9001** — TLS 1.3 handshake (server-side, sans-I/O), AES-128-GCM payload encryption, header protection, key updates, initial/handshake/1-RTT keys
+- **RFC 9001** — TLS 1.3 handshake (server-side, sans-I/O), AES-128-GCM payload encryption, header protection, key updates, initial/handshake/1-RTT keys; Ed25519 and P-256 ECDSA certificates
 - **RFC 9002** — RTT estimation, PTO-based loss detection, ACK-based loss detection, persistent congestion, ECN CE reaction
 - **RFC 9369** — QUIC v2 (`0x6b3343cf`): v2 initial salt, `quicv2 *` key-derivation labels, long-header type-bit rotation, v2 Retry integrity tag
 - **RFC 9438** — CUBIC congestion control with saturation arithmetic, overflow guards
@@ -24,8 +24,8 @@ A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no 
 ## Build & Test
 
 ```sh
-zig build                          # build library
-zig build test --summary all       # run all 918 tests
+zig build                          # build library + interop server
+zig build test --summary all       # run all 924 tests
 ```
 
 ## Usage
@@ -75,21 +75,27 @@ src/
     flow_control.zig            # RFC 9000 §4  — per-connection & per-stream flow control
     loss_recovery.zig           # RFC 9002 §6  — RTT estimator, PTO, loss detection, ACK tracking
     pool.zig                    # O(1) fixed-capacity pool allocator
+    fuzz.zig                    # fuzz targets for frame, varint, transport params, packet, stream, loss recovery
     congestion/
       cubic.zig                 # RFC 9438     — CUBIC congestion control
+
+tools/
+  server.zig                    # quic-interop-runner compatible UDP server (HTTP/0.9, event-driven)
+  pem.zig                       # PEM → DER decoder, PKCS#8 key extraction (Ed25519 + P-256)
+  Dockerfile                    # multi-stage build → minimal Alpine image for interop runner
 ```
 
 The hot/cold connection split keeps the 64-byte hot path cache-friendly:
 
 ```zig
 pub const ConnectionHot = struct {
-    rx_pn_space: [3]u64,        // largest received PN per epoch
-    tx_pn_space: [3]u64,        // next TX PN per epoch
+    rx_pn: [3]u64,              // largest received PN per epoch
+    tx_pn: [3]u64,              // next TX PN per epoch
     state:       ConnState,
     epoch:       u8,
     rx_pn_valid: [3]bool,       // replay protection per epoch
-    // ...
-    comptime { std.debug.assert(@sizeOf(@This()) == 64); }
+    _pad: [11]u8,
+    comptime { std.debug.assert(@sizeOf(ConnectionHot) == 64); }
 };
 ```
 
@@ -101,9 +107,9 @@ pub const ConnectionHot = struct {
 - Retry tokens + address validation — RFC 9000 §8.1
 - ECN (Explicit Congestion Notification) — RFC 9000 §12.1, RFC 9002 §B.1
 - QUIC v2 — RFC 9369 (v2 salt, labels, header type rotation, Retry integrity tag)
+- Interop server — quic-interop-runner compatible Docker image; CI wired up (TESTCASE: handshake, transfer, retry, keyupdate, v2)
 
 ### Next
-- Interop testing via quic-interop-runner — run our server against Chrome/ngtcp2/quic-go (v1 + v2)
 - 0-RTT session resumption — low-latency reconnects
 
 ### Later
@@ -111,17 +117,17 @@ pub const ConnectionHot = struct {
 
 ## Test Coverage
 
-- **918 tests passing** across all modules
+- **924 tests passing** across all modules
 - RFC test vectors verified (RFC 9001 Appendix A crypto vectors)
 - Fuzz targets for frame round-trip, GapList, stream send buffer, loss recovery, RTT estimation
 - Regression tests for all major bugs fixed
 
 ## Known Limitations
 
-- **TLS server-only** — by design; interop is tested by running our server against ngtcp2/quic-go/Chrome
+- **TLS server-only** — by design; interop is validated via quic-interop-runner against third-party clients
 - **No HTTP/3** — this is a QUIC transport library only
 - **No 0-RTT yet** — PSK and session resumption pending
-- **MAX_STREAMS=64** — configurable, pre-allocated hash pool
+- **MAX_STREAMS=64** — compile-time constant, pre-allocated hash pool
 
 ## Design Notes
 
