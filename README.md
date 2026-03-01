@@ -2,7 +2,7 @@
 
 A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no threads, no allocator in the hot path. The library is a state machine you drive; you own the I/O.
 
-> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9369, 9438 fully implemented. 924 tests passing. Interop server built and wired into quic-interop-runner CI.
+> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9369, 9438 fully implemented. 926 tests passing. Interop server built and wired into quic-interop-runner CI.
 
 ## Features
 
@@ -25,7 +25,7 @@ A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no 
 
 ```sh
 zig build                          # build library + interop server
-zig build test --summary all       # run all 924 tests
+zig build test --summary all       # run all 926 tests
 ```
 
 ## Usage
@@ -117,7 +117,7 @@ pub const ConnectionHot = struct {
 
 ## Test Coverage
 
-- **924 tests passing** across all modules
+- **926 tests passing** across all modules
 - RFC test vectors verified (RFC 9001 Appendix A crypto vectors)
 - Fuzz targets for frame round-trip, GapList, stream send buffer, loss recovery, RTT estimation
 - Regression tests for all major bugs fixed
