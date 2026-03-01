@@ -46,6 +46,8 @@ pub const LongHeader = struct {
     packet_type: PacketType,
     version: u32,
     dest_cid: ConnectionId,
+    /// Actual wire length of the destination CID (0-20 bytes).
+    dest_cid_len: u8,
     src_cid: ConnectionId,
     /// Token (Initial packets only; empty slice for others).
     token: []const u8,
@@ -72,26 +74,32 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     const version = std.mem.readInt(u32, buf[pos..][0..4], .big);
     pos += 4;
 
-    // Destination CID
+    // Destination CID (RFC allows 0–20 bytes)
     if (pos >= buf.len) return error.PacketTooShort;
     const dcid_len = buf[pos];
     pos += 1;
     if (pos + dcid_len > buf.len) return error.PacketTooShort;
-    // For known QUIC versions, CID length must match our fixed 8-byte CID format.
-    if ((version == QUIC_VERSION_1 or version == QUIC_VERSION_2) and dcid_len != cid.len) return error.UnsupportedCidLength;
+    // Reject CID lengths > 20 (RFC 9000 §17.2).
+    if ((version == QUIC_VERSION_1 or version == QUIC_VERSION_2) and dcid_len > 20) return error.UnsupportedCidLength;
     var dest_cid: ConnectionId = .{};
-    if (dcid_len > 0) @memcpy(&dest_cid.bytes, buf[pos..][0..dcid_len]);
+    if (dcid_len > 0) {
+        const copy_len = @min(dcid_len, cid.len);
+        @memcpy(dest_cid.bytes[0..copy_len], buf[pos..][0..copy_len]);
+    }
     pos += dcid_len;
 
-    // Source CID
+    // Source CID (RFC allows 0–20 bytes)
     if (pos >= buf.len) return error.PacketTooShort;
     const scid_len = buf[pos];
     pos += 1;
     if (pos + scid_len > buf.len) return error.PacketTooShort;
-    // For known QUIC versions, CID length must match our fixed 8-byte CID format.
-    if ((version == QUIC_VERSION_1 or version == QUIC_VERSION_2) and scid_len != cid.len) return error.UnsupportedCidLength;
+    // Reject CID lengths > 20 (RFC 9000 §17.2).
+    if ((version == QUIC_VERSION_1 or version == QUIC_VERSION_2) and scid_len > 20) return error.UnsupportedCidLength;
     var src_cid: ConnectionId = .{};
-    if (scid_len > 0) @memcpy(&src_cid.bytes, buf[pos..][0..scid_len]);
+    if (scid_len > 0) {
+        const copy_len = @min(scid_len, cid.len);
+        @memcpy(src_cid.bytes[0..copy_len], buf[pos..][0..copy_len]);
+    }
     pos += scid_len;
 
     const pkt_type = longHeaderType(first_byte, version);
@@ -132,6 +140,7 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
             .packet_type = pkt_type,
             .version = version,
             .dest_cid = dest_cid,
+            .dest_cid_len = dcid_len,
             .src_cid = src_cid,
             .token = token,
             .pn_len = pn_len,
@@ -326,7 +335,7 @@ pub fn encodeRetry(
     dcid: ConnectionId, // client's src CID → send back as DCID
     scid: ConnectionId, // new server CID used in Retry
     token: []const u8, // opaque address-validation token
-    odcid: ConnectionId, // original DCID (for Integrity Tag pseudo-header)
+    odcid: []const u8, // original DCID bytes (variable length, for Integrity Tag)
     version: u32,
 ) usize {
     var pos: usize = 0;
@@ -381,13 +390,13 @@ pub fn encodeRetry(
             0xa1, 0x8b, 0x0d, 0x12,
         };
 
-    // Pseudo-header for AAD: [odcid.len] ++ odcid.bytes ++ retry_packet_without_tag
+    // Pseudo-header for AAD: [odcid_len] ++ odcid_bytes ++ retry_packet_without_tag
     var aad_buf: [256]u8 = undefined;
     var aad_len: usize = 0;
-    aad_buf[aad_len] = cid.len;
+    aad_buf[aad_len] = @intCast(odcid.len);
     aad_len += 1;
-    @memcpy(aad_buf[aad_len..][0..cid.len], &odcid.bytes);
-    aad_len += cid.len;
+    @memcpy(aad_buf[aad_len..][0..odcid.len], odcid);
+    aad_len += odcid.len;
     @memcpy(aad_buf[aad_len..][0..pos], buf[0..pos]);
     aad_len += pos;
 
@@ -403,6 +412,44 @@ pub fn encodeRetry(
     pos += 16;
 
     return pos;
+}
+
+/// Compute the byte offset of the packet-number field in a long-header packet.
+///
+/// The packet type bits (5–4) are NOT header-protected, so this function is safe
+/// to call on the raw (still-protected) buffer.  Call before header-protection
+/// removal to locate the PN field and the HP sample (at pn_off + 4).
+pub fn longHeaderPnOffset(buf: []const u8, version: u32) !usize {
+    if (buf.len < 7) return error.PacketTooShort;
+
+    const dcid_len = buf[5];
+    if (buf.len < 6 + dcid_len + 1) return error.PacketTooShort;
+    const scid_len = buf[6 + dcid_len];
+
+    var pos: usize = 6 + dcid_len + 1 + scid_len;
+    if (pos > buf.len) return error.PacketTooShort;
+
+    // Initial packets carry a token before the payload-length field.
+    const pkt_type = longHeaderType(buf[0], version);
+    if (pkt_type == .initial) {
+        const tr = varint.decode(buf[pos..]) orelse return error.PacketTooShort;
+        pos += tr.len;
+        const tok_len: usize = @intCast(tr.value);
+        if (pos + tok_len > buf.len) return error.PacketTooShort;
+        pos += tok_len;
+    }
+
+    // Payload-length varint (covers PN bytes + ciphertext + AEAD tag).
+    const lr = varint.decode(buf[pos..]) orelse return error.PacketTooShort;
+    pos += lr.len;
+
+    return pos; // PN field starts here
+}
+
+/// Compute the byte offset of the packet-number field in a short-header packet.
+/// Short header: first_byte(1) + DCID(dcid_len) + PN(...).
+pub fn shortHeaderPnOffset(dcid_len: usize) usize {
+    return 1 + dcid_len;
 }
 
 /// Decode a full packet number from a truncated value per RFC 9000 §A.3.
@@ -476,19 +523,19 @@ test "packet: decodePacketNumber" {
     try testing.expectEqual(@as(u64, 0xa82f9b32), decoded);
 }
 
-test "packet: long header with wrong CID length returns UnsupportedCidLength" {
+test "packet: long header with CID length > 20 returns UnsupportedCidLength" {
     const testing = std.testing;
     var buf: [256]u8 = undefined;
-    // Build a QUIC v1 Initial packet with a 4-byte DCID (not the expected 8 bytes)
+    // Build a QUIC v1 Initial packet with a 21-byte DCID (exceeds RFC maximum of 20)
     buf[0] = 0xc0; // long header, Initial
     std.mem.writeInt(u32, buf[1..5], QUIC_VERSION_1, .big);
-    buf[5] = 4; // DCID length = 4 (wrong; must be 8 for our library)
-    @memset(buf[6..10], 0xaa);
-    buf[10] = 8; // SCID length
-    @memset(buf[11..19], 0xbb);
+    buf[5] = 21; // DCID length = 21 (invalid; RFC allows 0-20)
+    @memset(buf[6..27], 0xaa);
+    buf[27] = 8; // SCID length
+    @memset(buf[28..36], 0xbb);
     // pad rest
-    @memset(buf[19..32], 0);
-    try testing.expectError(error.UnsupportedCidLength, parseLongHeader(buf[0..32]));
+    @memset(buf[36..64], 0);
+    try testing.expectError(error.UnsupportedCidLength, parseLongHeader(buf[0..64]));
 }
 
 test "packet: encodeVersionNegotiation structure" {
@@ -561,7 +608,7 @@ test "packet: encodeRetry structure" {
     const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
     const token = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
 
-    const n = encodeRetry(&buf, dcid, scid, &token, odcid, QUIC_VERSION_1);
+    const n = encodeRetry(&buf, dcid, scid, &token, &odcid.bytes, QUIC_VERSION_1);
 
     // Verify first byte is 0xf0 (Retry packet, v1: raw type bits 0b11)
     try testing.expectEqual(@as(u8, 0xf0), buf[0]);
@@ -597,7 +644,7 @@ test "packet: encodeRetry integrity tag is 16 bytes" {
     const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
     const token = [_]u8{0xAA} ** 62; // max size token
 
-    const n = encodeRetry(&buf, dcid, scid, &token, odcid, QUIC_VERSION_1);
+    const n = encodeRetry(&buf, dcid, scid, &token, &odcid.bytes, QUIC_VERSION_1);
 
     // Expected: 1 + 4 + 1 + 8 + 1 + 8 + varint(62) + 62 + 16
     // varint(62) = 1 byte, so total = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 62 + 16 = 102

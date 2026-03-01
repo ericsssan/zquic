@@ -50,8 +50,9 @@ pub const TransportParams = struct {
     initial_source_connection_id: ?[20]u8 = null,
     initial_source_connection_id_len: u8 = 0,
     /// Original destination CID from the Initial packet (sent after Retry).
-    /// RFC 9000 §18.2 parameter 0x00.
-    original_destination_connection_id: ?ConnectionId = null,
+    /// RFC 9000 §18.2 parameter 0x00.  Variable length 0–20 bytes.
+    original_destination_connection_id: ?[20]u8 = null,
+    original_destination_connection_id_len: u8 = 0,
     /// Retry source CID from the Retry packet we sent.
     /// RFC 9000 §18.2 parameter 0x10.
     retry_source_connection_id: ?ConnectionId = null,
@@ -112,10 +113,11 @@ pub fn encode(params: TransportParams, buf: []u8) usize {
     }
 
     if (params.original_destination_connection_id) |odcid| {
+        const odcid_len = params.original_destination_connection_id_len;
         pos += varint.encode(buf[pos..], TP_ORIGINAL_DESTINATION_CONNECTION_ID);
-        pos += varint.encode(buf[pos..], cid.len);
-        @memcpy(buf[pos..][0..cid.len], &odcid.bytes);
-        pos += cid.len;
+        pos += varint.encode(buf[pos..], odcid_len);
+        @memcpy(buf[pos..][0..odcid_len], odcid[0..odcid_len]);
+        pos += odcid_len;
     }
 
     if (params.retry_source_connection_id) |scid| {
@@ -242,10 +244,11 @@ pub fn decode(buf: []const u8) !TransportParams {
                 params.initial_source_connection_id_len = copy_len;
             },
             TP_ORIGINAL_DESTINATION_CONNECTION_ID => {
-                if (param_len != cid.len) return error.InvalidParams;
-                var odcid: ConnectionId = .{};
-                @memcpy(&odcid.bytes, param_data);
+                if (param_len > 20) return error.InvalidParams;
+                var odcid: [20]u8 = [_]u8{0} ** 20;
+                @memcpy(odcid[0..param_len], param_data);
                 params.original_destination_connection_id = odcid;
+                params.original_destination_connection_id_len = @intCast(param_len);
             },
             TP_RETRY_SOURCE_CONNECTION_ID => {
                 if (param_len != cid.len) return error.InvalidParams;
@@ -567,15 +570,20 @@ test "transport_params: original_destination_connection_id round-trip" {
     const testing = std.testing;
     var buf: [512]u8 = undefined;
 
-    const odcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    // Use an 8-byte ODCID (common case)
+    const odcid_bytes = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var odcid_raw: [20]u8 = [_]u8{0} ** 20;
+    @memcpy(odcid_raw[0..8], &odcid_bytes);
     const params = TransportParams{
-        .original_destination_connection_id = odcid,
+        .original_destination_connection_id = odcid_raw,
+        .original_destination_connection_id_len = 8,
     };
     const n = encode(params, &buf);
     const decoded = try decode(buf[0..n]);
 
     try testing.expect(decoded.original_destination_connection_id != null);
-    try testing.expect(ConnectionId.eql(odcid, decoded.original_destination_connection_id.?));
+    try testing.expectEqual(@as(u8, 8), decoded.original_destination_connection_id_len);
+    try testing.expectEqualSlices(u8, &odcid_bytes, decoded.original_destination_connection_id.?[0..8]);
 }
 
 test "transport_params: retry_source_connection_id round-trip" {
@@ -597,10 +605,13 @@ test "transport_params: both retry params encode/decode together" {
     const testing = std.testing;
     var buf: [512]u8 = undefined;
 
-    const odcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
+    const odcid_bytes = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var odcid_raw: [20]u8 = [_]u8{0} ** 20;
+    @memcpy(odcid_raw[0..8], &odcid_bytes);
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
     const params = TransportParams{
-        .original_destination_connection_id = odcid,
+        .original_destination_connection_id = odcid_raw,
+        .original_destination_connection_id_len = 8,
         .retry_source_connection_id = scid,
     };
     const n = encode(params, &buf);
@@ -608,17 +619,17 @@ test "transport_params: both retry params encode/decode together" {
 
     try testing.expect(decoded.original_destination_connection_id != null);
     try testing.expect(decoded.retry_source_connection_id != null);
-    try testing.expect(ConnectionId.eql(odcid, decoded.original_destination_connection_id.?));
+    try testing.expectEqualSlices(u8, &odcid_bytes, decoded.original_destination_connection_id.?[0..8]);
     try testing.expect(ConnectionId.eql(scid, decoded.retry_source_connection_id.?));
 }
 
-test "transport_params: original_destination_connection_id with wrong length returns error" {
+test "transport_params: original_destination_connection_id with length > 20 returns error" {
     const testing = std.testing;
     var buf: [64]u8 = undefined;
     var pos: usize = 0;
     pos += varint.encode(buf[pos..], TP_ORIGINAL_DESTINATION_CONNECTION_ID);
-    pos += varint.encode(buf[pos..], 4); // wrong: should be 8 bytes
-    @memset(buf[pos..][0..4], 0xaa);
-    pos += 4;
+    pos += varint.encode(buf[pos..], 21); // invalid: RFC max is 20 bytes
+    @memset(buf[pos..][0..21], 0xaa);
+    pos += 21;
     try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
 }

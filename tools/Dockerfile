@@ -27,6 +27,8 @@ FROM --platform=linux/amd64 alpine:3.19
 
 COPY --from=builder /build/zig-out/bin/server /server
 
+RUN mkdir -p /logs
+
 EXPOSE 443/udp
 
 ENV PORT=443

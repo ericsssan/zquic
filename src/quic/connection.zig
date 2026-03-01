@@ -322,7 +322,9 @@ pub const Connection = struct {
     /// Connection ID we chose for Retry packet (null if no Retry sent).
     retry_scid: ?ConnectionId = null,
     /// Original DCID from validated Retry token (null if no token validation).
-    original_dcid: ?ConnectionId = null,
+    /// Variable length 0–20 bytes (quic-go sends 20-byte initial DCIDs).
+    original_dcid: ?[20]u8 = null,
+    original_dcid_len: u8 = 0,
 
     // Pending retransmit flags
     pending_handshake_done: bool,
@@ -696,19 +698,61 @@ pub const Connection = struct {
             }
         }
 
-        const result = try packet.parseLongHeader(data);
+        // Read raw header fields (not HP-protected: version, DCID, SCID are in the clear).
+        if (data.len < 7) return error.PacketTooShort;
+        const ver = std.mem.readInt(u32, data[1..5], .big);
+        const raw_dcid_len = data[5];
+        if (raw_dcid_len > 20) return data.len; // invalid CID length; silently drop
+        if (data.len < 6 + raw_dcid_len) return error.PacketTooShort;
+        const raw_dcid = data[6..][0..raw_dcid_len];
+
+        // Packet type bits 5–4 are NOT header-protected (RFC 9001 §5.4.1).
+        const raw_pkt_type = packet.longHeaderType(data[0], ver);
+
+        // On the first Initial, derive initial keys from the client's DCID before HP removal.
+        // Keys are required to select the HP key and remove header protection.
+        if (raw_pkt_type == .initial and self.hot.state == .idle) {
+            self.quic_version = ver;
+            self.tls_state.quic_version = ver;
+            self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
+            self.hot.state = .handshake;
+            // Set peer_cid from the SCID field (also not HP-protected).
+            if (data.len >= 6 + raw_dcid_len + 1) {
+                const raw_scid_len = data[6 + raw_dcid_len];
+                if (raw_scid_len <= 20 and data.len >= 6 + raw_dcid_len + 1 + raw_scid_len) {
+                    const copy_len = @min(raw_scid_len, cid_mod.len);
+                    var pc: ConnectionId = .{};
+                    if (copy_len > 0) @memcpy(pc.bytes[0..copy_len], data[6 + raw_dcid_len + 1 ..][0..copy_len]);
+                    self.peer_cid = pc;
+                }
+            }
+        }
+
+        // Select the header-protection key for this packet type.
+        const hp_key: [16]u8 = switch (raw_pkt_type) {
+            .initial => self.initial_keys.client.hp,
+            .handshake => if (self.hs_keys) |hk| hk.client.hp else return data.len,
+            else => return data.len, // 0-RTT/Retry: can't process
+        };
+
+        // Compute offset of the packet-number field; validate buffer has space for HP sample.
+        const pn_off = packet.longHeaderPnOffset(data, ver) catch return data.len;
+        if (pn_off + 4 + 16 > data.len) return error.PacketTooShort;
+
+        // Copy packet to a mutable buffer and remove header protection in place.
+        // Buffer must hold the full packet; packets larger than this are silently truncated.
+        var hp_buf: [1500]u8 = undefined;
+        const pkt_len = @min(data.len, hp_buf.len);
+        @memcpy(hp_buf[0..pkt_len], data[0..pkt_len]);
+        _ = crypto.removeHeaderProtection(hp_key, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+
+        // Parse with header protection removed.
+        const result = try packet.parseLongHeader(hp_buf[0..pkt_len]);
         const hdr = result.header;
 
         switch (hdr.packet_type) {
             .initial => {
-                // On first Initial, record peer CID, negotiate version, and derive initial keys.
-                if (self.hot.state == .idle) {
-                    self.peer_cid = hdr.src_cid;
-                    self.quic_version = hdr.version;
-                    self.tls_state.quic_version = hdr.version;
-                    self.initial_keys = crypto.deriveInitialKeys(&hdr.dest_cid.bytes, hdr.version);
-                    self.hot.state = .handshake;
-                }
+                // peer_cid, quic_version and initial_keys were set in the pre-HP block above.
 
                 // Address validation via Retry (RFC 9000 §8.1).
                 // Only on the first Initial (original_dcid == null); retransmitted
@@ -716,17 +760,18 @@ pub const Connection = struct {
                 if (self.config.validate_addr and self.original_dcid == null) {
                     if (hdr.token.len == 0) {
                         // No token: send Retry and stop processing this datagram.
-                        try self.sendRetry(hdr, src, self.current_time_ns, io);
+                        try self.sendRetry(hdr, raw_dcid, src, self.current_time_ns, io);
                         return result.consumed;
                     }
-                    if (self.validateToken(hdr.token, src, self.current_time_ns)) |odcid| {
-                        self.original_dcid = odcid;
+                    if (self.validateToken(hdr.token, src, self.current_time_ns)) |tok| {
+                        self.original_dcid = tok.raw;
+                        self.original_dcid_len = tok.len;
                     } else {
                         return error.InvalidToken;
                     }
                 }
 
-                // Decrypt the Initial packet
+                // Decrypt the Initial packet.
                 const keys = self.initial_keys.client;
                 const pn = packet.decodePacketNumber(
                     self.hot.rx_pn[0],
@@ -737,9 +782,9 @@ pub const Connection = struct {
                 // Replay protection: drop packets whose PN we've already surpassed.
                 if (self.hot.rx_pn_valid[0] and pn <= self.hot.rx_pn[0]) return result.consumed;
 
-                // Build AAD = header bytes (before payload)
+                // AAD = HP-removed header bytes (before payload, per RFC 9001 §5.3).
                 const payload_start = result.consumed - hdr.payload.len;
-                const aad = data[0..payload_start];
+                const aad = hp_buf[0..payload_start];
 
                 if (hdr.payload.len < 16) return error.PacketTooShort;
                 const pt_len = hdr.payload.len - 16;
@@ -758,7 +803,7 @@ pub const Connection = struct {
                 return result.consumed;
             },
             .handshake => {
-                // Handshake packet: use handshake keys
+                // Handshake packet: use handshake keys.
                 if (self.hs_keys == null) return result.consumed;
                 const keys = self.hs_keys.?.client;
                 const pn = packet.decodePacketNumber(
@@ -768,8 +813,9 @@ pub const Connection = struct {
                 );
                 // Replay protection
                 if (self.hot.rx_pn_valid[1] and pn <= self.hot.rx_pn[1]) return result.consumed;
+                // AAD = HP-removed header bytes.
                 const payload_start = result.consumed - hdr.payload.len;
-                const aad = data[0..payload_start];
+                const aad = hp_buf[0..payload_start];
                 if (hdr.payload.len < 16) return error.PacketTooShort;
                 const pt_len = hdr.payload.len - 16;
                 var plaintext: [MAX_PACKET_SIZE]u8 = undefined;
@@ -786,7 +832,16 @@ pub const Connection = struct {
 
     fn processShortHeaderPacket(self: *Connection, data: []const u8) !usize {
         if (self.app_keys == null) return 0;
-        const result = try packet.parseShortHeader(data, cid_mod.len);
+
+        // Remove header protection before parsing.
+        const pn_off = packet.shortHeaderPnOffset(cid_mod.len);
+        if (pn_off + 4 + 16 > data.len) return 0;
+        var hp_buf: [1500]u8 = undefined;
+        const pkt_len = @min(data.len, hp_buf.len);
+        @memcpy(hp_buf[0..pkt_len], data[0..pkt_len]);
+        _ = crypto.removeHeaderProtection(self.app_keys.?.client.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+
+        const result = try packet.parseShortHeader(hp_buf[0..pkt_len], cid_mod.len);
         const hdr = result.header;
         const pn = packet.decodePacketNumber(
             self.hot.rx_pn[2],
@@ -796,7 +851,8 @@ pub const Connection = struct {
         // Replay protection: silently drop packets with PN <= highest seen in this epoch.
         if (self.hot.rx_pn_valid[2] and pn <= self.hot.rx_pn[2]) return result.consumed;
         const payload_start = result.consumed - hdr.payload.len;
-        const aad = data[0..payload_start];
+        // AAD = HP-removed header bytes (per RFC 9001 §5.3).
+        const aad = hp_buf[0..payload_start];
         if (hdr.payload.len < 16) return result.consumed;
         const pt_len = hdr.payload.len - 16;
         var plaintext: [MAX_PACKET_SIZE]u8 = undefined;
@@ -1016,6 +1072,7 @@ pub const Connection = struct {
             var our_params = transport_params.TransportParams{};
             if (self.original_dcid) |odcid| {
                 our_params.original_destination_connection_id = odcid;
+                our_params.original_destination_connection_id_len = self.original_dcid_len;
                 if (self.retry_scid) |scid| {
                     our_params.retry_source_connection_id = scid;
                 }
@@ -1642,11 +1699,11 @@ pub const Connection = struct {
     /// Build and enqueue a Retry packet (RFC 9000 §8.1).
     /// Generates a fresh address-validation token, picks a new SCID, and pushes
     /// `retry_sent` so the caller knows to drain and discard this connection.
-    fn sendRetry(self: *Connection, hdr: packet.LongHeader, src: SocketAddr, now_ns: i64, io: std.Io) !void {
-        const token = self.generateToken(src, hdr.dest_cid, now_ns, io);
+    fn sendRetry(self: *Connection, hdr: packet.LongHeader, odcid: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
+        const token = self.generateToken(src, odcid, now_ns, io);
         self.retry_scid = ConnectionId.generate(0, io);
         var buf: [256]u8 = undefined;
-        const n = packet.encodeRetry(&buf, hdr.src_cid, self.retry_scid.?, &token, hdr.dest_cid, self.quic_version);
+        const n = packet.encodeRetry(&buf, hdr.src_cid, self.retry_scid.?, &token, odcid, self.quic_version);
         try self.enqueueSend(buf[0..n]);
         self.events.push(.retry_sent);
     }
@@ -2032,13 +2089,24 @@ pub const Connection = struct {
     /// Generate a stateless Retry token (62 bytes).
     /// Format: [12]u8 nonce || [34]u8 AES-128-GCM(plaintext) || [16]u8 tag
     /// Plaintext: [16]u8 IPv6-normalized address || [2]u8 port || [8]u8 timestamp || [8]u8 ODCID
-    fn generateToken(self: *const Connection, src: SocketAddr, odcid: ConnectionId, now_ns: i64, io: std.Io) [62]u8 {
+    // Token size: nonce(12) + ciphertext(47) + tag(16) = 75 bytes.
+    // Plaintext layout: odcid_len(1) + odcid(20, zero-padded) + addr(16) + port(2) + ts(8) = 47 bytes.
+    const TOKEN_SIZE: usize = 75;
+
+    fn generateToken(self: *const Connection, src: SocketAddr, odcid: []const u8, now_ns: i64, io: std.Io) [TOKEN_SIZE]u8 {
         // Normalize address to IPv6 for consistent handling
         const addr_ipv6 = normalizeAddressToIPv6(src);
 
-        // Build plaintext (34 bytes)
-        var plaintext: [34]u8 = undefined;
+        // Build plaintext (47 bytes): odcid_len(1) + odcid(20) + addr(16) + port(2) + ts(8)
+        var plaintext: [47]u8 = [_]u8{0} ** 47;
         var pos: usize = 0;
+
+        // Original DCID length (1 byte) + DCID bytes (padded to 20)
+        plaintext[pos] = @intCast(@min(odcid.len, 20));
+        pos += 1;
+        const copy_len = @min(odcid.len, 20);
+        @memcpy(plaintext[pos..][0..copy_len], odcid[0..copy_len]);
+        pos += 20; // always advance by 20 (zero-padded)
 
         // Address (16 bytes)
         @memcpy(plaintext[pos..][0..16], &addr_ipv6);
@@ -2057,12 +2125,10 @@ pub const Connection = struct {
         std.mem.writeInt(u64, plaintext[pos..][0..8], now_u64, .little);
         pos += 8;
 
-        // Original DCID (8 bytes)
-        @memcpy(plaintext[pos..][0..8], &odcid.bytes);
-        pos += 8;
+        std.debug.assert(pos == 47);
 
         // Generate random nonce
-        var token: [62]u8 = undefined;
+        var token: [TOKEN_SIZE]u8 = undefined;
         var nonce: [12]u8 = undefined;
         io.random(&nonce);
 
@@ -2072,28 +2138,29 @@ pub const Connection = struct {
         std.crypto.kdf.hkdf.HkdfSha256.expand(&token_key, label, self.config.token_secret);
 
         // Encrypt plaintext with AES-128-GCM
-        var ciphertext: [34]u8 = undefined;
+        var ciphertext: [47]u8 = undefined;
         var tag: [16]u8 = undefined;
         std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&ciphertext, &tag, &plaintext, &.{}, nonce, token_key);
 
         // Assemble token: nonce || ciphertext || tag
         @memcpy(token[0..12], &nonce);
-        @memcpy(token[12..46], &ciphertext);
-        @memcpy(token[46..62], &tag);
+        @memcpy(token[12..59], &ciphertext);
+        @memcpy(token[59..75], &tag);
 
         return token;
     }
 
     /// Validate a token from an Initial packet.
-    /// Returns the original DCID on success, null on validation failure.
-    fn validateToken(self: *const Connection, token: []const u8, src: SocketAddr, now_ns: i64) ?ConnectionId {
-        // Token must be exactly 62 bytes
-        if (token.len != 62) return null;
+    /// Returns the original DCID (raw bytes, length) on success, null on failure.
+    const ValidatedToken = struct { raw: [20]u8, len: u8 };
+    fn validateToken(self: *const Connection, token: []const u8, src: SocketAddr, now_ns: i64) ?ValidatedToken {
+        // Token must be exactly TOKEN_SIZE (75) bytes
+        if (token.len != TOKEN_SIZE) return null;
 
-        // Extract components
+        // Extract components: nonce(12) + ciphertext(47) + tag(16)
         const nonce = token[0..12];
-        const ciphertext = token[12..46];
-        const tag_in = token[46..62];
+        const ciphertext = token[12..59];
+        const tag_in = token[59..75];
 
         // Derive token key
         var token_key: [16]u8 = undefined;
@@ -2101,7 +2168,7 @@ pub const Connection = struct {
         std.crypto.kdf.hkdf.HkdfSha256.expand(&token_key, label, self.config.token_secret);
 
         // Decrypt with AES-128-GCM
-        var plaintext: [34]u8 = undefined;
+        var plaintext: [47]u8 = undefined;
         var tag_arr: [16]u8 = undefined;
         @memcpy(&tag_arr, tag_in);
 
@@ -2110,15 +2177,22 @@ pub const Connection = struct {
 
         std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(
             &plaintext,
-            ciphertext[0..34],
+            ciphertext[0..47],
             tag_arr,
             &.{},
             nonce_arr,
             token_key,
         ) catch return null;
 
-        // Extract fields from plaintext
+        // Extract fields from plaintext: odcid_len(1) + odcid(20) + addr(16) + port(2) + ts(8)
         var pos: usize = 0;
+
+        // Original DCID length + bytes
+        const odcid_len: u8 = if (plaintext[pos] <= 20) plaintext[pos] else return null;
+        pos += 1;
+        var odcid_raw: [20]u8 = [_]u8{0} ** 20;
+        @memcpy(&odcid_raw, plaintext[pos..][0..20]);
+        pos += 20;
 
         // Address (16 bytes, must match normalized version)
         const addr_ipv6_stored = plaintext[pos..][0..16];
@@ -2139,6 +2213,8 @@ pub const Connection = struct {
         const issued_at_u64 = std.mem.readInt(u64, plaintext[pos..][0..8], .little);
         pos += 8;
 
+        std.debug.assert(pos == 47);
+
         const now_u64: u64 = @intCast(@max(now_ns, 0));
 
         // Reject tokens from the future (clock skew)
@@ -2149,11 +2225,7 @@ pub const Connection = struct {
         const validity_u64: u64 = @intCast(@max(self.config.token_validity_ns, 0));
         if (elapsed_u64 > validity_u64) return null;
 
-        // Extract original DCID (8 bytes)
-        var odcid: ConnectionId = undefined;
-        @memcpy(&odcid.bytes, plaintext[pos..][0..8]);
-
-        return odcid;
+        return .{ .raw = odcid_raw, .len = odcid_len };
     }
 };
 
@@ -3739,6 +3811,8 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
         ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
     );
     crypto.encryptPayload(client_keys, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
+    // Apply header protection so receive() can remove it correctly.
+    crypto.applyHeaderProtection(client_keys.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
     const pkt = enc_buf[0 .. hdr_len + ct_len];
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
@@ -4723,13 +4797,15 @@ test "token: valid token can be generated and validated" {
     const odcid = ConnectionId.generate(0, io);
     const now_ns: i64 = 1_000_000_000;
 
-    // Generate token
-    const token = conn.generateToken(src, odcid, now_ns, io);
-    try testing.expectEqual(@as(usize, 62), token.len);
+    // Generate token (pass DCID as slice)
+    const token = conn.generateToken(src, &odcid.bytes, now_ns, io);
+    try testing.expectEqual(@as(usize, Connection.TOKEN_SIZE), token.len);
 
-    // Validate token immediately (should succeed)
+    // Validate token immediately (should succeed, returns ValidatedToken)
     const result = conn.validateToken(&token, src, now_ns);
-    try testing.expectEqual(odcid, result);
+    try testing.expect(result != null);
+    try testing.expectEqual(@as(u8, cid_mod.len), result.?.len);
+    try testing.expectEqualSlices(u8, &odcid.bytes, result.?.raw[0..cid_mod.len]);
 }
 
 test "token: expired token is rejected" {
@@ -4745,12 +4821,11 @@ test "token: expired token is rejected" {
     const odcid = ConnectionId.generate(0, io);
     const now_ns: i64 = 1_000_000_000;
 
-    // Generate token
-    const token = conn.generateToken(src, odcid, now_ns, io);
+    const token = conn.generateToken(src, &odcid.bytes, now_ns, io);
 
     // Validate after token has expired (120 seconds later)
     const result = conn.validateToken(&token, src, now_ns + 120 * std.time.ns_per_s);
-    try testing.expectEqual(@as(?ConnectionId, null), result);
+    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
 }
 
 test "token: future-dated token is rejected (clock skew)" {
@@ -4767,11 +4842,11 @@ test "token: future-dated token is rejected (clock skew)" {
 
     // Generate token "from the future"
     const future_ts = now_ns + 60 * std.time.ns_per_s;
-    const token = conn.generateToken(src, odcid, future_ts, io);
+    const token = conn.generateToken(src, &odcid.bytes, future_ts, io);
 
     // Try to validate with an earlier timestamp
     const result = conn.validateToken(&token, src, now_ns);
-    try testing.expectEqual(@as(?ConnectionId, null), result);
+    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
 }
 
 test "token: different source address causes validation failure" {
@@ -4788,11 +4863,11 @@ test "token: different source address causes validation failure" {
     const now_ns: i64 = 1_000_000_000;
 
     // Generate token for src1
-    const token = conn.generateToken(src1, odcid, now_ns, io);
+    const token = conn.generateToken(src1, &odcid.bytes, now_ns, io);
 
     // Try to validate with src2 (should fail)
     const result = conn.validateToken(&token, src2, now_ns);
-    try testing.expectEqual(@as(?ConnectionId, null), result);
+    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
 }
 
 test "token: tampered token (corrupted AEAD tag) is rejected" {
@@ -4808,14 +4883,14 @@ test "token: tampered token (corrupted AEAD tag) is rejected" {
     const now_ns: i64 = 1_000_000_000;
 
     // Generate token
-    var token = conn.generateToken(src, odcid, now_ns, io);
+    var token = conn.generateToken(src, &odcid.bytes, now_ns, io);
 
     // Corrupt the AEAD tag (last 16 bytes)
-    token[61] ^= 0xff; // flip bits in last byte of tag
+    token[74] ^= 0xff; // flip bits in last byte of tag
 
     // Validation should fail
     const result = conn.validateToken(&token, src, now_ns);
-    try testing.expectEqual(@as(?ConnectionId, null), result);
+    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
 }
 
 test "token: IPv6 source address validation" {
@@ -4831,12 +4906,14 @@ test "token: IPv6 source address validation" {
     const now_ns: i64 = 1_000_000_000;
 
     // Generate token with IPv6 source
-    const token = conn.generateToken(src, odcid, now_ns, io);
-    try testing.expectEqual(@as(usize, 62), token.len);
+    const token = conn.generateToken(src, &odcid.bytes, now_ns, io);
+    try testing.expectEqual(@as(usize, Connection.TOKEN_SIZE), token.len);
 
     // Validate with same IPv6 source (should succeed)
     const result = conn.validateToken(&token, src, now_ns);
-    try testing.expectEqual(odcid, result);
+    try testing.expect(result != null);
+    try testing.expectEqual(@as(u8, cid_mod.len), result.?.len);
+    try testing.expectEqualSlices(u8, &odcid.bytes, result.?.raw[0..cid_mod.len]);
 }
 
 test "token: truncated token is rejected" {
@@ -4855,7 +4932,7 @@ test "token: truncated token is rejected" {
 
     // Validation should fail
     const result = conn.validateToken(&truncated, src, now_ns);
-    try testing.expectEqual(@as(?ConnectionId, null), result);
+    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
 }
 
 test "retry: transport params wiring with original_dcid and retry_scid" {
@@ -4870,14 +4947,16 @@ test "retry: transport params wiring with original_dcid and retry_scid" {
     const original_dcid = ConnectionId.generate(0, io);
     const now_ns: i64 = 1_000_000_000;
 
-    const token = conn.generateToken(src, original_dcid, now_ns, io);
+    const token = conn.generateToken(src, &original_dcid.bytes, now_ns, io);
 
     // Validate the token (simulating receiving an Initial with this token)
-    const validated_dcid = conn.validateToken(&token, src, now_ns);
-    try testing.expectEqual(original_dcid, validated_dcid);
+    const validated = conn.validateToken(&token, src, now_ns);
+    try testing.expect(validated != null);
+    try testing.expectEqualSlices(u8, &original_dcid.bytes, validated.?.raw[0..validated.?.len]);
 
     // Set the original_dcid in the connection (would normally happen during Initial processing)
-    conn.original_dcid = validated_dcid;
+    conn.original_dcid = validated.?.raw;
+    conn.original_dcid_len = validated.?.len;
 
     // Set a retry_scid (would be generated when sending the Retry)
     conn.retry_scid = ConnectionId.generate(1, io);
@@ -4886,13 +4965,15 @@ test "retry: transport params wiring with original_dcid and retry_scid" {
     var test_params = transport_params.TransportParams{};
     if (conn.original_dcid) |odcid| {
         test_params.original_destination_connection_id = odcid;
+        test_params.original_destination_connection_id_len = conn.original_dcid_len;
         if (conn.retry_scid) |scid| {
             test_params.retry_source_connection_id = scid;
         }
     }
 
     // Verify the params were set correctly
-    try testing.expectEqual(original_dcid, test_params.original_destination_connection_id);
+    try testing.expect(test_params.original_destination_connection_id != null);
+    try testing.expectEqualSlices(u8, &original_dcid.bytes, test_params.original_destination_connection_id.?[0..test_params.original_destination_connection_id_len]);
     try testing.expectEqual(conn.retry_scid, test_params.retry_source_connection_id);
 
     // Test encoding/decoding the params with the new fields
@@ -4902,7 +4983,8 @@ test "retry: transport params wiring with original_dcid and retry_scid" {
 
     // Decode and verify
     const decoded = try transport_params.decode(encoded_buf[0..encoded_len]);
-    try testing.expectEqual(test_params.original_destination_connection_id, decoded.original_destination_connection_id);
+    try testing.expect(decoded.original_destination_connection_id != null);
+    try testing.expectEqualSlices(u8, &original_dcid.bytes, decoded.original_destination_connection_id.?[0..decoded.original_destination_connection_id_len]);
     try testing.expectEqual(test_params.retry_source_connection_id, decoded.retry_source_connection_id);
 }
 
@@ -4939,6 +5021,9 @@ fn buildInitialPacket(
         ct_len,
     );
     crypto.encryptPayload(keys.client, pn, buf[0..hdr_len], pt[0..pt_len], buf[hdr_len..][0..ct_len]);
+    // Apply header protection so processLongHeaderPacket can remove it.
+    // PN is at buf[hdr_len-4..hdr_len], sample is at buf[hdr_len..hdr_len+16].
+    crypto.applyHeaderProtection(keys.client.hp, &buf[0], buf[hdr_len - 4 ..][0..4], buf[hdr_len..][0..16]);
     return .{ .keys = keys, .pkt_len = hdr_len + ct_len };
 }
 
@@ -5004,7 +5089,7 @@ test "retry: validate_addr=true, valid token: original_dcid stored, handshake pr
 
     // Generate a valid token for this src + dcid
     const odcid = ConnectionId{ .bytes = dcid_bytes };
-    const token = conn.generateToken(src, odcid, now_ns, io);
+    const token = conn.generateToken(src, &odcid.bytes, now_ns, io);
 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
@@ -5036,7 +5121,7 @@ test "retry: validate_addr=true, expired token: error.InvalidToken" {
     const now_ns: i64 = issued_ns + 120 * std.time.ns_per_s; // 2 minutes later → expired
 
     const odcid = ConnectionId{ .bytes = dcid_bytes };
-    const token = conn.generateToken(src, odcid, issued_ns, io);
+    const token = conn.generateToken(src, &odcid.bytes, issued_ns, io);
 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
@@ -5055,7 +5140,7 @@ test "retry: validate_addr=true, tampered token: error.InvalidToken" {
     const now_ns: i64 = 3_000_000_000;
 
     const odcid = ConnectionId{ .bytes = dcid_bytes };
-    var token = conn.generateToken(src, odcid, now_ns, io);
+    var token = conn.generateToken(src, &odcid.bytes, now_ns, io);
     token[5] ^= 0xFF; // tamper with ciphertext byte
 
     var buf: [256]u8 = undefined;
@@ -5076,7 +5161,7 @@ test "retry: validate_addr=true, wrong-address token: error.InvalidToken" {
     const now_ns: i64 = 4_000_000_000;
 
     const odcid = ConnectionId{ .bytes = dcid_bytes };
-    const token = conn.generateToken(src1, odcid, now_ns, io); // token bound to src1
+    const token = conn.generateToken(src1, &odcid.bytes, now_ns, io); // token bound to src1
 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
@@ -5260,7 +5345,8 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
     );
     crypto.encryptPayload(keys.client, 0, enc_buf[0..hdr_len], &pt, enc_buf[hdr_len..][0..ct_len]);
     const total = hdr_len + ct_len;
-    crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len + 4 ..][0..16]);
+    // PN is at enc_buf[hdr_len-4..hdr_len], sample is at enc_buf[hdr_len..hdr_len+16].
+    crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
     const result = conn.receive(enc_buf[0..total], .{ .v4 = .{ .addr = .{0} ** 4, .port = 1234 } }, 0, io);
     _ = result catch {};

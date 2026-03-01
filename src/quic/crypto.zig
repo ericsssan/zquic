@@ -205,6 +205,38 @@ pub fn applyHeaderProtection(
     }
 }
 
+/// Remove header protection from a received QUIC packet (RFC 9001 §5.4).
+///
+/// Performs two-step removal:
+///   1. Unmask `first_byte` to recover the real bits (including pn_len).
+///   2. Use the recovered pn_len to unmask exactly that many PN bytes.
+///
+/// `pn_field` must point to at least 4 bytes starting at the PN offset.
+/// Returns the actual packet-number length (1..4) decoded from `first_byte`.
+pub fn removeHeaderProtection(
+    hp_key: [16]u8,
+    first_byte: *u8,
+    pn_field: *[4]u8,
+    sample: *const [16]u8,
+) u8 {
+    var mask: [16]u8 = undefined;
+    const aes = Aes128.initEnc(hp_key);
+    aes.encrypt(&mask, sample);
+
+    // Long header: mask bits 0..3; short header: mask bits 0..4.
+    if (first_byte.* & 0x80 != 0) {
+        first_byte.* ^= mask[0] & 0x0f;
+    } else {
+        first_byte.* ^= mask[0] & 0x1f;
+    }
+
+    const pn_len: u8 = (first_byte.* & 0x03) + 1;
+    for (0..pn_len) |i| {
+        pn_field[i] ^= mask[1 + i];
+    }
+    return pn_len;
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
