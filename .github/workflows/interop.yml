@@ -19,9 +19,20 @@ jobs:
       github.event.workflow_run.conclusion == 'success'
 
     steps:
-      - name: Install system dependencies
+      - name: Install Docker Engine 28.1+
         run: |
           sudo apt-get update
+          sudo apt-get install -y ca-certificates curl
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          docker --version
+
+      - name: Install system dependencies
+        run: |
           sudo apt-get install -y tshark jq python3-pip
 
       - name: Clone quic-interop-runner
@@ -47,7 +58,6 @@ jobs:
             --test handshake,transfer,retry,keyupdate,v2 \
             --log-dir logs \
             --json results.json \
-            --debug \
             -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest \
             || true   # runner exits non-zero on any failure; we check below
 
