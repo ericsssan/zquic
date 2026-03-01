@@ -362,8 +362,7 @@ pub fn encodeRetry(
     @memcpy(buf[pos..][0..cid.len], &scid.bytes);
     pos += cid.len;
 
-    // Token (variable length)
-    pos += varint.encode(buf[pos..], @intCast(token.len));
+    // Token (variable length, no length prefix — RFC 9000 §17.2.5)
     @memcpy(buf[pos..][0..token.len], token);
     pos += token.len;
 
@@ -624,16 +623,12 @@ test "packet: encodeRetry structure" {
     try testing.expectEqual(@as(u8, cid.len), buf[14]);
     try testing.expectEqualSlices(u8, &scid.bytes, buf[15..23]);
 
-    // Verify token length and content
-    var pos: usize = 23;
-    const token_len_vi = varint.decode(buf[pos..]) orelse return error.InvalidFormat;
-    try testing.expectEqual(@as(u62, 4), token_len_vi.value);
-    pos += token_len_vi.len;
+    // Token starts immediately after SCID — no length prefix (RFC 9000 §17.2.5).
+    const pos: usize = 23;
     try testing.expectEqualSlices(u8, &token, buf[pos..][0..4]);
-    pos += 4;
 
     // Verify integrity tag is 16 bytes at the end
-    try testing.expectEqual(@as(usize, 16), n - pos);
+    try testing.expectEqual(@as(usize, 16), n - (pos + 4));
 }
 
 test "packet: encodeRetry integrity tag is 16 bytes" {
@@ -646,9 +641,8 @@ test "packet: encodeRetry integrity tag is 16 bytes" {
 
     const n = encodeRetry(&buf, dcid, scid, &token, &odcid.bytes, QUIC_VERSION_1);
 
-    // Expected: 1 + 4 + 1 + 8 + 1 + 8 + varint(62) + 62 + 16
-    // varint(62) = 1 byte, so total = 1 + 4 + 1 + 8 + 1 + 8 + 1 + 62 + 16 = 102
-    try testing.expectEqual(@as(usize, 102), n);
+    // Expected: 1 + 4 + 1 + 8 + 1 + 8 + 62 + 16 = 101 (no length prefix on token)
+    try testing.expectEqual(@as(usize, 101), n);
 }
 
 test "packet: longHeaderType v2 rotates packet type bits" {

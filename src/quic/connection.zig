@@ -1070,6 +1070,11 @@ pub const Connection = struct {
         // This includes original_dcid if address validation with Retry was used.
         if (self.tls_state.state == .wait_client_hello) {
             var our_params = transport_params.TransportParams{};
+            // RFC 9000 §18.2: initial_source_connection_id is mandatory in server params.
+            var isci: [20]u8 = [_]u8{0} ** 20;
+            @memcpy(isci[0..cid_mod.len], &self.local_cid.bytes);
+            our_params.initial_source_connection_id = isci;
+            our_params.initial_source_connection_id_len = cid_mod.len;
             if (self.original_dcid) |odcid| {
                 our_params.original_destination_connection_id = odcid;
                 our_params.original_destination_connection_id_len = self.original_dcid_len;
@@ -1401,6 +1406,7 @@ pub const Connection = struct {
                 );
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
                 try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.count = 0; // ACK is not ack-eliciting; no frame info tracked
@@ -1425,6 +1431,7 @@ pub const Connection = struct {
                 );
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                crypto.applyHeaderProtection(hk.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
                 try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.count = 0;
@@ -1440,6 +1447,7 @@ pub const Connection = struct {
                 const ct_len = fpos + 16;
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(ak, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                crypto.applyHeaderProtection(ak.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
                 try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.count = 0;
@@ -1459,6 +1467,7 @@ pub const Connection = struct {
             const ct_len = n + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
             crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..n], self.enc_scratch[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
             const out_len = hdr_len + ct_len;
             try self.enqueueSend(self.enc_scratch[0..out_len]);
             var fi = loss_recovery_mod.SentFrameInfo{};
@@ -1524,6 +1533,7 @@ pub const Connection = struct {
         }
 
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(self.enc_scratch[0..out_len]);
 
@@ -1553,6 +1563,7 @@ pub const Connection = struct {
             const ct_len = pos + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
             crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
             const out_len = hdr_len + ct_len;
             try self.enqueueSend(self.enc_scratch[0..out_len]);
             var fi = loss_recovery_mod.SentFrameInfo{};
@@ -1630,6 +1641,7 @@ pub const Connection = struct {
                 );
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
                 try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.frames[0] = .{ .crypto_frame = .{
@@ -1657,6 +1669,7 @@ pub const Connection = struct {
                 );
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                crypto.applyHeaderProtection(hk.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
                 try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.frames[0] = .{ .crypto_frame = .{
@@ -1736,6 +1749,7 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(self.enc_scratch[0..out_len]);
 
@@ -1780,6 +1794,7 @@ pub const Connection = struct {
             self.closing_frame_buf[0..self.closing_frame_len],
             self.enc_scratch[hdr_len..][0..ct_len],
         );
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(self.enc_scratch[0..out_len]);
         // Not tracked for retransmission — closing state re-sends on every receive().
@@ -1804,6 +1819,7 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(self.enc_scratch[0..out_len]);
 
@@ -1847,6 +1863,7 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(self.enc_scratch[0..out_len]);
         // Not tracked via loss recovery — PATH_RESPONSE is not retransmittable.
@@ -1868,6 +1885,7 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
         // Store challenge so incoming PATH_RESPONSE can be validated.
         self.pending_path_challenge = data;
@@ -1922,6 +1940,7 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(self.enc_scratch[0..out_len]);
 
@@ -2000,6 +2019,7 @@ pub const Connection = struct {
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+        crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
         const out_len = hdr_len + ct_len;
         try self.enqueueSend(self.enc_scratch[0..out_len]);
         self.loss.onPacketSent(pn, 2, out_len, has_ack_eliciting, self.current_time_ns, fi);
