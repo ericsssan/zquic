@@ -24,14 +24,38 @@ const stream_mod = @import("stream.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 
 // ---------------------------------------------------------------------------
+// Compatibility shim: std.testing.fuzz changed its callback signature between
+// dev builds. In builds that have std.testing.Smith the callback receives
+// `*Smith`; in older builds it receives `[]const u8`.
+// ---------------------------------------------------------------------------
+
+/// The type passed to each fuzz callback by std.testing.fuzz.
+const FuzzInput = if (@hasDecl(std.testing, "Smith")) *std.testing.Smith else []const u8;
+
+/// Extract a variable-length byte slice from the fuzz input into `buf`.
+/// Returns a slice of `buf` containing the bytes.
+inline fn getBytes(input: FuzzInput, buf: []u8) []const u8 {
+    if (@hasDecl(std.testing, "Smith")) {
+        const n = input.slice(buf);
+        return buf[0..n];
+    } else {
+        const n = @min(buf.len, input.len);
+        @memcpy(buf[0..n], input[0..n]);
+        return buf[0..n];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fuzz target functions
 // ---------------------------------------------------------------------------
 
 /// Frame parser must not crash on any byte sequence.
-fn fuzzFrameParse(_: void, input: []const u8) anyerror!void {
+fn fuzzFrameParse(_: void, input: FuzzInput) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    const bytes = getBytes(input, &buf);
     var pos: usize = 0;
-    while (pos < input.len) {
-        const result = frame.parseFrame(input[pos..]) catch return;
+    while (pos < bytes.len) {
+        const result = frame.parseFrame(bytes[pos..]) catch return;
         if (result.consumed == 0) return;
         pos += result.consumed;
     }
@@ -39,39 +63,47 @@ fn fuzzFrameParse(_: void, input: []const u8) anyerror!void {
 
 /// Varint encode → decode round-trip: encode(decode(x)) must reproduce the
 /// same value and consume the same number of bytes.
-fn fuzzVarint(_: void, input: []const u8) anyerror!void {
-    const decoded = varint.decode(input) orelse return;
+fn fuzzVarint(_: void, input: FuzzInput) anyerror!void {
     var buf: [8]u8 = undefined;
-    const n = varint.encode(&buf, decoded.value);
+    const bytes = getBytes(input, &buf);
+    const decoded = varint.decode(bytes) orelse return;
+    var enc_buf: [8]u8 = undefined;
+    const enc_n = varint.encode(&enc_buf, decoded.value);
     // Re-decode the canonical encoding — must give back the same value.
-    const redecoded = varint.decode(buf[0..n]) orelse return;
+    const redecoded = varint.decode(enc_buf[0..enc_n]) orelse return;
     try std.testing.expectEqual(decoded.value, redecoded.value);
-    try std.testing.expectEqual(@as(u8, @intCast(n)), redecoded.len);
+    try std.testing.expectEqual(@as(u8, @intCast(enc_n)), redecoded.len);
 }
 
 /// Transport params decoder must not crash on any input.
-fn fuzzTransportParams(_: void, input: []const u8) anyerror!void {
-    _ = transport_params.decode(input) catch return;
+fn fuzzTransportParams(_: void, input: FuzzInput) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    _ = transport_params.decode(bytes) catch return;
 }
 
 /// Packet header parser must not crash on any input.
-fn fuzzPacketParse(_: void, input: []const u8) anyerror!void {
-    if (input.len == 0) return;
-    if (packet.isLongHeader(input[0])) {
-        _ = packet.parseLongHeader(input) catch return;
+fn fuzzPacketParse(_: void, input: FuzzInput) anyerror!void {
+    var buf: [2048]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    if (bytes.len == 0) return;
+    if (packet.isLongHeader(bytes[0])) {
+        _ = packet.parseLongHeader(bytes) catch return;
     } else {
-        _ = packet.parseShortHeader(input, 8) catch return;
+        _ = packet.parseShortHeader(bytes, 8) catch return;
     }
 }
 
 /// Stream receiveData must not crash on any (offset, data, fin) combination.
 /// Properties: flow control or buffer errors are the only expected outcomes.
-fn fuzzStreamReceive(_: void, input: []const u8) anyerror!void {
-    if (input.len < 9) return;
+fn fuzzStreamReceive(_: void, input: FuzzInput) anyerror!void {
+    var buf: [4096 + 9]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    if (bytes.len < 9) return;
     // First 8 bytes: offset (u64 little-endian); byte 8: fin flag; rest: data.
-    const offset: u64 = std.mem.readInt(u64, input[0..8], .little);
-    const fin = input[8] & 1 != 0;
-    const data = input[9..];
+    const offset: u64 = std.mem.readInt(u64, bytes[0..8], .little);
+    const fin = bytes[8] & 1 != 0;
+    const data = bytes[9..];
     var s = stream_mod.Stream.init(0);
     // Must not crash; flow-control or buffer errors are expected and fine.
     s.receiveData(offset, data, fin) catch return;
@@ -79,15 +111,17 @@ fn fuzzStreamReceive(_: void, input: []const u8) anyerror!void {
 
 /// RttEstimator.update must not crash, overflow, or produce NaN/zero values
 /// regardless of sample_ns, ack_delay_ns, max_ack_delay_ns inputs.
-fn fuzzRttUpdate(_: void, input: []const u8) anyerror!void {
-    if (input.len < 3) return;
+fn fuzzRttUpdate(_: void, input: FuzzInput) anyerror!void {
+    var buf: [768]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    if (bytes.len < 3) return;
     var rtt = loss_recovery_mod.RttEstimator{};
     var i: usize = 0;
-    while (i + 3 <= input.len) : (i += 3) {
+    while (i + 3 <= bytes.len) : (i += 3) {
         // Scale bytes to milliseconds to exercise meaningful RTT ranges.
-        const sample_ns = @as(u64, input[i]) * 1_000_000;
-        const ack_delay = @as(u64, input[i + 1]) * 1_000_000;
-        const max_delay = @as(u64, input[i + 2]) * 1_000_000 + 1; // +1 to avoid zero
+        const sample_ns = @as(u64, bytes[i]) * 1_000_000;
+        const ack_delay = @as(u64, bytes[i + 1]) * 1_000_000;
+        const max_delay = @as(u64, bytes[i + 2]) * 1_000_000 + 1; // +1 to avoid zero
         rtt.update(sample_ns, ack_delay, max_delay);
         // smoothed_rtt and rtt_var must always remain positive after initialization.
         if (rtt.initialized) {
@@ -99,13 +133,15 @@ fn fuzzRttUpdate(_: void, input: []const u8) anyerror!void {
 /// Frame encode→parse round-trip: parse a frame from fuzz bytes, re-encode it,
 /// re-parse the encoded bytes, and verify the values are identical.
 /// This catches asymmetry between encodeFrame and parseFrame.
-fn fuzzFrameRoundTrip(_: void, input: []const u8) anyerror!void {
-    const r1 = frame.parseFrame(input) catch return;
-    if (r1.consumed == 0) return;
+fn fuzzFrameRoundTrip(_: void, input: FuzzInput) anyerror!void {
     var buf: [4096]u8 = undefined;
-    const enc_len = frame.encodeFrame(&buf, r1.frame);
+    const bytes = getBytes(input, &buf);
+    const r1 = frame.parseFrame(bytes) catch return;
+    if (r1.consumed == 0) return;
+    var enc_buf: [4096]u8 = undefined;
+    const enc_len = frame.encodeFrame(&enc_buf, r1.frame);
     if (enc_len == 0) return;
-    const r2 = frame.parseFrame(buf[0..enc_len]) catch return;
+    const r2 = frame.parseFrame(enc_buf[0..enc_len]) catch return;
     // After a clean round-trip the consumed byte count must be stable.
     try std.testing.expectEqual(enc_len, r2.consumed);
 }
@@ -115,13 +151,15 @@ fn fuzzFrameRoundTrip(_: void, input: []const u8) anyerror!void {
 ///   - count never exceeds MAX_GAPS
 ///   - contiguousFrom(base) >= base always
 ///   - window_end >= contiguousFrom(0) always
-fn fuzzGapList(_: void, input: []const u8) anyerror!void {
-    if (input.len < 2) return;
+fn fuzzGapList(_: void, input: FuzzInput) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    if (bytes.len < 2) return;
     var gl = stream_mod.GapList.init(0, stream_mod.STREAM_BUF_SIZE);
     var i: usize = 0;
-    while (i + 2 <= input.len) : (i += 2) {
-        const offset = @as(u64, input[i]) * 16; // spread fills across buffer range
-        const len: usize = @as(usize, input[i + 1]) + 1; // 1..256
+    while (i + 2 <= bytes.len) : (i += 2) {
+        const offset = @as(u64, bytes[i]) * 16; // spread fills across buffer range
+        const len: usize = @as(usize, bytes[i + 1]) + 1; // 1..256
         gl.fill(offset, len);
         // Invariant 1: gap count within bounds
         try std.testing.expect(gl.count <= stream_mod.MAX_GAPS);
@@ -136,25 +174,25 @@ fn fuzzGapList(_: void, input: []const u8) anyerror!void {
 ///   - getSendData returns what was written at the same offset
 ///   - onAcked only advances send_acked monotonically
 ///   - no panic or safety-checked UB on any input combination
-fn fuzzStreamSendBuffer(_: void, input: []const u8) anyerror!void {
-    if (input.len < 2) return;
+fn fuzzStreamSendBuffer(_: void, input: FuzzInput) anyerror!void {
+    var buf: [4096]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    if (bytes.len < 2) return;
     var s = stream_mod.Stream.init(0);
     s.send_max = std.math.maxInt(u64); // no flow-control limit for this fuzz target
-    var written_total: u64 = 0;
     var i: usize = 0;
-    while (i < input.len) {
-        const op = input[i] & 0x3; // 2-bit opcode
-        const arg = if (i + 1 < input.len) input[i + 1] else 0;
+    while (i < bytes.len) {
+        const op = bytes[i] & 0x3; // 2-bit opcode
+        const arg = if (i + 1 < bytes.len) bytes[i + 1] else 0;
         i += 2;
         switch (op) {
             0 => {
                 // Write arg bytes
                 const data_len: usize = @as(usize, arg) + 1;
-                const end = @min(i + data_len, input.len);
-                const data = input[i..end];
+                const end = @min(i + data_len, bytes.len);
+                const data = bytes[i..end];
                 i = end;
-                const n = s.bufferSendData(data);
-                written_total += n;
+                _ = s.bufferSendData(data);
             },
             1 => {
                 // Peek at current send_acked offset
@@ -184,14 +222,16 @@ fn fuzzStreamSendBuffer(_: void, input: []const u8) anyerror!void {
 ///   - bytes_in_flight never wraps (saturating subtract is used internally, but
 ///     we verify it stays within plausible bounds)
 ///   - No panic or UB regardless of input order or epoch values
-fn fuzzLossRecoveryLoop(_: void, input: []const u8) anyerror!void {
+fn fuzzLossRecoveryLoop(_: void, input: FuzzInput) anyerror!void {
+    var buf: [512]u8 = undefined;
+    const bytes = getBytes(input, &buf);
     var lr = loss_recovery_mod.LossRecovery.init();
     var pn: u64 = 1;
     var now_ns: i64 = 1_000_000;
     var i: usize = 0;
-    while (i < input.len) {
-        const op = input[i] & 0x1; // 1-bit opcode
-        const b = if (i + 1 < input.len) input[i + 1] else 1;
+    while (i < bytes.len) {
+        const op = bytes[i] & 0x1; // 1-bit opcode
+        const b = if (i + 1 < bytes.len) bytes[i + 1] else 1;
         i += 2;
         const epoch: u8 = b & 0x3; // 0..2
         const ack_eliciting = (b >> 2) & 0x1 != 0;
@@ -221,14 +261,16 @@ fn fuzzLossRecoveryLoop(_: void, input: []const u8) anyerror!void {
 
 /// RTT estimator with full u64 inputs: ptoBase must always be >= K_GRANULARITY_NS.
 /// This exercises the saturating arithmetic added to ptoBase and the EWMA updates.
-fn fuzzRttFullRange(_: void, input: []const u8) anyerror!void {
-    if (input.len < 8) return;
+fn fuzzRttFullRange(_: void, input: FuzzInput) anyerror!void {
+    var buf: [2048]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    if (bytes.len < 8) return;
     var rtt = loss_recovery_mod.RttEstimator{};
     var i: usize = 0;
-    while (i + 8 <= input.len) : (i += 8) {
+    while (i + 8 <= bytes.len) : (i += 8) {
         // Use full u64 values to reach extreme RTT ranges.
-        const sample_ns = std.mem.readInt(u64, input[i..][0..8], .little);
-        const ack_delay: u64 = if (i + 8 < input.len) @as(u64, input[i + 8]) * 1_000_000 else 0;
+        const sample_ns = std.mem.readInt(u64, bytes[i..][0..8], .little);
+        const ack_delay: u64 = if (i + 8 < bytes.len) @as(u64, bytes[i + 8]) * 1_000_000 else 0;
         const max_delay: u64 = 25_000_000;
         rtt.update(sample_ns, ack_delay, max_delay);
     }
