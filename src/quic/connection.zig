@@ -1507,44 +1507,113 @@ pub const Connection = struct {
     }
 
     fn queueTlsOutput(self: *Connection, tls_data: []const u8) !void {
-        // Queue TLS output as Initial + Handshake packets.
-        // Phase 1 simplified: everything goes in one packet.
-        var fpos: usize = 0;
+        if (tls_data.len == 0) return;
 
-        const tls_offset = self.crypto_send_offset[0];
-        const crypto_frame: frame.Frame = .{ .crypto = .{ .offset = @intCast(tls_offset), .data = tls_data } };
-        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame);
+        // RFC 9001 §4.1.3: ServerHello MUST be sent in an Initial CRYPTO frame;
+        // EncryptedExtensions through Finished MUST be in Handshake CRYPTO frames.
+        //
+        // Split point: end of the first TLS handshake message (ServerHello).
+        // TLS handshake message format: type(1) || length(3) || body(length).
+        const sh_end: usize = blk: {
+            if (tls_data.len >= 4 and tls_data[0] == 0x02) { // SERVER_HELLO
+                const body_len: usize =
+                    (@as(usize, tls_data[1]) << 16) |
+                    (@as(usize, tls_data[2]) << 8) |
+                    @as(usize, tls_data[3]);
+                break :blk @min(4 + body_len, tls_data.len);
+            }
+            // Unexpected format — treat all data as Initial (graceful fallback).
+            break :blk tls_data.len;
+        };
 
-        // Encrypt with server initial keys and emit as Initial packet
-        const ik = self.initial_keys.server;
-        const pn = self.hot.tx_pn[0];
-        self.hot.tx_pn[0] += 1;
+        // Initial epoch: ServerHello.
+        if (sh_end > 0) {
+            _ = try self.sendCryptoChunk(tls_data[0..sh_end], 0);
+        }
 
-        const ct_out_len = fpos + 16;
-        const hdr_len = packet.encodeLongHeader(
-            &self.enc_scratch,
-            .initial,
-            self.quic_version,
-            self.peer_cid,
-            self.local_cid,
-            &.{},
-            @intCast(pn),
-            ct_out_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
-        );
-        if (hdr_len + ct_out_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-        crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_out_len]);
-        const out_len = hdr_len + ct_out_len;
-        try self.enqueueSend(self.enc_scratch[0..out_len]);
+        // Handshake epoch: EncryptedExtensions + Certificate + CertificateVerify + Finished.
+        var sent: usize = sh_end;
+        while (sent < tls_data.len) {
+            sent += try self.sendCryptoChunk(tls_data[sent..], 1);
+        }
+    }
 
-        var fi = loss_recovery_mod.SentFrameInfo{};
-        fi.frames[0] = .{ .crypto_frame = .{
+    /// Encrypt and enqueue up to one packet worth of CRYPTO data in `epoch`
+    /// (0 = Initial, 1 = Handshake).  Returns the number of data bytes consumed.
+    fn sendCryptoChunk(self: *Connection, data: []const u8, epoch: u8) !usize {
+        // Per-packet data limit: MAX_PACKET_SIZE minus long header overhead (~30 bytes),
+        // CRYPTO frame overhead (type 1 + offset varint 4 + length varint 2 = 7), AEAD tag 16.
+        const max_chunk = MAX_PACKET_SIZE - 53;
+        const chunk_len = @min(data.len, max_chunk);
+        const chunk = data[0..chunk_len];
+
+        const tls_offset = self.crypto_send_offset[epoch];
+        const crypto_frame_val: frame.Frame = .{ .crypto = .{
             .offset = @intCast(tls_offset),
-            .len = @intCast(@min(tls_data.len, 0xffff)),
+            .data = chunk,
         } };
-        fi.count = 1;
-        self.crypto_send_offset[0] += tls_data.len;
-        self.loss.onPacketSent(pn, 0, out_len, true, self.current_time_ns, fi);
+        var fpos: usize = 0;
+        fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
+
+        switch (epoch) {
+            0 => {
+                const ik = self.initial_keys.server;
+                const pn = self.hot.tx_pn[0];
+                self.hot.tx_pn[0] += 1;
+                const ct_len = fpos + 16;
+                const hdr_len = packet.encodeLongHeader(
+                    &self.enc_scratch,
+                    .initial,
+                    self.quic_version,
+                    self.peer_cid,
+                    self.local_cid,
+                    &.{},
+                    @intCast(pn),
+                    ct_len,
+                );
+                if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+                var fi = loss_recovery_mod.SentFrameInfo{};
+                fi.frames[0] = .{ .crypto_frame = .{
+                    .offset = @intCast(tls_offset),
+                    .len = @intCast(@min(chunk_len, 0xffff)),
+                } };
+                fi.count = 1;
+                self.crypto_send_offset[0] += chunk_len;
+                self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
+            },
+            1 => {
+                const hk = self.hs_keys.?.server;
+                const pn = self.hot.tx_pn[1];
+                self.hot.tx_pn[1] += 1;
+                const ct_len = fpos + 16;
+                const hdr_len = packet.encodeLongHeader(
+                    &self.enc_scratch,
+                    .handshake,
+                    self.quic_version,
+                    self.peer_cid,
+                    self.local_cid,
+                    &.{},
+                    @intCast(pn),
+                    ct_len,
+                );
+                if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+                var fi = loss_recovery_mod.SentFrameInfo{};
+                fi.frames[0] = .{ .crypto_frame = .{
+                    .offset = @intCast(tls_offset),
+                    .len = @intCast(@min(chunk_len, 0xffff)),
+                } };
+                fi.count = 1;
+                self.crypto_send_offset[1] += chunk_len;
+                self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
+            },
+            else => unreachable,
+        }
         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+        return chunk_len;
     }
 
     /// Encode and enqueue a Version Negotiation packet in response to an
@@ -5211,4 +5280,47 @@ test "connection: v2 quic_version propagated to initial key derivation" {
     // v2 initial keys must differ from v1.
     try testing.expect(!std.mem.eql(u8, &k_v1.client.key, &k_v2.client.key));
     try testing.expect(!std.mem.eql(u8, &k_v1.server.key, &k_v2.server.key));
+}
+
+test "connection: queueTlsOutput splits ServerHello into Initial epoch and rest into Handshake epoch" {
+    // RFC 9001 §4.1.3: ServerHello MUST be in an Initial CRYPTO frame;
+    // EncryptedExtensions through Finished MUST be in Handshake CRYPTO frames.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Set up valid encryption keys.
+    const dcid = [_]u8{0x42} ** 8;
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+    const hs_secret = [_]u8{0xab} ** 32;
+    conn.hs_keys = tls.HandshakeKeys{
+        .client = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
+        .server = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
+    };
+
+    // Construct fake TLS data: ServerHello (type 0x02, 5-byte body) + fake HS message.
+    const sh_body_len: usize = 5;
+    var tls_data: [4 + sh_body_len + 4 + 3]u8 = undefined;
+    // ServerHello header
+    tls_data[0] = 0x02; // SERVER_HELLO type
+    tls_data[1] = 0x00;
+    tls_data[2] = 0x00;
+    tls_data[3] = @intCast(sh_body_len);
+    @memset(tls_data[4..][0..sh_body_len], 0x11); // body
+    // Fake EncryptedExtensions (type 0x08, 3-byte body)
+    tls_data[4 + sh_body_len + 0] = 0x08;
+    tls_data[4 + sh_body_len + 1] = 0x00;
+    tls_data[4 + sh_body_len + 2] = 0x00;
+    tls_data[4 + sh_body_len + 3] = 0x03;
+    @memset(tls_data[4 + sh_body_len + 4 ..], 0x22); // body (3 bytes)
+
+    const sq_before = conn.sq_tail;
+    try conn.queueTlsOutput(&tls_data);
+
+    // Two packets enqueued: one Initial (ServerHello) and one Handshake (rest).
+    try testing.expectEqual(sq_before + 2, conn.sq_tail);
+    // Initial epoch offset advanced by ServerHello size (4 + 5 = 9).
+    try testing.expectEqual(@as(u64, 9), conn.crypto_send_offset[0]);
+    // Handshake epoch offset advanced by remaining data (4 + 3 = 7 + 3 body = 7).
+    try testing.expectEqual(@as(u64, 7), conn.crypto_send_offset[1]);
 }
