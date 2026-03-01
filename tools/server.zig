@@ -71,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
     var cert_der_buf: [4096]u8 = undefined;
     var key_der_buf: [512]u8 = undefined;
     const cert_der_len = try pem.pemToDer(cert_pem_buf[0..cert_pem_len], &cert_der_buf);
-    const key_der_len = try pem.pemToDer(key_pem_buf[0..key_pem_len], &key_der_buf);
+    const key_der_len = try pem.pemToDerBlock(key_pem_buf[0..key_pem_len], "PRIVATE KEY", &key_der_buf);
     const key_material = try pem.parsePrivateKey(key_der_buf[0..key_der_len]);
 
     const config: quic.Config = .{

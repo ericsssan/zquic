@@ -38,12 +38,32 @@ pub fn parsePrivateKey(der: []const u8) !KeyMaterial {
 
 /// Decode the first PEM block between "-----BEGIN ..." and "-----END ...".
 /// Returns number of DER bytes written into `out`.
-pub fn pemToDer(pem: []const u8, out: []u8) !usize {
-    const begin = std.mem.indexOf(u8, pem, "-----BEGIN ") orelse return error.NoPemMarker;
-    const body_start = (std.mem.indexOfPos(u8, pem, begin, "\n") orelse return error.NoPemMarker) + 1;
-    const end_marker = std.mem.indexOfPos(u8, pem, body_start, "-----END ") orelse return error.NoPemMarker;
-    const body = std.mem.trim(u8, pem[body_start..end_marker], " \t\r\n");
+pub fn pemToDer(pem_input: []const u8, out: []u8) !usize {
+    return pemToDerBlock(pem_input, null, out);
+}
 
+/// Decode the first PEM block whose header line contains `header_filter` (case-sensitive).
+/// Pass `null` for `header_filter` to accept any block (same as pemToDer).
+/// Returns number of DER bytes written into `out`.
+pub fn pemToDerBlock(pem_input: []const u8, header_filter: ?[]const u8, out: []u8) !usize {
+    var search_pos: usize = 0;
+    while (true) {
+        const begin = std.mem.indexOfPos(u8, pem_input, search_pos, "-----BEGIN ") orelse return error.NoPemMarker;
+        const header_end = std.mem.indexOfPos(u8, pem_input, begin, "\n") orelse return error.NoPemMarker;
+        const header_line = pem_input[begin..header_end];
+        if (header_filter == null or std.mem.indexOf(u8, header_line, header_filter.?) != null) {
+            const body_start = header_end + 1;
+            const end_marker = std.mem.indexOfPos(u8, pem_input, body_start, "-----END ") orelse return error.NoPemMarker;
+            const body = pem_input[body_start..end_marker];
+            return pemDecodeBody(std.mem.trim(u8, body, " \t\r\n"), out);
+        }
+        // Skip past this block's end marker and continue searching.
+        const end_marker = std.mem.indexOfPos(u8, pem_input, begin, "-----END ") orelse return error.NoPemMarker;
+        search_pos = end_marker + 9; // past "-----END "
+    }
+}
+
+fn pemDecodeBody(body: []const u8, out: []u8) !usize {
     // Strip all line endings from the base64 body.
     var clean: [8192]u8 = undefined;
     var ci: usize = 0;
@@ -54,7 +74,6 @@ pub fn pemToDer(pem: []const u8, out: []u8) !usize {
             ci += 1;
         }
     }
-
     const decoder = std.base64.standard.Decoder;
     const decoded_len = try decoder.calcSizeForSlice(clean[0..ci]);
     if (decoded_len > out.len) return error.OutputTooSmall;
@@ -155,4 +174,31 @@ test "pem: no PEM marker returns error" {
 test "pem: seed not found returns error" {
     const der = [_]u8{0x30} ** 32; // all 0x30, no 0x04 0x20 pattern
     try std.testing.expectError(error.Ed25519SeedNotFound, pkcs8Ed25519Seed(&der));
+}
+
+test "pem: pemToDerBlock skips EC PARAMETERS to find EC PRIVATE KEY" {
+    // Simulates an openssl ecparam -genkey output: EC PARAMETERS first, then EC PRIVATE KEY.
+    const pem_input =
+        "-----BEGIN EC PARAMETERS-----\n" ++
+        "BggqhkjOPQMBBw==\n" ++
+        "-----END EC PARAMETERS-----\n" ++
+        "-----BEGIN EC PRIVATE KEY-----\n" ++
+        "aGVsbG8gd29ybGQ=\n" ++
+        "-----END EC PRIVATE KEY-----\n";
+    var out: [32]u8 = undefined;
+    // Without filter: returns the first block (EC PARAMETERS)
+    const n_first = try pemToDer(pem_input, &out);
+    try std.testing.expectEqualSlices(u8, "\x06\x08\x2a\x86\x48\xce\x3d\x03\x01\x07", out[0..n_first]);
+    // With "PRIVATE KEY" filter: skips EC PARAMETERS, returns EC PRIVATE KEY body
+    const n_key = try pemToDerBlock(pem_input, "PRIVATE KEY", &out);
+    try std.testing.expectEqualSlices(u8, "hello world", out[0..n_key]);
+}
+
+test "pem: pemToDerBlock with no matching block returns NoPemMarker" {
+    const pem_input =
+        "-----BEGIN EC PARAMETERS-----\n" ++
+        "BggqhkjOPQMBBw==\n" ++
+        "-----END EC PARAMETERS-----\n";
+    var out: [32]u8 = undefined;
+    try std.testing.expectError(error.NoPemMarker, pemToDerBlock(pem_input, "PRIVATE KEY", &out));
 }
