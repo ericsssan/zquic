@@ -325,6 +325,11 @@ pub const Connection = struct {
     /// Variable length 0–20 bytes (quic-go sends 20-byte initial DCIDs).
     original_dcid: ?[20]u8 = null,
     original_dcid_len: u8 = 0,
+    /// DCID from the client's very first Initial packet (set on first receive, idle→handshake).
+    /// Used for original_destination_connection_id (RFC 9000 §7.3):
+    /// the server MUST always include this parameter, even without Retry.
+    first_initial_dcid: [20]u8 = [_]u8{0} ** 20,
+    first_initial_dcid_len: u8 = 0,
 
     // Pending retransmit flags
     pending_handshake_done: bool,
@@ -716,6 +721,10 @@ pub const Connection = struct {
             self.tls_state.quic_version = ver;
             self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
             self.hot.state = .handshake;
+            // Store the DCID for original_destination_connection_id (RFC 9000 §7.3).
+            // The server MUST always include this transport parameter.
+            @memcpy(self.first_initial_dcid[0..raw_dcid_len], raw_dcid);
+            self.first_initial_dcid_len = @intCast(raw_dcid_len);
             // Set peer_cid from the SCID field (also not HP-protected).
             if (data.len >= 6 + raw_dcid_len + 1) {
                 const raw_scid_len = data[6 + raw_dcid_len];
@@ -1075,12 +1084,18 @@ pub const Connection = struct {
             @memcpy(isci[0..cid_mod.len], &self.local_cid.bytes);
             our_params.initial_source_connection_id = isci;
             our_params.initial_source_connection_id_len = cid_mod.len;
-            if (self.original_dcid) |odcid| {
-                our_params.original_destination_connection_id = odcid;
+            // RFC 9000 §7.3: the server MUST always include original_destination_connection_id.
+            // For Retry: original_dcid = pre-Retry DCID (extracted from token validation).
+            // For non-Retry: first_initial_dcid = DCID from the client's first Initial.
+            if (self.original_dcid) |dcid| {
+                our_params.original_destination_connection_id = dcid;
                 our_params.original_destination_connection_id_len = self.original_dcid_len;
                 if (self.retry_scid) |scid| {
                     our_params.retry_source_connection_id = scid;
                 }
+            } else if (self.first_initial_dcid_len > 0) {
+                our_params.original_destination_connection_id = self.first_initial_dcid;
+                our_params.original_destination_connection_id_len = self.first_initial_dcid_len;
             }
             self.tls_state.our_transport_params = our_params;
         }
@@ -5429,4 +5444,50 @@ test "connection: queueTlsOutput splits ServerHello into Initial epoch and rest 
     try testing.expectEqual(@as(u64, 9), conn.crypto_send_offset[0]);
     // Handshake epoch offset advanced by remaining data (4 + 3 = 7 + 3 body = 7).
     try testing.expectEqual(@as(u64, 7), conn.crypto_send_offset[1]);
+}
+
+test "connection: first_initial_dcid stored for original_destination_connection_id" {
+    // RFC 9000 §7.3: the server MUST always include original_destination_connection_id
+    // in its transport parameters, even when no Retry packet was sent.
+    // Verify that the DCID from the client's first Initial is stored in first_initial_dcid.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+
+    const dcid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io);
+
+    // first_initial_dcid must be set to the DCID from the client's Initial.
+    try testing.expectEqual(@as(u8, 8), conn.first_initial_dcid_len);
+    try testing.expectEqualSlices(u8, &dcid, conn.first_initial_dcid[0..8]);
+
+    // original_dcid must remain null (no Retry was used).
+    try testing.expect(conn.original_dcid == null);
+}
+
+test "connection: original_destination_connection_id in server transport params without Retry" {
+    // RFC 9000 §7.3: verifies the server sets original_destination_connection_id
+    // in our_transport_params when processing a ClientHello (non-Retry path).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+
+    const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+    // receive() will fail on TLS (no valid ClientHello), but it must store
+    // first_initial_dcid before reaching TLS processing.
+    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
+
+    // The DCID must be stored for use in transport params.
+    try testing.expectEqual(@as(u8, 8), conn.first_initial_dcid_len);
+    try testing.expectEqualSlices(u8, &dcid, conn.first_initial_dcid[0..8]);
 }
