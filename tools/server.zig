@@ -77,8 +77,8 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(127);
     };
 
-    var cert_der_buf: [8192]u8 = undefined;
-    var key_der_buf: [2048]u8 = undefined;
+    var cert_der_buf: [16384]u8 = undefined;
+    var key_der_buf: [4096]u8 = undefined;
     const cert_der_len = try pem.pemToDer(cert_pem_buf[0..cert_pem_len], &cert_der_buf);
     const key_der_len = try pem.pemToDerBlock(key_pem_buf[0..key_pem_len], "PRIVATE KEY", &key_der_buf);
     const key_material = try pem.parsePrivateKey(key_der_buf[0..key_der_len]);
@@ -92,6 +92,7 @@ pub fn main(init: std.process.Init) !void {
             .ed25519 => .ed25519,
             .p256 => .p256,
         },
+        .initial_quic_version = if (std.mem.eql(u8, testcase, "v2")) quic.packet.QUIC_VERSION_2 else quic.packet.QUIC_VERSION_1,
     };
 
     // Bind UDP socket.
@@ -372,28 +373,58 @@ fn computeTimeout(deadline: ?i64) std.Io.Timeout {
 }
 
 /// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
-/// 1-RTT QUIC packets.  Written to /logs/keys.log (the path the interop runner
-/// expects for server logs) after the TLS handshake completes.
+/// 1-RTT QUIC packets including those with key updates.  Written to /logs/keys.log
+/// (the path the interop runner expects for server logs) after the TLS handshake completes.
+/// Generates multiple secret generations (CLIENT_TRAFFIC_SECRET_0 through _19, etc.) to
+/// support packet decryption after key rotations.
 fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
     const tls = &conn.tls_state;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
-    var buf: [2048]u8 = undefined;
-    const content = std.fmt.bufPrint(&buf,
-        "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n" ++
-        "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n" ++
-        "CLIENT_TRAFFIC_SECRET_0 {s} {s}\n" ++
-        "SERVER_TRAFFIC_SECRET_0 {s} {s}\n",
-        .{
-            random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower),
-            random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower),
-            random_hex, std.fmt.bytesToHex(tls.client_app_secret, .lower),
-            random_hex, std.fmt.bytesToHex(tls.server_app_secret, .lower),
-        },
-    ) catch return;
+
+    // Generate up to 20 generations of rotated secrets for key updates.
+    const num_generations = 20;
+    var buf: [16384]u8 = undefined;
+    var pos: usize = 0;
+
+    // Write handshake secrets
+    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
+    pos += line.len;
+
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
+    pos += line.len;
+
+    // Write initial application secrets (generation 0)
+    var client_secret = tls.client_app_secret;
+    var server_secret = tls.server_app_secret;
+
+    line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_0 {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(client_secret, .lower) }) catch return;
+    pos += line.len;
+
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_0 {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(server_secret, .lower) }) catch return;
+    pos += line.len;
+
+    // Generate and write rotated secrets for key updates
+    for (1..num_generations) |gen| {
+        client_secret = quic.crypto.deriveNextAppSecret(client_secret, conn.quic_version);
+        server_secret = quic.crypto.deriveNextAppSecret(server_secret, conn.quic_version);
+
+        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n",
+            .{ gen, random_hex, std.fmt.bytesToHex(client_secret, .lower) }) catch return;
+        pos += line.len;
+
+        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n",
+            .{ gen, random_hex, std.fmt.bytesToHex(server_secret, .lower) }) catch return;
+        pos += line.len;
+    }
+
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
-    file.writePositionalAll(io, content, 0) catch {};
-    std.debug.print("keylog written ({d} bytes)\n", .{content.len});
+    file.writePositionalAll(io, buf[0..pos], 0) catch {};
+    std.debug.print("keylog written ({d} bytes)\n", .{pos});
 }
 
 fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {

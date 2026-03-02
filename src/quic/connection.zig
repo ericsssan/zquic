@@ -171,6 +171,9 @@ pub const Config = struct {
     cert_seed: ?[32]u8 = null,
     /// Key algorithm for cert_der (ignored when cert_der is null).
     cert_key_algorithm: tls.KeyAlgorithm = .ed25519,
+    /// Initial QUIC version (0x00000001 = v1, 0x6b3343cf = v2).
+    /// Overridden by client's version in first Initial packet.
+    initial_quic_version: u32 = packet.QUIC_VERSION_1,
 };
 
 // ---------------------------------------------------------------------------
@@ -410,7 +413,7 @@ pub const Connection = struct {
             .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
             .initial_keys = undefined,
             .tls_state = tls_server,
-            .quic_version = packet.QUIC_VERSION_1,
+            .quic_version = config.initial_quic_version,
             .hs_keys = null,
             .app_keys = null,
             .streams = .{},
