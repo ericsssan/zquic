@@ -65,7 +65,7 @@ pub fn pemToDerBlock(pem_input: []const u8, header_filter: ?[]const u8, out: []u
 
 fn pemDecodeBody(body: []const u8, out: []u8) !usize {
     // Strip all line endings from the base64 body.
-    var clean: [8192]u8 = undefined;
+    var clean: [16384]u8 = undefined;
     var ci: usize = 0;
     for (body) |c| {
         if (c != '\n' and c != '\r') {

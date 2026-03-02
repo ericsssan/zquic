@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(127);
     };
 
-    var cert_der_buf: [4096]u8 = undefined;
+    var cert_der_buf: [8192]u8 = undefined;
     var key_der_buf: [2048]u8 = undefined;
     const cert_der_len = try pem.pemToDer(cert_pem_buf[0..cert_pem_len], &cert_der_buf);
     const key_der_len = try pem.pemToDerBlock(key_pem_buf[0..key_pem_len], "PRIVATE KEY", &key_der_buf);
