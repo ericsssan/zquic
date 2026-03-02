@@ -1616,6 +1616,9 @@ pub const Connection = struct {
     /// epoch 2 = 1-RTT (short header, app_keys.?.server)
     /// ACK frames are not ack-eliciting (RFC 9002 §2), so ack_eliciting=false.
     fn sendEncryptedAck(self: *Connection, epoch: u8) !void {
+        // RFC 9000 §13.2: only send ACKs if we've actually received packets in this epoch.
+        if (!self.hot.rx_pn_valid[epoch]) return;
+
         var fpos: usize = 0;
         // Build ACK ranges from the received-packet bitmap so that the peer can
         // precisely identify which packets we have (and have not) received.  This
@@ -1623,6 +1626,16 @@ pub const Connection = struct {
         // cover all ack-eliciting packets it has received.
         var ack_ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
         const ack_range_count = buildAckRangesFromBitmap(self.rx_pn_bitmap[epoch], &ack_ranges);
+
+        // DEBUG: Log ACK frame details
+        if (false) {  // Set to true to enable logging
+            std.debug.print("sendEncryptedAck epoch={} largest_acked={} bitmap={b:0>64} ranges_count={}\n", .{
+                epoch, self.hot.rx_pn[epoch], self.rx_pn_bitmap[epoch], ack_range_count,
+            });
+            for (0..ack_range_count) |i| {
+                std.debug.print("  range[{}]: gap={} ack_range={}\n", .{ i, ack_ranges[i].gap, ack_ranges[i].ack_range });
+            }
+        }
         const ack_frame_data: frame.Frame = .{ .ack = .{
             .largest_acked = @intCast(self.hot.rx_pn[epoch]),
             .ack_delay = 0,
@@ -6057,4 +6070,152 @@ test "connection: ACK with gap encodes correctly" {
     try testing.expectEqual(@as(u62, 1), ranges[0].ack_range);
     try testing.expectEqual(@as(u62, 1), ranges[1].gap);
     try testing.expectEqual(@as(u62, 1), ranges[1].ack_range);
+}
+
+test "connection: sendEncryptedAck skips if no packets received in epoch" {
+    // Regression: ACK frame generation was using rx_pn[epoch] without checking
+    // if rx_pn_valid[epoch] was true. This caused invalid ACK frames to be sent
+    // with largest_acked = 0 when no packets had been received in that epoch.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+
+    // Manually trigger pending_ack[0] without receiving any packets.
+    conn.pending_ack[0] = true;
+    try testing.expect(!conn.hot.rx_pn_valid[0]); // no packets received yet
+
+    // sendEncryptedAck should return early without generating a packet.
+    try conn.sendEncryptedAck(0);
+
+    // Verify that no packet was queued (sq should still be empty).
+    try testing.expectEqual(@as(usize, 0), conn.sq_head);
+    try testing.expectEqual(@as(usize, 0), conn.sq_tail);
+}
+
+test "connection: sendEncryptedAck sends valid ACK after receiving packet" {
+    // Verify that sendEncryptedAck only sends ACKs when rx_pn_valid[epoch] is true.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+
+    // Mark packet 5 as received in epoch 0.
+    conn.markPnReceived(0, 5);
+    try testing.expect(conn.hot.rx_pn_valid[0]); // now valid
+    try testing.expectEqual(@as(u64, 5), conn.hot.rx_pn[0]);
+
+    // Set pending_ack and send ACK.
+    conn.pending_ack[0] = true;
+    try conn.sendEncryptedAck(0);
+
+    // Verify that a packet was queued.
+    try testing.expect(conn.sq_head != conn.sq_tail);
+
+    // Decrypt and verify the ACK frame contains largest_acked = 5.
+    const slot = &conn.sq[0];
+    const ik = conn.initial_keys.server;
+    const pn_off = try packet.longHeaderPnOffset(slot.buf[0..slot.len], packet.QUIC_VERSION_1);
+    var hp_buf: [1500]u8 = undefined;
+    @memcpy(hp_buf[0..slot.len], slot.buf[0..slot.len]);
+    _ = crypto.removeHeaderProtection(ik.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+    const parse_result = try packet.parseLongHeader(hp_buf[0..slot.len]);
+    const pn: u64 = packet.decodePacketNumber(0, parse_result.header.packet_number, @as(u8, parse_result.header.pn_len) * 8);
+    const payload_start = parse_result.consumed - parse_result.header.payload.len;
+    var plaintext: [256]u8 = undefined;
+    const pt_len = parse_result.header.payload.len - 16;
+    try crypto.decryptPayload(ik, pn, hp_buf[0..payload_start], parse_result.header.payload, plaintext[0..pt_len]);
+
+    // Parse and verify ACK frame.
+    const f = try frame.parseFrame(plaintext[0..pt_len]);
+    try testing.expect(f.frame == .ack);
+    const ack = f.frame.ack;
+    try testing.expectEqual(@as(u62, 5), ack.largest_acked); // must be 5, not 0
+}
+
+test "connection: markPnReceived with extreme packet number jump" {
+    // Regression: receiving packets with very large gaps (>64 packets) causes
+    // bitmap shifts that might generate invalid ACK ranges.
+    // Test: receive pkt 100, then pkt 200 (shift = 100 >= 64, resets bitmap to 1)
+    const testing = std.testing;
+    var conn = try Connection.accept(.{}, testing.io);
+    conn.markPnReceived(2, 100);
+    try testing.expectEqual(@as(u64, 100), conn.hot.rx_pn[2]);
+    try testing.expectEqual(@as(u64, 1), conn.rx_pn_bitmap[2]);
+
+    // Receive packet way in the future (shift >= 64)
+    conn.markPnReceived(2, 200);
+    try testing.expectEqual(@as(u64, 200), conn.hot.rx_pn[2]);
+    try testing.expectEqual(@as(u64, 1), conn.rx_pn_bitmap[2]); // bitmap reset to 1
+
+    // The bitmap should correctly represent only packet 200
+    try testing.expect(conn.isPnDuplicate(2, 200)); // pkt 200 received
+    try testing.expect(!conn.isPnDuplicate(2, 199)); // pkt 199 NOT received (in window, not received)
+    try testing.expect(conn.isPnDuplicate(2, 100)); // pkt 100 treated as duplicate (too old, > 64 packets ago)
+}
+
+test "connection: ACK generation with interleaved out-of-order packets" {
+    // Diagnostic test: simulate pattern that might trigger ACK frame error
+    // Packets arrive in order like: 5, 7, 6, 9, 8, 10
+    // This creates shifting bitmap with multiple gaps
+    const testing = std.testing;
+    var conn = try Connection.accept(.{}, testing.io);
+
+    std.debug.print("\n=== ACK DIAGNOSTIC TEST: Interleaved packets ===\n", .{});
+
+    // Simulate: recv 5
+    conn.markPnReceived(2, 5);
+    std.debug.print("After pkt 5: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
+
+    // Simulate: recv 7 (gap of 1)
+    conn.markPnReceived(2, 7);
+    std.debug.print("After pkt 7: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
+
+    // Simulate: recv 6 (fill in gap)
+    conn.markPnReceived(2, 6);
+    std.debug.print("After pkt 6: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
+
+    // Simulate: recv 9 (another gap)
+    conn.markPnReceived(2, 9);
+    std.debug.print("After pkt 9: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
+
+    // Simulate: recv 8 (fill gap)
+    conn.markPnReceived(2, 8);
+    std.debug.print("After pkt 8: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
+
+    // Simulate: recv 10 (extend forward)
+    conn.markPnReceived(2, 10);
+    std.debug.print("After pkt 10: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
+
+    // Final state: packets [5,6,7,8,9,10] all received
+    // Bitmap should be all 1s in positions 0-5
+    try testing.expectEqual(@as(u64, 10), conn.hot.rx_pn[2]);
+    try testing.expectEqual(@as(u64, 0x3F), conn.rx_pn_bitmap[2]); // 0b111111
+
+    // Verify final bitmap state
+    // All 6 packets received: bitmap should have bits 0-5 set (largest is 10, so 10, 9, 8, 7, 6, 5)
+    std.debug.print("Final verification: expected contiguous packets [5..10]\n", .{});
+}
+
+test "connection: ACK generation with sequential packet arrival" {
+    // Simulate receiving many packets in sequence (like during file transfer)
+    // This might reveal the issue if it's related to large packet numbers or bitmap shifts
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Simulate receiving packets 1..100 in order (epoch 2 = 1-RTT)
+    for (1..101) |pn| {
+        conn.markPnReceived(2, pn);
+    }
+
+    std.debug.print("\nSEQUENTIAL 1..100: largest_acked={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
+
+    // Verify state
+    try testing.expectEqual(@as(u64, 100), conn.hot.rx_pn[2]);
+    try testing.expect(conn.hot.rx_pn_valid[2]);
+    // For 100 sequential packets, the bitmap should be all 1s (at least for the last 64 packets)
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), conn.rx_pn_bitmap[2]);
 }
