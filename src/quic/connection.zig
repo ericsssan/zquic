@@ -6480,3 +6480,74 @@ test "connection: key_phase bit and key_generation independent" {
     try testing.expectEqual(initial_phase, conn.current_key_phase);
     try testing.expectEqual(initial_gen + 2, conn.current_key_generation);
 }
+
+test "connection: full key rotation flow - secret derivation for interop" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Simulate TLS handshake completion with real secret material
+    conn.tls_state.client_random = [_]u8{0x11} ** 32;
+    conn.tls_state.client_hs_secret = [_]u8{0x33} ** 32;
+    conn.tls_state.server_hs_secret = [_]u8{0x44} ** 32;
+    conn.tls_state.client_app_secret = [_]u8{0x55} ** 32;
+    conn.tls_state.server_app_secret = [_]u8{0x66} ** 32;
+
+    // Setup application keys (simulating post-handshake state)
+    conn.app_keys = .{
+        .client = .{ .key = [_]u8{0xaa} ** 16, .iv = [_]u8{0xbb} ** 12, .hp = [_]u8{0xcc} ** 16 },
+        .server = .{ .key = [_]u8{0xdd} ** 16, .iv = [_]u8{0xee} ** 12, .hp = [_]u8{0xff} ** 16 },
+    };
+    conn.next_app_keys = conn.app_keys.?;
+    conn.next_client_secret = crypto.deriveNextAppSecret(conn.tls_state.client_app_secret, packet.QUIC_VERSION_1);
+    conn.next_server_secret = crypto.deriveNextAppSecret(conn.tls_state.server_app_secret, packet.QUIC_VERSION_1);
+
+    // Verify we can derive secrets BEFORE any key rotation
+    const gen0_before = conn.deriveSecretsForGeneration(0);
+    try testing.expectEqualSlices(u8, &conn.tls_state.client_app_secret, &gen0_before.client);
+
+    // Simulate client initiating key update (quic-go sends packets with key_phase=1)
+    // Server detects mismatch and calls rotateKeys()
+    conn.rotateKeys();
+
+    // After rotation:
+    // - Generation counter incremented
+    try testing.expectEqual(@as(u32, 1), conn.current_key_generation);
+    // - Can derive secrets for generation 0 and 1
+    const gen0_after = conn.deriveSecretsForGeneration(0);
+    const gen1_after = conn.deriveSecretsForGeneration(1);
+
+    // Generation 0 secrets unchanged (initial secrets)
+    try testing.expectEqualSlices(u8, &gen0_before.client, &gen0_after.client);
+    try testing.expectEqualSlices(u8, &gen0_before.server, &gen0_after.server);
+
+    // Generation 1 secrets are NEW and different
+    try testing.expect(!std.mem.eql(u8, &gen0_after.client, &gen1_after.client));
+    try testing.expect(!std.mem.eql(u8, &gen0_after.server, &gen1_after.server));
+
+    // Client sends another key update
+    conn.rotateKeys();
+    try testing.expectEqual(@as(u32, 2), conn.current_key_generation);
+
+    // Can derive all three generations
+    const gen0_final = conn.deriveSecretsForGeneration(0);
+    const gen1_final = conn.deriveSecretsForGeneration(1);
+    const gen2_final = conn.deriveSecretsForGeneration(2);
+
+    // Verify determinism: deriving same generation yields same result
+    try testing.expectEqualSlices(u8, &gen0_after.client, &gen0_final.client);
+    try testing.expectEqualSlices(u8, &gen1_after.client, &gen1_final.client);
+
+    // And gen2 is unique
+    try testing.expect(!std.mem.eql(u8, &gen1_final.client, &gen2_final.client));
+    try testing.expect(!std.mem.eql(u8, &gen1_final.server, &gen2_final.server));
+
+    // This test PROVES that the server can derive secrets for all generations
+    // that were used during key updates, which is what's needed for SSLKEYLOG.
+    // The keylog file should contain:
+    // - CLIENT_HANDSHAKE_TRAFFIC_SECRET
+    // - SERVER_HANDSHAKE_TRAFFIC_SECRET
+    // - CLIENT_TRAFFIC_SECRET_0 + SERVER_TRAFFIC_SECRET_0
+    // - CLIENT_TRAFFIC_SECRET_1 + SERVER_TRAFFIC_SECRET_1
+    // - CLIENT_TRAFFIC_SECRET_2 + SERVER_TRAFFIC_SECRET_2
+}
