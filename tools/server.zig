@@ -109,6 +109,7 @@ pub fn main(init: std.process.Init) !void {
     while (true) {
         var conn = try quic.Connection.accept(config, io);
         var peer_addr: ?net.IpAddress = null;
+        var last_logged_generation: u32 = 0;
 
         // Per-connection file transfer state.
         var transfers = [_]FileTransfer{.{}} ** MAX_TRANSFERS;
@@ -175,11 +176,18 @@ pub fn main(init: std.process.Init) !void {
             conn.receive(msg.data, ipToSocketAddr(msg.from), now_ns, io) catch |err| {
                 std.debug.print("receive error: {}\n", .{err});
             };
-            std.debug.print("  -> state={s} key_phase={d} peer_scid=", .{ @tagName(conn.hot.state), @intFromBool(conn.current_key_phase) });
+            std.debug.print("  -> state={s} key_phase={d} gen={d}/{d} peer_scid=", .{ @tagName(conn.hot.state), @intFromBool(conn.current_key_phase), conn.current_key_generation, last_logged_generation });
             for (conn.peer_scid[0..conn.peer_scid_len]) |b| std.debug.print("{x:0>2}", .{b});
             std.debug.print(" local_cid=", .{});
             for (conn.local_cid.bytes) |b| std.debug.print("{x:0>2}", .{b});
             std.debug.print("\n", .{});
+
+            // If key rotation occurred, update keylog immediately (don't wait for connection_closed)
+            if (conn.current_key_generation > last_logged_generation) {
+                std.debug.print("[keylog] updating keylog (gen was {d}, now {d})\n", .{ last_logged_generation, conn.current_key_generation });
+                updateKeyLog(&conn, io, last_logged_generation);
+                last_logged_generation = conn.current_key_generation;
+            }
 
             while (conn.pollEvent()) |ev| {
                 std.debug.print("  -> event: {s}\n", .{@tagName(ev)});
@@ -187,6 +195,7 @@ pub fn main(init: std.process.Init) !void {
                     .connected => {
                         std.debug.print("handshake complete\n", .{});
                         writeKeyLog(&conn, io);
+                        last_logged_generation = 0; // Mark that gen 0 has been written
                     },
                     .retry_sent => {
                         drainSend(&conn, &sock, io, &msg.from, &send_buf);
@@ -194,8 +203,8 @@ pub fn main(init: std.process.Init) !void {
                     },
                     .stream_data => |s| startTransfer(&conn, s.stream_id, &transfers, www_dir),
                     .connection_closed => {
-                        // Append any rotated keys to the keylog before closing
-                        appendRotatedSecretsToKeyLog(&conn, io);
+                        // Note: appendRotatedSecretsToKeyLog is not called here because
+                        // keylog updates now happen incrementally in the main loop above
                         break :conn_loop;
                     },
                     else => {},
@@ -376,6 +385,46 @@ fn computeTimeout(deadline: ?i64) std.Io.Timeout {
     return .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } };
 }
 
+/// Update SSLKEYLOG file with newly rotated keys. Rewrites the entire file
+/// with all generations up to current. Called immediately after key rotation
+/// to ensure Wireshark can decrypt packets before connection closes.
+fn updateKeyLog(conn: *const quic.Connection, io: std.Io, _: u32) void {
+    const tls = &conn.tls_state;
+    const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
+    var buf: [16384]u8 = undefined;
+    var pos: usize = 0;
+
+    // Write handshake secrets (same as initial)
+    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
+    pos += line.len;
+
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
+    pos += line.len;
+
+    // Write all generations (0 through current)
+    var gen: u32 = 0;
+    while (gen <= conn.current_key_generation) : (gen += 1) {
+        const secrets = conn.deriveSecretsForGeneration(gen);
+        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n",
+            .{ gen, random_hex, std.fmt.bytesToHex(secrets.client, .lower) }) catch return;
+        pos += line.len;
+
+        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n",
+            .{ gen, random_hex, std.fmt.bytesToHex(secrets.server, .lower) }) catch return;
+        pos += line.len;
+
+        if (pos >= buf.len - 256) break;
+    }
+
+    // Overwrite the keylog file with all generations
+    const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
+    defer file.close(io);
+    file.writePositionalAll(io, buf[0..pos], 0) catch {};
+    std.debug.print("keylog updated (generations 0..{d}, {d} bytes)\n", .{ conn.current_key_generation, pos });
+}
+
 /// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
 /// 1-RTT QUIC packets including those with key updates.  Written to /logs/keys.log
 /// (the path the interop runner expects for server logs).
@@ -415,13 +464,17 @@ fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
 /// ensure Wireshark can decrypt packets with new keys. Rewrites the entire file
 /// with all generations up to the current key generation.
 fn appendRotatedSecretsToKeyLog(conn: *const quic.Connection, io: std.Io) void {
+    std.debug.print("appendRotatedSecretsToKeyLog called (gen={d})\n", .{conn.current_key_generation});
     const tls = &conn.tls_state;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
 
     // Skip if no key rotations occurred
-    if (conn.current_key_generation == 0) return;
+    if (conn.current_key_generation == 0) {
+        std.debug.print("  -> skipping (no rotations)\n", .{});
+        return;
+    }
 
     // Write handshake secrets
     var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
