@@ -372,10 +372,14 @@ pub const TlsServer = struct {
         transcript_so_far.final(&cv_hash);
         pos += try self.buildCertificateVerify(out[pos..], &cv_hash);
 
-        // Finished
+        // Update transcript with EE + Cert + CertificateVerify.
         self.transcript.update(out[ee_start..pos]);
+
+        // Compute Server Finished verify_data over H(CH || SH || EE || Cert || CertVerify).
+        // Use a snapshot so self.transcript remains usable — Sha256.final() is destructive.
+        var snap = self.transcript;
         var transcript_hash: [32]u8 = undefined;
-        self.transcript.final(&transcript_hash);
+        snap.final(&transcript_hash);
 
         // Compute finished_key = HKDF-Expand-Label(server_hs_secret, "finished", "", 32)
         var finished_key: [32]u8 = undefined;
@@ -384,7 +388,13 @@ pub const TlsServer = struct {
         var verify_data: [32]u8 = undefined;
         Hmac256.create(&verify_data, &transcript_hash, &finished_key);
 
+        const sf_start = pos;
         pos += buildFinishedMessage(out[pos..], &verify_data);
+
+        // Include Server Finished in the transcript for client Finished verification.
+        // Per RFC 8446 §4.4.4: client's verify_data = HMAC(finished_key,
+        //   H(CH || SH || EE || Cert || CertVerify || ServerFinished)).
+        self.transcript.update(out[sf_start..pos]);
 
         self.state = .wait_client_finished;
         return pos;
@@ -396,15 +406,26 @@ pub const TlsServer = struct {
         //   Early Secret = HKDF-Extract(0, 0)
         //   Handshake Secret = HKDF-Extract(DHE, Derive-Secret(ES, "derived", ""))
         //   Master Secret = HKDF-Extract(0, Derive-Secret(HS, "derived", ""))
+        //
+        // Derive-Secret(Secret, Label, Messages) = HKDF-Expand-Label(Secret, Label, Transcript-Hash(Messages), 32)
+        // When Messages = "" (empty): Transcript-Hash("") = SHA-256("") = sha256_empty (RFC 8446 §7.1).
 
         const zero32 = [_]u8{0} ** 32;
+        // SHA-256("") — context for Derive-Secret(., "derived", "") per RFC 8446 §7.1.
+        // Verified against RFC 8448 §3 test vectors.
+        const sha256_empty = [_]u8{
+            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+            0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+            0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+            0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+        };
 
         // Early Secret
         const early_secret = HkdfSha256.extract(&zero32, &zero32);
 
         // derived = Derive-Secret(early_secret, "derived", "")
         var derived: [32]u8 = undefined;
-        deriveSecret(&derived, early_secret, "derived", &[_]u8{});
+        deriveSecret(&derived, early_secret, "derived", &sha256_empty);
 
         // Handshake Secret
         self.handshake_secret = HkdfSha256.extract(&derived, &shared_secret);
@@ -426,7 +447,7 @@ pub const TlsServer = struct {
 
         // Master Secret
         var derived2: [32]u8 = undefined;
-        deriveSecret(&derived2, self.handshake_secret, "derived", &[_]u8{});
+        deriveSecret(&derived2, self.handshake_secret, "derived", &sha256_empty);
         self.master_secret = HkdfSha256.extract(&derived2, &zero32);
     }
 
@@ -465,13 +486,12 @@ pub const TlsServer = struct {
         const client_verify = data[4..][0..32];
         if (!std.crypto.timing_safe.eql([32]u8, expected_verify, client_verify.*)) return false;
 
-        // Transcript now includes client Finished
-        self.transcript.update(data[0 .. 4 + 32]);
+        // RFC 8446 §7.1: client/server app traffic secrets use the transcript
+        // through ServerFinished only (i.e. before ClientFinished is included).
+        self.deriveAppKeys(&transcript_hash);
 
-        // Derive application keys
-        var app_th: [32]u8 = undefined;
-        self.transcript.final(&app_th);
-        self.deriveAppKeys(&app_th);
+        // Transcript now includes client Finished (for any further derivations).
+        self.transcript.update(data[0 .. 4 + 32]);
 
         return true;
     }
@@ -987,6 +1007,45 @@ test "tls: certificate builds to expected size" {
     try testing.expectEqual(@as(u8, 0x30), buf[0]);
 }
 
+test "tls: key schedule derived step uses SHA256 of empty string (RFC 8448 §3)" {
+    // From RFC 8448 §3 (Simple 1-RTT Handshake, TLS_AES_128_GCM_SHA256):
+    //   Early Secret = HKDF-Extract(0x00*32, 0x00*32)
+    //   = 33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a
+    //   Derive-Secret(early_secret, "derived", "") = HKDF-Expand-Label(ES, "derived", SHA256(""), 32)
+    //   = 6f26155a108c702c5678f54fc9dbab697116c076189c482 5250cebeac3576c36...
+    //
+    // This test verifies that we use SHA256("") (not "") as the context for the "derived" step.
+    const testing = std.testing;
+    const zero32 = [_]u8{0} ** 32;
+
+    // Verify Early Secret matches RFC 8448
+    const early_secret = HkdfSha256.extract(&zero32, &zero32);
+    const expected_early: [32]u8 = .{
+        0x33, 0xad, 0x0a, 0x1c, 0x60, 0x7e, 0xc0, 0x3b,
+        0x09, 0xe6, 0xcd, 0x98, 0x93, 0x68, 0x0c, 0xe2,
+        0x10, 0xad, 0xf3, 0x00, 0xaa, 0x1f, 0x26, 0x60,
+        0xe1, 0xb2, 0x2e, 0x10, 0xf1, 0x70, 0xf9, 0x2a,
+    };
+    try testing.expectEqualSlices(u8, &expected_early, &early_secret);
+
+    // Verify the "derived" step uses SHA256("") context
+    const sha256_empty = [_]u8{
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    };
+    var derived: [32]u8 = undefined;
+    crypto.hkdfExpandLabel(&derived, early_secret, "derived", &sha256_empty);
+    const expected_derived: [32]u8 = .{
+        0x6f, 0x26, 0x15, 0xa1, 0x08, 0xc7, 0x02, 0xc5,
+        0x67, 0x8f, 0x54, 0xfc, 0x9d, 0xba, 0xb6, 0x97,
+        0x16, 0xc0, 0x76, 0x18, 0x9c, 0x48, 0x25, 0x0c,
+        0xeb, 0xea, 0xc3, 0x57, 0x6c, 0x36, 0x11, 0xba,
+    };
+    try testing.expectEqualSlices(u8, &expected_derived, &derived);
+}
+
 test "tls: key schedule produces handshake keys" {
     const io = std.testing.io;
     var server = try TlsServer.init(io);
@@ -1343,6 +1402,72 @@ test "tls: P-256 buildCertificateVerify produces DER ECDSA signature" {
     try std.testing.expect(sig_len >= 8 and sig_len <= 72);
     // DER SEQUENCE tag
     try std.testing.expectEqual(@as(u8, 0x30), out[8]);
+}
+
+test "tls: full handshake roundtrip: client Finished verifies correctly" {
+    // Regression test for two bugs:
+    //   1. Derive-Secret(., "derived", "") must use SHA-256("") as context (not "")
+    //   2. Server Finished must be added to the transcript before client Finished verification
+    //
+    // Simulates the server side of a TLS 1.3 handshake against a synthetic "client":
+    //   - Process ClientHello, get server flight
+    //   - Compute client Finished from the server's internal secrets
+    //   - Verify that processCrypto(client_finished) succeeds → state == established
+    const testing = std.testing;
+    const io = std.testing.io;
+
+    var server = try TlsServer.init(io);
+
+    // Build a minimal ClientHelloData with a known X25519 public key.
+    // Using all-0x42 as the client's ephemeral public key (for testing only — not a valid point
+    // but X25519.scalarmult will not reject it; the shared secret will be a known garbage value).
+    var ch: ClientHelloData = .{
+        .random = [_]u8{0x11} ** 32,
+        .legacy_session_id = [_]u8{0} ** 32,
+        .session_id_len = 0,
+        .client_x25519_pub = [_]u8{0x42} ** 32,
+        .has_x25519 = true,
+        .peer_transport_params = .{},
+    };
+    @memcpy(ch.alpn_names[0][0..10], "hq-interop");
+    ch.alpn_lens[0] = 10;
+    ch.alpn_count = 1;
+
+    // Hash a fake ClientHello into the transcript (normally done by processCrypto).
+    // The exact bytes don't matter as long as client and server use the same bytes.
+    const fake_ch_bytes = [_]u8{ 0x01, 0x00, 0x00, 0x04, 0x11, 0x22, 0x33, 0x44 };
+    server.transcript.update(&fake_ch_bytes);
+
+    // Run handleClientHello: produces ServerHello + EE + Cert + CV + SF.
+    var server_flight: [8192]u8 = undefined;
+    const n = try server.handleClientHello(ch, &server_flight, io);
+    _ = n;
+    try testing.expectEqual(TlsState.wait_client_finished, server.state);
+
+    // Now simulate the client side: compute client Finished using the same secrets.
+    // Per RFC 8446 §4.4.4:
+    //   finished_key  = HKDF-Expand-Label(client_hs_secret, "finished", "", 32)
+    //   verify_data   = HMAC-SHA256(finished_key, transcript_hash)
+    // where transcript_hash = H(CH || SH || EE || Cert || CertVerify || ServerFinished)
+    // which is exactly server.transcript's current state.
+    var client_finished_key: [32]u8 = undefined;
+    crypto.hkdfExpandLabel(&client_finished_key, server.client_hs_secret, "finished", "");
+
+    var snap = server.transcript; // snapshot — final() is destructive
+    var transcript_hash: [32]u8 = undefined;
+    snap.final(&transcript_hash);
+
+    var client_verify_data: [32]u8 = undefined;
+    Hmac256.create(&client_verify_data, &transcript_hash, &client_finished_key);
+
+    // Build the TLS Finished message.
+    var client_finished_msg: [36]u8 = undefined;
+    _ = buildFinishedMessage(&client_finished_msg, &client_verify_data);
+
+    // Feed the client Finished to the server.
+    var out: [256]u8 = undefined;
+    _ = try server.processCrypto(&client_finished_msg, &out, io);
+    try testing.expectEqual(TlsState.established, server.state);
 }
 
 test "tls: P-256 deinit zeros secret key bytes" {

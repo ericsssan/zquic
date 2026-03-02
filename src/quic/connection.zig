@@ -184,6 +184,10 @@ pub const Connection = struct {
     // Identity
     local_cid: ConnectionId,
     peer_cid: ConnectionId,
+    /// Client's SCID as received in the first Initial packet (0–20 bytes).
+    /// RFC 9000 §7.2: server DCID in long-header packets must equal client SCID.
+    peer_scid: [20]u8 = [_]u8{0} ** 20,
+    peer_scid_len: u8 = 0,
     peer_addr: SocketAddr,
 
     // Crypto
@@ -721,14 +725,21 @@ pub const Connection = struct {
             self.tls_state.quic_version = ver;
             self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
             self.hot.state = .handshake;
+            // Record the client's address now so the first post-handshake 1-RTT
+            // packet does not trigger a false path migration (RFC 9000 §9).
+            self.peer_addr = src;
             // Store the DCID for original_destination_connection_id (RFC 9000 §7.3).
             // The server MUST always include this transport parameter.
             @memcpy(self.first_initial_dcid[0..raw_dcid_len], raw_dcid);
             self.first_initial_dcid_len = @intCast(raw_dcid_len);
-            // Set peer_cid from the SCID field (also not HP-protected).
+            // Set peer_cid and peer_scid from the SCID field (not HP-protected).
             if (data.len >= 6 + raw_dcid_len + 1) {
                 const raw_scid_len = data[6 + raw_dcid_len];
                 if (raw_scid_len <= 20 and data.len >= 6 + raw_dcid_len + 1 + raw_scid_len) {
+                    // Store full wire SCID for use as DCID in server long-header packets.
+                    // RFC 9000 §7.2: server's DCID must exactly match client's SCID.
+                    if (raw_scid_len > 0) @memcpy(self.peer_scid[0..raw_scid_len], data[6 + raw_dcid_len + 1 ..][0..raw_scid_len]);
+                    self.peer_scid_len = @intCast(raw_scid_len);
                     const copy_len = @min(raw_scid_len, cid_mod.len);
                     var pc: ConnectionId = .{};
                     if (copy_len > 0) @memcpy(pc.bytes[0..copy_len], data[6 + raw_dcid_len + 1 ..][0..copy_len]);
@@ -769,12 +780,19 @@ pub const Connection = struct {
                 if (self.config.validate_addr and self.original_dcid == null) {
                     if (hdr.token.len == 0) {
                         // No token: send Retry and stop processing this datagram.
-                        try self.sendRetry(hdr, raw_dcid, src, self.current_time_ns, io);
+                        try self.sendRetry(raw_dcid, src, self.current_time_ns, io);
                         return result.consumed;
                     }
                     if (self.validateToken(hdr.token, src, self.current_time_ns)) |tok| {
                         self.original_dcid = tok.raw;
                         self.original_dcid_len = tok.len;
+                        // RFC 9000 §7.3: server MUST include retry_source_connection_id in
+                        // transport params when a Retry was used.  The post-Retry Initial's
+                        // DCID is exactly the SCID we put in the Retry packet.
+                        var rs: ConnectionId = .{};
+                        const copy_len = @min(raw_dcid_len, cid_mod.len);
+                        if (copy_len > 0) @memcpy(rs.bytes[0..copy_len], raw_dcid[0..copy_len]);
+                        self.retry_scid = rs;
                     } else {
                         return error.InvalidToken;
                     }
@@ -806,8 +824,16 @@ pub const Connection = struct {
                 self.bytes_recv += result.consumed;
                 self.pkts_recv += 1;
 
-                // Process frames in plaintext
-                try self.processFrames(plaintext[0..pt_len], 0, io);
+                // Process frames in plaintext.
+                // CryptoDataNotInOrder means a gap in the TLS stream; don't ACK so the
+                // peer retransmits the missing fragment, but don't stall the connection.
+                self.processFrames(plaintext[0..pt_len], 0, io) catch |err| {
+                    if (err == error.CryptoDataNotInOrder) {
+                        self.pending_ack[0] = false;
+                        return result.consumed;
+                    }
+                    return err;
+                };
 
                 return result.consumed;
             },
@@ -832,7 +858,13 @@ pub const Connection = struct {
                 try crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]);
                 if (pn > self.hot.rx_pn[1]) self.hot.rx_pn[1] = pn;
                 self.hot.rx_pn_valid[1] = true;
-                try self.processFrames(plaintext[0..pt_len], 1, io);
+                self.processFrames(plaintext[0..pt_len], 1, io) catch |err| {
+                    if (err == error.CryptoDataNotInOrder) {
+                        self.pending_ack[1] = false;
+                        return result.consumed;
+                    }
+                    return err;
+                };
                 return result.consumed;
             },
             else => return result.consumed, // ignore retry, 0-rtt
@@ -1413,7 +1445,7 @@ pub const Connection = struct {
                     &self.enc_scratch,
                     .initial,
                     self.quic_version,
-                    self.peer_cid,
+                    self.peer_scid[0..self.peer_scid_len],
                     self.local_cid,
                     &.{},
                     @intCast(pn),
@@ -1438,7 +1470,7 @@ pub const Connection = struct {
                     &self.enc_scratch,
                     .handshake,
                     self.quic_version,
-                    self.peer_cid,
+                    self.peer_scid[0..self.peer_scid_len],
                     self.local_cid,
                     &.{},
                     @intCast(pn),
@@ -1458,7 +1490,7 @@ pub const Connection = struct {
                 const ak = self.app_keys.?.server;
                 const pn = self.hot.tx_pn[2];
                 self.hot.tx_pn[2] += 1;
-                const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+                const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
                 const ct_len = fpos + 16;
                 if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(ak, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1478,7 +1510,7 @@ pub const Connection = struct {
             const n = frame.encodeFrame(&self.pkt_scratch, .ping);
             const pn = self.hot.tx_pn[2];
             self.hot.tx_pn[2] += 1;
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
             const ct_len = n + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
             crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..n], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1520,7 +1552,7 @@ pub const Connection = struct {
 
         // Short Header: 1 byte flag + 8 byte CID + 4 byte PN = 13 bytes
         // Plaintext + 16 (AEAD tag) + 13 (hdr) must equal target_size
-        const short_hdr_len = 13;
+        const short_hdr_len: usize = 1 + self.peer_scid_len + 4;
         const max_plaintext = if (target_size > short_hdr_len + 16)
             target_size - short_hdr_len - 16
         else
@@ -1539,7 +1571,7 @@ pub const Connection = struct {
         const ak = self.app_keys orelse return error.InvalidState;
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = pos + 16;
 
         // Verify target size is exactly achievable
@@ -1574,7 +1606,7 @@ pub const Connection = struct {
         if (self.app_keys) |ak| {
             const pn = self.hot.tx_pn[2];
             self.hot.tx_pn[2] += 1;
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
             const ct_len = pos + 16;
             if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
             crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1648,7 +1680,7 @@ pub const Connection = struct {
                     &self.enc_scratch,
                     .initial,
                     self.quic_version,
-                    self.peer_cid,
+                    self.peer_scid[0..self.peer_scid_len],
                     self.local_cid,
                     &.{},
                     @intCast(pn),
@@ -1676,7 +1708,7 @@ pub const Connection = struct {
                     &self.enc_scratch,
                     .handshake,
                     self.quic_version,
-                    self.peer_cid,
+                    self.peer_scid[0..self.peer_scid_len],
                     self.local_cid,
                     &.{},
                     @intCast(pn),
@@ -1727,11 +1759,11 @@ pub const Connection = struct {
     /// Build and enqueue a Retry packet (RFC 9000 §8.1).
     /// Generates a fresh address-validation token, picks a new SCID, and pushes
     /// `retry_sent` so the caller knows to drain and discard this connection.
-    fn sendRetry(self: *Connection, hdr: packet.LongHeader, odcid: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
+    fn sendRetry(self: *Connection, odcid: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
         const token = self.generateToken(src, odcid, now_ns, io);
         self.retry_scid = ConnectionId.generate(0, io);
         var buf: [256]u8 = undefined;
-        const n = packet.encodeRetry(&buf, hdr.src_cid, self.retry_scid.?, &token, odcid, self.quic_version);
+        const n = packet.encodeRetry(&buf, self.peer_scid[0..self.peer_scid_len], self.retry_scid.?, &token, odcid, self.quic_version);
         try self.enqueueSend(buf[0..n]);
         self.events.push(.retry_sent);
     }
@@ -1760,7 +1792,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1799,7 +1831,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = self.closing_frame_len + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(
@@ -1830,7 +1862,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1874,7 +1906,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1896,7 +1928,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -1951,7 +1983,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -2030,7 +2062,7 @@ pub const Connection = struct {
         const pn = self.hot.tx_pn[2];
         self.hot.tx_pn[2] += 1;
 
-        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_cid, @intCast(pn), self.current_key_phase);
+        const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
         const ct_len = fpos + 16;
         if (hdr_len + ct_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
         crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
@@ -3839,7 +3871,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
         &enc_buf,
         .initial,
         packet.QUIC_VERSION_1,
-        conn.local_cid,
+        &conn.local_cid.bytes,
         conn.local_cid,
         &.{},
         @intCast(pn),
@@ -5049,7 +5081,7 @@ fn buildInitialPacket(
         buf,
         .initial,
         packet.QUIC_VERSION_1,
-        dcid,
+        &dcid.bytes,
         scid,
         token,
         @intCast(pn),
@@ -5107,8 +5139,8 @@ test "retry: validate_addr=true, no token: retry_sent event and Retry packet que
     var out: [256]u8 = undefined;
     const n = conn.send(&out);
     try testing.expect(n > 0);
-    // Retry first byte is 0xf0
-    try testing.expectEqual(@as(u8, 0xf0), out[0]);
+    // Retry first byte is 0xff (v1: type bits 0b11, unused=0xf)
+    try testing.expectEqual(@as(u8, 0xff), out[0]);
 }
 
 test "retry: validate_addr=true, valid token: original_dcid stored, handshake proceeds" {
@@ -5372,7 +5404,7 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
         &enc_buf,
         .initial,
         packet.QUIC_VERSION_2,
-        dcid,
+        &dcid.bytes,
         scid,
         &.{},
         0,

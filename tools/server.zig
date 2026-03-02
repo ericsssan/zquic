@@ -121,11 +121,47 @@ pub fn main(init: std.process.Init) !void {
 
             peer_addr = msg.from;
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+            if (msg.data.len >= 6) {
+                const ver = std.mem.readInt(u32, msg.data[1..5], .big);
+                const dcid_len = msg.data[5];
+                const is_long = (msg.data[0] & 0x80) != 0;
+                const pkt_type_str = if (is_long) blk: {
+                    const t = (msg.data[0] >> 4) & 0x03;
+                    break :blk switch (t) {
+                        0 => "Initial",
+                        1 => "0-RTT",
+                        2 => "Handshake",
+                        3 => "Retry",
+                        else => "?",
+                    };
+                } else "1-RTT";
+                std.debug.print("recv pkt: len={d} type={s} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n",
+                    .{ msg.data.len, pkt_type_str, msg.data[0], ver, dcid_len });
+                if (dcid_len > 0 and msg.data.len >= 6 + dcid_len) {
+                    std.debug.print("  dcid=", .{});
+                    for (msg.data[6..][0..dcid_len]) |b| std.debug.print("{x:0>2}", .{b});
+                    std.debug.print("\n", .{});
+                }
+                const scid_off: usize = 6 + dcid_len;
+                if (msg.data.len > scid_off) {
+                    const scid_len = msg.data[scid_off];
+                    std.debug.print("  scid_len={d}", .{scid_len});
+                    if (scid_len > 0 and msg.data.len >= scid_off + 1 + scid_len) {
+                        std.debug.print(" scid=", .{});
+                        for (msg.data[scid_off + 1 ..][0..scid_len]) |b| std.debug.print("{x:0>2}", .{b});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
             conn.receive(msg.data, ipToSocketAddr(msg.from), now_ns, io) catch |err| {
                 std.debug.print("receive error: {}\n", .{err});
             };
+            std.debug.print("  -> state after receive: {s}, peer_cid=", .{@tagName(conn.hot.state)});
+            for (conn.peer_cid.bytes) |b| std.debug.print("{x:0>2}", .{b});
+            std.debug.print("\n", .{});
 
             while (conn.pollEvent()) |ev| {
+                std.debug.print("  -> event: {s}\n", .{@tagName(ev)});
                 switch (ev) {
                     .connected => std.debug.print("handshake complete\n", .{}),
                     .retry_sent => {
@@ -140,7 +176,29 @@ pub fn main(init: std.process.Init) !void {
 
             // Advance any pending file transfers now that the send window may have grown.
             flushTransfers(&conn, &transfers, www_dir, io);
-            drainSend(&conn, &sock, io, &msg.from, &send_buf);
+            std.debug.print("  sq depth={d}\n", .{conn.sq_tail - conn.sq_head});
+            var sent_bytes: usize = 0;
+            var pkt_count: usize = 0;
+            while (true) {
+                const n = conn.send(&send_buf);
+                if (n == 0) break;
+                pkt_count += 1;
+                // Print first 6 bytes of each sent packet for debugging.
+                if (n >= 6) {
+                    const ver = std.mem.readInt(u32, send_buf[1..5], .big);
+                    const dcid_len = send_buf[5];
+                    std.debug.print("  send[{d}]: len={d} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n",
+                        .{ pkt_count, n, send_buf[0], ver, dcid_len });
+                } else {
+                    std.debug.print("  send[{d}]: len={d} first=0x{x:0>2}\n",
+                        .{ pkt_count, n, send_buf[0] });
+                }
+                sock.send(io, &msg.from, send_buf[0..n]) catch |e| {
+                    std.debug.print("  send error: {}\n", .{e});
+                };
+                sent_bytes += n;
+            }
+            if (sent_bytes > 0) std.debug.print("  -> sent {d} bytes in {d} pkts\n", .{ sent_bytes, pkt_count });
         }
     }
 }

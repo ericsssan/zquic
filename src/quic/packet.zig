@@ -153,16 +153,19 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
 
 /// Encode a Long Header into `buf`, without payload.
 /// Returns the number of bytes written (header only, up to and including the PN).
+/// `dest_bytes` is the wire-format Destination Connection ID (0–20 bytes).
+/// `src` is the Source Connection ID (always the local 8-byte CID).
 pub fn encodeLongHeader(
     buf: []u8,
     pkt_type: PacketType,
     version: u32,
-    dest: ConnectionId,
+    dest_bytes: []const u8,
     src: ConnectionId,
     token: []const u8,
     pn: u32,
     payload_len: usize,
 ) usize {
+    std.debug.assert(dest_bytes.len <= 20);
     // We always use 4-byte packet numbers in Phase 1 (bits 0..1 = 0b11).
     const pn_len: u8 = 4;
     var pos: usize = 0;
@@ -179,11 +182,13 @@ pub fn encodeLongHeader(
     std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
     pos += 4;
 
-    // DCID
-    buf[pos] = cid.len;
+    // DCID (variable 0–20 bytes per RFC 9000 §17.2)
+    buf[pos] = @intCast(dest_bytes.len);
     pos += 1;
-    @memcpy(buf[pos..][0..cid.len], &dest.bytes);
-    pos += cid.len;
+    if (dest_bytes.len > 0) {
+        @memcpy(buf[pos..][0..dest_bytes.len], dest_bytes);
+        pos += dest_bytes.len;
+    }
 
     // SCID
     buf[pos] = cid.len;
@@ -258,7 +263,7 @@ pub fn parseShortHeader(buf: []const u8, dcid_len: usize) !struct { header: Shor
 
 pub fn encodeShortHeader(
     buf: []u8,
-    dest: ConnectionId,
+    dest: []const u8,
     pn: u32,
     key_phase: bool,
 ) usize {
@@ -268,8 +273,8 @@ pub fn encodeShortHeader(
     buf[pos] = 0x40 | (if (key_phase) @as(u8, 0x04) else 0) | (pn_len - 1);
     pos += 1;
 
-    @memcpy(buf[pos..][0..cid.len], &dest.bytes);
-    pos += cid.len;
+    @memcpy(buf[pos..][0..dest.len], dest);
+    pos += dest.len;
 
     std.mem.writeInt(u32, buf[pos..][0..4], pn, .big);
     pos += 4;
@@ -332,7 +337,7 @@ pub fn encodeVersionNegotiation(
 /// Returns the number of bytes written.
 pub fn encodeRetry(
     buf: []u8,
-    dcid: ConnectionId, // client's src CID → send back as DCID
+    dcid: []const u8, // client's src CID → send back as DCID (0–20 bytes)
     scid: ConnectionId, // new server CID used in Retry
     token: []const u8, // opaque address-validation token
     odcid: []const u8, // original DCID bytes (variable length, for Integrity Tag)
@@ -340,21 +345,22 @@ pub fn encodeRetry(
 ) usize {
     var pos: usize = 0;
 
-    // First byte: 1 (long) | 1 (fixed) | retry type bits | reserved | 0
-    // v1: Retry raw bits = 0b11 → 0xf0; v2: Retry raw bits = 0b00 → 0xc0 (RFC 9369 §3.1).
+    // First byte: 1 (long) | 1 (fixed) | retry type bits | unused (4 bits set to 0xf by convention)
+    // v1: Retry raw bits = 0b11 → 0xff; v2: Retry raw bits = 0b00 → 0xcf (RFC 9369 §3.1).
+    // The 4 unused bits are set to 0xf per RFC 9001 Appendix A.4 test vector convention.
     const retry_raw: u8 = if (version == QUIC_VERSION_2) 0b00 else 0b11;
-    buf[pos] = 0xc0 | (retry_raw << 4);
+    buf[pos] = (0xc0 | (retry_raw << 4)) | 0x0f;
     pos += 1;
 
     // Version (4 bytes)
     std.mem.writeInt(u32, buf[pos..][0..4], version, .big);
     pos += 4;
 
-    // DCID (client's source CID from Initial)
-    buf[pos] = cid.len;
+    // DCID (client's source CID from Initial — variable length, including 0)
+    buf[pos] = @intCast(dcid.len);
     pos += 1;
-    @memcpy(buf[pos..][0..cid.len], &dcid.bytes);
-    pos += cid.len;
+    @memcpy(buf[pos..][0..dcid.len], dcid);
+    pos += dcid.len;
 
     // SCID (new server CID)
     buf[pos] = cid.len;
@@ -378,15 +384,18 @@ pub fn encodeRetry(
             0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
             0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
         };
+    // Nonce values verified against RFC 9001 Appendix A.4 and RFC 9369 test vectors.
+    // Note: RFC 9001 §5.8 text has a typo — the authoritative values are from the
+    // Appendix A.4 test vector, which quic-go and other interop implementations use.
     const integrity_nonce = if (version == QUIC_VERSION_2)
         [_]u8{
             0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99,
-            0x90, 0xef, 0xfd, 0x52,
+            0x90, 0xef, 0xb0, 0x4a,
         }
     else
         [_]u8{
             0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
-            0xa1, 0x8b, 0x0d, 0x12,
+            0x23, 0x98, 0x25, 0xbb,
         };
 
     // Pseudo-header for AAD: [odcid_len] ++ odcid_bytes ++ retry_packet_without_tag
@@ -460,10 +469,15 @@ pub fn decodePacketNumber(largest_acked: u64, truncated: u32, pn_bits: u8) u64 {
 
     const candidate = (expected & ~pn_mask) | @as(u64, truncated);
 
-    if (candidate <= expected -| pn_hwin and candidate < (@as(u64, 1) << 62) - pn_win) {
+    // RFC 9000 §A.3: "if candidate_pn <= expected_pn - pn_hwin" uses signed arithmetic.
+    // Guard with expected >= pn_hwin to avoid Zig u64 underflow (saturating 0 gives false positives
+    // for PN=0 at connection start, producing the wrong nonce and failing AEAD decryption).
+    if (expected >= pn_hwin and candidate <= expected - pn_hwin and
+        candidate < (@as(u64, 1) << 62) - pn_win)
+    {
         return candidate + pn_win;
     }
-    if (candidate > expected + pn_hwin and candidate >= pn_win) {
+    if (candidate > expected +| pn_hwin and candidate >= pn_win) {
         return candidate - pn_win;
     }
     return candidate;
@@ -480,7 +494,7 @@ test "packet: long header encode/parse round-trip (Initial)" {
     const token = [_]u8{};
     const payload_len: usize = 100;
 
-    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, dcid, scid, &token, 42, payload_len);
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, &dcid.bytes, scid, &token, 42, payload_len);
     // Fill in dummy payload
     @memset(buf[hdr_len..][0..payload_len], 0xab);
 
@@ -500,7 +514,7 @@ test "packet: short header encode/parse round-trip" {
     var buf: [256]u8 = undefined;
     const dcid = ConnectionId{ .bytes = .{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11 } };
 
-    const hdr_len = encodeShortHeader(&buf, dcid, 7, false);
+    const hdr_len = encodeShortHeader(&buf, &dcid.bytes, 7, false);
     const payload = [_]u8{ 1, 2, 3, 4 };
     @memcpy(buf[hdr_len..][0..payload.len], &payload);
 
@@ -583,6 +597,20 @@ test "packet: decodePacketNumber wrap-around" {
     try std.testing.expectEqual(@as(u64, 261), decodePacketNumber(250, 5, 8));
 }
 
+test "packet: decodePacketNumber first packet PN=0 (largest_acked=0, rx_pn_valid=false sentinel)" {
+    // The first Initial from a QUIC client uses PN=0 (RFC 9000 §12.3 MUST).
+    // Before any packet has been received, largest_acked=0.
+    // The RFC A.3 algorithm uses signed arithmetic (expected - pn_hwin can be negative).
+    // Zig u64 saturating subtraction gave 0 instead of a negative sentinel, causing
+    // candidate(0) <= 0 to fire and return pn_win instead of 0 — wrong nonce → AEAD failure.
+    try std.testing.expectEqual(@as(u64, 0), decodePacketNumber(0, 0, 8));
+    try std.testing.expectEqual(@as(u64, 0), decodePacketNumber(0, 0, 16));
+    try std.testing.expectEqual(@as(u64, 0), decodePacketNumber(0, 0, 32));
+    // PN=1 on second packet still decodes correctly.
+    try std.testing.expectEqual(@as(u64, 1), decodePacketNumber(0, 1, 8));
+    try std.testing.expectEqual(@as(u64, 1), decodePacketNumber(0, 1, 32));
+}
+
 test "packet: parseLongHeader with non-empty Initial token" {
     const testing = std.testing;
     var buf: [300]u8 = undefined;
@@ -590,7 +618,7 @@ test "packet: parseLongHeader with non-empty Initial token" {
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
     const tok = [_]u8{ 0xAB, 0xCD, 0xEF, 0x01 }; // 4-byte token
 
-    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, dcid, scid, &tok, 99, 20);
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, &dcid.bytes, scid, &tok, 99, 20);
     @memset(buf[hdr_len..][0..20], 0xBB);
 
     const result = try parseLongHeader(buf[0 .. hdr_len + 20]);
@@ -607,10 +635,10 @@ test "packet: encodeRetry structure" {
     const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
     const token = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
 
-    const n = encodeRetry(&buf, dcid, scid, &token, &odcid.bytes, QUIC_VERSION_1);
+    const n = encodeRetry(&buf, &dcid.bytes, scid, &token, &odcid.bytes, QUIC_VERSION_1);
 
-    // Verify first byte is 0xf0 (Retry packet, v1: raw type bits 0b11)
-    try testing.expectEqual(@as(u8, 0xf0), buf[0]);
+    // Verify first byte is 0xff (Retry packet, v1: raw type bits 0b11, unused=0xf)
+    try testing.expectEqual(@as(u8, 0xff), buf[0]);
 
     // Verify version is QUIC v1
     try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[1..5], .big));
@@ -639,10 +667,43 @@ test "packet: encodeRetry integrity tag is 16 bytes" {
     const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
     const token = [_]u8{0xAA} ** 62; // max size token
 
-    const n = encodeRetry(&buf, dcid, scid, &token, &odcid.bytes, QUIC_VERSION_1);
+    const n = encodeRetry(&buf, &dcid.bytes, scid, &token, &odcid.bytes, QUIC_VERSION_1);
 
     // Expected: 1 + 4 + 1 + 8 + 1 + 8 + 62 + 16 = 101 (no length prefix on token)
     try testing.expectEqual(@as(usize, 101), n);
+}
+
+test "packet: encodeRetry integrity tag matches RFC 9001 Appendix A.4 test vector" {
+    // Test vectors from RFC 9001 Appendix A.4 / RFC 9369 Appendix A.
+    // These are the same vectors used by quic-go's retry_test.go.
+    const testing = std.testing;
+
+    // v1: origDCID=8394c8f03e515708, SCID=f067a5502a4262b5, token="token"
+    // expected tag = 04a265ba2eff4d829058fb3f0f2496ba
+    {
+        const orig_dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        const scid = ConnectionId{ .bytes = .{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 } };
+        const token = "token";
+        var buf: [256]u8 = undefined;
+        const n = encodeRetry(&buf, &.{}, scid, token, &orig_dcid, QUIC_VERSION_1);
+        // Retry packet = 1+4+1+0+1+8+5+16=36 bytes
+        try testing.expectEqual(@as(usize, 36), n);
+        const expected_tag = [_]u8{ 0x04, 0xa2, 0x65, 0xba, 0x2e, 0xff, 0x4d, 0x82, 0x90, 0x58, 0xfb, 0x3f, 0x0f, 0x24, 0x96, 0xba };
+        try testing.expectEqualSlices(u8, &expected_tag, buf[n - 16 .. n]);
+    }
+
+    // v2: same inputs but QUIC v2
+    // expected tag = c8646ce8bfe33952d955543665dcc7b6
+    {
+        const orig_dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+        const scid = ConnectionId{ .bytes = .{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 } };
+        const token = "token";
+        var buf: [256]u8 = undefined;
+        const n = encodeRetry(&buf, &.{}, scid, token, &orig_dcid, QUIC_VERSION_2);
+        try testing.expectEqual(@as(usize, 36), n);
+        const expected_tag = [_]u8{ 0xc8, 0x64, 0x6c, 0xe8, 0xbf, 0xe3, 0x39, 0x52, 0xd9, 0x55, 0x54, 0x36, 0x65, 0xdc, 0xc7, 0xb6 };
+        try testing.expectEqualSlices(u8, &expected_tag, buf[n - 16 .. n]);
+    }
 }
 
 test "packet: longHeaderType v2 rotates packet type bits" {
@@ -660,7 +721,7 @@ test "packet: encodeLongHeader v2 encodes Initial with raw bits 0b01" {
     const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
 
-    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_2, dcid, scid, &.{}, 1, 20);
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_2, &dcid.bytes, scid, &.{}, 1, 20);
     @memset(buf[hdr_len..][0..20], 0xab);
 
     // First byte bits 5–4 must be 0b01 (v2 Initial raw bits).
