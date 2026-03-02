@@ -40,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     // Determine the testcase; exit 127 if unsupported.
+    // Check this FIRST before attempting to load certs, so that compliance
+    // checks with unsupported testcases exit cleanly with 127.
     const testcase = init.environ_map.get("TESTCASE") orelse "transfer";
     var is_supported = false;
     for (supported_cases) |s| {
@@ -65,12 +67,18 @@ pub fn main(init: std.process.Init) !void {
     const key_path = try std.fmt.bufPrint(&key_path_buf, "{s}/priv.key", .{certs_dir});
 
     var cert_pem_buf: [8192]u8 = undefined;
-    var key_pem_buf: [4096]u8 = undefined;
-    const cert_pem_len = try readFileFull(io, cert_path, &cert_pem_buf);
-    const key_pem_len = try readFileFull(io, key_path, &key_pem_buf);
+    var key_pem_buf: [8192]u8 = undefined;
+    const cert_pem_len = readFileFull(io, cert_path, &cert_pem_buf) catch |err| {
+        std.debug.print("Failed to read certificate from {s}: {}\n", .{ cert_path, err });
+        std.process.exit(127);
+    };
+    const key_pem_len = readFileFull(io, key_path, &key_pem_buf) catch |err| {
+        std.debug.print("Failed to read key from {s}: {}\n", .{ key_path, err });
+        std.process.exit(127);
+    };
 
     var cert_der_buf: [4096]u8 = undefined;
-    var key_der_buf: [512]u8 = undefined;
+    var key_der_buf: [2048]u8 = undefined;
     const cert_der_len = try pem.pemToDer(cert_pem_buf[0..cert_pem_len], &cert_der_buf);
     const key_der_len = try pem.pemToDerBlock(key_pem_buf[0..key_pem_len], "PRIVATE KEY", &key_der_buf);
     const key_material = try pem.parsePrivateKey(key_der_buf[0..key_der_len]);

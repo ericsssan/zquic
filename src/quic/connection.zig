@@ -535,7 +535,9 @@ pub const Connection = struct {
         // it will be included (along with ServerHello) on the next datagram.
         for (0..3) |e| {
             if (self.pending_ack[e]) {
-                if (e == 0 and self.hs_keys == null) continue;
+                if (e == 0 and self.hs_keys == null) {
+                    continue;
+                }
                 self.pending_ack[e] = false;
                 self.sendEncryptedAck(@intCast(e)) catch {};
             }
@@ -990,7 +992,10 @@ pub const Connection = struct {
             while (bit < 64 and (bitmap >> @as(u6, @intCast(bit))) & 1 == 1) : (bit += 1) {
                 run += 1;
             }
-            out[count] = .{ .gap = gap, .ack_range = run - 1 };
+            // RFC 9000: gap value is (unacked_packets - 1) due to the decoding formula:
+            // next_range_high = current_range_low - gap - 2
+            const gap_value = if (gap > 0) gap - 1 else 0;
+            out[count] = .{ .gap = gap_value, .ack_range = run - 1 };
             count += 1;
         }
 
@@ -1055,6 +1060,9 @@ pub const Connection = struct {
             if (decrypted_with_next) {
                 std.debug.print("[conn] key update accepted — rotating keys\n", .{});
                 self.rotateKeys(); // promote next → current, derive new next
+                // RFC 9001 §6.4: After accepting peer-initiated key update,
+                // immediately acknowledge packets to synchronize key state
+                self.key_update_pending = false; // peer has successfully updated keys
             } else {
                 // Fallback: current keys (handles reordering during transition).
                 crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
@@ -1082,9 +1090,11 @@ pub const Connection = struct {
             self.key_update_pending = false;
         }
 
+        // Record packet reception AFTER successful decryption AND key rotation
         self.markPnReceived(2, pn);
         self.bytes_recv += data.len;
         self.pkts_recv += 1;
+        // Process frames with consistent key state
         self.processFrames(plaintext[0..pt_len], 2, null) catch {};
         return data.len;
     }
@@ -1119,7 +1129,9 @@ pub const Connection = struct {
     fn processFrames(self: *Connection, plaintext: []const u8, epoch: u8, io: ?std.Io) !void {
         var pos: usize = 0;
         while (pos < plaintext.len) {
-            const fr = frame.parseFrame(plaintext[pos..]) catch break;
+            const fr = frame.parseFrame(plaintext[pos..]) catch {
+                break;
+            };
             pos += fr.consumed;
 
             // RFC 9000 §12.4: reject frames not permitted in this epoch.
@@ -1129,7 +1141,9 @@ pub const Connection = struct {
             switch (fr.frame) {
                 .ack => {},
                 .padding => {},
-                else => self.pending_ack[epoch] = true,
+                else => {
+                    self.pending_ack[epoch] = true;
+                },
             }
 
             switch (fr.frame) {
@@ -1617,7 +1631,9 @@ pub const Connection = struct {
     /// ACK frames are not ack-eliciting (RFC 9002 §2), so ack_eliciting=false.
     fn sendEncryptedAck(self: *Connection, epoch: u8) !void {
         // RFC 9000 §13.2: only send ACKs if we've actually received packets in this epoch.
-        if (!self.hot.rx_pn_valid[epoch]) return;
+        if (!self.hot.rx_pn_valid[epoch]) {
+            return;
+        }
 
         var fpos: usize = 0;
         // Build ACK ranges from the received-packet bitmap so that the peer can
@@ -1627,15 +1643,6 @@ pub const Connection = struct {
         var ack_ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
         const ack_range_count = buildAckRangesFromBitmap(self.rx_pn_bitmap[epoch], &ack_ranges);
 
-        // DEBUG: Log ACK frame details
-        if (false) {  // Set to true to enable logging
-            std.debug.print("sendEncryptedAck epoch={} largest_acked={} bitmap={b:0>64} ranges_count={}\n", .{
-                epoch, self.hot.rx_pn[epoch], self.rx_pn_bitmap[epoch], ack_range_count,
-            });
-            for (0..ack_range_count) |i| {
-                std.debug.print("  range[{}]: gap={} ack_range={}\n", .{ i, ack_ranges[i].gap, ack_ranges[i].ack_range });
-            }
-        }
         const ack_frame_data: frame.Frame = .{ .ack = .{
             .largest_acked = @intCast(self.hot.rx_pn[epoch]),
             .ack_delay = 0,
@@ -3868,6 +3875,49 @@ test "connection: rotateKeys advances next-generation secrets" {
     try testing.expectEqualSlices(u8, &expected, &conn.next_client_secret);
 }
 
+test "connection: ACK generation after key update" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Setup: establish connection with initial keys
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.next_client_secret = [_]u8{0x55} ** 32;
+    conn.next_server_secret = [_]u8{0x66} ** 32;
+    conn.next_app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.hot.state = .established;
+
+    // Receive some packets (pn 10, 11, 12) to build up ACK bitmap
+    conn.markPnReceived(2, 10);
+    conn.markPnReceived(2, 11);
+    conn.markPnReceived(2, 12);
+
+    // Verify bitmap is correct before key update
+    try testing.expectEqual(@as(u64, 12), conn.hot.rx_pn[2]);
+    try testing.expect(conn.hot.rx_pn_valid[2]);
+    try testing.expectEqual(@as(u64, 0b111), conn.rx_pn_bitmap[2]); // bits 0,1,2 set for packets 12,11,10
+
+    // Perform key update (simulating peer-initiated)
+    const old_phase = conn.current_key_phase;
+    conn.rotateKeys();
+
+    // Verify key_phase flipped
+    try testing.expect(conn.current_key_phase != old_phase);
+
+    // Verify bitmap still intact after key update
+    try testing.expectEqual(@as(u64, 12), conn.hot.rx_pn[2]);
+    try testing.expect(conn.hot.rx_pn_valid[2]);
+    try testing.expectEqual(@as(u64, 0b111), conn.rx_pn_bitmap[2]);
+
+    // Test: receive another packet after key update and verify ACK generation still works
+    conn.markPnReceived(2, 13);
+    try testing.expectEqual(@as(u64, 13), conn.hot.rx_pn[2]);
+    // Bitmap should be shifted: packet 13 is the new largest, packets 12,11,10 are at positions -1,-2,-3
+    // Expected bitmap bits 0-3 should be set (for packets 13,12,11,10)
+    try testing.expectEqual(@as(u64, 0b1111), conn.rx_pn_bitmap[2]);
+}
+
 // ---------------------------------------------------------------------------
 // Phase 4 — Path Migration Tests (RFC 9000 §9)
 // ---------------------------------------------------------------------------
@@ -5912,14 +5962,15 @@ test "connection: buildAckRangesFromBitmap with gap" {
     // Bitmap: bits 0,1 set (packets N, N-1 received),
     //         bits 2,3 clear (packets N-2, N-3 missing),
     //         bits 4,5 set (packets N-4, N-5 received).
-    // Expected ACK: First Range [N-1,N] (ack_range=1), gap=2, Range [N-5,N-4] (ack_range=1).
+    // Expected ACK: First Range [N-1,N] (ack_range=1), gap=1, Range [N-5,N-4] (ack_range=1).
+    // Note: gap encodes as (missing_packets - 1) per RFC 9000 reconstruction formula.
     const testing = std.testing;
     const bitmap: u64 = 0b110011; // bits 0,1,4,5 set
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
     const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 1), ranges[0].ack_range); // [N-1, N]
-    try testing.expectEqual(@as(u62, 2), ranges[1].gap);       // 2 missing packets
+    try testing.expectEqual(@as(u62, 1), ranges[1].gap);       // 2 missing packets encoded as gap=1
     try testing.expectEqual(@as(u62, 1), ranges[1].ack_range); // [N-5, N-4]
 }
 
@@ -6064,11 +6115,11 @@ test "connection: ACK with gap encodes correctly" {
 
     // Expected: 2 ranges
     // Range 0: ack_range = 1 (bits 0-1 set = 2 packets)
-    // Gap: 1 (bit 2 clear = 1 missing packet between the ranges)
+    // Gap: 0 (1 missing packet encoded as gap=0 per RFC 9000 reconstruction)
     // Range 1: ack_range = 1 (bits 3-4 set = 2 packets)
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 1), ranges[0].ack_range);
-    try testing.expectEqual(@as(u62, 1), ranges[1].gap);
+    try testing.expectEqual(@as(u62, 0), ranges[1].gap);  // 1 missing packet = gap-1 = 0
     try testing.expectEqual(@as(u62, 1), ranges[1].ack_range);
 }
 
