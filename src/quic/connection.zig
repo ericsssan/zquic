@@ -6273,3 +6273,72 @@ test "connection: ACK generation with sequential packet arrival" {
     // For 100 sequential packets, the bitmap should be all 1s (at least for the last 64 packets)
     try testing.expectEqual(@as(u64, std.math.maxInt(u64)), conn.rx_pn_bitmap[2]);
 }
+
+test "connection: Config.initial_quic_version defaults to V1" {
+    const testing = std.testing;
+    const config: Config = .{};
+    try testing.expectEqual(packet.QUIC_VERSION_1, config.initial_quic_version);
+}
+
+test "connection: Config.initial_quic_version can be set to V2" {
+    const testing = std.testing;
+    const config: Config = .{ .initial_quic_version = packet.QUIC_VERSION_2 };
+    try testing.expectEqual(packet.QUIC_VERSION_2, config.initial_quic_version);
+}
+
+test "connection: accept() uses Config.initial_quic_version" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    
+    // Test with default V1
+    var conn_v1 = try Connection.accept(.{}, io);
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.quic_version);
+    
+    // Test with V2
+    var conn_v2 = try Connection.accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.quic_version);
+}
+
+test "connection: rotateKeys toggles current_key_phase" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    
+    const initial_phase = conn.current_key_phase;
+    try testing.expect(!initial_phase); // Should default to false
+    
+    // Mock app_keys to allow rotation
+    conn.app_keys = .{
+        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+    };
+    conn.next_app_keys = conn.app_keys.?;
+    conn.next_client_secret = [_]u8{0} ** 32;
+    conn.next_server_secret = [_]u8{0} ** 32;
+    
+    conn.rotateKeys();
+    try testing.expect(conn.current_key_phase != initial_phase);
+}
+
+test "connection: multiple key rotations toggle key_phase correctly" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    
+    const initial_phase = conn.current_key_phase;
+    
+    conn.app_keys = .{
+        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+    };
+    conn.next_app_keys = conn.app_keys.?;
+    conn.next_client_secret = [_]u8{0} ** 32;
+    conn.next_server_secret = [_]u8{0} ** 32;
+    
+    conn.rotateKeys();
+    const phase_after_1 = conn.current_key_phase;
+    try testing.expect(phase_after_1 != initial_phase);
+    
+    conn.rotateKeys();
+    try testing.expectEqual(initial_phase, conn.current_key_phase);
+}
