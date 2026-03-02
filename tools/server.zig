@@ -13,8 +13,9 @@ const pem = @import("pem.zig");
 const net = std.Io.net;
 const DEFAULT_PORT: u16 = 443;
 const MAX_DATAGRAM = 1452;
-// Chunk size ≤ STREAM_BUF_SIZE so streamSend never returns buffer-full.
-const SEND_CHUNK: usize = 2048;
+// Chunk size must fit inside a single QUIC packet (MAX_DATAGRAM=1452 minus
+// short header ~13 + AEAD 16 + STREAM frame header ~17 = ~46 bytes overhead).
+const SEND_CHUNK: usize = 1200;
 // Maximum concurrent file transfers per connection.
 const MAX_TRANSFERS = 8;
 
@@ -121,34 +122,43 @@ pub fn main(init: std.process.Init) !void {
 
             peer_addr = msg.from;
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-            if (msg.data.len >= 6) {
-                const ver = std.mem.readInt(u32, msg.data[1..5], .big);
-                const dcid_len = msg.data[5];
+            if (msg.data.len >= 1) {
                 const is_long = (msg.data[0] & 0x80) != 0;
-                const pkt_type_str = if (is_long) blk: {
-                    const t = (msg.data[0] >> 4) & 0x03;
-                    break :blk switch (t) {
+                if (is_long and msg.data.len >= 6) {
+                    const ver = std.mem.readInt(u32, msg.data[1..5], .big);
+                    const dcid_len = msg.data[5];
+                    const pkt_type_str = switch ((msg.data[0] >> 4) & 0x03) {
                         0 => "Initial",
                         1 => "0-RTT",
                         2 => "Handshake",
                         3 => "Retry",
                         else => "?",
                     };
-                } else "1-RTT";
-                std.debug.print("recv pkt: len={d} type={s} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n",
-                    .{ msg.data.len, pkt_type_str, msg.data[0], ver, dcid_len });
-                if (dcid_len > 0 and msg.data.len >= 6 + dcid_len) {
-                    std.debug.print("  dcid=", .{});
-                    for (msg.data[6..][0..dcid_len]) |b| std.debug.print("{x:0>2}", .{b});
-                    std.debug.print("\n", .{});
-                }
-                const scid_off: usize = 6 + dcid_len;
-                if (msg.data.len > scid_off) {
-                    const scid_len = msg.data[scid_off];
-                    std.debug.print("  scid_len={d}", .{scid_len});
-                    if (scid_len > 0 and msg.data.len >= scid_off + 1 + scid_len) {
-                        std.debug.print(" scid=", .{});
-                        for (msg.data[scid_off + 1 ..][0..scid_len]) |b| std.debug.print("{x:0>2}", .{b});
+                    std.debug.print("recv LONG pkt: len={d} type={s} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n",
+                        .{ msg.data.len, pkt_type_str, msg.data[0], ver, dcid_len });
+                    if (dcid_len > 0 and msg.data.len >= 6 + dcid_len) {
+                        std.debug.print("  dcid=", .{});
+                        for (msg.data[6..][0..dcid_len]) |b| std.debug.print("{x:0>2}", .{b});
+                        std.debug.print("\n", .{});
+                    }
+                    const scid_off: usize = 6 + dcid_len;
+                    if (msg.data.len > scid_off) {
+                        const scid_len = msg.data[scid_off];
+                        std.debug.print("  scid_len={d}", .{scid_len});
+                        if (scid_len > 0 and msg.data.len >= scid_off + 1 + scid_len) {
+                            std.debug.print(" scid=", .{});
+                            for (msg.data[scid_off + 1 ..][0..scid_len]) |b| std.debug.print("{x:0>2}", .{b});
+                        }
+                        std.debug.print("\n", .{});
+                    }
+                } else if (!is_long) {
+                    // Short header: byte 0 layout: 0 1 spin reserved reserved key_phase pn_len[1:0]
+                    const key_phase = (msg.data[0] >> 2) & 1;
+                    // DCID = our SCID = local_cid (8 bytes after first byte)
+                    std.debug.print("recv 1-RTT pkt: len={d} first=0x{x:0>2} key_phase={d}", .{ msg.data.len, msg.data[0], key_phase });
+                    if (msg.data.len >= 9) { // 1 + 8
+                        std.debug.print(" dcid=", .{});
+                        for (msg.data[1..9]) |b| std.debug.print("{x:0>2}", .{b});
                     }
                     std.debug.print("\n", .{});
                 }
@@ -156,14 +166,19 @@ pub fn main(init: std.process.Init) !void {
             conn.receive(msg.data, ipToSocketAddr(msg.from), now_ns, io) catch |err| {
                 std.debug.print("receive error: {}\n", .{err});
             };
-            std.debug.print("  -> state after receive: {s}, peer_cid=", .{@tagName(conn.hot.state)});
-            for (conn.peer_cid.bytes) |b| std.debug.print("{x:0>2}", .{b});
+            std.debug.print("  -> state={s} key_phase={d} peer_scid=", .{ @tagName(conn.hot.state), @intFromBool(conn.current_key_phase) });
+            for (conn.peer_scid[0..conn.peer_scid_len]) |b| std.debug.print("{x:0>2}", .{b});
+            std.debug.print(" local_cid=", .{});
+            for (conn.local_cid.bytes) |b| std.debug.print("{x:0>2}", .{b});
             std.debug.print("\n", .{});
 
             while (conn.pollEvent()) |ev| {
                 std.debug.print("  -> event: {s}\n", .{@tagName(ev)});
                 switch (ev) {
-                    .connected => std.debug.print("handshake complete\n", .{}),
+                    .connected => {
+                        std.debug.print("handshake complete\n", .{});
+                        writeKeyLog(&conn, io);
+                    },
                     .retry_sent => {
                         drainSend(&conn, &sock, io, &msg.from, &send_buf);
                         break :conn_loop;
@@ -183,15 +198,45 @@ pub fn main(init: std.process.Init) !void {
                 const n = conn.send(&send_buf);
                 if (n == 0) break;
                 pkt_count += 1;
-                // Print first 6 bytes of each sent packet for debugging.
-                if (n >= 6) {
+                if (n >= 1 and (send_buf[0] & 0x80) != 0 and n >= 6) {
+                    // Long header: print type, ver, dcid, scid
                     const ver = std.mem.readInt(u32, send_buf[1..5], .big);
                     const dcid_len = send_buf[5];
-                    std.debug.print("  send[{d}]: len={d} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n",
-                        .{ pkt_count, n, send_buf[0], ver, dcid_len });
+                    const pkt_type_str = switch ((send_buf[0] >> 4) & 0x03) {
+                        0 => "Initial",
+                        1 => "0-RTT",
+                        2 => "Handshake",
+                        3 => "Retry",
+                        else => "?",
+                    };
+                    std.debug.print("  send[{d}] LONG {s}: len={d} first=0x{x:0>2} ver=0x{x:0>8}", .{ pkt_count, pkt_type_str, n, send_buf[0], ver });
+                    if (n >= 6 + dcid_len + 1) {
+                        if (dcid_len > 0) {
+                            std.debug.print(" dcid=", .{});
+                            for (send_buf[6..][0..dcid_len]) |b| std.debug.print("{x:0>2}", .{b});
+                        } else {
+                            std.debug.print(" dcid=(empty)", .{});
+                        }
+                        const scid_len = send_buf[6 + dcid_len];
+                        std.debug.print(" scid_len={d}", .{scid_len});
+                        const scid_off: usize = 6 + dcid_len + 1;
+                        if (scid_len > 0 and n >= scid_off + scid_len) {
+                            std.debug.print(" scid=", .{});
+                            for (send_buf[scid_off..][0..scid_len]) |b| std.debug.print("{x:0>2}", .{b});
+                        }
+                    }
+                    std.debug.print("\n", .{});
+                } else if (n >= 1 and (send_buf[0] & 0x80) == 0) {
+                    // Short header 1-RTT
+                    const key_phase = (send_buf[0] >> 2) & 1;
+                    std.debug.print("  send[{d}] 1-RTT: len={d} first=0x{x:0>2} key_phase={d}", .{ pkt_count, n, send_buf[0], key_phase });
+                    if (n >= 9) {
+                        std.debug.print(" dcid=", .{});
+                        for (send_buf[1..9]) |b| std.debug.print("{x:0>2}", .{b});
+                    }
+                    std.debug.print("\n", .{});
                 } else {
-                    std.debug.print("  send[{d}]: len={d} first=0x{x:0>2}\n",
-                        .{ pkt_count, n, send_buf[0] });
+                    std.debug.print("  send[{d}]: len={d} first=0x{x:0>2}\n", .{ pkt_count, n, send_buf[0] });
                 }
                 sock.send(io, &msg.from, send_buf[0..n]) catch |e| {
                     std.debug.print("  send error: {}\n", .{e});
@@ -273,25 +318,29 @@ fn advanceTransfer(conn: *quic.Connection, t: *FileTransfer, io: std.Io) void {
     };
     defer file.close(io);
 
-    var data_buf: [SEND_CHUNK]u8 = undefined;
-    const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
-        conn.streamSend(t.stream_id, &.{}, true) catch {};
-        t.active = false;
-        return;
-    };
+    // Loop until the send queue is full or EOF is reached so we fill the
+    // congestion window on every event rather than sending one chunk at a time.
+    while (true) {
+        var data_buf: [SEND_CHUNK]u8 = undefined;
+        const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
+            conn.streamSend(t.stream_id, &.{}, true) catch {};
+            t.active = false;
+            return;
+        };
 
-    if (r == 0) {
-        // EOF — send FIN.
-        conn.streamSend(t.stream_id, &.{}, true) catch {};
-        t.active = false;
-        return;
+        if (r == 0) {
+            // EOF — send FIN.
+            conn.streamSend(t.stream_id, &.{}, true) catch {};
+            t.active = false;
+            return;
+        }
+
+        conn.streamSend(t.stream_id, data_buf[0..r], false) catch {
+            // Send queue or flow-control window full — retry next tick.
+            return;
+        };
+        t.offset += r;
     }
-
-    conn.streamSend(t.stream_id, data_buf[0..r], false) catch {
-        // Buffer full — leave offset unchanged and retry next tick.
-        return;
-    };
-    t.offset += r;
 }
 
 /// Read an entire file into `out`. Returns number of bytes read.
@@ -312,6 +361,31 @@ fn drainSend(conn: *quic.Connection, sock: *const net.Socket, io: std.Io, dest: 
 fn computeTimeout(deadline: ?i64) std.Io.Timeout {
     const d = deadline orelse return .none;
     return .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } };
+}
+
+/// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
+/// 1-RTT QUIC packets.  Written to /logs/keys.log (the path the interop runner
+/// expects for server logs) after the TLS handshake completes.
+fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
+    const tls = &conn.tls_state;
+    const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
+    var buf: [2048]u8 = undefined;
+    const content = std.fmt.bufPrint(&buf,
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n" ++
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n" ++
+        "CLIENT_TRAFFIC_SECRET_0 {s} {s}\n" ++
+        "SERVER_TRAFFIC_SECRET_0 {s} {s}\n",
+        .{
+            random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower),
+            random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower),
+            random_hex, std.fmt.bytesToHex(tls.client_app_secret, .lower),
+            random_hex, std.fmt.bytesToHex(tls.server_app_secret, .lower),
+        },
+    ) catch return;
+    const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
+    defer file.close(io);
+    file.writePositionalAll(io, content, 0) catch {};
+    std.debug.print("keylog written ({d} bytes)\n", .{content.len});
 }
 
 fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {

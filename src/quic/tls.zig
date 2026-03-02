@@ -129,6 +129,9 @@ pub const TlsServer = struct {
     // Server app secret
     server_app_secret: [32]u8,
 
+    // TLS client_random from ClientHello (used for SSLKEYLOG export).
+    client_random: [32]u8,
+
     // Negotiated transport parameters received from the peer.
     peer_params: transport_params.TransportParams,
 
@@ -173,6 +176,7 @@ pub const TlsServer = struct {
             .server_hs_secret = [_]u8{0} ** 32,
             .client_app_secret = [_]u8{0} ** 32,
             .server_app_secret = [_]u8{0} ** 32,
+            .client_random = [_]u8{0} ** 32,
             .peer_params = .{},
             .read_buf = undefined,
             .read_len = 0,
@@ -225,6 +229,7 @@ pub const TlsServer = struct {
             .server_hs_secret = [_]u8{0} ** 32,
             .client_app_secret = [_]u8{0} ** 32,
             .server_app_secret = [_]u8{0} ** 32,
+            .client_random = [_]u8{0} ** 32,
             .peer_params = .{},
             .read_buf = undefined,
             .read_len = 0,
@@ -329,6 +334,9 @@ pub const TlsServer = struct {
 
         // Store the client's transport parameters.
         self.peer_params = ch.peer_transport_params;
+
+        // Save client_random for SSLKEYLOG export.
+        self.client_random = ch.random;
 
         // 1. ECDH shared secret
         const shared = try X25519.scalarmult(self.ecdh_kp.secret_key, ch.client_x25519_pub);

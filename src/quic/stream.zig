@@ -440,6 +440,11 @@ pub const Stream = struct {
         return self.send_buf.write(data);
     }
 
+    /// Free space remaining in the send buffer.
+    pub fn sendBufferFree(self: *const Stream) usize {
+        return self.send_buf.writable();
+    }
+
     /// Called when the remote acknowledges bytes [offset, offset+len).
     /// Advances send_acked and frees the corresponding space in send_buf.
     pub fn onAcked(self: *Stream, offset: u64, len: u16) void {

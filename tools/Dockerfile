@@ -25,7 +25,11 @@ RUN zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
 # Stage 2: Minimal runtime image.
 FROM --platform=linux/amd64 alpine:3.19
 
+RUN apk add --no-cache iptables ip6tables iproute2
+
 COPY --from=builder /build/zig-out/bin/server /server
+COPY tools/run_server.sh /run_server.sh
+RUN chmod +x /run_server.sh
 
 RUN mkdir -p /logs
 
@@ -36,4 +40,4 @@ ENV TESTCASE=transfer
 ENV CERTS=/certs
 ENV WWW=/www
 
-ENTRYPOINT ["/server"]
+ENTRYPOINT ["/run_server.sh"]

@@ -125,7 +125,19 @@ pub const ConnectionHot = struct {
 // ---------------------------------------------------------------------------
 
 const MAX_PACKET_SIZE = 1350;
-const SEND_QUEUE_DEPTH = 8;
+const SEND_QUEUE_DEPTH = 16;
+
+/// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
+const CRYPTO_STAGE_DEPTH = 8;
+/// Maximum bytes in a single staged CRYPTO fragment (conservatively > max QUIC payload).
+const CRYPTO_STAGE_FRAG = 1400;
+
+/// A single buffered out-of-order CRYPTO fragment.
+const CryptoStagedFrag = struct {
+    offset: u64 = 0,
+    len: u16 = 0,
+    data: [CRYPTO_STAGE_FRAG]u8 = undefined,
+};
 
 const SendSlot = struct {
     buf: [MAX_PACKET_SIZE]u8,
@@ -320,6 +332,12 @@ pub const Connection = struct {
     /// Monotonically increasing ECN CE count seen per epoch [Initial, Handshake, 1-RTT].
     /// When a peer ACK reports a higher CE count, we treat it as a congestion event.
     ecn_ce_seen: [3]u62,
+    /// Per-epoch sliding-window bitmap of received packet numbers (RFC 9000 §13.2).
+    /// Bit i of rx_pn_bitmap[e] is set when packet (rx_pn[e] − i) was received.
+    /// Bit 0 is always set when rx_pn_valid[e] is true (= largest received packet).
+    /// Window covers the most recent 64 packet numbers; older PNs are treated as
+    /// duplicates (safe: RFC 9000 §13.2.3 only requires tracking a recent window).
+    rx_pn_bitmap: [3]u64,
 
     // Retry token state (RFC 9000 §8.1) ------------------------------------------
 
@@ -349,6 +367,10 @@ pub const Connection = struct {
     /// Per-epoch expected CRYPTO receive offset (RFC 9000 §19.6).
     /// Out-of-order/duplicate CRYPTO frames are rejected or trimmed against this.
     crypto_recv_offset: [3]u64,
+    /// Out-of-order CRYPTO fragment staging (RFC 9000 §19.6).
+    /// Stores fragments that arrived before their predecessors; drained in-order.
+    crypto_staged: [3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag,
+    crypto_staged_count: [3]u8,
     /// Deferred ACK flags: set when an ack-eliciting frame is received in an epoch.
     /// Flushed to encrypted ACK packets at the end of receive().
     pending_ack: [3]bool,
@@ -446,8 +468,11 @@ pub const Connection = struct {
             .last_vn_ns = -1_000_000_000, // sentinel: "1s before the epoch" so first VN is always allowed
             .crypto_send_offset = .{ 0, 0, 0 },
             .crypto_recv_offset = .{ 0, 0, 0 },
+            .crypto_staged = @import("std").mem.zeroes([3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag),
+            .crypto_staged_count = .{ 0, 0, 0 },
             .pending_ack = .{ false, false, false },
             .ecn_ce_seen = .{ 0, 0, 0 },
+            .rx_pn_bitmap = [_]u64{0} ** 3,
         };
     }
 
@@ -500,8 +525,17 @@ pub const Connection = struct {
 
         // Flush deferred ACKs — at most one encrypted ACK per packet-number space
         // per datagram (RFC 9000 §13.2.1).
+        //
+        // Exception: suppress the Initial-epoch (epoch 0) ACK if TLS has not yet
+        // produced any output (hs_keys == null).  When the client sends a
+        // fragmented ClientHello across two Initial packets, responding to the
+        // first with a standalone ACK-only packet delays ServerHello and causes
+        // tshark to see the client's first 1-RTT packet before the ServerHello
+        // in the left-node trace, breaking decryption.  Holding the ACK means
+        // it will be included (along with ServerHello) on the next datagram.
         for (0..3) |e| {
             if (self.pending_ack[e]) {
+                if (e == 0 and self.hs_keys == null) continue;
                 self.pending_ack[e] = false;
                 self.sendEncryptedAck(@intCast(e)) catch {};
             }
@@ -629,8 +663,8 @@ pub const Connection = struct {
     pub fn streamSend(self: *Connection, stream_id: u62, data: []const u8, fin: bool) !void {
         const st = self.streams.getOrCreate(stream_id) orelse return error.TooManyStreams;
         if (!st.canSend(@intCast(data.len))) return error.StreamNotWritable;
-        const n = st.bufferSendData(data);
-        if (n < data.len) return error.BufferFull;
+        // Check buffer capacity before any mutation so the operation is all-or-nothing.
+        if (st.sendBufferFree() < data.len) return error.BufferFull;
         if (fin) st.send_fin = true;
         if (self.hot.state == .established) {
             try self.queueStreamData(stream_id, data, fin);
@@ -725,6 +759,11 @@ pub const Connection = struct {
             self.tls_state.quic_version = ver;
             self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
             self.hot.state = .handshake;
+            std.debug.print("[conn] accepted Initial: ver=0x{x:0>8} our_scid=", .{ver});
+            for (self.local_cid.bytes) |b| std.debug.print("{x:0>2}", .{b});
+            std.debug.print(" client_dcid=", .{});
+            for (raw_dcid) |b| std.debug.print("{x:0>2}", .{b});
+            std.debug.print("\n", .{});
             // Record the client's address now so the first post-handshake 1-RTT
             // packet does not trigger a false path migration (RFC 9000 §9).
             self.peer_addr = src;
@@ -806,8 +845,8 @@ pub const Connection = struct {
                     @as(u8, hdr.pn_len) * 8,
                 );
 
-                // Replay protection: drop packets whose PN we've already surpassed.
-                if (self.hot.rx_pn_valid[0] and pn <= self.hot.rx_pn[0]) return result.consumed;
+                // Replay / duplicate protection (RFC 9000 §13.2).
+                if (self.isPnDuplicate(0, pn)) return result.consumed;
 
                 // AAD = HP-removed header bytes (before payload, per RFC 9001 §5.3).
                 const payload_start = result.consumed - hdr.payload.len;
@@ -819,21 +858,12 @@ pub const Connection = struct {
                 if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 try crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]);
 
-                if (pn > self.hot.rx_pn[0]) self.hot.rx_pn[0] = pn;
-                self.hot.rx_pn_valid[0] = true;
+                self.markPnReceived(0, pn);
                 self.bytes_recv += result.consumed;
                 self.pkts_recv += 1;
 
                 // Process frames in plaintext.
-                // CryptoDataNotInOrder means a gap in the TLS stream; don't ACK so the
-                // peer retransmits the missing fragment, but don't stall the connection.
-                self.processFrames(plaintext[0..pt_len], 0, io) catch |err| {
-                    if (err == error.CryptoDataNotInOrder) {
-                        self.pending_ack[0] = false;
-                        return result.consumed;
-                    }
-                    return err;
-                };
+                try self.processFrames(plaintext[0..pt_len], 0, io);
 
                 return result.consumed;
             },
@@ -846,8 +876,8 @@ pub const Connection = struct {
                     hdr.packet_number,
                     @as(u8, hdr.pn_len) * 8,
                 );
-                // Replay protection
-                if (self.hot.rx_pn_valid[1] and pn <= self.hot.rx_pn[1]) return result.consumed;
+                // Replay / duplicate protection (RFC 9000 §13.2).
+                if (self.isPnDuplicate(1, pn)) return result.consumed;
                 // AAD = HP-removed header bytes.
                 const payload_start = result.consumed - hdr.payload.len;
                 const aad = hp_buf[0..payload_start];
@@ -856,41 +886,149 @@ pub const Connection = struct {
                 var plaintext: [MAX_PACKET_SIZE]u8 = undefined;
                 if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
                 try crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]);
-                if (pn > self.hot.rx_pn[1]) self.hot.rx_pn[1] = pn;
-                self.hot.rx_pn_valid[1] = true;
-                self.processFrames(plaintext[0..pt_len], 1, io) catch |err| {
-                    if (err == error.CryptoDataNotInOrder) {
-                        self.pending_ack[1] = false;
-                        return result.consumed;
-                    }
-                    return err;
-                };
+                self.markPnReceived(1, pn);
+                try self.processFrames(plaintext[0..pt_len], 1, io);
                 return result.consumed;
             },
             else => return result.consumed, // ignore retry, 0-rtt
         }
     }
 
+    /// Returns the bytes we send as our SCID in long-header packets.
+    ///
+    /// We echo the client's original DCID so that the client never needs to
+    /// change its own DCID (the "new" server SCID equals the client's current
+    /// DCID).  This keeps all packets in a single Wireshark connection, which
+    /// is required for pcap-based interop test analysis (the NS-3 left-pcap
+    /// capture delay can otherwise cause the server's Initial to appear after
+    /// the client's DCID-change packet, breaking Wireshark's connection
+    /// tracking and SSLKEYLOG decryption context).
+    ///
+    /// Falls back to local_cid if no Initial has been processed yet (tests).
+    fn ourScidBytes(self: *const Connection) []const u8 {
+        if (self.first_initial_dcid_len > 0) {
+            return self.first_initial_dcid[0..self.first_initial_dcid_len];
+        }
+        return &self.local_cid.bytes;
+    }
+
+    // -----------------------------------------------------------------------
+    // Packet-number tracking helpers (RFC 9000 §13.2)
+    // -----------------------------------------------------------------------
+
+    /// Returns true when `pn` in `epoch` has already been processed.
+    /// Uses the 64-slot sliding-window bitmap; any PN more than 63 below the
+    /// largest-received is conservatively treated as a duplicate (RFC 9000 §13.2.3).
+    fn isPnDuplicate(self: *const Connection, epoch: u8, pn: u64) bool {
+        if (!self.hot.rx_pn_valid[epoch]) return false;
+        const largest = self.hot.rx_pn[epoch];
+        if (pn > largest) return false; // new packet, larger than anything seen
+        const delta = largest - pn;
+        if (delta >= 64) return true; // outside window → treat as duplicate
+        return (self.rx_pn_bitmap[epoch] >> @as(u6, @intCast(delta))) & 1 == 1;
+    }
+
+    /// Record that `pn` in `epoch` was successfully decrypted and processed.
+    /// Updates rx_pn[epoch] / rx_pn_valid[epoch] and the bitmap.
+    fn markPnReceived(self: *Connection, epoch: u8, pn: u64) void {
+        if (!self.hot.rx_pn_valid[epoch]) {
+            // First packet in this epoch.
+            self.hot.rx_pn[epoch] = pn;
+            self.hot.rx_pn_valid[epoch] = true;
+            self.rx_pn_bitmap[epoch] = 1; // bit 0 = the largest (only) received PN
+            return;
+        }
+        const largest = self.hot.rx_pn[epoch];
+        if (pn > largest) {
+            // New largest: left-shift the bitmap to make room, set bit 0.
+            const shift = pn - largest;
+            self.rx_pn_bitmap[epoch] = if (shift >= 64)
+                1
+            else
+                (self.rx_pn_bitmap[epoch] << @as(u6, @intCast(shift))) | 1;
+            self.hot.rx_pn[epoch] = pn;
+        } else {
+            // Out-of-order fill: mark the specific bit without changing largest.
+            const delta = largest - pn;
+            if (delta < 64) {
+                self.rx_pn_bitmap[epoch] |= @as(u64, 1) << @as(u6, @intCast(delta));
+            }
+            // delta >= 64: too old to track; isPnDuplicate already gates this path.
+        }
+    }
+
+    /// Build ACK ranges from a received-packet sliding-window bitmap.
+    ///
+    /// `bitmap` — rx_pn_bitmap[epoch], bit 0 = largest received, bit i = largest−i.
+    /// `out`    — output slice of at most 32 AckRange entries.
+    ///
+    /// Returns the number of entries filled.  The first entry carries the
+    /// "First ACK Range" (RFC 9000 §19.3); subsequent entries carry the
+    /// (gap, ack_range) pairs for additional blocks.
+    fn buildAckRangesFromBitmap(bitmap: u64, out: *[32]frame.AckRange) usize {
+        var bit: usize = 0;
+
+        // Count the first run of 1s starting at bit 0 (the contiguous block below
+        // and including largest_acked).
+        var first_run: u62 = 0;
+        while (bit < 64 and (bitmap >> @as(u6, @intCast(bit))) & 1 == 1) : (bit += 1) {
+            first_run += 1;
+        }
+        out[0] = .{ .gap = 0, .ack_range = if (first_run > 0) first_run - 1 else 0 };
+        var count: usize = 1;
+
+        while (bit < 64 and count < 32) {
+            // Run of 0s = gap between ACK blocks.
+            var gap: u62 = 0;
+            while (bit < 64 and (bitmap >> @as(u6, @intCast(bit))) & 1 == 0) : (bit += 1) {
+                gap += 1;
+            }
+            if (bit >= 64) break; // no more received packets in window
+
+            // Run of 1s = next ACK block.
+            var run: u62 = 0;
+            while (bit < 64 and (bitmap >> @as(u6, @intCast(bit))) & 1 == 1) : (bit += 1) {
+                run += 1;
+            }
+            out[count] = .{ .gap = gap, .ack_range = run - 1 };
+            count += 1;
+        }
+
+        return count;
+    }
+
     fn processShortHeaderPacket(self: *Connection, data: []const u8) !usize {
         if (self.app_keys == null) return 0;
 
+        // DCID in short headers = client's DCID in all subsequent packets = our SCID.
+        // RFC 9000 §7.2: client uses server's SCID as its DCID.
+        // Since we echo the client's original DCID as our SCID (DCID echo), the client
+        // keeps its original DCID.  Fall back to cid_mod.len for unit tests.
+        const our_scid_len: usize = if (self.first_initial_dcid_len > 0)
+            self.first_initial_dcid_len
+        else
+            cid_mod.len;
+
         // Remove header protection before parsing.
-        const pn_off = packet.shortHeaderPnOffset(cid_mod.len);
-        if (pn_off + 4 + 16 > data.len) return 0;
+        const pn_off = packet.shortHeaderPnOffset(our_scid_len);
+        if (pn_off + 4 + 16 > data.len) {
+            std.debug.print("[conn] 1-RTT too short for HP: len={d} need={d}\n", .{ data.len, pn_off + 4 + 16 });
+            return 0;
+        }
         var hp_buf: [1500]u8 = undefined;
         const pkt_len = @min(data.len, hp_buf.len);
         @memcpy(hp_buf[0..pkt_len], data[0..pkt_len]);
         _ = crypto.removeHeaderProtection(self.app_keys.?.client.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
-        const result = try packet.parseShortHeader(hp_buf[0..pkt_len], cid_mod.len);
+        const result = try packet.parseShortHeader(hp_buf[0..pkt_len], our_scid_len);
         const hdr = result.header;
         const pn = packet.decodePacketNumber(
             self.hot.rx_pn[2],
             hdr.packet_number,
             @as(u8, hdr.pn_len) * 8,
         );
-        // Replay protection: silently drop packets with PN <= highest seen in this epoch.
-        if (self.hot.rx_pn_valid[2] and pn <= self.hot.rx_pn[2]) return result.consumed;
+        // Replay / duplicate protection (RFC 9000 §13.2).
+        if (self.isPnDuplicate(2, pn)) return result.consumed;
         const payload_start = result.consumed - hdr.payload.len;
         // AAD = HP-removed header bytes (per RFC 9001 §5.3).
         const aad = hp_buf[0..payload_start];
@@ -901,18 +1039,26 @@ pub const Connection = struct {
 
         // Key phase handling (RFC 9001 §6): different phase bit indicates key update.
         if (hdr.key_phase != self.current_key_phase) {
+            std.debug.print("[conn] 1-RTT pn={d} key_phase MISMATCH hdr={d} cur={d} — trying next keys\n",
+                .{ pn, @intFromBool(hdr.key_phase), @intFromBool(self.current_key_phase) });
             // Peer has initiated a key update. Try next-generation keys first.
             var decrypted_with_next = false;
             if (self.next_app_keys) |nk| {
                 if (crypto.decryptPayload(nk.client, pn, aad, hdr.payload, plaintext[0..pt_len])) |_| {
                     decrypted_with_next = true;
-                } else |_| {}
+                } else |_| {
+                    std.debug.print("[conn] next keys decrypt FAILED\n", .{});
+                }
+            } else {
+                std.debug.print("[conn] next_app_keys is null!\n", .{});
             }
             if (decrypted_with_next) {
+                std.debug.print("[conn] key update accepted — rotating keys\n", .{});
                 self.rotateKeys(); // promote next → current, derive new next
             } else {
                 // Fallback: current keys (handles reordering during transition).
                 crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
+                    std.debug.print("[conn] current keys decrypt FAILED (key_phase mismatch path) — dropping\n", .{});
                     // RFC 9000 §10.3: decryption failure → check for stateless reset.
                     if (self.checkStatelessReset(data)) {
                         self.hot.state = .closed;
@@ -924,6 +1070,8 @@ pub const Connection = struct {
         } else {
             // Same phase: use current keys; clear pending flag (peer ACKed our update).
             crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
+                std.debug.print("[conn] 1-RTT pn={d} decrypt FAILED key_phase={d} — dropping\n",
+                    .{ pn, @intFromBool(self.current_key_phase) });
                 // RFC 9000 §10.3: decryption failure → check for stateless reset.
                 if (self.checkStatelessReset(data)) {
                     self.hot.state = .closed;
@@ -934,8 +1082,7 @@ pub const Connection = struct {
             self.key_update_pending = false;
         }
 
-        if (pn > self.hot.rx_pn[2]) self.hot.rx_pn[2] = pn;
-        self.hot.rx_pn_valid[2] = true;
+        self.markPnReceived(2, pn);
         self.bytes_recv += data.len;
         self.pkts_recv += 1;
         self.processFrames(plaintext[0..pt_len], 2, null) catch {};
@@ -1098,27 +1245,83 @@ pub const Connection = struct {
         // Pure duplicate: already processed all bytes in this frame → skip.
         if (end <= expected) return;
 
-        // Gap: can't reassemble out-of-order CRYPTO without a full reassembly buffer.
-        if (@as(u64, f.offset) > expected) return error.CryptoDataNotInOrder;
+        // Out-of-order: stage for later delivery when its predecessor arrives.
+        if (@as(u64, f.offset) > expected) {
+            try self.stageCryptoFrag(epoch, @as(u64, f.offset), f.data);
+            return;
+        }
 
-        // Partial overlap: trim leading bytes already processed.
+        // Partial overlap: trim leading bytes already delivered.
         const trim = expected - @as(u64, f.offset);
         const effective_data = f.data[trim..];
 
-        self.crypto_recv_offset[epoch] = end;
+        // In-order delivery: feed to TLS, then drain any buffered staging.
+        try self.deliverCryptoChunk(epoch, effective_data, io);
+        try self.drainStagedCrypto(epoch, io);
+    }
 
-        // Before processing ClientHello, set our transport parameters for EncryptedExtensions.
-        // This includes original_dcid if address validation with Retry was used.
+    /// Buffer a CRYPTO fragment that arrived out of order.
+    fn stageCryptoFrag(self: *Connection, epoch: u8, offset: u64, data: []const u8) !void {
+        const count = self.crypto_staged_count[epoch];
+        if (count >= CRYPTO_STAGE_DEPTH) return; // staging full; peer will retransmit
+        const copy_len: u16 = @intCast(@min(data.len, CRYPTO_STAGE_FRAG));
+        self.crypto_staged[epoch][count] = .{
+            .offset = offset,
+            .len = copy_len,
+        };
+        @memcpy(self.crypto_staged[epoch][count].data[0..copy_len], data[0..copy_len]);
+        self.crypto_staged_count[epoch] = count + 1;
+    }
+
+    /// Drain staged fragments that are now deliverable (in-order).
+    fn drainStagedCrypto(self: *Connection, epoch: u8, io: std.Io) !void {
+        while (true) {
+            const expected = self.crypto_recv_offset[epoch];
+            const count = self.crypto_staged_count[epoch];
+            // Find a staged fragment that overlaps or starts at expected.
+            var found: usize = count;
+            for (0..count) |i| {
+                const frag = &self.crypto_staged[epoch][i];
+                const frag_end = frag.offset + frag.len;
+                if (frag_end > expected and frag.offset <= expected) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found == count) break;
+
+            const frag = self.crypto_staged[epoch][found];
+            // Remove from staging array.
+            if (found < count - 1) {
+                std.mem.copyForwards(
+                    CryptoStagedFrag,
+                    self.crypto_staged[epoch][found .. count - 1],
+                    self.crypto_staged[epoch][found + 1 .. count],
+                );
+            }
+            self.crypto_staged_count[epoch] = count - 1;
+
+            // Trim leading overlap and deliver.
+            const t: u64 = if (frag.offset < expected) expected - frag.offset else 0;
+            const d = frag.data[@intCast(t)..frag.len];
+            if (d.len > 0) try self.deliverCryptoChunk(epoch, d, io);
+        }
+    }
+
+    /// Feed one contiguous in-order chunk to the TLS state machine and handle its output.
+    fn deliverCryptoChunk(self: *Connection, epoch: u8, data: []const u8, io: std.Io) !void {
+        self.crypto_recv_offset[epoch] += data.len;
+
+        // Before processing ClientHello, configure transport parameters for EncryptedExtensions.
         if (self.tls_state.state == .wait_client_hello) {
             var our_params = transport_params.TransportParams{};
-            // RFC 9000 §18.2: initial_source_connection_id is mandatory in server params.
+            // initial_source_connection_id MUST equal the SCID we sent in our Initial packet
+            // (RFC 9000 §7.3). Our wire SCID is ourScidBytes() = local_cid.bytes.
+            const scid_bytes = self.ourScidBytes();
             var isci: [20]u8 = [_]u8{0} ** 20;
-            @memcpy(isci[0..cid_mod.len], &self.local_cid.bytes);
+            @memcpy(isci[0..scid_bytes.len], scid_bytes);
             our_params.initial_source_connection_id = isci;
-            our_params.initial_source_connection_id_len = cid_mod.len;
-            // RFC 9000 §7.3: the server MUST always include original_destination_connection_id.
-            // For Retry: original_dcid = pre-Retry DCID (extracted from token validation).
-            // For non-Retry: first_initial_dcid = DCID from the client's first Initial.
+            our_params.initial_source_connection_id_len = @intCast(scid_bytes.len);
             if (self.original_dcid) |dcid| {
                 our_params.original_destination_connection_id = dcid;
                 our_params.original_destination_connection_id_len = self.original_dcid_len;
@@ -1133,54 +1336,46 @@ pub const Connection = struct {
         }
 
         var out_buf: [8192]u8 = undefined;
-        const out_len = try self.tls_state.processCrypto(effective_data, &out_buf, io);
+        const out_len = try self.tls_state.processCrypto(data, &out_buf, io);
 
-        // Update HS keys if TLS just derived them
-        if (self.hs_keys == null and
-            self.tls_state.state != .wait_client_hello)
-        {
+        if (self.hs_keys == null and self.tls_state.state != .wait_client_hello) {
             self.hs_keys = self.tls_state.handshake_keys;
         }
 
         if (out_len > 0) {
-            // Queue the TLS output as CRYPTO frames in the appropriate epoch packets.
-            // Initial epoch: wrap in Initial packet.
-            // Handshake epoch: wrap in Handshake packet.
-            // For Phase 1: queue Initial packet with ServerHello,
-            //              then Handshake packet with EE+Cert+CV+Finished.
-            // Simplified: queue everything as one Initial packet and one Handshake packet.
             try self.queueTlsOutput(out_buf[0..out_len]);
         }
 
         if (self.tls_state.isComplete()) {
             self.app_keys = self.tls_state.app_keys;
             self.hot.state = .established;
-            self.path_validated = true; // handshake completion validates the peer address
+            self.path_validated = true;
             self.events.push(.connected);
 
-            // Pre-compute next-generation app keys for key update support (RFC 9001 §6).
             self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.client_app_secret, self.quic_version);
             self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.server_app_secret, self.quic_version);
             self.next_app_keys = tls.AppKeys{
                 .client = crypto.derivePacketKeys(self.next_client_secret, self.quic_version),
                 .server = crypto.derivePacketKeys(self.next_server_secret, self.quic_version),
             };
+            // RFC 9001 §6.1: header protection key does not change with key updates.
+            // Override the derived hp fields with the gen-0 hp from the active keys.
+            if (self.app_keys) |cur| {
+                self.next_app_keys.?.client.hp = cur.client.hp;
+                self.next_app_keys.?.server.hp = cur.server.hp;
+            }
 
-            // Apply negotiated transport parameters.
             const params = self.tls_state.peerTransportParams();
             self.conn_flow.updateSendMax(params.initial_max_data);
             self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
             self.cached_ack_delay_exp = @intCast(@min(params.ack_delay_exponent, 20));
-            // Cache per-stream send limits for use when opening new streams (RFC 9000 §7.3).
             self.peer_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
 
-            // Initialize peer stream limits from transport parameters.
             const bidi_limit = @min(params.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62)));
             const uni_limit = @min(params.initial_max_streams_uni, @as(u64, std.math.maxInt(u62)));
             self.peer_max_streams_bidi = @intCast(bidi_limit);
             self.peer_max_streams_uni = @intCast(uni_limit);
 
-            // Cache peer migration preference.
             self.peer_disable_migration = params.disable_active_migration;
 
             try self.queueHandshakeDone();
@@ -1422,11 +1617,17 @@ pub const Connection = struct {
     /// ACK frames are not ack-eliciting (RFC 9002 §2), so ack_eliciting=false.
     fn sendEncryptedAck(self: *Connection, epoch: u8) !void {
         var fpos: usize = 0;
+        // Build ACK ranges from the received-packet bitmap so that the peer can
+        // precisely identify which packets we have (and have not) received.  This
+        // is required by RFC 9000 §13.2: an endpoint MUST send ACK frames that
+        // cover all ack-eliciting packets it has received.
+        var ack_ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+        const ack_range_count = buildAckRangesFromBitmap(self.rx_pn_bitmap[epoch], &ack_ranges);
         const ack_frame_data: frame.Frame = .{ .ack = .{
             .largest_acked = @intCast(self.hot.rx_pn[epoch]),
             .ack_delay = 0,
-            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
-            .range_count = 1,
+            .ranges = ack_ranges,
+            .range_count = ack_range_count,
             .ect0 = 0,
             .ect1 = 0,
             .ecn_ce = 0,
@@ -1446,7 +1647,7 @@ pub const Connection = struct {
                     .initial,
                     self.quic_version,
                     self.peer_scid[0..self.peer_scid_len],
-                    self.local_cid,
+                    self.ourScidBytes(),
                     &.{},
                     @intCast(pn),
                     ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
@@ -1471,7 +1672,7 @@ pub const Connection = struct {
                     .handshake,
                     self.quic_version,
                     self.peer_scid[0..self.peer_scid_len],
-                    self.local_cid,
+                    self.ourScidBytes(),
                     &.{},
                     @intCast(pn),
                     ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
@@ -1681,7 +1882,7 @@ pub const Connection = struct {
                     .initial,
                     self.quic_version,
                     self.peer_scid[0..self.peer_scid_len],
-                    self.local_cid,
+                    self.ourScidBytes(),
                     &.{},
                     @intCast(pn),
                     ct_len,
@@ -1709,7 +1910,7 @@ pub const Connection = struct {
                     .handshake,
                     self.quic_version,
                     self.peer_scid[0..self.peer_scid_len],
-                    self.local_cid,
+                    self.ourScidBytes(),
                     &.{},
                     @intCast(pn),
                     ct_len,
@@ -1817,9 +2018,13 @@ pub const Connection = struct {
 
         const st = self.streams.getOrCreate(id) orelse return;
         const offset: u62 = @intCast(st.send_offset);
-        st.onSent(data.len);
-
+        // Enqueue the packet first; if the send queue is full this returns an error
+        // and no state is changed (send_buf and send_offset remain unmodified).
         try self.encryptAndEnqueueStreamFrame(id, offset, data, fin);
+        // Only after the packet is successfully queued: buffer for retransmission
+        // and advance the send offset.
+        _ = st.bufferSendData(data);
+        st.onSent(data.len);
     }
 
     /// Encrypt and enqueue the pre-serialized CONNECTION_CLOSE frame.
@@ -2081,6 +2286,7 @@ pub const Connection = struct {
     /// derive the new next generation.  Called on peer-initiated key updates
     /// (inside processShortHeaderPacket) and as part of initiateKeyUpdate.
     fn rotateKeys(self: *Connection) void {
+        std.debug.print("[conn] rotateKeys: phase {} → {}\n", .{ self.current_key_phase, !self.current_key_phase });
         // Zero the outgoing application keys before replacing them (RFC 9001 §6,
         // defence-in-depth: previous-epoch key material must not linger in memory).
         if (self.app_keys) |*old| {
@@ -2104,6 +2310,11 @@ pub const Connection = struct {
             .client = crypto.derivePacketKeys(self.next_client_secret, self.quic_version),
             .server = crypto.derivePacketKeys(self.next_server_secret, self.quic_version),
         };
+        // RFC 9001 §6.1: header protection key does not change with key updates.
+        if (self.app_keys) |cur| {
+            self.next_app_keys.?.client.hp = cur.client.hp;
+            self.next_app_keys.?.server.hp = cur.server.hp;
+        }
     }
 
     /// Initiate a locally-triggered key update (RFC 9001 §6).
@@ -3765,8 +3976,7 @@ test "connection: sendEncryptedAck for Initial epoch produces long header" {
     // Derive real initial keys with a dummy DCID.
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
-    conn.hot.rx_pn_valid[0] = true;
-    conn.hot.rx_pn[0] = 5;
+    conn.markPnReceived(0, 5);
 
     try conn.sendEncryptedAck(0);
 
@@ -3784,8 +3994,7 @@ test "connection: sendEncryptedAck for 1-RTT epoch produces short header" {
     var conn = try Connection.accept(.{}, io);
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
-    conn.hot.rx_pn_valid[2] = true;
-    conn.hot.rx_pn[2] = 3;
+    conn.markPnReceived(2, 3);
 
     try conn.sendEncryptedAck(2);
 
@@ -3850,7 +4059,7 @@ test "connection: ACK frame does NOT set pending_ack" {
 
 test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     // receive() with a PING frame (encapsulated in an Initial packet) must
-    // produce an encrypted ACK in the send queue.
+    // produce an encrypted ACK in the send queue once hs_keys are available.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
@@ -3858,6 +4067,12 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
     conn.hot.state = .handshake; // past idle so Initial packets are processed
     conn.peer_cid = conn.local_cid;
+    // hs_keys must be non-null so epoch-0 ACK is not suppressed.
+    const hs_secret = [_]u8{0xab} ** 32;
+    conn.hs_keys = tls.HandshakeKeys{
+        .client = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
+        .server = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
+    };
 
     // Build a PING frame and wrap it in an encrypted Initial packet.
     var pt: [4]u8 = undefined;
@@ -3872,7 +4087,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
         .initial,
         packet.QUIC_VERSION_1,
         &conn.local_cid.bytes,
-        conn.local_cid,
+        &conn.local_cid.bytes,
         &.{},
         @intCast(pn),
         ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
@@ -3889,6 +4104,49 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     try testing.expect(conn.sq_tail > 0);
     // pending_ack[0] must be false (flushed).
     try testing.expect(!conn.pending_ack[0]);
+}
+
+test "connection: receive() suppresses epoch-0 ACK when hs_keys is null" {
+    // When hs_keys == null (TLS has not yet produced ServerHello), a standalone
+    // Initial ACK must NOT be sent.  This prevents the interop-runner left-node
+    // trace from showing a client 1-RTT packet before the ServerHello.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe };
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+    conn.hot.state = .handshake;
+    conn.peer_cid = conn.local_cid;
+    // hs_keys intentionally left null (TLS hasn't produced output yet).
+
+    // Build a PING frame wrapped in an encrypted Initial packet.
+    var pt: [4]u8 = undefined;
+    const pt_len = frame.encodeFrame(&pt, .ping);
+    var enc_buf: [256]u8 = undefined;
+    const client_keys = conn.initial_keys.client;
+    const pn: u64 = 1;
+    const ct_len = pt_len + 16;
+    const hdr_len = packet.encodeLongHeader(
+        &enc_buf,
+        .initial,
+        packet.QUIC_VERSION_1,
+        &conn.local_cid.bytes,
+        &conn.local_cid.bytes,
+        &.{},
+        @intCast(pn),
+        ct_len,
+    );
+    crypto.encryptPayload(client_keys, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
+    crypto.applyHeaderProtection(client_keys.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+    const pkt = enc_buf[0 .. hdr_len + ct_len];
+
+    const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
+    try conn.receive(pkt, src, 0, io);
+
+    // No packet must be enqueued — ACK is suppressed until ServerHello is ready.
+    try testing.expectEqual(@as(usize, 0), conn.sq_tail);
+    // pending_ack[0] must remain true so it fires once hs_keys become available.
+    try testing.expect(conn.pending_ack[0]);
 }
 
 // ---- Step 3: Connection MAX_DATA window growth ----
@@ -3976,19 +4234,21 @@ test "connection: CRYPTO duplicate frame is silently ignored" {
     try testing.expectEqual(@as(u64, 10), conn.crypto_recv_offset[0]);
 }
 
-test "connection: CRYPTO gap returns CryptoDataNotInOrder" {
+test "connection: CRYPTO gap is staged, offset does not advance" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
     conn.crypto_recv_offset[0] = 0;
 
     const data = [_]u8{0x55} ** 5;
-    // Frame at offset 100 when expected is 0 — gap!
+    // Frame at offset 100 when expected is 0 — gap: should be staged, not an error.
     const f: frame.CryptoFrame = .{ .offset = 100, .data = &data };
-    const result = conn.processCryptoFrame(f, 0, io);
-    try testing.expectError(error.CryptoDataNotInOrder, result);
-    // Offset must NOT have advanced.
+    try conn.processCryptoFrame(f, 0, io);
+    // Offset must NOT have advanced (fragment is staged, not yet delivered).
     try testing.expectEqual(@as(u64, 0), conn.crypto_recv_offset[0]);
+    // Fragment is in the staging buffer.
+    try testing.expectEqual(@as(u8, 1), conn.crypto_staged_count[0]);
+    try testing.expectEqual(@as(u64, 100), conn.crypto_staged[0][0].offset);
 }
 
 test "connection: CRYPTO partial overlap trims leading bytes" {
@@ -5082,7 +5342,7 @@ fn buildInitialPacket(
         .initial,
         packet.QUIC_VERSION_1,
         &dcid.bytes,
-        scid,
+        &scid.bytes,
         token,
         @intCast(pn),
         ct_len,
@@ -5405,7 +5665,7 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
         .initial,
         packet.QUIC_VERSION_2,
         &dcid.bytes,
-        scid,
+        &scid.bytes,
         &.{},
         0,
         ct_len,
@@ -5522,4 +5782,279 @@ test "connection: original_destination_connection_id in server transport params 
     // The DCID must be stored for use in transport params.
     try testing.expectEqual(@as(u8, 8), conn.first_initial_dcid_len);
     try testing.expectEqualSlices(u8, &dcid, conn.first_initial_dcid[0..8]);
+}
+
+test "connection: ourScidBytes echoes client DCID after Initial received" {
+    // DCID echo: the server advertises the client's original DCID as its own SCID.
+    // This keeps all packets in a single Wireshark connection (no DCID change by
+    // the client), enabling correct pcap-based interop test analysis.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+
+    // Before any Initial is received, ourScidBytes falls back to local_cid.
+    try testing.expectEqualSlices(u8, &conn.local_cid.bytes, conn.ourScidBytes());
+
+    const dcid = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x00, 0x01 };
+    const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
+
+    // After Initial received, ourScidBytes must equal the client's DCID.
+    try testing.expectEqualSlices(u8, &dcid, conn.ourScidBytes());
+}
+
+test "connection: ourScidBytes length matches first_initial_dcid_len" {
+    // Regression: processShortHeaderPacket computes short-header DCID offset using
+    // first_initial_dcid_len (not the fixed cid_mod.len).  Verify that ourScidBytes()
+    // returns exactly first_initial_dcid_len bytes after an Initial is received.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+
+    const dcid = [_]u8{ 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11 };
+    const scid = [_]u8{ 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28 };
+    var buf: [256]u8 = undefined;
+    const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 4433 } };
+    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
+
+    // ourScidBytes() length must equal first_initial_dcid_len (both 8 here).
+    try testing.expectEqual(@as(usize, 8), conn.ourScidBytes().len);
+    try testing.expectEqual(conn.first_initial_dcid_len, @as(u8, @intCast(conn.ourScidBytes().len)));
+    // The bytes must match the client's original DCID.
+    try testing.expectEqualSlices(u8, &dcid, conn.ourScidBytes());
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-order packet number tracking (RFC 9000 §13.2)
+// ---------------------------------------------------------------------------
+
+test "connection: isPnDuplicate returns false for first packet" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    // No packet received yet.
+    try testing.expect(!conn.isPnDuplicate(0, 0));
+    try testing.expect(!conn.isPnDuplicate(0, 100));
+}
+
+test "connection: markPnReceived then isPnDuplicate returns true for same PN" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.markPnReceived(0, 10);
+    try testing.expect(conn.isPnDuplicate(0, 10));
+    try testing.expect(!conn.isPnDuplicate(0, 11)); // never received
+    try testing.expect(!conn.isPnDuplicate(0, 9));  // never received (out-of-order hole)
+}
+
+test "connection: markPnReceived out-of-order fills bitmap correctly" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    // Receive pkts 5, 3, 4 (out of order: 5 first, then gap-fill).
+    conn.markPnReceived(0, 5);
+    try testing.expectEqual(@as(u64, 5), conn.hot.rx_pn[0]);
+    try testing.expect(!conn.isPnDuplicate(0, 3)); // not yet received
+
+    conn.markPnReceived(0, 3); // out-of-order fill
+    try testing.expect(conn.isPnDuplicate(0, 3));  // now received
+    try testing.expect(!conn.isPnDuplicate(0, 4)); // still missing
+    try testing.expectEqual(@as(u64, 5), conn.hot.rx_pn[0]); // largest unchanged
+
+    conn.markPnReceived(0, 4); // fill the remaining gap
+    try testing.expect(conn.isPnDuplicate(0, 4));
+    try testing.expect(conn.isPnDuplicate(0, 3));
+    try testing.expect(conn.isPnDuplicate(0, 5));
+}
+
+test "connection: isPnDuplicate treats PN > 63 below largest as duplicate" {
+    // PNs more than 63 below largest are outside the sliding window and must be
+    // treated as duplicates to prevent replay (RFC 9000 §13.2.3).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.markPnReceived(0, 100);
+    try testing.expect(conn.isPnDuplicate(0, 36));  // 100 - 36 = 64 → duplicate
+    try testing.expect(!conn.isPnDuplicate(0, 37)); // 100 - 37 = 63 → within window
+}
+
+test "connection: buildAckRangesFromBitmap all contiguous" {
+    // Bitmap: bits 0-3 set → packets [largest-3, largest] all received.
+    // Expected: one range with ack_range=3.
+    const testing = std.testing;
+    const bitmap: u64 = 0b1111; // bits 0,1,2,3 set
+    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    try testing.expectEqual(@as(usize, 1), count);
+    try testing.expectEqual(@as(u62, 3), ranges[0].ack_range);
+}
+
+test "connection: buildAckRangesFromBitmap with gap" {
+    // Bitmap: bits 0,1 set (packets N, N-1 received),
+    //         bits 2,3 clear (packets N-2, N-3 missing),
+    //         bits 4,5 set (packets N-4, N-5 received).
+    // Expected ACK: First Range [N-1,N] (ack_range=1), gap=2, Range [N-5,N-4] (ack_range=1).
+    const testing = std.testing;
+    const bitmap: u64 = 0b110011; // bits 0,1,4,5 set
+    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u62, 1), ranges[0].ack_range); // [N-1, N]
+    try testing.expectEqual(@as(u62, 2), ranges[1].gap);       // 2 missing packets
+    try testing.expectEqual(@as(u62, 1), ranges[1].ack_range); // [N-5, N-4]
+}
+
+test "connection: sendEncryptedAck encodes gaps from received bitmap" {
+    // When packets N and N-2 were received (N-1 missing), the ACK must carry
+    // two ranges separated by a gap of 1 so the sender knows N-1 is missing.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    const dcid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+
+    // Mark packets 0 and 2 received (packet 1 is missing).
+    conn.markPnReceived(0, 0);
+    conn.markPnReceived(0, 2); // largest is now 2; bitmap: bit0=pkt2, bit1=pkt1(missing), bit2=pkt0
+    conn.markPnReceived(0, 0); // duplicate mark of pkt 0 (fills bit 2)
+    try conn.sendEncryptedAck(0);
+
+    // Decrypt the queued ACK packet to inspect its frame content.
+    const slot = &conn.sq[0];
+    const ik = conn.initial_keys.server;
+    // Parse the long header.
+    const pn_off = try packet.longHeaderPnOffset(slot.buf[0..slot.len], packet.QUIC_VERSION_1);
+    var hp_buf: [1500]u8 = undefined;
+    @memcpy(hp_buf[0..slot.len], slot.buf[0..slot.len]);
+    _ = crypto.removeHeaderProtection(ik.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+    const parse_result = try packet.parseLongHeader(hp_buf[0..slot.len]);
+    const pn: u64 = packet.decodePacketNumber(0, parse_result.header.packet_number, @as(u8, parse_result.header.pn_len) * 8);
+    const payload_start = parse_result.consumed - parse_result.header.payload.len;
+    var plaintext: [256]u8 = undefined;
+    const pt_len = parse_result.header.payload.len - 16;
+    try crypto.decryptPayload(ik, pn, hp_buf[0..payload_start], parse_result.header.payload, plaintext[0..pt_len]);
+
+    // Parse the ACK frame from the plaintext.
+    const f = try frame.parseFrame(plaintext[0..pt_len]);
+    try testing.expect(f.frame == .ack);
+    const ack = f.frame.ack;
+    // largest_acked must be 2; there must be at least 2 ranges (gap for missing pkt 1).
+    try testing.expectEqual(@as(u62, 2), ack.largest_acked);
+    try testing.expect(ack.range_count >= 2);
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests: out-of-order packet handling (RFC 9000 §13.2)
+// ---------------------------------------------------------------------------
+
+test "connection: out-of-order 1-RTT packets are processed not dropped" {
+    // Regression: before the fix, any packet with PN ≤ largest-seen was silently
+    // dropped (even if that specific PN was never actually received).
+    // This test verifies out-of-order packets are now correctly processed.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+
+    // Establish connection by manually setting up keys and state.
+    const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+    conn.hot.state = .established; // skip handshake
+
+    // Derive app keys (simplified; just use a fixed 16-byte key for both directions).
+    const app_key = [_]u8{0xAA} ** 16;
+    const app_iv = [_]u8{0xBB} ** 12;
+    const app_hp = [_]u8{0xCC} ** 16;
+    conn.app_keys = tls.AppKeys{
+        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
+        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
+    };
+    conn.peer_cid = conn.local_cid;
+
+    // Build and process packet 5 first.
+    var pkt5: [256]u8 = undefined;
+    const pkt5_len = packet.encodeShortHeader(&pkt5, &conn.local_cid.bytes, 5, false);
+    var pt5: [8]u8 = undefined;
+    const pt5_len = frame.encodeFrame(&pt5, .ping);
+    const ct5_len = pt5_len + 16;
+    crypto.encryptPayload(conn.app_keys.?.client, 5, pkt5[0..pkt5_len], pt5[0..pt5_len], pkt5[pkt5_len..][0..ct5_len]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt5[0], pkt5[pkt5_len - 4 ..][0..4], pkt5[pkt5_len..][0..16]);
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+    try conn.receive(pkt5[0 .. pkt5_len + ct5_len], src, 1_000_000_000, io);
+    // After pkt 5: rx_pn[2] = 5, bitmap has bit 0 set.
+    try testing.expectEqual(@as(u64, 5), conn.hot.rx_pn[2]);
+    try testing.expect(conn.isPnDuplicate(2, 5)); // pkt 5 received
+    try testing.expect(!conn.isPnDuplicate(2, 4)); // pkt 4 NOT received (gap)
+
+    // Now receive packet 3 (out of order, after pkt 5).
+    var pkt3: [256]u8 = undefined;
+    const pkt3_len = packet.encodeShortHeader(&pkt3, &conn.local_cid.bytes, 3, false);
+    var pt3: [8]u8 = undefined;
+    const pt3_len = frame.encodeFrame(&pt3, .ping);
+    const ct3_len = pt3_len + 16;
+    crypto.encryptPayload(conn.app_keys.?.client, 3, pkt3[0..pkt3_len], pt3[0..pt3_len], pkt3[pkt3_len..][0..ct3_len]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt3[0], pkt3[pkt3_len - 4 ..][0..4], pkt3[pkt3_len..][0..16]);
+
+    // This should NOT be dropped (before the fix, it would have been).
+    try conn.receive(pkt3[0 .. pkt3_len + ct3_len], src, 1_000_000_001, io);
+    try testing.expect(conn.isPnDuplicate(2, 3)); // pkt 3 is now marked as received
+    try testing.expect(conn.isPnDuplicate(2, 5)); // pkt 5 still received
+    try testing.expect(!conn.isPnDuplicate(2, 4)); // pkt 4 still missing
+
+    // Receive pkt 4 to fill the gap.
+    var pkt4: [256]u8 = undefined;
+    const pkt4_len = packet.encodeShortHeader(&pkt4, &conn.local_cid.bytes, 4, false);
+    var pt4: [8]u8 = undefined;
+    const pt4_len = frame.encodeFrame(&pt4, .ping);
+    const ct4_len = pt4_len + 16;
+    crypto.encryptPayload(conn.app_keys.?.client, 4, pkt4[0..pkt4_len], pt4[0..pt4_len], pkt4[pkt4_len..][0..ct4_len]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt4[0], pkt4[pkt4_len - 4 ..][0..4], pkt4[pkt4_len..][0..16]);
+
+    _ = try conn.receive(pkt4[0 .. pkt4_len + ct4_len], src, 1_000_000_002, io);
+    // Now all three packets are marked as received.
+    try testing.expect(conn.isPnDuplicate(2, 3));
+    try testing.expect(conn.isPnDuplicate(2, 4));
+    try testing.expect(conn.isPnDuplicate(2, 5));
+}
+
+test "connection: packets outside 64-packet window are treated as duplicates" {
+    // Packets more than 63 below largest are outside the sliding window
+    // and must be treated as duplicates for safety (RFC 9000 §13.2.3).
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Receive pkt 100.
+    conn.markPnReceived(0, 100);
+    try testing.expect(conn.isPnDuplicate(0, 100));
+
+    // Pkt 36 is 100-36=64 positions away. The window covers the last 64 PNs.
+    // Pkt 37 is 63 away (within window), pkt 36 is 64 away (outside).
+    try testing.expect(!conn.isPnDuplicate(0, 37)); // 63 away → within window (not yet received)
+    try testing.expect(conn.isPnDuplicate(0, 36));  // 64 away → outside window → duplicate
+}
+
+test "connection: ACK with gap encodes correctly" {
+    // Regression: ensure ACK ranges handle gaps correctly when packets are missing.
+    // Simple case: receive pkts at positions [0,1] and [3,4] with pkt 2 missing.
+    // Bit positions (LSB=0): bit 0,1 set, bit 2 clear, bits 3,4 set = 0b11011
+    const testing = std.testing;
+    const bitmap: u64 = 0b11011; // bits {0,1,3,4} set
+    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+
+    // Expected: 2 ranges
+    // Range 0: ack_range = 1 (bits 0-1 set = 2 packets)
+    // Gap: 1 (bit 2 clear = 1 missing packet between the ranges)
+    // Range 1: ack_range = 1 (bits 3-4 set = 2 packets)
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expectEqual(@as(u62, 1), ranges[0].ack_range);
+    try testing.expectEqual(@as(u62, 1), ranges[1].gap);
+    try testing.expectEqual(@as(u62, 1), ranges[1].ack_range);
 }

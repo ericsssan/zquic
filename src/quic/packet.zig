@@ -154,18 +154,19 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
 /// Encode a Long Header into `buf`, without payload.
 /// Returns the number of bytes written (header only, up to and including the PN).
 /// `dest_bytes` is the wire-format Destination Connection ID (0–20 bytes).
-/// `src` is the Source Connection ID (always the local 8-byte CID).
+/// `src_bytes` is the wire-format Source Connection ID (0–20 bytes).
 pub fn encodeLongHeader(
     buf: []u8,
     pkt_type: PacketType,
     version: u32,
     dest_bytes: []const u8,
-    src: ConnectionId,
+    src_bytes: []const u8,
     token: []const u8,
     pn: u32,
     payload_len: usize,
 ) usize {
     std.debug.assert(dest_bytes.len <= 20);
+    std.debug.assert(src_bytes.len <= 20);
     // We always use 4-byte packet numbers in Phase 1 (bits 0..1 = 0b11).
     const pn_len: u8 = 4;
     var pos: usize = 0;
@@ -190,11 +191,13 @@ pub fn encodeLongHeader(
         pos += dest_bytes.len;
     }
 
-    // SCID
-    buf[pos] = cid.len;
+    // SCID (variable 0–20 bytes)
+    buf[pos] = @intCast(src_bytes.len);
     pos += 1;
-    @memcpy(buf[pos..][0..cid.len], &src.bytes);
-    pos += cid.len;
+    if (src_bytes.len > 0) {
+        @memcpy(buf[pos..][0..src_bytes.len], src_bytes);
+        pos += src_bytes.len;
+    }
 
     // Token (Initial only)
     if (pkt_type == .initial) {
@@ -494,7 +497,7 @@ test "packet: long header encode/parse round-trip (Initial)" {
     const token = [_]u8{};
     const payload_len: usize = 100;
 
-    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, &dcid.bytes, scid, &token, 42, payload_len);
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, &dcid.bytes, &scid.bytes, &token, 42, payload_len);
     // Fill in dummy payload
     @memset(buf[hdr_len..][0..payload_len], 0xab);
 
@@ -618,7 +621,7 @@ test "packet: parseLongHeader with non-empty Initial token" {
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
     const tok = [_]u8{ 0xAB, 0xCD, 0xEF, 0x01 }; // 4-byte token
 
-    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, &dcid.bytes, scid, &tok, 99, 20);
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_1, &dcid.bytes, &scid.bytes, &tok, 99, 20);
     @memset(buf[hdr_len..][0..20], 0xBB);
 
     const result = try parseLongHeader(buf[0 .. hdr_len + 20]);
@@ -721,7 +724,7 @@ test "packet: encodeLongHeader v2 encodes Initial with raw bits 0b01" {
     const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
 
-    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_2, &dcid.bytes, scid, &.{}, 1, 20);
+    const hdr_len = encodeLongHeader(&buf, .initial, QUIC_VERSION_2, &dcid.bytes, &scid.bytes, &.{}, 1, 20);
     @memset(buf[hdr_len..][0..20], 0xab);
 
     // First byte bits 5–4 must be 0b01 (v2 Initial raw bits).
