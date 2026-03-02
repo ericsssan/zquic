@@ -309,6 +309,9 @@ pub const Connection = struct {
     next_client_secret: [32]u8,
     /// Next-generation server traffic secret.
     next_server_secret: [32]u8,
+    /// Current key generation number (0 = initial, 1 = first rotation, etc).
+    /// Used for SSLKEYLOG tracking of rotated secrets.
+    current_key_generation: u32,
 
     // Path migration state (RFC 9000 §9) ----------------------------------------
 
@@ -464,6 +467,7 @@ pub const Connection = struct {
             .next_app_keys = null,
             .next_client_secret = [_]u8{0} ** 32,
             .next_server_secret = [_]u8{0} ** 32,
+            .current_key_generation = 0,
             .peer_disable_migration = false,
             .pending_handshake_done = false,
             .pending_max_data = false,
@@ -2317,6 +2321,7 @@ pub const Connection = struct {
         }
         self.app_keys = self.next_app_keys;
         self.current_key_phase = !self.current_key_phase;
+        self.current_key_generation += 1;
         self.key_update_pending = false;
 
         // Derive next-next generation from the (now-current) secrets.
@@ -2348,6 +2353,18 @@ pub const Connection = struct {
         if (self.key_update_pending) return error.KeyUpdatePending;
         self.rotateKeys(); // flips phase, derives new next, clears pending
         self.key_update_pending = true; // signal TX side to use new key_phase
+    }
+
+    /// Derive client and server secrets for a given generation (0=initial, 1+=rotations).
+    /// Used for SSLKEYLOG to track all key generations.
+    pub fn deriveSecretsForGeneration(self: *const Connection, generation: u32) struct { client: [32]u8, server: [32]u8 } {
+        var client = self.tls_state.client_app_secret;
+        var server = self.tls_state.server_app_secret;
+        for (0..generation) |_| {
+            client = crypto.deriveNextAppSecret(client, self.quic_version);
+            server = crypto.deriveNextAppSecret(server, self.quic_version);
+        }
+        return .{ .client = client, .server = server };
     }
 
     // -----------------------------------------------------------------------

@@ -193,7 +193,11 @@ pub fn main(init: std.process.Init) !void {
                         break :conn_loop;
                     },
                     .stream_data => |s| startTransfer(&conn, s.stream_id, &transfers, www_dir),
-                    .connection_closed => break :conn_loop,
+                    .connection_closed => {
+                        // Append any rotated keys to the keylog before closing
+                        appendRotatedSecretsToKeyLog(&conn, io);
+                        break :conn_loop;
+                    },
                     else => {},
                 }
             }
@@ -374,16 +378,12 @@ fn computeTimeout(deadline: ?i64) std.Io.Timeout {
 
 /// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
 /// 1-RTT QUIC packets including those with key updates.  Written to /logs/keys.log
-/// (the path the interop runner expects for server logs) after the TLS handshake completes.
-/// Generates multiple secret generations (CLIENT_TRAFFIC_SECRET_0 through _19, etc.) to
-/// support packet decryption after key rotations.
+/// (the path the interop runner expects for server logs).
+/// Writes initial secrets at handshake, then appends rotated secrets dynamically.
 fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
     const tls = &conn.tls_state;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
-
-    // Generate up to 20 generations of rotated secrets for key updates.
-    const num_generations = 20;
-    var buf: [16384]u8 = undefined;
+    var buf: [4096]u8 = undefined;
     var pos: usize = 0;
 
     // Write handshake secrets
@@ -396,35 +396,62 @@ fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
     pos += line.len;
 
     // Write initial application secrets (generation 0)
-    var client_secret = tls.client_app_secret;
-    var server_secret = tls.server_app_secret;
-
+    const secrets_0 = conn.deriveSecretsForGeneration(0);
     line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_0 {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(client_secret, .lower) }) catch return;
+        .{ random_hex, std.fmt.bytesToHex(secrets_0.client, .lower) }) catch return;
     pos += line.len;
 
     line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_0 {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(server_secret, .lower) }) catch return;
+        .{ random_hex, std.fmt.bytesToHex(secrets_0.server, .lower) }) catch return;
     pos += line.len;
-
-    // Generate and write rotated secrets for key updates
-    for (1..num_generations) |gen| {
-        client_secret = quic.crypto.deriveNextAppSecret(client_secret, conn.quic_version);
-        server_secret = quic.crypto.deriveNextAppSecret(server_secret, conn.quic_version);
-
-        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n",
-            .{ gen, random_hex, std.fmt.bytesToHex(client_secret, .lower) }) catch return;
-        pos += line.len;
-
-        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n",
-            .{ gen, random_hex, std.fmt.bytesToHex(server_secret, .lower) }) catch return;
-        pos += line.len;
-    }
 
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
     file.writePositionalAll(io, buf[0..pos], 0) catch {};
     std.debug.print("keylog written ({d} bytes)\n", .{pos});
+}
+
+/// Update SSLKEYLOG file with any new rotated keys. Called after key updates to
+/// ensure Wireshark can decrypt packets with new keys. Rewrites the entire file
+/// with all generations up to the current key generation.
+fn appendRotatedSecretsToKeyLog(conn: *const quic.Connection, io: std.Io) void {
+    const tls = &conn.tls_state;
+    const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
+    var buf: [16384]u8 = undefined;
+    var pos: usize = 0;
+
+    // Skip if no key rotations occurred
+    if (conn.current_key_generation == 0) return;
+
+    // Write handshake secrets
+    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
+    pos += line.len;
+
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
+        .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
+    pos += line.len;
+
+    // Write all generations (0 through current)
+    var gen: u32 = 0;
+    while (gen <= conn.current_key_generation) : (gen += 1) {
+        const secrets = conn.deriveSecretsForGeneration(gen);
+        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n",
+            .{ gen, random_hex, std.fmt.bytesToHex(secrets.client, .lower) }) catch return;
+        pos += line.len;
+
+        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n",
+            .{ gen, random_hex, std.fmt.bytesToHex(secrets.server, .lower) }) catch return;
+        pos += line.len;
+
+        if (pos >= buf.len - 256) break; // Avoid buffer overflow
+    }
+
+    // Overwrite the keylog file with all generations
+    const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
+    defer file.close(io);
+    file.writePositionalAll(io, buf[0..pos], 0) catch {};
+    std.debug.print("keylog updated ({d} bytes with generations 0..{d})\n", .{ pos, conn.current_key_generation });
 }
 
 fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {
