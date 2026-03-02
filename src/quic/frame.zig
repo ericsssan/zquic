@@ -144,6 +144,16 @@ pub const ParseResult = struct {
     consumed: usize,
 };
 
+/// Parse a QUIC frame from a buffer.
+///
+/// Returns ParseResult on success, or one of:
+///   - BufferEmpty: no data in buffer
+///   - InvalidFrame: malformed frame data (frame type/fields invalid)
+///   - UnknownFrame: unrecognized frame type code
+///
+/// Note: Error messages do not include frame type context. To identify which
+/// frame type failed, log the first byte(s) before calling parseFrame, or
+/// enhance ParseResult to include frame_type_hint: u8 for debugging.
 pub fn parseFrame(buf: []const u8) !ParseResult {
     if (buf.len == 0) return error.BufferEmpty;
 
