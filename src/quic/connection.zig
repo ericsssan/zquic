@@ -6341,9 +6341,9 @@ test "connection: multiple key rotations toggle key_phase correctly" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
-    
+
     const initial_phase = conn.current_key_phase;
-    
+
     conn.app_keys = .{
         .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
         .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
@@ -6351,11 +6351,132 @@ test "connection: multiple key rotations toggle key_phase correctly" {
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = [_]u8{0} ** 32;
     conn.next_server_secret = [_]u8{0} ** 32;
-    
+
     conn.rotateKeys();
     const phase_after_1 = conn.current_key_phase;
     try testing.expect(phase_after_1 != initial_phase);
-    
+
     conn.rotateKeys();
     try testing.expectEqual(initial_phase, conn.current_key_phase);
+}
+
+test "connection: key generation counter increments on rotation" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Initially at generation 0
+    try testing.expectEqual(@as(u32, 0), conn.current_key_generation);
+
+    // Setup for key rotation
+    conn.app_keys = .{
+        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+    };
+    conn.next_app_keys = conn.app_keys.?;
+    conn.next_client_secret = [_]u8{0} ** 32;
+    conn.next_server_secret = [_]u8{0} ** 32;
+
+    // After first rotation, should be generation 1
+    conn.rotateKeys();
+    try testing.expectEqual(@as(u32, 1), conn.current_key_generation);
+
+    // After second rotation, should be generation 2
+    conn.rotateKeys();
+    try testing.expectEqual(@as(u32, 2), conn.current_key_generation);
+
+    // After third rotation, should be generation 3
+    conn.rotateKeys();
+    try testing.expectEqual(@as(u32, 3), conn.current_key_generation);
+}
+
+test "connection: deriveSecretsForGeneration returns correct generation secrets" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Set initial secrets
+    conn.tls_state.client_app_secret = [_]u8{0xaa} ** 32;
+    conn.tls_state.server_app_secret = [_]u8{0xbb} ** 32;
+
+    // Generation 0 should return the initial secrets
+    const gen0 = conn.deriveSecretsForGeneration(0);
+    try testing.expectEqualSlices(u8, &conn.tls_state.client_app_secret, &gen0.client);
+    try testing.expectEqualSlices(u8, &conn.tls_state.server_app_secret, &gen0.server);
+
+    // Generation 1 should be derived (different from gen 0)
+    const gen1 = conn.deriveSecretsForGeneration(1);
+    try testing.expect(!std.mem.eql(u8, &gen0.client, &gen1.client));
+    try testing.expect(!std.mem.eql(u8, &gen0.server, &gen1.server));
+
+    // Generation 2 should be different from gen 1
+    const gen2 = conn.deriveSecretsForGeneration(2);
+    try testing.expect(!std.mem.eql(u8, &gen1.client, &gen2.client));
+    try testing.expect(!std.mem.eql(u8, &gen1.server, &gen2.server));
+
+    // But gen1 called again should produce same secrets (deterministic)
+    const gen1_again = conn.deriveSecretsForGeneration(1);
+    try testing.expectEqualSlices(u8, &gen1.client, &gen1_again.client);
+    try testing.expectEqualSlices(u8, &gen1.server, &gen1_again.server);
+}
+
+test "connection: multiple sequential key rotations with generation tracking" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const initial_gen = conn.current_key_generation;
+    try testing.expectEqual(@as(u32, 0), initial_gen);
+
+    // Setup for multiple rotations
+    conn.app_keys = .{
+        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+    };
+    conn.next_app_keys = conn.app_keys.?;
+    conn.next_client_secret = [_]u8{1} ** 32;
+    conn.next_server_secret = [_]u8{2} ** 32;
+
+    // Perform 10 sequential rotations
+    var i: u32 = 0;
+    while (i < 10) : (i += 1) {
+        conn.rotateKeys();
+        try testing.expectEqual(i + 1, conn.current_key_generation);
+    }
+
+    // Verify we can still derive secrets for all generations
+    var gen: u32 = 0;
+    while (gen <= conn.current_key_generation) : (gen += 1) {
+        const secrets = conn.deriveSecretsForGeneration(gen);
+        // Just verify we get valid secret data (non-zero length)
+        try testing.expectEqual(@as(usize, 32), secrets.client.len);
+        try testing.expectEqual(@as(usize, 32), secrets.server.len);
+    }
+}
+
+test "connection: key_phase bit and key_generation independent" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    const initial_phase = conn.current_key_phase;
+    const initial_gen = conn.current_key_generation;
+
+    // Setup for rotation
+    conn.app_keys = .{
+        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+    };
+    conn.next_app_keys = conn.app_keys.?;
+    conn.next_client_secret = [_]u8{0} ** 32;
+    conn.next_server_secret = [_]u8{0} ** 32;
+
+    // After 2 rotations:
+    // - key_phase should return to initial (false->true->false)
+    // - key_generation should be 2
+    conn.rotateKeys();
+    conn.rotateKeys();
+
+    try testing.expectEqual(initial_phase, conn.current_key_phase);
+    try testing.expectEqual(initial_gen + 2, conn.current_key_generation);
 }
