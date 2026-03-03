@@ -211,6 +211,8 @@ pub const Connection = struct {
     tls_state: tls.TlsServer,
     /// QUIC version negotiated for this connection (v1 or v2).
     quic_version: u32,
+    /// Server's configured QUIC version (for version negotiation).
+    configured_version: u32,
 
     // Per-epoch packet keys (null until negotiated)
     hs_keys: ?tls.HandshakeKeys,
@@ -432,6 +434,7 @@ pub const Connection = struct {
             .initial_keys = undefined,
             .tls_state = tls_server,
             .quic_version = config.initial_quic_version,
+            .configured_version = config.initial_quic_version,
             .hs_keys = null,
             .app_keys = null,
             .streams = .{},
@@ -755,21 +758,32 @@ pub const Connection = struct {
     }
 
     fn processLongHeaderPacket(self: *Connection, data: []const u8, src: SocketAddr, io: std.Io) !usize {
-        // RFC 9000 §6: Version negotiation.
+        // RFC 9000 §6 + RFC 9368: Version negotiation with compatible version support.
         // Check the version field before full parsing — VN packets (version 0) have
         // a different wire format that parseLongHeader cannot handle.
         if (data.len >= 5) {
             const ver = std.mem.readInt(u32, data[1..5], .big);
-            if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2) {
-                if (ver != 0) {
-                    // Defense-in-depth: per-version DoS protection.
-                    // Only send VN if we haven't recently sent one for this version (60s cooldown).
-                    if (!self.shouldThrottleVersionNeg(ver)) {
-                        self.sendVersionNeg(data) catch {};
+
+            // RFC 9368: Compatible version negotiation.
+            // If we're in idle state and receive a compatible version, accept it.
+            // Otherwise, if unsupported/incompatible, send Version Negotiation.
+            if (self.hot.state == .idle) {
+                // Check if version is supported (v1 or v2).
+                if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2 and ver != 0) {
+                    // Unsupported version; send Version Negotiation.
+                    if (ver != 0) {
+                        if (!self.shouldThrottleVersionNeg(ver)) {
+                            self.sendVersionNeg(data) catch {};
+                        }
                     }
+                    return data.len;
                 }
-                // Version 0 = received a VN packet from the peer; ignore it.
-                return data.len;
+                // v1 and v2 are compatible; accept this packet and upgrade to configured version.
+            } else {
+                // Handshake already started; check version matches what was negotiated.
+                if (ver != self.quic_version and ver != 0) {
+                    return data.len; // Silently drop mismatched version
+                }
             }
         }
 
@@ -790,6 +804,10 @@ pub const Connection = struct {
         // On the first Initial, derive initial keys from the client's DCID before HP removal.
         // Keys are required to select the HP key and remove header protection.
         if (raw_pkt_type == .initial and self.hot.state == .idle) {
+            // RFC 9368: Compatible version negotiation.
+            // Use the client's version for initial keys (must match for decryption).
+            // This enables compatible version negotiation where client sends v1 and
+            // we can eventually respond in v2 after handshake.
             self.quic_version = ver;
             self.tls_state.quic_version = ver;
             self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
@@ -2065,9 +2083,28 @@ pub const Connection = struct {
         const copy_len = @min(scid_len, cid_mod.len);
         @memcpy(src_cid.bytes[0..copy_len], raw[pos..][0..copy_len]);
 
-        var vn_buf: [32]u8 = undefined;
-        const n = packet.encodeVersionNegotiation(&vn_buf, src_cid, self.local_cid);
-        try self.enqueueSend(vn_buf[0..n]);
+        // Encode VN packet with supported versions.
+        // RFC 9000 §6: advertise all versions the server supports for compatibility.
+        var vn_buf: [36]u8 = undefined;
+        var vn_pos: usize = 0;
+        vn_buf[vn_pos] = 0x80; // long header bit set
+        vn_pos += 1;
+        std.mem.writeInt(u32, vn_buf[vn_pos..][0..4], 0, .big); // version = 0 (VN marker)
+        vn_pos += 4;
+        vn_buf[vn_pos] = cid_mod.len;
+        vn_pos += 1;
+        @memcpy(vn_buf[vn_pos..][0..cid_mod.len], &src_cid.bytes);
+        vn_pos += cid_mod.len;
+        vn_buf[vn_pos] = cid_mod.len;
+        vn_pos += 1;
+        @memcpy(vn_buf[vn_pos..][0..cid_mod.len], &self.local_cid.bytes);
+        vn_pos += cid_mod.len;
+        // Advertise both QUIC v1 and v2 as supported versions.
+        std.mem.writeInt(u32, vn_buf[vn_pos..][0..4], packet.QUIC_VERSION_1, .big);
+        vn_pos += 4;
+        std.mem.writeInt(u32, vn_buf[vn_pos..][0..4], packet.QUIC_VERSION_2, .big);
+        vn_pos += 4;
+        try self.enqueueSend(vn_buf[0..vn_pos]);
     }
 
     /// Build and enqueue a Retry packet (RFC 9000 §8.1).
