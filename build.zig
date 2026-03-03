@@ -39,6 +39,22 @@ pub fn build(b: *std.Build) void {
     const server_step = b.step("run-server", "Run interop server (default port 4433)");
     server_step.dependOn(&run_server.step);
 
+    // Key rotation verification tool
+    const verify_mod = b.createModule(.{
+        .root_source_file = b.path("tools/verify_key_rotation.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    verify_mod.addImport("zquic", zquic_mod);
+    const verify = b.addExecutable(.{
+        .name = "verify-key-rotation",
+        .root_module = verify_mod,
+    });
+    b.installArtifact(verify);
+    const run_verify = b.addRunArtifact(verify);
+    const verify_step = b.step("verify-key-rotation", "Run key rotation verification");
+    verify_step.dependOn(&run_verify.step);
+
     // Per-module unit tests
     const test_step = b.step("test", "Run unit tests");
     const test_files = [_][]const u8{
