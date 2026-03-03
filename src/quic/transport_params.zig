@@ -28,6 +28,7 @@ const TP_DISABLE_ACTIVE_MIGRATION: u62 = 0x0c;
 const TP_ACTIVE_CONNECTION_ID_LIMIT: u62 = 0x0e;
 const TP_INITIAL_SOURCE_CONNECTION_ID: u62 = 0x0f;
 const TP_RETRY_SOURCE_CONNECTION_ID: u62 = 0x10;
+const TP_VERSION_INFORMATION: u62 = 0x11;
 
 // ---------------------------------------------------------------------------
 // TransportParams
@@ -56,6 +57,10 @@ pub const TransportParams = struct {
     /// Retry source CID from the Retry packet we sent.
     /// RFC 9000 §18.2 parameter 0x10.
     retry_source_connection_id: ?ConnectionId = null,
+    /// Version information: list of supported QUIC versions.
+    /// RFC 9369 parameter 0x11. Stored as raw bytes (4 bytes per version).
+    version_information: ?[20]u8 = null,
+    version_information_len: u8 = 0, // Number of bytes (multiple of 4)
 };
 
 // ---------------------------------------------------------------------------
@@ -127,6 +132,13 @@ pub fn encode(params: TransportParams, buf: []u8) usize {
         pos += cid.len;
     }
 
+    if (params.version_information) |vi| {
+        pos += varint.encode(buf[pos..], TP_VERSION_INFORMATION);
+        pos += varint.encode(buf[pos..], @intCast(params.version_information_len));
+        @memcpy(buf[pos..][0..params.version_information_len], vi[0..params.version_information_len]);
+        pos += params.version_information_len;
+    }
+
     return pos;
 }
 
@@ -160,7 +172,7 @@ pub fn decode(buf: []const u8) !TransportParams {
 
         const param_data = buf[pos..][0..param_len];
 
-        // Check for duplicates among known IDs 0x00, 0x01..0x0f, 0x10
+        // Check for duplicates among known IDs 0x00, 0x01..0x0f, 0x10, 0x11
         if (id_vi.value == 0) {
             const bit: u32 = 1; // bit 0 for ID 0
             if (seen & bit != 0) return error.DuplicateParam;
@@ -171,6 +183,10 @@ pub fn decode(buf: []const u8) !TransportParams {
             seen |= bit;
         } else if (id_vi.value == 16) {
             const bit: u32 = @as(u32, 1) << 16; // bit 16 for ID 16 (0x10)
+            if (seen & bit != 0) return error.DuplicateParam;
+            seen |= bit;
+        } else if (id_vi.value == 17) {
+            const bit: u32 = @as(u32, 1) << 17; // bit 17 for ID 17 (0x11)
             if (seen & bit != 0) return error.DuplicateParam;
             seen |= bit;
         }
@@ -255,6 +271,15 @@ pub fn decode(buf: []const u8) !TransportParams {
                 var scid: ConnectionId = .{};
                 @memcpy(&scid.bytes, param_data);
                 params.retry_source_connection_id = scid;
+            },
+            TP_VERSION_INFORMATION => {
+                // RFC 9369: version_information is a list of 32-bit version numbers.
+                // Must be multiple of 4 bytes and fit in our buffer (max 20 bytes).
+                if (param_len % 4 != 0 or param_len > 20) return error.InvalidParams;
+                var vi: [20]u8 = undefined;
+                @memcpy(vi[0..param_len], param_data);
+                params.version_information = vi;
+                params.version_information_len = @intCast(param_len);
             },
             else => {}, // Unknown parameters are silently skipped (RFC 9000 §18.1).
         }
@@ -631,5 +656,53 @@ test "transport_params: original_destination_connection_id with length > 20 retu
     pos += varint.encode(buf[pos..], 21); // invalid: RFC max is 20 bytes
     @memset(buf[pos..][0..21], 0xaa);
     pos += 21;
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: version_information round-trip" {
+    const testing = std.testing;
+    var buf: [512]u8 = undefined;
+
+    // Version information: two versions (8 bytes total)
+    var vi: [20]u8 = undefined;
+    vi[0] = 0x00;
+    vi[1] = 0x00;
+    vi[2] = 0x00;
+    vi[3] = 0x01; // QUIC v1 (0x00000001)
+    vi[4] = 0x6b;
+    vi[5] = 0x33;
+    vi[6] = 0x43;
+    vi[7] = 0x50; // QUIC v2 (0x6b3343c0)
+    const params = TransportParams{
+        .version_information = vi,
+        .version_information_len = 8,
+    };
+    const n = encode(params, &buf);
+    const decoded = try decode(buf[0..n]);
+
+    try testing.expect(decoded.version_information != null);
+    try testing.expectEqual(@as(u8, 8), decoded.version_information_len);
+    try testing.expectEqualSlices(u8, vi[0..8], decoded.version_information.?[0..8]);
+}
+
+test "transport_params: version_information with invalid length (not multiple of 4) returns error" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_VERSION_INFORMATION);
+    pos += varint.encode(buf[pos..], 5); // invalid: not multiple of 4
+    @memset(buf[pos..][0..5], 0xaa);
+    pos += 5;
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: version_information with length > 20 returns error" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    pos += varint.encode(buf[pos..], TP_VERSION_INFORMATION);
+    pos += varint.encode(buf[pos..], 24); // invalid: > 20 bytes (6 versions)
+    @memset(buf[pos..][0..24], 0xaa);
+    pos += 24;
     try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
 }

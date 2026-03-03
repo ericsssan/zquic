@@ -42,6 +42,7 @@ const TLS_VERSION_1_3: u16 = 0x0304;
 const TLS_VERSION_LEGACY: u16 = 0x0303;
 const CIPHER_TLS_AES_128_GCM_SHA256: u16 = 0x1301;
 const GROUP_X25519: u16 = 0x001d;
+const GROUP_SECP256R1: u16 = 0x0017; // P-256
 
 // Extension types
 const EXT_SUPPORTED_VERSIONS: u16 = 0x002b;
@@ -141,6 +142,11 @@ pub const TlsServer = struct {
     // QUIC version negotiated for this connection (set by Connection after accept).
     // Determines which key derivation labels to use (RFC 9001 vs RFC 9369).
     quic_version: u32 = packet_mod.QUIC_VERSION_1,
+
+    // Server's initially configured QUIC version (set by Connection).
+    // Used for compatible version negotiation: if peer's version_information
+    // includes this version, we can switch to it during handshake.
+    server_configured_version: u32 = packet_mod.QUIC_VERSION_1,
 
     // ALPN negotiation (RFC 7301 / TLS ext 0x0010).
     // required_alpn_len == 0 means no ALPN check.
@@ -338,6 +344,29 @@ pub const TlsServer = struct {
 
         // Store the client's transport parameters.
         self.peer_params = ch.peer_transport_params;
+
+        // Compatible version negotiation (RFC 9369): if the peer supports our configured version,
+        // switch to it for both packet headers AND key derivation (per RFC 9369 §3).
+        // Handshake keys are derived using the negotiated version (not the initial version).
+        if (self.peer_params.version_information) |vi_buf| {
+            const vi_len = self.peer_params.version_information_len;
+            if (vi_len >= 4 and vi_len % 4 == 0) {
+                // version_information is a list of 32-bit version numbers.
+                // Check if any matches our server_configured_version.
+                var i: u8 = 0;
+                while (i < vi_len) : (i += 4) {
+                    const ver = @as(u32, vi_buf[i]) << 24 |
+                               @as(u32, vi_buf[i + 1]) << 16 |
+                               @as(u32, vi_buf[i + 2]) << 8 |
+                               @as(u32, vi_buf[i + 3]);
+                    if (ver == self.server_configured_version and ver != self.quic_version) {
+                        // Peer supports our configured version; switch to it for key derivation.
+                        self.quic_version = ver;
+                        break;
+                    }
+                }
+            }
+        }
 
         // Save client_random for SSLKEYLOG export.
         self.client_random = ch.random;
