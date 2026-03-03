@@ -552,35 +552,52 @@ test "crypto: v2 derivePacketKeys uses quicv2 labels" {
 // REGRESSION TESTS: CPU OPTIMIZATIONS
 // ---------------------------------------------------------------------------
 
-test "regression: buildNonce unrolled loop consistency" {
+test "regression: buildNonce unrolled loop correctness" {
     // Regression test for nonce building optimization (loop unrolling).
-    // Verifies that the unrolled 8-byte XOR produces correct results and is consistent.
+    // Verifies that the unrolled 8-byte XOR produces correct byte-by-byte results.
     const testing = std.testing;
 
     const iv = [_]u8{ 0xfa, 0x04, 0x4b, 0x2f, 0x42, 0xa3, 0xfd, 0x3b, 0x46, 0xfb, 0x25, 0x5c };
 
-    // Test PN = 0 (no XOR change)
+    // Test PN = 0 (no change to any byte)
     {
-        const nonce1 = buildNonce(iv, 0);
-        const nonce2 = buildNonce(iv, 0);
-        try testing.expectEqualSlices(u8, &nonce1, &nonce2);
-        try testing.expectEqualSlices(u8, &iv, &nonce1); // PN=0 doesn't change nonce
+        const nonce = buildNonce(iv, 0);
+        try testing.expectEqualSlices(u8, &iv, &nonce);
     }
 
-    // Test that different PNs produce different nonces
+    // Test PN = 1: only bytes 4-11 should be affected (XOR with big-endian 0x0000000000000001)
+    // pn_bytes = [0,0,0,0,0,0,0,1], so only nonce[11] ^= 1
     {
-        const nonce1 = buildNonce(iv, 1);
-        const nonce2 = buildNonce(iv, 2);
-        try testing.expect(!std.mem.eql(u8, &nonce1, &nonce2));
+        const nonce = buildNonce(iv, 1);
+        // First 4 bytes should be unchanged
+        try testing.expectEqualSlices(u8, iv[0..4], nonce[0..4]);
+        // Bytes 4-10 should be unchanged (no XOR with zero)
+        try testing.expectEqualSlices(u8, iv[4..11], nonce[4..11]);
+        // Last byte should be XOR'd with 1
+        try testing.expectEqual(@as(u8, iv[11] ^ 1), nonce[11]);
     }
 
-    // Test that large PN values work correctly
+    // Test PN = 256 (0x0000000000000100): affects nonce[10] and nonce[11]
+    // pn_bytes = [0,0,0,0,0,0,1,0], so nonce[10] ^= 1, nonce[11] ^= 0
     {
-        const nonce_small = buildNonce(iv, 0xFF);
-        const nonce_large = buildNonce(iv, 0xFFFFFFFF);
-        // Both should be valid nonces (12 bytes each)
-        try testing.expectEqual(@as(usize, 12), nonce_small.len);
-        try testing.expectEqual(@as(usize, 12), nonce_large.len);
+        const nonce = buildNonce(iv, 256);
+        try testing.expectEqualSlices(u8, iv[0..4], nonce[0..4]); // unchanged
+        try testing.expectEqualSlices(u8, iv[4..10], nonce[4..10]); // unchanged
+        try testing.expectEqual(@as(u8, iv[10] ^ 1), nonce[10]); // XOR'd
+        try testing.expectEqual(iv[11], nonce[11]); // unchanged (XOR with 0)
+    }
+
+    // Test PN = 0xFFFFFFFF: affects nonce[8..12]
+    // pn_bytes = [0,0,0,0,FF,FF,FF,FF], so nonce[8..12] ^= FF
+    {
+        const nonce = buildNonce(iv, 0xFFFFFFFF);
+        try testing.expectEqualSlices(u8, iv[0..4], nonce[0..4]); // unchanged
+        try testing.expectEqualSlices(u8, iv[4..8], nonce[4..8]); // unchanged
+        // Bytes 8-11 should be XOR'd with FF
+        try testing.expectEqual(@as(u8, iv[8] ^ 0xFF), nonce[8]);
+        try testing.expectEqual(@as(u8, iv[9] ^ 0xFF), nonce[9]);
+        try testing.expectEqual(@as(u8, iv[10] ^ 0xFF), nonce[10]);
+        try testing.expectEqual(@as(u8, iv[11] ^ 0xFF), nonce[11]);
     }
 }
 
