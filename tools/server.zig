@@ -213,6 +213,19 @@ pub fn main(init: std.process.Init) !void {
 
             // Advance any pending file transfers now that the send window may have grown.
             flushTransfers(&conn, &transfers, www_dir, io);
+
+            // Check if all transfers are complete and close the connection.
+            var all_transfers_done = true;
+            for (transfers) |t| {
+                if (t.active) {
+                    all_transfers_done = false;
+                    break;
+                }
+            }
+            if (all_transfers_done) {
+                conn.close(0, true, "") catch {};
+            }
+
             std.debug.print("  sq depth={d}\n", .{conn.sq_tail - conn.sq_head});
             var sent_bytes: usize = 0;
             var pkt_count: usize = 0;
