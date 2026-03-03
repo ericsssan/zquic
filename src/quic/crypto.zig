@@ -262,9 +262,15 @@ fn buildNonce(iv: [12]u8, pn: u64) [12]u8 {
     var nonce = iv;
     // XOR packet number into the low-order bytes (big-endian, left-padded).
     const pn_bytes = std.mem.toBytes(std.mem.nativeToBig(u64, pn));
-    for (0..8) |i| {
-        nonce[4 + i] ^= pn_bytes[i];
-    }
+    // Unroll the 8-byte XOR loop to eliminate loop overhead
+    nonce[4] ^= pn_bytes[0];
+    nonce[5] ^= pn_bytes[1];
+    nonce[6] ^= pn_bytes[2];
+    nonce[7] ^= pn_bytes[3];
+    nonce[8] ^= pn_bytes[4];
+    nonce[9] ^= pn_bytes[5];
+    nonce[10] ^= pn_bytes[6];
+    nonce[11] ^= pn_bytes[7];
     return nonce;
 }
 
