@@ -1195,3 +1195,116 @@ test "frame: ACK (0x02) without ECN has_ecn=false" {
         else => return error.WrongFrameType,
     }
 }
+
+// ============================================================================
+// Regression tests for frame parsing optimizations
+// ============================================================================
+
+test "frame: parse STREAM frame (high-frequency type)" {
+    const testing = std.testing;
+    // Regression: STREAM moved to first case in switch; verify it still parses correctly
+    var buf: [256]u8 = undefined;
+    const stream_frame = Frame{ .stream = .{
+        .stream_id = 42,
+        .offset = 100,
+        .fin = false,
+        .data = "hello",
+    } };
+    const n = encodeFrame(&buf, stream_frame);
+
+    const parsed = try parseFrame(buf[0..n]);
+    switch (parsed.frame) {
+        .stream => |s| {
+            try testing.expectEqual(@as(u62, 42), s.stream_id);
+            try testing.expectEqual(@as(u62, 100), s.offset);
+            try testing.expectEqual(false, s.fin);
+            try testing.expectEqualSlices(u8, "hello", s.data);
+        },
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: parse PADDING frame (common frame type)" {
+    const testing = std.testing;
+    // Regression: PADDING moved to early position; verify it still parses correctly
+    var buf: [10]u8 = undefined;
+    @memset(&buf, 0x00); // PADDING is all zeros
+
+    const parsed = try parseFrame(&buf);
+    switch (parsed.frame) {
+        .padding => |p| try testing.expectEqual(@as(usize, 10), p),
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: parse PING frame (moved to early position)" {
+    // Regression: PING moved earlier in switch; verify it still parses correctly
+    const buf = [_]u8{0x01}; // PING frame type
+
+    const parsed = try parseFrame(&buf);
+    switch (parsed.frame) {
+        .ping => {},
+        else => return error.WrongFrameType,
+    }
+}
+
+test "frame: parse all critical frame types in sequence" {
+    const testing = std.testing;
+    // Regression: verify reordered switch handles all frame types correctly
+    const frame_types = [_]u8{
+        0x00, // PADDING
+        0x01, // PING
+        0x02, // ACK
+        0x06, // CRYPTO
+        0x08, // STREAM (with offset, length, fin)
+        0x1c, // CONNECTION_CLOSE
+    };
+
+    for (frame_types) |ft| {
+        var buf: [256]u8 = undefined;
+        // Build minimal valid frame for each type
+        var pos: usize = 0;
+
+        if (ft == 0x00) {
+            // PADDING: just zeros
+            buf[0] = 0x00;
+            pos = 1;
+        } else if (ft == 0x01) {
+            // PING: just type
+            buf[0] = 0x01;
+            pos = 1;
+        } else if (ft == 0x02) {
+            // ACK: type + largest_acked + ack_delay + range_count + first_range
+            buf[0] = 0x02;
+            buf[1] = 0x00; // largest_acked = 0 (1 byte)
+            buf[2] = 0x00; // ack_delay = 0 (1 byte)
+            buf[3] = 0x00; // range_count = 0 (1 byte)
+            buf[4] = 0x00; // first_range = 0 (1 byte)
+            pos = 5;
+        } else if (ft == 0x06) {
+            // CRYPTO: type + offset + length + data
+            buf[0] = 0x06;
+            buf[1] = 0x00; // offset = 0
+            buf[2] = 0x05; // length = 5
+            buf[3..8].* = "hello".*;
+            pos = 8;
+        } else if (ft == 0x08) {
+            // STREAM (0x08 = no offset, no length, no fin): type + stream_id + data
+            buf[0] = 0x08;
+            buf[1] = 0x00; // stream_id = 0
+            buf[2..7].* = "hello".*;
+            pos = 7;
+        } else if (ft == 0x1c) {
+            // CONNECTION_CLOSE: type + error_code + frame_type + reason_len + reason
+            buf[0] = 0x1c;
+            buf[1] = 0x00; // error_code = 0
+            buf[2] = 0x00; // frame_type = 0
+            buf[3] = 0x02; // reason_len = 2
+            buf[4..6].* = "OK".*;
+            pos = 6;
+        }
+
+        const parsed = try parseFrame(buf[0..pos]);
+        try testing.expect(parsed.consumed > 0);
+    }
+}

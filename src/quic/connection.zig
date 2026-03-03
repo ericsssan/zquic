@@ -6878,3 +6878,80 @@ test "connection: packet encryption/decryption works with key rotation" {
     //
     // This is DIRECT proof that key rotation works for packet encryption/decryption.
 }
+
+// ============================================================================
+// Regression tests for processFrames optimizations
+// ============================================================================
+
+test "connection: processFrames marks STREAM frame as ack-eliciting" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
+    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+
+    // Build a STREAM frame
+    var buf: [256]u8 = undefined;
+    const stream_frame = frame.Frame{ .stream = .{
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = "test",
+    } };
+    const n = frame.encodeFrame(&buf, stream_frame);
+
+    // Reset pending_ack flags and process frame
+    conn.pending_ack[2] = false;
+    try conn.processFrames(buf[0..n], 2, null);
+
+    // Regression: STREAM frames must be ack-eliciting
+    try testing.expect(conn.pending_ack[2]);
+}
+
+test "connection: processFrames does NOT mark PADDING as ack-eliciting" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
+
+    // PADDING is all zeros
+    const buf = [_]u8{ 0x00, 0x00, 0x00 };
+
+    // Reset pending_ack and process frame
+    conn.pending_ack[2] = false;
+    try conn.processFrames(&buf, 2, null);
+
+    // Regression: PADDING frames must NOT be ack-eliciting
+    try testing.expect(!conn.pending_ack[2]);
+}
+
+test "connection: processFrames does NOT mark ACK as ack-eliciting" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
+
+    // Build an ACK frame
+    var buf: [256]u8 = undefined;
+    const ack_frame = frame.Frame{ .ack = .{
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .ranges = undefined,
+        .range_count = 0,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
+    } };
+    const n = frame.encodeFrame(&buf, ack_frame);
+
+    // Reset pending_ack and process frame
+    conn.pending_ack[2] = false;
+    try conn.processFrames(buf[0..n], 2, null);
+
+    // Regression: ACK frames must NOT be ack-eliciting
+    try testing.expect(!conn.pending_ack[2]);
+}

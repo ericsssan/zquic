@@ -155,3 +155,46 @@ test "varint: decode returns null on short buffer" {
     const buf = [_]u8{0x40};
     try testing.expectEqual(@as(?DecodeResult, null), decode(&buf));
 }
+
+test "varint: single-byte fast-path (all values 0-63)" {
+    const testing = std.testing;
+    // Regression test for fast-path optimization: verify all single-byte values decode correctly
+    for (0..64) |i| {
+        const val: u62 = @intCast(i);
+        var buf: [1]u8 = undefined;
+        const len = encode(&buf, val);
+        try testing.expectEqual(@as(usize, 1), len);
+
+        const result = decode(&buf).?;
+        try testing.expectEqual(val, result.value);
+        try testing.expectEqual(@as(u8, 1), result.len);
+    }
+}
+
+test "varint: fast-path boundary (63 vs 64)" {
+    const testing = std.testing;
+    // Regression test: ensure boundary between fast-path (< 0x40) and slow-path (>= 0x40) is correct
+
+    // 63 should be 1-byte (fast-path)
+    var buf1: [1]u8 = undefined;
+    const len1 = encode(&buf1, 63);
+    try testing.expectEqual(@as(usize, 1), len1);
+    try testing.expectEqual(@as(u62, 63), decode(&buf1).?.value);
+
+    // 64 should be 2-byte (slow-path)
+    var buf2: [2]u8 = undefined;
+    const len2 = encode(&buf2, 64);
+    try testing.expectEqual(@as(usize, 2), len2);
+    try testing.expectEqual(@as(u62, 64), decode(&buf2).?.value);
+}
+
+test "varint: fast-path does not decode 2-byte as 1-byte" {
+    const testing = std.testing;
+    // Regression test: ensure fast-path check (buf[0] < 0x40) correctly rejects multi-byte prefixes
+
+    // 2-byte value (prefix 01 = 0x40-0x7f)
+    const buf = [_]u8{ 0x40, 0x01 }; // encodes value 1 in 2-byte format
+    const result = decode(&buf).?;
+    try testing.expectEqual(@as(u62, 1), result.value);
+    try testing.expectEqual(@as(u8, 2), result.len); // Must consume 2 bytes, not 1
+}
