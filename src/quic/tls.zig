@@ -299,11 +299,15 @@ pub const TlsServer = struct {
                 // Hash the complete ClientHello into the transcript before processing.
                 // The key schedule requires H(ClientHello || ServerHello).
                 self.transcript.update(self.read_buf[0..self.read_len]);
+                // Defense-in-depth: zero the plaintext CRYPTO buffer to prevent leakage.
+                std.crypto.secureZero(u8, @as(*volatile [8192]u8, @ptrCast(&self.read_buf)));
                 self.read_len = 0;
                 return try self.handleClientHello(ch, out, io);
             },
             .wait_client_finished => {
                 const ok = try self.verifyClientFinished(self.read_buf[0..self.read_len]);
+                // Defense-in-depth: zero plaintext ClientFinished message after verification.
+                std.crypto.secureZero(u8, @as(*volatile [8192]u8, @ptrCast(&self.read_buf)));
                 self.read_len = 0;
                 if (!ok) return error.BadFinished;
                 self.state = .established;

@@ -364,9 +364,11 @@ pub const Connection = struct {
     pending_max_data: bool,
     /// Count of streams with a pending_reset set; avoids O(MAX_STREAMS) scan in tick().
     pending_reset_count: u8,
-    /// Timestamp of the last Version Negotiation response (nanoseconds).
-    /// Used to rate-limit VN responses to 1 per second.
-    last_vn_ns: i64,
+    /// Per-version DoS protection: track last 4 unknown versions + response times.
+    /// Prevents attackers from spamming different versions (RFC 9000 §5.1 rate-limiting).
+    unknown_versions: [4]u32,
+    unknown_version_times: [4]i64,
+    unknown_version_idx: u8,
 
     // Per-epoch TLS send offset (for FrameInfo tracking)
     crypto_send_offset: [3]u64,
@@ -472,7 +474,9 @@ pub const Connection = struct {
             .pending_handshake_done = false,
             .pending_max_data = false,
             .pending_reset_count = 0,
-            .last_vn_ns = -1_000_000_000, // sentinel: "1s before the epoch" so first VN is always allowed
+            .unknown_versions = [_]u32{0} ** 4,
+            .unknown_version_times = [_]i64{std.math.minInt(i64)} ** 4,
+            .unknown_version_idx = 0,
             .crypto_send_offset = .{ 0, 0, 0 },
             .crypto_recv_offset = .{ 0, 0, 0 },
             .crypto_staged = @import("std").mem.zeroes([3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag),
@@ -739,9 +743,9 @@ pub const Connection = struct {
             const ver = std.mem.readInt(u32, data[1..5], .big);
             if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2) {
                 if (ver != 0) {
-                    // Rate-limit VN responses to 1 per second to prevent amplification.
-                    if (self.current_time_ns - self.last_vn_ns >= 1_000_000_000) {
-                        self.last_vn_ns = self.current_time_ns;
+                    // Defense-in-depth: per-version DoS protection.
+                    // Only send VN if we haven't recently sent one for this version (60s cooldown).
+                    if (!self.shouldThrottleVersionNeg(ver)) {
                         self.sendVersionNeg(data) catch {};
                     }
                 }
@@ -768,11 +772,6 @@ pub const Connection = struct {
             self.tls_state.quic_version = ver;
             self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
             self.hot.state = .handshake;
-            std.debug.print("[conn] accepted Initial: ver=0x{x:0>8} our_scid=", .{ver});
-            for (self.local_cid.bytes) |b| std.debug.print("{x:0>2}", .{b});
-            std.debug.print(" client_dcid=", .{});
-            for (raw_dcid) |b| std.debug.print("{x:0>2}", .{b});
-            std.debug.print("\n", .{});
             // Record the client's address now so the first post-handshake 1-RTT
             // packet does not trigger a false path migration (RFC 9000 §9).
             self.peer_addr = src;
@@ -1024,7 +1023,6 @@ pub const Connection = struct {
         // Remove header protection before parsing.
         const pn_off = packet.shortHeaderPnOffset(our_scid_len);
         if (pn_off + 4 + 16 > data.len) {
-            std.debug.print("[conn] 1-RTT too short for HP: len={d} need={d}\n", .{ data.len, pn_off + 4 + 16 });
             return 0;
         }
         var hp_buf: [1500]u8 = undefined;
@@ -1051,21 +1049,16 @@ pub const Connection = struct {
 
         // Key phase handling (RFC 9001 §6): different phase bit indicates key update.
         if (hdr.key_phase != self.current_key_phase) {
-            std.debug.print("[conn] 1-RTT pn={d} key_phase MISMATCH hdr={d} cur={d} — trying next keys\n",
-                .{ pn, @intFromBool(hdr.key_phase), @intFromBool(self.current_key_phase) });
             // Peer has initiated a key update. Try next-generation keys first.
             var decrypted_with_next = false;
             if (self.next_app_keys) |nk| {
                 if (crypto.decryptPayload(nk.client, pn, aad, hdr.payload, plaintext[0..pt_len])) |_| {
                     decrypted_with_next = true;
                 } else |_| {
-                    std.debug.print("[conn] next keys decrypt FAILED\n", .{});
+                    // next keys decrypt failed
                 }
-            } else {
-                std.debug.print("[conn] next_app_keys is null!\n", .{});
             }
             if (decrypted_with_next) {
-                std.debug.print("[conn] key update accepted — rotating keys\n", .{});
                 self.rotateKeys(); // promote next → current, derive new next
                 // RFC 9001 §6.4: After accepting peer-initiated key update,
                 // immediately acknowledge packets to synchronize key state
@@ -1073,7 +1066,6 @@ pub const Connection = struct {
             } else {
                 // Fallback: current keys (handles reordering during transition).
                 crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
-                    std.debug.print("[conn] current keys decrypt FAILED (key_phase mismatch path) — dropping\n", .{});
                     // RFC 9000 §10.3: decryption failure → check for stateless reset.
                     if (self.checkStatelessReset(data)) {
                         self.hot.state = .closed;
@@ -1085,8 +1077,6 @@ pub const Connection = struct {
         } else {
             // Same phase: use current keys; clear pending flag (peer ACKed our update).
             crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
-                std.debug.print("[conn] 1-RTT pn={d} decrypt FAILED key_phase={d} — dropping\n",
-                    .{ pn, @intFromBool(self.current_key_phase) });
                 // RFC 9000 §10.3: decryption failure → check for stateless reset.
                 if (self.checkStatelessReset(data)) {
                     self.hot.state = .closed;
@@ -1961,6 +1951,33 @@ pub const Connection = struct {
         return chunk_len;
     }
 
+    /// Check whether we should throttle sending a VN packet for this version.
+    /// Returns true if we've recently sent VN for this version (60s cooldown).
+    /// Updates the per-version tracking on first-time or expired entries.
+    fn shouldThrottleVersionNeg(self: *Connection, version: u32) bool {
+        const COOLDOWN_NS = 60 * 1_000_000_000; // 60 seconds
+
+        // Check if this version is in our recent list within cooldown window.
+        for (&self.unknown_versions, &self.unknown_version_times) |*stored_ver, *stored_time| {
+            if (stored_ver.* == version) {
+                // Found this version in our list.
+                if (self.current_time_ns - stored_time.* < COOLDOWN_NS) {
+                    return true; // throttle: recently sent VN for this version
+                }
+                // Cooldown expired; update the timestamp and proceed to send VN.
+                stored_time.* = self.current_time_ns;
+                return false;
+            }
+        }
+
+        // Version not in our list; record it (round-robin: FIFO slot).
+        const idx = self.unknown_version_idx & 3;
+        self.unknown_versions[idx] = version;
+        self.unknown_version_times[idx] = self.current_time_ns;
+        self.unknown_version_idx += 1;
+        return false; // permit: first time seeing this version
+    }
+
     /// Encode and enqueue a Version Negotiation packet in response to an
     /// unknown-version long-header packet.  `raw` is the received datagram.
     fn sendVersionNeg(self: *Connection, raw: []const u8) !void {
@@ -2313,7 +2330,6 @@ pub const Connection = struct {
     /// derive the new next generation.  Called on peer-initiated key updates
     /// (inside processShortHeaderPacket) and as part of initiateKeyUpdate.
     fn rotateKeys(self: *Connection) void {
-        std.debug.print("[conn] rotateKeys: phase {} → {}\n", .{ self.current_key_phase, !self.current_key_phase });
         // Zero the outgoing application keys before replacing them (RFC 9001 §6,
         // defence-in-depth: previous-epoch key material must not linger in memory).
         if (self.app_keys) |*old| {
@@ -3120,28 +3136,37 @@ test "security: processAck malformed gap returns InvalidFrame" {
     try testing.expectError(error.InvalidFrame, conn.processAck(ack, 0));
 }
 
-test "security: VN rate limit suppresses second response within 1s" {
+test "security: VN rate limit suppresses same version within 60s" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
 
     var pkt: [32]u8 = undefined;
     pkt[0] = 0xc0;
-    std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big);
+    std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big); // unknown version
     pkt[5] = 8;
     @memset(pkt[6..14], 0xaa);
     pkt[14] = 8;
     @memset(pkt[15..23], 0xbb);
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
 
+    // First unknown version: send VN
     conn.receive(&pkt, src, 0, io) catch {};
     var out: [64]u8 = undefined;
     try testing.expect(conn.send(&out) > 0);
 
-    conn.receive(&pkt, src, 500_000_000, io) catch {};
+    // Same version within 60s: throttle (no VN)
+    conn.receive(&pkt, src, 30_000_000_000, io) catch {}; // +30s
     try testing.expectEqual(@as(usize, 0), conn.send(&out));
 
-    conn.receive(&pkt, src, 1_001_000_000, io) catch {};
+    // Different unknown version within 60s of first: send VN (different version)
+    std.mem.writeInt(u32, pkt[1..5], 0x00000003, .big); // different version
+    conn.receive(&pkt, src, 35_000_000_000, io) catch {};
+    try testing.expect(conn.send(&out) > 0);
+
+    // First version after 60s: send VN again (cooldown expired)
+    std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big);
+    conn.receive(&pkt, src, 61_000_000_000, io) catch {}; // +61s
     try testing.expect(conn.send(&out) > 0);
 }
 

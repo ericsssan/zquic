@@ -16,15 +16,30 @@ iptables -A FORWARD -i eth1 -o eth0 -j DROP
 ip6tables -A FORWARD -i eth0 -o eth1 -j DROP
 ip6tables -A FORWARD -i eth1 -o eth0 -j DROP
 
+# Validate WAITFORSERVER format (hostname:port or IP:port)
 if [[ -n "$WAITFORSERVER" ]]; then
-  wait-for-it-quic -t 10s $WAITFORSERVER
+  if ! [[ "$WAITFORSERVER" =~ ^[a-zA-Z0-9.-]+:[0-9]+$ ]]; then
+    echo "Error: WAITFORSERVER invalid format (expected host:port, got: $WAITFORSERVER)" >&2
+    exit 1
+  fi
+  wait-for-it-quic -t 10s "$WAITFORSERVER"
 fi
 
-echo "Using scenario:" $SCENARIO
+# Validate SCENARIO format (alphanumeric, dash, underscore, dot, slash only)
+if [[ -z "$SCENARIO" ]]; then
+  echo "Error: SCENARIO environment variable not set" >&2
+  exit 1
+fi
+if ! [[ "$SCENARIO" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+  echo "Error: SCENARIO invalid format (got: $SCENARIO)" >&2
+  exit 1
+fi
+
+echo "Using scenario: $SCENARIO"
 
 dumpcap -i eth0 -s 0 -w "/logs/trace_node_left.pcap" &
 dumpcap -i eth1 -s 0 -w "/logs/trace_node_right.pcap" &
-eval ./scratch/"$SCENARIO &"
+./scratch/"$SCENARIO" &
 
 PID=`jobs -p | tr '\n' ' '`
 trap "kill -SIGINT $PID" INT
