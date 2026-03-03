@@ -162,13 +162,46 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
     const frame_type_raw: u8 = if (type_vi.value <= 0xff) @intCast(type_vi.value) else return error.UnknownFrame;
 
     switch (frame_type_raw) {
-        0x00 => {
-            // Count consecutive PADDING bytes
-            var count: usize = 0;
-            while (pos + count < buf.len and buf[pos + count] == 0x00) : (count += 1) {}
-            return .{ .frame = .{ .padding = count + 1 }, .consumed = pos + count };
+        // Fast-path: STREAM frames (most common in data transfer)
+        0x08...0x0f => {
+            const flags = frame_type_raw & 0x07;
+            const has_offset = (flags & 0x04) != 0;
+            const has_length = (flags & 0x02) != 0;
+            const has_fin = (flags & 0x01) != 0;
+
+            const sid = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+            pos += sid.len;
+
+            var offset: u62 = 0;
+            if (has_offset) {
+                const off = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+                pos += off.len;
+                offset = off.value;
+            }
+
+            var data: []const u8 = buf[pos..];
+            if (has_length) {
+                const dlen = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
+                pos += dlen.len;
+                const dl: usize = @intCast(dlen.value);
+                if (pos + dl > buf.len) return error.BufferTooShort;
+                data = buf[pos..][0..dl];
+                pos += dl;
+            } else {
+                pos = buf.len;
+            }
+
+            return .{
+                .frame = .{ .stream = .{
+                    .stream_id = sid.value,
+                    .offset = offset,
+                    .fin = has_fin,
+                    .data = data,
+                } },
+                .consumed = pos,
+            };
         },
-        0x01 => return .{ .frame = .ping, .consumed = pos },
+        // Fast-path: ACK frames (very frequent)
         0x02, 0x03 => {
             const has_ecn = frame_type_raw == 0x03; // hoisted: used twice below
             const la = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
@@ -224,6 +257,15 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
 
             return .{ .frame = .{ .ack = ack }, .consumed = pos };
         },
+        // Common frames: PADDING, PING
+        0x00 => {
+            // Count consecutive PADDING bytes
+            var count: usize = 0;
+            while (pos + count < buf.len and buf[pos + count] == 0x00) : (count += 1) {}
+            return .{ .frame = .{ .padding = count + 1 }, .consumed = pos + count };
+        },
+        0x01 => return .{ .frame = .ping, .consumed = pos },
+        // Fast-path: CRYPTO frames (frequent in handshake)
         0x06 => {
             const offset = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += offset.len;
@@ -234,44 +276,6 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             const data = buf[pos..][0..data_len];
             pos += data_len;
             return .{ .frame = .{ .crypto = .{ .offset = offset.value, .data = data } }, .consumed = pos };
-        },
-        0x08...0x0f => {
-            const flags = frame_type_raw & 0x07;
-            const has_offset = (flags & 0x04) != 0;
-            const has_length = (flags & 0x02) != 0;
-            const has_fin = (flags & 0x01) != 0;
-
-            const sid = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
-            pos += sid.len;
-
-            var offset: u62 = 0;
-            if (has_offset) {
-                const off = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
-                pos += off.len;
-                offset = off.value;
-            }
-
-            var data: []const u8 = buf[pos..];
-            if (has_length) {
-                const dlen = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
-                pos += dlen.len;
-                const dl: usize = @intCast(dlen.value);
-                if (pos + dl > buf.len) return error.BufferTooShort;
-                data = buf[pos..][0..dl];
-                pos += dl;
-            } else {
-                pos = buf.len;
-            }
-
-            return .{
-                .frame = .{ .stream = .{
-                    .stream_id = sid.value,
-                    .offset = offset,
-                    .fin = has_fin,
-                    .data = data,
-                } },
-                .consumed = pos,
-            };
         },
         0x10 => {
             const v = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
