@@ -250,7 +250,7 @@ pub const SentPacketTable = struct {
                 result.newly_lost += 1;
                 result.bytes_lost += slot.size;
                 if (slot.in_flight) {
-                    bif.* = if (bif.* >= slot.size) bif.* - slot.size else 0;
+                    bif.* -|= slot.size;
                 }
                 if (result.lost_frame_count < MAX_LOSS_EVENTS) {
                     result.lost_frames[result.lost_frame_count] = self.frame_info[idx];
@@ -1017,4 +1017,81 @@ test "rtt: ptoBase saturates sum of smoothed + var_term + max_ack_delay" {
     rtt.rtt_var = 1; // var_term = max(4, K_GRAN) — either way large
     const pto = rtt.ptoBase(1_000_000); // +1ms would overflow without saturation
     try testing.expectEqual(std.math.maxInt(u64), pto);
+}
+
+// ============================================================================
+// Regression tests for loss detection optimizations
+// ============================================================================
+
+test "loss_recovery: detectLoss in-flight bytes saturate on subtraction" {
+    // Regression: in-flight byte accounting uses saturating subtraction
+    // to prevent underflow when lost packet size exceeds in-flight bytes.
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    // Add one packet: 100 bytes, in-flight
+    const pkt = SentPacket{
+        .pn = 0,
+        .sent_ns = 0,
+        .size = 100,
+        .epoch = 0,
+        .in_flight = true,
+        .ack_eliciting = false,
+        .valid = true,
+    };
+    _ = table.add(pkt, .{});
+
+    // Simulate initial in-flight state: 50 bytes (less than packet size)
+    var bif: u64 = 50;
+    var result = AckResult{};
+
+    // Declare packet as lost (via time threshold)
+    table.detectLoss(10, 1_000_000_000, 2_000_000_000, 0, &result, &bif);
+
+    // bif should saturate to 0, not wrap around
+    try testing.expectEqual(@as(u64, 0), bif);
+    try testing.expectEqual(@as(u64, 1), result.newly_lost);
+    try testing.expectEqual(@as(u64, 100), result.bytes_lost);
+}
+
+test "loss_recovery: detectLoss multiple packets in-flight accounting" {
+    // Regression: multiple lost packets properly decrement in-flight bytes
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    // Add 3 packets
+    const pkt1 = SentPacket{.pn = 0, .sent_ns = 0, .size = 30, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
+    const pkt2 = SentPacket{.pn = 1, .sent_ns = 100, .size = 40, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
+    const pkt3 = SentPacket{.pn = 2, .sent_ns = 200, .size = 50, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
+    _ = table.add(pkt1, .{});
+    _ = table.add(pkt2, .{});
+    _ = table.add(pkt3, .{});
+
+    var bif: u64 = 120; // 30 + 40 + 50
+    var result = AckResult{};
+
+    // Declare all 3 packets as lost via packet threshold
+    table.detectLoss(2 + 3, 0, 100, 0, &result, &bif); // largest_acked = 5, pkt_threshold = 3
+
+    // All 3 should be lost, in-flight decremented by 120 total
+    try testing.expectEqual(@as(u64, 3), result.newly_lost);
+    try testing.expectEqual(@as(u64, 120), result.bytes_lost);
+    try testing.expectEqual(@as(u64, 0), bif); // 120 - 120 = 0
+}
+
+test "loss_recovery: detectLoss partial in-flight decrement" {
+    // Regression: partial loss of in-flight bytes (not saturating underflow)
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    const pkt = SentPacket{.pn = 0, .sent_ns = 0, .size = 50, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
+    _ = table.add(pkt, .{});
+
+    var bif: u64 = 200;
+    var result = AckResult{};
+
+    table.detectLoss(3, 1_000_000_000, 2_000_000_000, 0, &result, &bif);
+
+    // 200 - 50 = 150 (normal subtraction, no underflow)
+    try testing.expectEqual(@as(u64, 150), bif);
 }

@@ -379,6 +379,17 @@ pub const Connection = struct {
     /// Stores fragments that arrived before their predecessors; drained in-order.
     crypto_staged: [3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag,
     crypto_staged_count: [3]u8,
+    /// Total bytes currently staged per epoch (DoS defense: prevents unbounded memory pinning).
+    /// Limit: 16KB per epoch. Frames exceeding this are silently dropped.
+    crypto_staged_bytes: [3]u32 = [_]u32{0, 0, 0},
+    /// Highest peer-provided sequence in NEW_CONNECTION_ID (monotonic bound for validation).
+    peer_cid_highest_seq: u62 = 0,
+
+    /// Resource limit telemetry counters (for observability).
+    gaps_full_count: u32 = 0,       // Times GapList filled up (stream reass)
+    ack_ranges_dropped_count: u32 = 0,  // Times ACK ranges truncated
+    crypto_staged_bytes_peak: u32 = 0,  // Peak staged crypto bytes per epoch
+
     /// Deferred ACK flags: set when an ack-eliciting frame is received in an epoch.
     /// Flushed to encrypted ACK packets at the end of receive().
     pending_ack: [3]bool,
@@ -1300,16 +1311,32 @@ pub const Connection = struct {
     }
 
     /// Buffer a CRYPTO fragment that arrived out of order.
+    /// DoS defense: silently drop fragments if staging exceeds 16KB per epoch.
     fn stageCryptoFrag(self: *Connection, epoch: u8, offset: u64, data: []const u8) !void {
         const count = self.crypto_staged_count[epoch];
         if (count >= CRYPTO_STAGE_DEPTH) return; // staging full; peer will retransmit
+
         const copy_len: u16 = @intCast(@min(data.len, CRYPTO_STAGE_FRAG));
+
+        // DoS defense: enforce 16KB byte limit per epoch to prevent memory pinning.
+        // If adding this fragment would exceed 16KB, silently drop (peer will retransmit).
+        const CRYPTO_STAGED_BYTES_LIMIT = 16_384;
+        if (self.crypto_staged_bytes[epoch] +| copy_len > CRYPTO_STAGED_BYTES_LIMIT) {
+            return; // Limit exceeded; drop and let peer retransmit
+        }
+
         self.crypto_staged[epoch][count] = .{
             .offset = offset,
             .len = copy_len,
         };
         @memcpy(self.crypto_staged[epoch][count].data[0..copy_len], data[0..copy_len]);
         self.crypto_staged_count[epoch] = count + 1;
+
+        // Track bytes and peak usage
+        self.crypto_staged_bytes[epoch] +|= copy_len;
+        if (self.crypto_staged_bytes[epoch] > self.crypto_staged_bytes_peak) {
+            self.crypto_staged_bytes_peak = self.crypto_staged_bytes[epoch];
+        }
     }
 
     /// Drain staged fragments that are now deliverable (in-order).
@@ -1339,6 +1366,9 @@ pub const Connection = struct {
                 );
             }
             self.crypto_staged_count[epoch] = count - 1;
+
+            // Decrement byte counter for drained fragment
+            self.crypto_staged_bytes[epoch] -|= frag.len;
 
             // Trim leading overlap and deliver.
             const t: u64 = if (frag.offset < expected) expected - frag.offset else 0;
@@ -2217,7 +2247,25 @@ pub const Connection = struct {
     }
 
     /// Process a NEW_CONNECTION_ID frame: store the CID and retire entries below retire_prior_to.
+    /// Security: Validate sequence number is monotonic and not excessively large (DoS defense).
     fn processNewConnectionId(self: *Connection, ncid: frame.NewConnectionIdFrame) void {
+        // RFC 9000: Sequence number must be >= retire_prior_to (don't store already-retired CIDs).
+        if (ncid.sequence_number < self.peer_cid_retire_prior) return;
+
+        // Security: Sequence number must be >= previously seen max (monotonic constraint).
+        // Prevents probing attacks where attacker sends decreasing sequence numbers.
+        if (ncid.sequence_number < self.peer_cid_highest_seq) return;
+
+        // Security: Sequence number must not exceed current_max + 1000 (DoS defense).
+        // This prevents attacker from causing unbounded sequence space exploration.
+        const max_allowed_seq = self.peer_cid_highest_seq +| 1000;
+        if (ncid.sequence_number > max_allowed_seq) return;
+
+        // Update the highest-seen sequence number
+        if (ncid.sequence_number > self.peer_cid_highest_seq) {
+            self.peer_cid_highest_seq = ncid.sequence_number;
+        }
+
         // Update the retire-prior-to pointer (monotonically increasing).
         if (ncid.retire_prior_to > self.peer_cid_retire_prior) {
             self.peer_cid_retire_prior = ncid.retire_prior_to;
@@ -2228,9 +2276,6 @@ pub const Connection = struct {
                 }
             }
         }
-
-        // Don't store CIDs that are already retired.
-        if (ncid.sequence_number < self.peer_cid_retire_prior) return;
 
         // Store in the first free slot.
         for (&self.peer_cid_table) |*entry| {
@@ -6954,4 +6999,125 @@ test "connection: processFrames does NOT mark ACK as ack-eliciting" {
 
     // Regression: ACK frames must NOT be ack-eliciting
     try testing.expect(!conn.pending_ack[2]);
+}
+
+// ============================================================================
+// Regression tests for security hardening (Medium-risk mitigation)
+// ============================================================================
+
+test "security: CRYPTO staging byte limit prevents memory pinning" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+    conn.hot.state = .established;
+
+    // Each fragment is limited to CRYPTO_STAGE_FRAG (1400 bytes)
+    // Limit is 16KB per epoch. 16384 / 1400 = ~11 full fragments of 1400 bytes
+    const epoch: u8 = 0;
+
+    // Stage fragments up to the limit (16384 / 1400 = ~11 fragments of 1400 bytes)
+    var offset: u64 = 0;
+    for (0..12) |i| {
+        const buf = [_]u8{0} ** 1400;
+        if (i < 11) {
+            try conn.stageCryptoFrag(epoch, offset, &buf);
+            offset += CRYPTO_STAGE_FRAG;
+        } else {
+            // Try to stage one more fragment when at capacity (should be dropped)
+            const initial_count = conn.crypto_staged_count[epoch];
+            const initial_bytes = conn.crypto_staged_bytes[epoch];
+            try conn.stageCryptoFrag(epoch, offset, &buf);
+            // Should be dropped due to byte limit exceeded
+            try testing.expectEqual(initial_count, conn.crypto_staged_count[epoch]);
+            try testing.expectEqual(initial_bytes, conn.crypto_staged_bytes[epoch]);
+        }
+    }
+}
+
+test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Store first CID with seq=10
+    conn.processNewConnectionId(.{
+        .sequence_number = 10,
+        .retire_prior_to = 0,
+        .cid_len = 8,
+        .cid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .stateless_reset_token = [_]u8{0} ** 16,
+    });
+
+    // Try to store CID with seq=9 (non-monotonic, should be rejected)
+    conn.processNewConnectionId(.{
+        .sequence_number = 9,
+        .retire_prior_to = 0,
+        .cid_len = 8,
+        .cid = [_]u8{2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .stateless_reset_token = [_]u8{0} ** 16,
+    });
+
+    // Only the first CID should be stored
+    try testing.expectEqual(true, conn.peer_cid_table[0].valid);
+    try testing.expectEqual(@as(u62, 10), conn.peer_cid_table[0].seq);
+    try testing.expectEqual(false, conn.peer_cid_table[1].valid);
+}
+
+test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Store first CID with seq=100
+    conn.processNewConnectionId(.{
+        .sequence_number = 100,
+        .retire_prior_to = 0,
+        .cid_len = 8,
+        .cid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .stateless_reset_token = [_]u8{0} ** 16,
+    });
+
+    // Try to store CID with seq > 100 + 1000 (should be rejected)
+    conn.processNewConnectionId(.{
+        .sequence_number = 1101, // > 100 + 1000
+        .retire_prior_to = 0,
+        .cid_len = 8,
+        .cid = [_]u8{2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .stateless_reset_token = [_]u8{0} ** 16,
+    });
+
+    // Only the first CID should be stored
+    try testing.expectEqual(true, conn.peer_cid_table[0].valid);
+    try testing.expectEqual(@as(u62, 100), conn.peer_cid_table[0].seq);
+    try testing.expectEqual(false, conn.peer_cid_table[1].valid);
+}
+
+test "security: NEW_CONNECTION_ID sequence within bounds is accepted" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Store first CID with seq=100
+    conn.processNewConnectionId(.{
+        .sequence_number = 100,
+        .retire_prior_to = 0,
+        .cid_len = 8,
+        .cid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .stateless_reset_token = [_]u8{0} ** 16,
+    });
+
+    // Store CID with seq=1100 (= 100 + 1000, at boundary, should be accepted)
+    conn.processNewConnectionId(.{
+        .sequence_number = 1100,
+        .retire_prior_to = 0,
+        .cid_len = 8,
+        .cid = [_]u8{2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .stateless_reset_token = [_]u8{0} ** 16,
+    });
+
+    // Both CIDs should be stored
+    try testing.expectEqual(true, conn.peer_cid_table[0].valid);
+    try testing.expectEqual(@as(u62, 100), conn.peer_cid_table[0].seq);
+    try testing.expectEqual(true, conn.peer_cid_table[1].valid);
+    try testing.expectEqual(@as(u62, 1100), conn.peer_cid_table[1].seq);
 }

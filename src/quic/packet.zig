@@ -94,21 +94,23 @@ pub const LongHeader = struct {
 /// Parse a Long Header from `buf`.
 /// Returns the header and the total number of bytes consumed (header + payload).
 pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: usize } {
+    // Fast-path bounds check: minimum header is 7 bytes (1 first + 4 version + 1 dcid_len + 1 scid_len)
+    // This single check gates all subsequent field accesses.
     if (buf.len < 7) return error.PacketTooShort;
     if (!isLongHeader(buf[0])) return error.NotLongHeader;
 
     const first_byte = buf[0];
-    var pos: usize = 1;
 
-    // Version (4 bytes)
-    if (pos + 4 > buf.len) return error.PacketTooShort;
-    const version = std.mem.readInt(u32, buf[pos..][0..4], .big);
-    pos += 4;
+    // Guaranteed safe: buf.len >= 7 allows reading fixed-size header fields.
+    // Extract first 7 bytes which contain: first_byte(1) + version(4) + dcid_len(1) + scid_len(1)
+    const header_fixed = buf[0..7];
 
-    // Destination CID (RFC allows 0–20 bytes)
-    if (pos >= buf.len) return error.PacketTooShort;
-    const dcid_len = buf[pos];
-    pos += 1;
+    // Version (4 bytes) - safe within header_fixed[1..5]
+    const version = std.mem.readInt(u32, header_fixed[1..5], .big);
+
+    // Destination CID length at header_fixed[5] (safe within bounds)
+    const dcid_len = header_fixed[5];
+    var pos: usize = 6; // Position after dcid_len byte
     if (pos + dcid_len > buf.len) return error.PacketTooShort;
     // Reject CID lengths > 20 (RFC 9000 §17.2).
     if ((version == QUIC_VERSION_1 or version == QUIC_VERSION_2) and dcid_len > 20) return error.UnsupportedCidLength;
@@ -120,6 +122,7 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     pos += dcid_len;
 
     // Source CID (RFC allows 0–20 bytes)
+    // Bounds check: ensure we can read SCID length byte
     if (pos >= buf.len) return error.PacketTooShort;
     const scid_len = buf[pos];
     pos += 1;
@@ -858,4 +861,85 @@ test "regression: decodePacketNumberBytes values match pattern" {
     std.mem.writeInt(u32, buf[0..4], 0x12345678, .big);
     const pn4 = decodePacketNumberBytes(&buf, 0, 4);
     try testing.expectEqual(@as(u32, 0x12345678), pn4);
+}
+
+// ============================================================================
+// Regression tests for packet parsing optimizations
+// ============================================================================
+
+test "packet: parseLongHeader with minimal Initial packet" {
+    const testing = std.testing;
+    // Regression: Fast-path bounds check must handle minimal Initial packet.
+    // Format: [first_byte | version(4) | dcid_len | scid_len | token_len | length_varint | packet_number | encrypted_payload]
+    // With dcid_len=0, scid_len=0, token_len=0, length=1, pn_len=1 (from first_byte), we need 10 bytes.
+    var buf: [10]u8 = undefined;
+    buf[0] = 0xc0; // Initial packet, pn_len=1 (bits 1:0 = 00)
+    std.mem.writeInt(u32, buf[1..5], QUIC_VERSION_1, .big);
+    buf[5] = 0; // dcid_len = 0
+    buf[6] = 0; // scid_len = 0
+    buf[7] = 0; // token_len = 0
+    buf[8] = 1; // length = 1 (just the 1-byte packet number)
+    buf[9] = 0; // packet number = 0
+
+    const result = try parseLongHeader(&buf);
+    try testing.expectEqual(@as(u32, QUIC_VERSION_1), result.header.version);
+    try testing.expectEqual(@as(u8, 0), result.header.dest_cid_len);
+}
+
+test "packet: parseLongHeader with 6-byte buffer fails fast" {
+    const testing = std.testing;
+    // Regression: early bounds check must reject < 7 bytes immediately
+    var buf: [6]u8 = undefined;
+    @memset(&buf, 0xc0); // Partial Initial packet
+
+    const result = parseLongHeader(&buf);
+    try testing.expectError(error.PacketTooShort, result);
+}
+
+test "packet: parseLongHeader with DCID boundary check" {
+    const testing = std.testing;
+    // Regression: ensure DCID length bounds check works correctly
+    // 8-byte DCID is common case: first_byte + version + dcid_len + dcid(8) + scid_len + token_len + length + pn
+    var buf: [50]u8 = undefined;
+    buf[0] = 0xc0; // Initial
+    std.mem.writeInt(u32, buf[1..5], QUIC_VERSION_1, .big);
+    buf[5] = 8; // dcid_len = 8
+    @memset(buf[6..14], 0xaa); // 8-byte DCID
+    buf[14] = 0; // scid_len = 0
+    buf[15] = 0; // token_len = 0
+    buf[16] = 1; // length = 1
+    buf[17] = 0; // packet number = 0
+
+    const result = try parseLongHeader(buf[0..18]);
+    try testing.expectEqual(@as(u8, 8), result.header.dest_cid_len);
+}
+
+test "packet: parseLongHeader with DCID exceeding buffer fails" {
+    const testing = std.testing;
+    // Regression: DCID bounds check must catch buffer overflow
+    var buf: [10]u8 = undefined;
+    buf[0] = 0xc0;
+    std.mem.writeInt(u32, buf[1..5], QUIC_VERSION_1, .big);
+    buf[5] = 20; // dcid_len = 20, but we only have 5 bytes left
+    @memset(buf[6..10], 0xaa);
+
+    const result = parseLongHeader(&buf);
+    try testing.expectError(error.PacketTooShort, result);
+}
+
+test "packet: parseLongHeader with max DCID length (20 bytes)" {
+    const testing = std.testing;
+    // Regression: ensure 20-byte DCID (RFC maximum) parses correctly
+    var buf: [50]u8 = undefined;
+    buf[0] = 0xc0;
+    std.mem.writeInt(u32, buf[1..5], QUIC_VERSION_1, .big);
+    buf[5] = 20; // dcid_len = 20
+    @memset(buf[6..26], 0xbb); // 20-byte DCID
+    buf[26] = 0; // scid_len = 0
+    buf[27] = 0; // token_len = 0
+    buf[28] = 1; // length = 1
+    buf[29] = 0; // packet number = 0
+
+    const result = try parseLongHeader(buf[0..30]);
+    try testing.expectEqual(@as(u8, 20), result.header.dest_cid_len);
 }

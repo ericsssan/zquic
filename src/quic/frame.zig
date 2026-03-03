@@ -271,6 +271,8 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             pos += offset.len;
             const length = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += length.len;
+            // Secondary validation: CRYPTO data length must not exceed 64KB (RFC 9000 §19.6 practical limit)
+            if (length.value > 65536) return error.InvalidFrame;
             const data_len: usize = @intCast(length.value);
             if (pos + data_len > buf.len) return error.BufferTooShort;
             const data = buf[pos..][0..data_len];
