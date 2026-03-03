@@ -765,8 +765,8 @@ pub const Connection = struct {
             const ver = std.mem.readInt(u32, data[1..5], .big);
 
             // RFC 9368: Compatible version negotiation.
-            // If we're in idle state and receive a compatible version, accept it.
-            // Otherwise, if unsupported/incompatible, send Version Negotiation.
+            // v1 and v2 can negotiate together. Client chooses version by sending with that version.
+            // Server must respond with matching version (initial keys are version-specific).
             if (self.hot.state == .idle) {
                 // Check if version is supported (v1 or v2).
                 if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2 and ver != 0) {
@@ -778,7 +778,10 @@ pub const Connection = struct {
                     }
                     return data.len;
                 }
-                // v1 and v2 are compatible; accept this packet and upgrade to configured version.
+                // v1 and v2 are compatible; adopt client's version for this connection.
+                if (ver != 0) {
+                    self.quic_version = ver;
+                }
             } else {
                 // Handshake already started; check version matches what was negotiated.
                 if (ver != self.quic_version and ver != 0) {
