@@ -544,14 +544,20 @@ pub const Connection = struct {
         // tshark to see the client's first 1-RTT packet before the ServerHello
         // in the left-node trace, breaking decryption.  Holding the ACK means
         // it will be included (along with ServerHello) on the next datagram.
-        for (0..3) |e| {
-            if (self.pending_ack[e]) {
-                if (e == 0 and self.hs_keys == null) {
-                    continue;
-                }
-                self.pending_ack[e] = false;
-                self.sendEncryptedAck(@intCast(e)) catch {};
+        // Unroll the 3-epoch loop to eliminate loop overhead.
+        if (self.pending_ack[0]) {
+            if (self.hs_keys != null) {
+                self.pending_ack[0] = false;
+                self.sendEncryptedAck(0) catch {};
             }
+        }
+        if (self.pending_ack[1]) {
+            self.pending_ack[1] = false;
+            self.sendEncryptedAck(1) catch {};
+        }
+        if (self.pending_ack[2]) {
+            self.pending_ack[2] = false;
+            self.sendEncryptedAck(2) catch {};
         }
     }
 
