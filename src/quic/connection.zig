@@ -1164,17 +1164,16 @@ pub const Connection = struct {
             if (!isFrameAllowedInEpoch(fr.frame, epoch)) return error.ProtocolViolation;
 
             // RFC 9000 §19.19: all frames except PADDING and ACK are ack-eliciting.
-            switch (fr.frame) {
-                .ack => {},
-                .padding => {},
-                else => {
-                    self.pending_ack[epoch] = true;
-                },
+            const is_ack_eliciting = switch (fr.frame) {
+                .padding, .ack => false,
+                else => true,
+            };
+            if (is_ack_eliciting) {
+                self.pending_ack[epoch] = true;
             }
 
             switch (fr.frame) {
                 .padding => {},
-                .ping => {},
                 .ack => |a| try self.processAck(a, epoch),
                 .crypto => |c| {
                     if (io) |real_io| {
