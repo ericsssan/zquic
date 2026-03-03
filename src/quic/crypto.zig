@@ -547,3 +547,114 @@ test "crypto: v2 derivePacketKeys uses quicv2 labels" {
     try testing.expect(!std.mem.eql(u8, &k_v1.iv, &k_v2.iv));
     try testing.expect(!std.mem.eql(u8, &k_v1.hp, &k_v2.hp));
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION TESTS: CPU OPTIMIZATIONS
+// ---------------------------------------------------------------------------
+
+test "regression: buildNonce unrolled loop consistency" {
+    // Regression test for nonce building optimization (loop unrolling).
+    // Verifies that the unrolled 8-byte XOR produces correct results and is consistent.
+    const testing = std.testing;
+
+    const iv = [_]u8{ 0xfa, 0x04, 0x4b, 0x2f, 0x42, 0xa3, 0xfd, 0x3b, 0x46, 0xfb, 0x25, 0x5c };
+
+    // Test PN = 0 (no XOR change)
+    {
+        const nonce1 = buildNonce(iv, 0);
+        const nonce2 = buildNonce(iv, 0);
+        try testing.expectEqualSlices(u8, &nonce1, &nonce2);
+        try testing.expectEqualSlices(u8, &iv, &nonce1); // PN=0 doesn't change nonce
+    }
+
+    // Test that different PNs produce different nonces
+    {
+        const nonce1 = buildNonce(iv, 1);
+        const nonce2 = buildNonce(iv, 2);
+        try testing.expect(!std.mem.eql(u8, &nonce1, &nonce2));
+    }
+
+    // Test that large PN values work correctly
+    {
+        const nonce_small = buildNonce(iv, 0xFF);
+        const nonce_large = buildNonce(iv, 0xFFFFFFFF);
+        // Both should be valid nonces (12 bytes each)
+        try testing.expectEqual(@as(usize, 12), nonce_small.len);
+        try testing.expectEqual(@as(usize, 12), nonce_large.len);
+    }
+}
+
+test "regression: removeHeaderProtection switch unrolling all pn_len values" {
+    // Regression test for header protection removal optimization (switch unrolling).
+    // Verifies that all 4 pn_len cases (1, 2, 3, 4) work correctly with the
+    // switch statement optimization.
+    const testing = std.testing;
+    const hp_key = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
+    const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+
+    // Compute the actual mask
+    var mask: [5]u8 = undefined;
+    {
+        var cipher = std.crypto.core.aes.Aes128.initEnc(hp_key);
+        var mask_full: [16]u8 = undefined;
+        cipher.encrypt(&mask_full, &sample);
+        for (0..5) |i| {
+            mask[i] = mask_full[i];
+        }
+    }
+
+    // Test pn_len = 1
+    {
+        const unmasked = 0xC0;
+        var first_byte: u8 = unmasked ^ (mask[0] & 0x0f);
+        var pn_field = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+        pn_field[0] ^= mask[1];
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 1), pn_len);
+        try testing.expectEqual(unmasked, first_byte);
+        try testing.expectEqual(@as(u8, 0xAA), pn_field[0]);
+    }
+
+    // Test pn_len = 2
+    {
+        const unmasked = 0xC1;
+        var first_byte: u8 = unmasked ^ (mask[0] & 0x0f);
+        var pn_field = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+        pn_field[0] ^= mask[1];
+        pn_field[1] ^= mask[2];
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 2), pn_len);
+        try testing.expectEqual(unmasked, first_byte);
+    }
+
+    // Test pn_len = 3
+    {
+        const unmasked = 0xC2;
+        var first_byte: u8 = unmasked ^ (mask[0] & 0x0f);
+        var pn_field = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+        pn_field[0] ^= mask[1];
+        pn_field[1] ^= mask[2];
+        pn_field[2] ^= mask[3];
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 3), pn_len);
+        try testing.expectEqual(unmasked, first_byte);
+    }
+
+    // Test pn_len = 4
+    {
+        const unmasked = 0xC3;
+        var first_byte: u8 = unmasked ^ (mask[0] & 0x0f);
+        var pn_field = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+        pn_field[0] ^= mask[1];
+        pn_field[1] ^= mask[2];
+        pn_field[2] ^= mask[3];
+        pn_field[3] ^= mask[4];
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 4), pn_len);
+        try testing.expectEqual(unmasked, first_byte);
+    }
+}

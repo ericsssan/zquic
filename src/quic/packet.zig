@@ -775,3 +775,87 @@ test "packet: encodeVersionNegotiation lists v1 and v2" {
     try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[23..27], .big));
     try testing.expectEqual(QUIC_VERSION_2, std.mem.readInt(u32, buf[27..31], .big));
 }
+
+// ---------------------------------------------------------------------------
+// REGRESSION TESTS: CPU OPTIMIZATIONS
+// ---------------------------------------------------------------------------
+
+test "regression: decodePacketNumberBytes all lengths (pn_len 1-4)" {
+    // Regression test for packet number decoding optimization (switch unrolling).
+    // Verifies that the switch statement implementation correctly decodes
+    // packet numbers of all 4 possible lengths.
+    const testing = std.testing;
+
+    // pn_len = 1: single byte
+    {
+        var buf = [_]u8{ 0x42, 0xFF, 0xFF, 0xFF };
+        const pn = decodePacketNumberBytes(&buf, 0, 1);
+        try testing.expectEqual(@as(u32, 0x42), pn);
+    }
+
+    // pn_len = 2: two bytes, big-endian
+    {
+        var buf = [_]u8{ 0x12, 0x34, 0xFF, 0xFF };
+        const pn = decodePacketNumberBytes(&buf, 0, 2);
+        try testing.expectEqual(@as(u32, 0x1234), pn);
+    }
+
+    // pn_len = 3: three bytes, big-endian
+    {
+        var buf = [_]u8{ 0x12, 0x34, 0x56, 0xFF };
+        const pn = decodePacketNumberBytes(&buf, 0, 3);
+        try testing.expectEqual(@as(u32, 0x123456), pn);
+    }
+
+    // pn_len = 4: four bytes, big-endian
+    {
+        var buf = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
+        const pn = decodePacketNumberBytes(&buf, 0, 4);
+        try testing.expectEqual(@as(u32, 0x12345678), pn);
+    }
+}
+
+test "regression: decodePacketNumberBytes offset positioning" {
+    // Regression test verifying that decodePacketNumberBytes correctly
+    // handles non-zero buffer positions (called with different pos values).
+    const testing = std.testing;
+
+    var buf = [_]u8{ 0xFF, 0xFF, 0x12, 0x34, 0x56, 0x78 };
+
+    // Decode from position 2 (pn_len=2)
+    const pn2 = decodePacketNumberBytes(&buf, 2, 2);
+    try testing.expectEqual(@as(u32, 0x1234), pn2);
+
+    // Decode from position 2 (pn_len=4)
+    const pn4 = decodePacketNumberBytes(&buf, 2, 4);
+    try testing.expectEqual(@as(u32, 0x12345678), pn4);
+}
+
+test "regression: decodePacketNumberBytes values match pattern" {
+    // Regression test verifying that decodePacketNumberBytes produces
+    // correct packet number values for various inputs and pn_len values.
+    const testing = std.testing;
+
+    // Test encoding then decoding different packet numbers
+    var buf: [8]u8 = undefined;
+
+    // pn_len = 1: single byte (0x42)
+    std.mem.writeInt(u32, buf[0..4], 0x42000000, .big); // Only first byte matters
+    const pn1 = decodePacketNumberBytes(&buf, 0, 1);
+    try testing.expectEqual(@as(u32, 0x42), pn1);
+
+    // pn_len = 2: two bytes (0x1234)
+    std.mem.writeInt(u32, buf[0..4], 0x12340000, .big);
+    const pn2 = decodePacketNumberBytes(&buf, 0, 2);
+    try testing.expectEqual(@as(u32, 0x1234), pn2);
+
+    // pn_len = 3: three bytes (0x123456)
+    std.mem.writeInt(u32, buf[0..4], 0x12345600, .big);
+    const pn3 = decodePacketNumberBytes(&buf, 0, 3);
+    try testing.expectEqual(@as(u32, 0x123456), pn3);
+
+    // pn_len = 4: four bytes (0x12345678)
+    std.mem.writeInt(u32, buf[0..4], 0x12345678, .big);
+    const pn4 = decodePacketNumberBytes(&buf, 0, 4);
+    try testing.expectEqual(@as(u32, 0x12345678), pn4);
+}
