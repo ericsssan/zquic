@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     // Bind UDP socket.
-    const bind_addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(port) };
+    const bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(port) };
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
 
