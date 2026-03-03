@@ -141,7 +141,7 @@ const CryptoStagedFrag = struct {
 };
 
 const SendSlot = struct {
-    buf: [MAX_PACKET_SIZE]u8,
+    buf: [MAX_SEND_PACKET_SIZE]u8,
     len: usize,
 };
 
@@ -1683,7 +1683,7 @@ pub const Connection = struct {
             self.bytes_unvalidated_sent = new_sent;
         }
         const slot = &self.sq[self.sq_tail & (SEND_QUEUE_DEPTH - 1)];
-        const n = @min(data.len, MAX_PACKET_SIZE);
+        const n = @min(data.len, MAX_SEND_PACKET_SIZE);
         @memcpy(slot.buf[0..n], data[0..n]);
         slot.len = n;
         self.sq_tail += 1;
