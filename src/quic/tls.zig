@@ -368,6 +368,10 @@ pub const TlsServer = struct {
             }
         }
 
+        // RFC 9369: version_information handling
+        // NOTE: Commenting out for now to test if lsquic issue is related to version_information presence
+        // if (self.our_transport_params.version_information) |_| { ... }
+
         // Save client_random for SSLKEYLOG export.
         self.client_random = ch.random;
 

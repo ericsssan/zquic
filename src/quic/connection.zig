@@ -1446,22 +1446,9 @@ pub const Connection = struct {
                 our_params.original_destination_connection_id_len = self.first_initial_dcid_len;
             }
 
-            // RFC 9369: Send version_information listing supported versions
-            // Format: chosen_version (4 bytes) followed by other_versions (4-byte chunks)
-            var version_info: [20]u8 = undefined;
-            const chosen_ver = self.quic_version;
-            version_info[0] = @as(u8, @intCast((chosen_ver >> 24) & 0xff));
-            version_info[1] = @as(u8, @intCast((chosen_ver >> 16) & 0xff));
-            version_info[2] = @as(u8, @intCast((chosen_ver >> 8) & 0xff));
-            version_info[3] = @as(u8, @intCast(chosen_ver & 0xff));
-            // Add the other version (if chosen is v1, add v2; if v2, add v1)
-            const other_ver = if (chosen_ver == packet.QUIC_VERSION_1) packet.QUIC_VERSION_2 else packet.QUIC_VERSION_1;
-            version_info[4] = @as(u8, @intCast((other_ver >> 24) & 0xff));
-            version_info[5] = @as(u8, @intCast((other_ver >> 16) & 0xff));
-            version_info[6] = @as(u8, @intCast((other_ver >> 8) & 0xff));
-            version_info[7] = @as(u8, @intCast(other_ver & 0xff));
-            our_params.version_information = version_info;
-            our_params.version_information_len = 8;
+            // RFC 9369: version_information - for v2 negotiation
+            // NOTE: Will be set in TLS layer after version negotiation
+            // our_params.version_information is left null for now
 
             self.tls_state.our_transport_params = our_params;
         }
@@ -1470,6 +1457,10 @@ pub const Connection = struct {
         const out_len = try self.tls_state.processCrypto(data, &out_buf, io);
 
         if (self.hs_keys == null and self.tls_state.state != .wait_client_hello) {
+            // RFC 9369: Sync the negotiated version from TLS layer (compatible version negotiation)
+            if (self.quic_version != self.tls_state.quic_version) {
+                self.quic_version = self.tls_state.quic_version;
+            }
             self.hs_keys = self.tls_state.handshake_keys;
         }
 
