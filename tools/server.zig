@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     const cert_path = try std.fmt.bufPrint(&cert_path_buf, "{s}/cert.pem", .{certs_dir});
     const key_path = try std.fmt.bufPrint(&key_path_buf, "{s}/priv.key", .{certs_dir});
 
-    var cert_pem_buf: [8192]u8 = undefined;
+    var cert_pem_buf: [65536]u8 = undefined;
     var key_pem_buf: [8192]u8 = undefined;
     const cert_pem_len = readFileFull(io, cert_path, &cert_pem_buf) catch |err| {
         std.debug.print("Failed to read certificate from {s}: {}\n", .{ cert_path, err });
@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(127);
     };
 
-    var cert_der_buf: [16384]u8 = undefined;
+    var cert_der_buf: [65536]u8 = undefined;
     var key_der_buf: [4096]u8 = undefined;
     const cert_der_len = try pem.pemToDer(cert_pem_buf[0..cert_pem_len], &cert_der_buf);
     const key_der_len = try pem.pemToDerBlock(key_pem_buf[0..key_pem_len], "PRIVATE KEY", &key_der_buf);

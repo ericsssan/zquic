@@ -211,7 +211,7 @@ pub const TlsServer = struct {
     /// `seed` is the 32-byte Ed25519 seed or P-256 private scalar depending on `algorithm`.
     /// Use when loading certs from disk (e.g. interop runner /certs/).
     pub fn initFromCert(cert_der: []const u8, seed: [32]u8, algorithm: KeyAlgorithm, io: std.Io) !TlsServer {
-        if (cert_der.len > 4096) return error.CertTooLarge;
+        if (cert_der.len > 65536) return error.CertTooLarge;
         const ecdh_kp = X25519.KeyPair.generate(io);
         const sign_key: SignKey = switch (algorithm) {
             .ed25519 => .{ .ed25519 = try Ed25519.KeyPair.generateDeterministic(seed) },
