@@ -39,6 +39,37 @@ pub fn longHeaderType(first_byte: u8, version: u32) PacketType {
 }
 
 // ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Decode packet number from 1-4 bytes in buffer at position.
+/// Packet number length is determined by the first_byte lower 2 bits: +1.
+/// Uses switch statement unrolling to avoid loop overhead.
+fn decodePacketNumberBytes(buf: []const u8, pos: usize, pn_len: u8) u32 {
+    var pn: u32 = 0;
+    switch (pn_len) {
+        1 => pn = buf[pos],
+        2 => {
+            pn = @as(u32, buf[pos]) << 8;
+            pn |= buf[pos + 1];
+        },
+        3 => {
+            pn = @as(u32, buf[pos]) << 16;
+            pn |= @as(u32, buf[pos + 1]) << 8;
+            pn |= buf[pos + 2];
+        },
+        4 => {
+            pn = @as(u32, buf[pos]) << 24;
+            pn |= @as(u32, buf[pos + 1]) << 16;
+            pn |= @as(u32, buf[pos + 2]) << 8;
+            pn |= buf[pos + 3];
+        },
+        else => unreachable,
+    }
+    return pn;
+}
+
+// ---------------------------------------------------------------------------
 // Long Header
 // ---------------------------------------------------------------------------
 
@@ -125,10 +156,7 @@ pub fn parseLongHeader(buf: []const u8) !struct { header: LongHeader, consumed: 
     const pn_len: u8 = (first_byte & 0x03) + 1;
     if (rem_len < pn_len) return error.PacketTooShort;
 
-    var pn: u32 = 0;
-    for (0..pn_len) |i| {
-        pn = (pn << 8) | buf[pos + i];
-    }
+    const pn = decodePacketNumberBytes(buf, pos, pn_len);
     pos += pn_len;
 
     const payload_end = pos + rem_len - pn_len;
@@ -245,10 +273,7 @@ pub fn parseShortHeader(buf: []const u8, dcid_len: usize) !struct { header: Shor
     const pn_len: u8 = (first_byte & 0x03) + 1;
     if (pos + pn_len > buf.len) return error.PacketTooShort;
 
-    var pn: u32 = 0;
-    for (0..pn_len) |i| {
-        pn = (pn << 8) | buf[pos + i];
-    }
+    const pn = decodePacketNumberBytes(buf, pos, pn_len);
     pos += pn_len;
 
     return .{
