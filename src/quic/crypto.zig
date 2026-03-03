@@ -231,8 +231,25 @@ pub fn removeHeaderProtection(
     }
 
     const pn_len: u8 = (first_byte.* & 0x03) + 1;
-    for (0..pn_len) |i| {
-        pn_field[i] ^= mask[1 + i];
+    // Unroll the PN XOR loop (always 1-4 iterations) to avoid loop overhead
+    switch (pn_len) {
+        1 => pn_field[0] ^= mask[1],
+        2 => {
+            pn_field[0] ^= mask[1];
+            pn_field[1] ^= mask[2];
+        },
+        3 => {
+            pn_field[0] ^= mask[1];
+            pn_field[1] ^= mask[2];
+            pn_field[2] ^= mask[3];
+        },
+        4 => {
+            pn_field[0] ^= mask[1];
+            pn_field[1] ^= mask[2];
+            pn_field[2] ^= mask[3];
+            pn_field[3] ^= mask[4];
+        },
+        else => unreachable,
     }
     return pn_len;
 }
@@ -374,6 +391,96 @@ test "crypto: applyHeaderProtection is self-inverse (XOR involution)" {
 
     try std.testing.expectEqual(orig_first, first_byte);
     try std.testing.expectEqualSlices(u8, &orig_pn, &pn_bytes);
+}
+
+test "crypto: removeHeaderProtection handles all pn_len values (1-4)" {
+    const testing = std.testing;
+    const hp_key = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
+    const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+
+    // Compute actual mask using AES
+    var mask: [5]u8 = undefined;
+    {
+        var cipher = std.crypto.core.aes.Aes128.initEnc(hp_key);
+        var mask_full: [16]u8 = undefined;
+        cipher.encrypt(&mask_full, &sample);
+        for (0..5) |i| {
+            mask[i] = mask_full[i];
+        }
+    }
+
+    // Test pn_len = 1 (first_byte pn_len bits = 00)
+    {
+        const unmasked_first: u8 = 0xC0; // long header, pn_len = 1
+        const unmasked_pn = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+
+        // Apply mask to create the "wire" format
+        var first_byte: u8 = unmasked_first ^ (mask[0] & 0x0f);
+        var pn_field = unmasked_pn;
+        pn_field[0] ^= mask[1]; // Only first byte masked since pn_len = 1
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 1), pn_len);
+        try testing.expectEqual(unmasked_first, first_byte);
+        try testing.expectEqual(unmasked_pn[0], pn_field[0]);
+    }
+
+    // Test pn_len = 2 (first_byte pn_len bits = 01)
+    {
+        const unmasked_first: u8 = 0xC1;
+        const unmasked_pn = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+
+        var first_byte: u8 = unmasked_first ^ (mask[0] & 0x0f);
+        var pn_field = unmasked_pn;
+        pn_field[0] ^= mask[1];
+        pn_field[1] ^= mask[2];
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 2), pn_len);
+        try testing.expectEqual(unmasked_first, first_byte);
+        try testing.expectEqual(unmasked_pn[0], pn_field[0]);
+        try testing.expectEqual(unmasked_pn[1], pn_field[1]);
+    }
+
+    // Test pn_len = 3 (first_byte pn_len bits = 10)
+    {
+        const unmasked_first: u8 = 0xC2;
+        const unmasked_pn = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+
+        var first_byte: u8 = unmasked_first ^ (mask[0] & 0x0f);
+        var pn_field = unmasked_pn;
+        pn_field[0] ^= mask[1];
+        pn_field[1] ^= mask[2];
+        pn_field[2] ^= mask[3];
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 3), pn_len);
+        try testing.expectEqual(unmasked_first, first_byte);
+        try testing.expectEqual(unmasked_pn[0], pn_field[0]);
+        try testing.expectEqual(unmasked_pn[1], pn_field[1]);
+        try testing.expectEqual(unmasked_pn[2], pn_field[2]);
+    }
+
+    // Test pn_len = 4 (first_byte pn_len bits = 11)
+    {
+        const unmasked_first: u8 = 0xC3;
+        const unmasked_pn = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD };
+
+        var first_byte: u8 = unmasked_first ^ (mask[0] & 0x0f);
+        var pn_field = unmasked_pn;
+        pn_field[0] ^= mask[1];
+        pn_field[1] ^= mask[2];
+        pn_field[2] ^= mask[3];
+        pn_field[3] ^= mask[4];
+
+        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        try testing.expectEqual(@as(u8, 4), pn_len);
+        try testing.expectEqual(unmasked_first, first_byte);
+        try testing.expectEqual(unmasked_pn[0], pn_field[0]);
+        try testing.expectEqual(unmasked_pn[1], pn_field[1]);
+        try testing.expectEqual(unmasked_pn[2], pn_field[2]);
+        try testing.expectEqual(unmasked_pn[3], pn_field[3]);
+    }
 }
 
 test "crypto: nonce build" {
