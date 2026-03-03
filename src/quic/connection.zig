@@ -2102,10 +2102,10 @@ pub const Connection = struct {
         vn_pos += 1;
         @memcpy(vn_buf[vn_pos..][0..cid_mod.len], &self.local_cid.bytes);
         vn_pos += cid_mod.len;
-        // Advertise both QUIC v1 and v2 as supported versions.
-        std.mem.writeInt(u32, vn_buf[vn_pos..][0..4], packet.QUIC_VERSION_1, .big);
-        vn_pos += 4;
-        std.mem.writeInt(u32, vn_buf[vn_pos..][0..4], packet.QUIC_VERSION_2, .big);
+        // Advertise the server's configured version.
+        // If server is configured for v2, only advertise v2.
+        // If server is configured for v1, only advertise v1.
+        std.mem.writeInt(u32, vn_buf[vn_pos..][0..4], self.configured_version, .big);
         vn_pos += 4;
         try self.enqueueSend(vn_buf[0..vn_pos]);
     }
