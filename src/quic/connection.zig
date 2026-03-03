@@ -1954,7 +1954,8 @@ pub const Connection = struct {
     /// Check whether we should throttle sending a VN packet for this version.
     /// Returns true if we've recently sent VN for this version (60s cooldown).
     /// Updates the per-version tracking on first-time or expired entries.
-    fn shouldThrottleVersionNeg(self: *Connection, version: u32) bool {
+    /// Public for testing purposes.
+    pub fn shouldThrottleVersionNeg(self: *Connection, version: u32) bool {
         const COOLDOWN_NS = 60 * 1_000_000_000; // 60 seconds
 
         // Check if this version is in our recent list within cooldown window.
@@ -3845,6 +3846,66 @@ test "security: NEW_CONNECTION_ID parse rejects cid_len = 21" {
     buf[3] = 21;
     @memset(buf[4..][0..37], 0); // 21-byte cid + 16-byte token
     try testing.expectError(error.InvalidFrame, frame.parseFrame(buf[0..41]));
+}
+
+test "security: shouldThrottleVersionNeg tracks per-version cooldown" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Version A at t=0: should not throttle (first time)
+    conn.current_time_ns = 0;
+    try testing.expect(!conn.shouldThrottleVersionNeg(0xAAAAAAAA));
+
+    // Version A at t=30s: should throttle (within 60s cooldown)
+    conn.current_time_ns = 30_000_000_000;
+    try testing.expect(conn.shouldThrottleVersionNeg(0xAAAAAAAA));
+
+    // Version B at t=30s: should not throttle (different version)
+    try testing.expect(!conn.shouldThrottleVersionNeg(0xBBBBBBBB));
+
+    // Version C at t=40s: should not throttle (different version)
+    conn.current_time_ns = 40_000_000_000;
+    try testing.expect(!conn.shouldThrottleVersionNeg(0xCCCCCCCC));
+
+    // Version D at t=50s: should not throttle (different version)
+    try testing.expect(!conn.shouldThrottleVersionNeg(0xDDDDDDDD));
+
+    // Version E at t=60s: should not throttle (different version, fills 4th slot)
+    conn.current_time_ns = 60_000_000_000;
+    try testing.expect(!conn.shouldThrottleVersionNeg(0xEEEEEEEE));
+
+    // Version A at t=61s: should throttle (within 60s cooldown, recorded at t=0)
+    // Time diff = 61s - 0s = 61s > 60s cooldown, should NOT throttle (cooldown expired)
+    conn.current_time_ns = 61_000_000_000;
+    try testing.expect(!conn.shouldThrottleVersionNeg(0xAAAAAAAA));
+}
+
+test "security: shouldThrottleVersionNeg round-robin eviction after 4 versions" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    conn.current_time_ns = 0;
+
+    // Record 4 versions (fills all slots)
+    try testing.expect(!conn.shouldThrottleVersionNeg(0x11111111));
+    try testing.expect(!conn.shouldThrottleVersionNeg(0x22222222));
+    try testing.expect(!conn.shouldThrottleVersionNeg(0x33333333));
+    try testing.expect(!conn.shouldThrottleVersionNeg(0x44444444));
+
+    // All 4 should throttle at t=30s (within 60s cooldown)
+    conn.current_time_ns = 30_000_000_000;
+    try testing.expect(conn.shouldThrottleVersionNeg(0x11111111));
+    try testing.expect(conn.shouldThrottleVersionNeg(0x22222222));
+    try testing.expect(conn.shouldThrottleVersionNeg(0x33333333));
+    try testing.expect(conn.shouldThrottleVersionNeg(0x44444444));
+
+    // Record a 5th version (evicts slot 0: 0x11111111)
+    try testing.expect(!conn.shouldThrottleVersionNeg(0x55555555));
+
+    // 0x11111111 should NOT throttle anymore (was evicted)
+    try testing.expect(!conn.shouldThrottleVersionNeg(0x11111111));
 }
 
 // ---------------------------------------------------------------------------
