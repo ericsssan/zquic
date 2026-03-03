@@ -274,7 +274,7 @@ test "transport_params: round-trip encode/decode with non-default values" {
 
     const original = TransportParams{
         .max_idle_timeout_ms = 60_000,
-        .max_udp_payload_size = 1350,
+        .max_udp_payload_size = 1200,
         .initial_max_data = 2 * 1024 * 1024,
         .initial_max_stream_data_bidi_local = 512 * 1024,
         .initial_max_stream_data_bidi_remote = 512 * 1024,

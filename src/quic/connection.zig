@@ -124,7 +124,7 @@ pub const ConnectionHot = struct {
 // Send queue
 // ---------------------------------------------------------------------------
 
-const MAX_PACKET_SIZE = 1350;
+const MAX_PACKET_SIZE = 1200;
 const SEND_QUEUE_DEPTH = 16;
 
 /// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
@@ -760,6 +760,9 @@ pub const Connection = struct {
             }
         }
 
+        // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
+        if (data.len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+
         // Read raw header fields (not HP-protected: version, DCID, SCID are in the clear).
         if (data.len < 7) return error.PacketTooShort;
         const ver = std.mem.readInt(u32, data[1..5], .big);
@@ -813,14 +816,13 @@ pub const Connection = struct {
         if (pn_off + 4 + 16 > data.len) return error.PacketTooShort;
 
         // Copy packet to a mutable buffer and remove header protection in place.
-        // Buffer must hold the full packet; packets larger than this are silently truncated.
-        var hp_buf: [1500]u8 = undefined;
-        const pkt_len = @min(data.len, hp_buf.len);
-        @memcpy(hp_buf[0..pkt_len], data[0..pkt_len]);
+        // Buffer sized to MAX_PACKET_SIZE; packets larger than this were already rejected above.
+        var hp_buf: [MAX_PACKET_SIZE]u8 = undefined;
+        @memcpy(hp_buf[0..data.len], data);
         _ = crypto.removeHeaderProtection(hp_key, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
         // Parse with header protection removed.
-        const result = try packet.parseLongHeader(hp_buf[0..pkt_len]);
+        const result = try packet.parseLongHeader(hp_buf[0..data.len]);
         const hdr = result.header;
 
         switch (hdr.packet_type) {
@@ -1036,6 +1038,9 @@ pub const Connection = struct {
     fn processShortHeaderPacket(self: *Connection, data: []const u8) !usize {
         if (self.app_keys == null) return 0;
 
+        // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
+        if (data.len > MAX_PACKET_SIZE) return 0;
+
         // DCID in short headers = client's DCID in all subsequent packets = our SCID.
         // RFC 9000 §7.2: client uses server's SCID as its DCID.
         // Since we echo the client's original DCID as our SCID (DCID echo), the client
@@ -1050,12 +1055,11 @@ pub const Connection = struct {
         if (pn_off + 4 + 16 > data.len) {
             return 0;
         }
-        var hp_buf: [1500]u8 = undefined;
-        const pkt_len = @min(data.len, hp_buf.len);
-        @memcpy(hp_buf[0..pkt_len], data[0..pkt_len]);
+        var hp_buf: [MAX_PACKET_SIZE]u8 = undefined;
+        @memcpy(hp_buf[0..data.len], data);
         _ = crypto.removeHeaderProtection(self.app_keys.?.client.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
-        const result = try packet.parseShortHeader(hp_buf[0..pkt_len], our_scid_len);
+        const result = try packet.parseShortHeader(hp_buf[0..data.len], our_scid_len);
         const hdr = result.header;
         const pn = packet.decodePacketNumber(
             self.hot.rx_pn[2],
@@ -4905,12 +4909,12 @@ test "PMTUD: queuePmtudProbe succeeds when conditions are met" {
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
-    // Attempt to queue a probe at valid size (within MAX_PACKET_SIZE=1350)
-    try conn.queuePmtudProbe(1300);
+    // Attempt to queue a probe at valid size (within MAX_PACKET_SIZE=1200)
+    try conn.queuePmtudProbe(1200);
 
     // Verify probe is tracked
     try testing.expect(conn.pmtud_probing != null);
-    try testing.expectEqual(@as(u16, 1300), conn.pmtud_probing.?.target_size);
+    try testing.expectEqual(@as(u16, 1200), conn.pmtud_probing.?.target_size);
     try testing.expectEqual(@as(u64, 0), conn.pmtud_probing.?.packet_number); // first pn
     try testing.expectEqual(@as(u2, 2), conn.pmtud_probing.?.epoch); // 1-RTT
     try testing.expectEqual(@as(i64, 1_000_000_000), conn.pmtud_probing.?.sent_ns);
@@ -4930,11 +4934,11 @@ test "PMTUD: queuePmtudProbe rejects invalid sizes" {
     try testing.expectError(error.InvalidSize, conn.queuePmtudProbe(1199));
     try testing.expectError(error.InvalidSize, conn.queuePmtudProbe(0));
 
-    // Verify max valid size within send buffer (1350) is allowed
-    try conn.queuePmtudProbe(1350);
+    // Verify max valid size within MAX_PACKET_SIZE (1200) is allowed
+    try conn.queuePmtudProbe(1200);
 
     // Sizes beyond MAX_PACKET_SIZE are rejected
-    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1351));
+    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1201));
 }
 
 test "PMTUD: queuePmtudProbe rejects when no 1-RTT keys" {
@@ -4962,11 +4966,11 @@ test "PMTUD: queuePmtudProbe initiates and stores probe info" {
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate a probe at valid size
-    try conn.queuePmtudProbe(1300);
+    try conn.queuePmtudProbe(1200);
 
     // Verify probe was started with correct target and timestamp
     try testing.expect(conn.pmtud_probing != null);
-    try testing.expectEqual(@as(u16, 1300), conn.pmtud_probing.?.target_size);
+    try testing.expectEqual(@as(u16, 1200), conn.pmtud_probing.?.target_size);
     try testing.expectEqual(conn.current_time_ns, conn.pmtud_probing.?.sent_ns);
 }
 
@@ -4976,15 +4980,15 @@ test "PMTUD: probe timeout detected at 3×PTO without ACK" {
     var conn = try Connection.accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
-    conn.path_mtu = 1300;
+    conn.path_mtu = 1200;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.cached_max_ack_delay_ns = 25_000_000; // 25ms
 
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
-    // Manually initiate probe at valid size
-    try conn.queuePmtudProbe(1300);
+    // Manually initiate probe at maximum valid size (1200)
+    try conn.queuePmtudProbe(1200);
 
     // Calculate PTO (initial RTT is 1 second by default)
     const pto_ns = conn.loss.rtt.ptoBase(conn.cached_max_ack_delay_ns); // ~1s + margin
@@ -4992,8 +4996,8 @@ test "PMTUD: probe timeout detected at 3×PTO without ACK" {
     // Fast forward past 3×PTO
     conn.tick(conn.current_time_ns + @as(i64, @intCast(pto_ns * 3)) + 1_000_000);
 
-    // Verify probe was cleared and MTU backed off via binary search: (1200 + 1300) / 2 = 1250
-    try testing.expectEqual(@as(u16, 1250), conn.path_mtu);
+    // Verify probe was cleared. At RFC minimum (1200), binary search stays at 1200.
+    try testing.expectEqual(@as(u16, 1200), conn.path_mtu);
     try testing.expect(conn.pmtud_probing == null);
 }
 
@@ -5010,7 +5014,7 @@ test "PMTUD: ACK detection marks probe as successful" {
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate probe at valid size
-    try conn.queuePmtudProbe(1300);
+    try conn.queuePmtudProbe(1200);
     const probe_pn = conn.pmtud_probing.?.packet_number;
 
     // Simulate receiving an ACK that includes the probe packet number
@@ -5031,7 +5035,7 @@ test "PMTUD: ACK detection marks probe as successful" {
     try conn.processFrames(ack_buf[0..ack_len], 2, null);
 
     // Verify probe was marked successful and path_mtu updated to probed size
-    try testing.expectEqual(@as(u16, 1300), conn.path_mtu);
+    try testing.expectEqual(@as(u16, 1200), conn.path_mtu);
     try testing.expect(conn.pmtud_probing == null);
 }
 
@@ -5050,7 +5054,7 @@ test "PMTUD: does not backoff on ACK with gap containing probe" {
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate probe at valid size
-    try conn.queuePmtudProbe(1300);
+    try conn.queuePmtudProbe(1200);
     const probe_pn = conn.pmtud_probing.?.packet_number;
 
     // Send another packet to have something larger to ACK
@@ -5094,7 +5098,7 @@ test "PMTUD: does not backoff on ACK with unreachable packet" {
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Queue a small probe manually
-    try conn.queuePmtudProbe(1300);
+    try conn.queuePmtudProbe(1200);
     const probe_pn = conn.pmtud_probing.?.packet_number;
 
     // ACK a different packet (not the probe)
@@ -5154,7 +5158,7 @@ test "PMTUD: state machine: probe can only be initiated when none in flight" {
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate probe manually
-    try conn.queuePmtudProbe(1300);
+    try conn.queuePmtudProbe(1200);
     try testing.expect(conn.pmtud_probing != null);
     const first_pn = conn.pmtud_probing.?.packet_number;
 
@@ -5181,7 +5185,7 @@ test "PMTUD: respects 1-second retry interval after failure" {
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate and timeout probe manually
-    try conn.queuePmtudProbe(1300);
+    try conn.queuePmtudProbe(1200);
     const pto_ns = conn.loss.rtt.ptoBase(conn.cached_max_ack_delay_ns);
     conn.tick(conn.current_time_ns + @as(i64, @intCast(pto_ns * 3)) + 1_000_000);
 
@@ -5206,7 +5210,7 @@ test "PMTUD: probe packet is marked ack-eliciting" {
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Queue probe at realistic size (< MAX_PACKET_SIZE)
-    try conn.queuePmtudProbe(1300);
+    try conn.queuePmtudProbe(1200);
 
     // Verify it was registered in loss recovery as ack-eliciting
     // (The onPacketSent call in queuePmtudProbe passes true for ack_eliciting)
@@ -5287,8 +5291,8 @@ test "PMTUD: short header padding calculation is correct" {
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
-    try conn.queuePmtudProbe(1300);
-    try testing.expectEqual(@as(u16, 1300), conn.pmtud_probing.?.target_size);
+    try conn.queuePmtudProbe(1200);
+    try testing.expectEqual(@as(u16, 1200), conn.pmtud_probing.?.target_size);
 }
 
 test "PMTUD: rejects probe size above MAX_PACKET_SIZE" {
@@ -5301,7 +5305,7 @@ test "PMTUD: rejects probe size above MAX_PACKET_SIZE" {
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
-    try conn.queuePmtudProbe(1350);
+    try conn.queuePmtudProbe(1200);
     try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1351));
 }
 
