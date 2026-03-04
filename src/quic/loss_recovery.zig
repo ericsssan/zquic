@@ -1060,9 +1060,9 @@ test "loss_recovery: detectLoss multiple packets in-flight accounting" {
     var table = SentPacketTable.init();
 
     // Add 3 packets
-    const pkt1 = SentPacket{.pn = 0, .sent_ns = 0, .size = 30, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
-    const pkt2 = SentPacket{.pn = 1, .sent_ns = 100, .size = 40, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
-    const pkt3 = SentPacket{.pn = 2, .sent_ns = 200, .size = 50, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
+    const pkt1 = SentPacket{ .pn = 0, .sent_ns = 0, .size = 30, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true };
+    const pkt2 = SentPacket{ .pn = 1, .sent_ns = 100, .size = 40, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true };
+    const pkt3 = SentPacket{ .pn = 2, .sent_ns = 200, .size = 50, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true };
     _ = table.add(pkt1, .{});
     _ = table.add(pkt2, .{});
     _ = table.add(pkt3, .{});
@@ -1084,7 +1084,7 @@ test "loss_recovery: detectLoss partial in-flight decrement" {
     const testing = std.testing;
     var table = SentPacketTable.init();
 
-    const pkt = SentPacket{.pn = 0, .sent_ns = 0, .size = 50, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true};
+    const pkt = SentPacket{ .pn = 0, .sent_ns = 0, .size = 50, .epoch = 0, .in_flight = true, .ack_eliciting = false, .valid = true };
     _ = table.add(pkt, .{});
 
     var bif: u64 = 200;

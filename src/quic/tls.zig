@@ -356,9 +356,9 @@ pub const TlsServer = struct {
                 var i: u8 = 0;
                 while (i < vi_len) : (i += 4) {
                     const ver = @as(u32, vi_buf[i]) << 24 |
-                               @as(u32, vi_buf[i + 1]) << 16 |
-                               @as(u32, vi_buf[i + 2]) << 8 |
-                               @as(u32, vi_buf[i + 3]);
+                        @as(u32, vi_buf[i + 1]) << 16 |
+                        @as(u32, vi_buf[i + 2]) << 8 |
+                        @as(u32, vi_buf[i + 3]);
                     if (ver == self.server_configured_version and ver != self.quic_version) {
                         // Peer supports our configured version; switch to it for key derivation.
                         self.quic_version = ver;

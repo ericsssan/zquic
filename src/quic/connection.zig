@@ -124,8 +124,8 @@ pub const ConnectionHot = struct {
 // Send queue
 // ---------------------------------------------------------------------------
 
-const MAX_PACKET_SIZE = 1500;  // Maximum received packet size (standard MTU)
-const MAX_SEND_PACKET_SIZE = 1452;  // Maximum packet size for sending (UDP datagram limit)
+const MAX_PACKET_SIZE = 1500; // Maximum received packet size (standard MTU)
+const MAX_SEND_PACKET_SIZE = 1452; // Maximum packet size for sending (UDP datagram limit)
 const SEND_QUEUE_DEPTH = 16;
 
 /// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
@@ -391,14 +391,14 @@ pub const Connection = struct {
     crypto_staged_count: [3]u8,
     /// Total bytes currently staged per epoch (DoS defense: prevents unbounded memory pinning).
     /// Limit: 16KB per epoch. Frames exceeding this are silently dropped.
-    crypto_staged_bytes: [3]u32 = [_]u32{0, 0, 0},
+    crypto_staged_bytes: [3]u32 = [_]u32{ 0, 0, 0 },
     /// Highest peer-provided sequence in NEW_CONNECTION_ID (monotonic bound for validation).
     peer_cid_highest_seq: u62 = 0,
 
     /// Resource limit telemetry counters (for observability).
-    gaps_full_count: u32 = 0,       // Times GapList filled up (stream reass)
-    ack_ranges_dropped_count: u32 = 0,  // Times ACK ranges truncated
-    crypto_staged_bytes_peak: u32 = 0,  // Peak staged crypto bytes per epoch
+    gaps_full_count: u32 = 0, // Times GapList filled up (stream reass)
+    ack_ranges_dropped_count: u32 = 0, // Times ACK ranges truncated
+    crypto_staged_bytes_peak: u32 = 0, // Peak staged crypto bytes per epoch
 
     /// Deferred ACK flags: set when an ack-eliciting frame is received in an epoch.
     /// Flushed to encrypted ACK packets at the end of receive().
@@ -3340,7 +3340,7 @@ test "initial_packet: RFC9000§9 - drop Initial packets in established state" {
     pkt[2] = 0x00; // Version byte 1
     pkt[3] = 0x00; // Version byte 2
     pkt[4] = 0x01; // Version byte 3 (v1)
-    pkt[5] = 8;    // DCID length
+    pkt[5] = 8; // DCID length
     // DCID = 8 bytes (arbitrary)
     pkt[6] = 0x00;
     pkt[7] = 0x01;
@@ -3384,7 +3384,7 @@ test "initial_packet: RFC9000§9 - drop Initial with mismatched DCID in handshak
     pkt[2] = 0x00;
     pkt[3] = 0x00;
     pkt[4] = 0x01; // Version v1
-    pkt[5] = 8;    // DCID length
+    pkt[5] = 8; // DCID length
     // DCID = 0x10 0x11 ... (different from local_cid)
     pkt[6] = 0x10;
     pkt[7] = 0x11;
@@ -6385,7 +6385,7 @@ test "connection: markPnReceived then isPnDuplicate returns true for same PN" {
     conn.markPnReceived(0, 10);
     try testing.expect(conn.isPnDuplicate(0, 10));
     try testing.expect(!conn.isPnDuplicate(0, 11)); // never received
-    try testing.expect(!conn.isPnDuplicate(0, 9));  // never received (out-of-order hole)
+    try testing.expect(!conn.isPnDuplicate(0, 9)); // never received (out-of-order hole)
 }
 
 test "connection: markPnReceived out-of-order fills bitmap correctly" {
@@ -6398,7 +6398,7 @@ test "connection: markPnReceived out-of-order fills bitmap correctly" {
     try testing.expect(!conn.isPnDuplicate(0, 3)); // not yet received
 
     conn.markPnReceived(0, 3); // out-of-order fill
-    try testing.expect(conn.isPnDuplicate(0, 3));  // now received
+    try testing.expect(conn.isPnDuplicate(0, 3)); // now received
     try testing.expect(!conn.isPnDuplicate(0, 4)); // still missing
     try testing.expectEqual(@as(u64, 5), conn.hot.rx_pn[0]); // largest unchanged
 
@@ -6415,7 +6415,7 @@ test "connection: isPnDuplicate treats PN > 63 below largest as duplicate" {
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
     conn.markPnReceived(0, 100);
-    try testing.expect(conn.isPnDuplicate(0, 36));  // 100 - 36 = 64 → duplicate
+    try testing.expect(conn.isPnDuplicate(0, 36)); // 100 - 36 = 64 → duplicate
     try testing.expect(!conn.isPnDuplicate(0, 37)); // 100 - 37 = 63 → within window
 }
 
@@ -6442,7 +6442,7 @@ test "connection: buildAckRangesFromBitmap with gap" {
     const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 1), ranges[0].ack_range); // [N-1, N]
-    try testing.expectEqual(@as(u62, 1), ranges[1].gap);       // 2 missing packets encoded as gap=1
+    try testing.expectEqual(@as(u62, 1), ranges[1].gap); // 2 missing packets encoded as gap=1
     try testing.expectEqual(@as(u62, 1), ranges[1].ack_range); // [N-5, N-4]
 }
 
@@ -6505,9 +6505,9 @@ test "connection: buildAckRangesFromBitmap large gap (CTZ optimization)" {
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
     const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
-    try testing.expectEqual(@as(u62, 0), ranges[0].ack_range);       // bit 0
-    try testing.expectEqual(@as(u62, 61), ranges[1].gap);            // 62 missing packets encoded as gap=61
-    try testing.expectEqual(@as(u62, 0), ranges[1].ack_range);       // bit 63
+    try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // bit 0
+    try testing.expectEqual(@as(u62, 61), ranges[1].gap); // 62 missing packets encoded as gap=61
+    try testing.expectEqual(@as(u62, 0), ranges[1].ack_range); // bit 63
 }
 
 test "connection: buildAckRangesFromBitmap leading zeros (CTZ optimization)" {
@@ -6530,7 +6530,7 @@ test "connection: buildAckRangesFromBitmap trailing zeros (CTZ optimization)" {
     const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // first_run=0
-    try testing.expectEqual(@as(u62, 3), ranges[1].gap);       // gap of 4 encoded as 3
+    try testing.expectEqual(@as(u62, 3), ranges[1].gap); // gap of 4 encoded as 3
     try testing.expectEqual(@as(u62, 3), ranges[1].ack_range); // run of 4 encoded as 3
 }
 
@@ -6575,7 +6575,7 @@ test "connection: buildAckRangesFromBitmap byte pattern (CTZ optimization)" {
     // Expected: gap of 8, run of 8
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // first_run = 0
-    try testing.expectEqual(@as(u62, 7), ranges[1].gap);       // gap of 8 = 7
+    try testing.expectEqual(@as(u62, 7), ranges[1].gap); // gap of 8 = 7
     try testing.expectEqual(@as(u62, 7), ranges[1].ack_range); // run of 8 = 7
 }
 
@@ -6706,7 +6706,7 @@ test "connection: packets outside 64-packet window are treated as duplicates" {
     // Pkt 36 is 100-36=64 positions away. The window covers the last 64 PNs.
     // Pkt 37 is 63 away (within window), pkt 36 is 64 away (outside).
     try testing.expect(!conn.isPnDuplicate(0, 37)); // 63 away → within window (not yet received)
-    try testing.expect(conn.isPnDuplicate(0, 36));  // 64 away → outside window → duplicate
+    try testing.expect(conn.isPnDuplicate(0, 36)); // 64 away → outside window → duplicate
 }
 
 test "connection: ACK with gap encodes correctly" {
@@ -6724,7 +6724,7 @@ test "connection: ACK with gap encodes correctly" {
     // Range 1: ack_range = 1 (bits 3-4 set = 2 packets)
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 1), ranges[0].ack_range);
-    try testing.expectEqual(@as(u62, 0), ranges[1].gap);  // 1 missing packet = gap-1 = 0
+    try testing.expectEqual(@as(u62, 0), ranges[1].gap); // 1 missing packet = gap-1 = 0
     try testing.expectEqual(@as(u62, 1), ranges[1].ack_range);
 }
 
@@ -6891,11 +6891,11 @@ test "connection: Config.initial_quic_version can be set to V2" {
 test "connection: accept() uses Config.initial_quic_version" {
     const testing = std.testing;
     const io = std.testing.io;
-    
+
     // Test with default V1
     var conn_v1 = try Connection.accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.quic_version);
-    
+
     // Test with V2
     var conn_v2 = try Connection.accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.quic_version);
@@ -6905,10 +6905,10 @@ test "connection: rotateKeys toggles current_key_phase" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection.accept(.{}, io);
-    
+
     const initial_phase = conn.current_key_phase;
     try testing.expect(!initial_phase); // Should default to false
-    
+
     // Mock app_keys to allow rotation
     conn.app_keys = .{
         .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
@@ -6917,7 +6917,7 @@ test "connection: rotateKeys toggles current_key_phase" {
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = [_]u8{0} ** 32;
     conn.next_server_secret = [_]u8{0} ** 32;
-    
+
     conn.rotateKeys();
     try testing.expect(conn.current_key_phase != initial_phase);
 }
@@ -7337,7 +7337,7 @@ test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
         .sequence_number = 10,
         .retire_prior_to = 0,
         .cid_len = 8,
-        .cid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
@@ -7346,7 +7346,7 @@ test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
         .sequence_number = 9,
         .retire_prior_to = 0,
         .cid_len = 8,
-        .cid = [_]u8{2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .cid = [_]u8{ 2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
@@ -7366,7 +7366,7 @@ test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {
         .sequence_number = 100,
         .retire_prior_to = 0,
         .cid_len = 8,
-        .cid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
@@ -7375,7 +7375,7 @@ test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {
         .sequence_number = 1101, // > 100 + 1000
         .retire_prior_to = 0,
         .cid_len = 8,
-        .cid = [_]u8{2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .cid = [_]u8{ 2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
@@ -7395,7 +7395,7 @@ test "security: NEW_CONNECTION_ID sequence within bounds is accepted" {
         .sequence_number = 100,
         .retire_prior_to = 0,
         .cid_len = 8,
-        .cid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
@@ -7404,7 +7404,7 @@ test "security: NEW_CONNECTION_ID sequence within bounds is accepted" {
         .sequence_number = 1100,
         .retire_prior_to = 0,
         .cid_len = 8,
-        .cid = [_]u8{2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+        .cid = [_]u8{ 2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
@@ -7443,7 +7443,7 @@ test "security: token plaintext zeroization on generation" {
         .addr = [_]u8{ 127, 0, 0, 1 },
         .port = 4433,
     } };
-    const odcid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8};
+    const odcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const token = conn.generateToken(addr, &odcid, 1_000_000_000, io);
 
     // Token should be generated (75 bytes)
@@ -7462,7 +7462,7 @@ test "security: token plaintext zeroization on validation" {
         .addr = [_]u8{ 127, 0, 0, 1 },
         .port = 4433,
     } };
-    const odcid = [_]u8{1, 2, 3, 4, 5, 6, 7, 8};
+    const odcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     const token = conn.generateToken(addr, &odcid, 1_000_000_000, io);
 
     // Validate the token (plaintext is zeroized internally after validation)

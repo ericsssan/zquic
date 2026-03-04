@@ -146,8 +146,7 @@ pub fn main(init: std.process.Init) !void {
                         3 => "Retry",
                         else => "?",
                     };
-                    std.debug.print("recv LONG pkt: len={d} type={s} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n",
-                        .{ msg.data.len, pkt_type_str, msg.data[0], ver, dcid_len });
+                    std.debug.print("recv LONG pkt: len={d} type={s} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n", .{ msg.data.len, pkt_type_str, msg.data[0], ver, dcid_len });
                     if (dcid_len > 0 and msg.data.len >= 6 + dcid_len) {
                         std.debug.print("  dcid=", .{});
                         for (msg.data[6..][0..dcid_len]) |b| std.debug.print("{x:0>2}", .{b});
@@ -404,24 +403,20 @@ fn updateKeyLog(conn: *const quic.Connection, io: std.Io, _: u32) void {
     var pos: usize = 0;
 
     // Write handshake secrets (same as initial)
-    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
+    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
     pos += line.len;
 
-    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
     pos += line.len;
 
     // Write all generations (0 through current)
     var gen: u32 = 0;
     while (gen <= conn.current_key_generation) : (gen += 1) {
         const secrets = conn.deriveSecretsForGeneration(gen);
-        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n",
-            .{ gen, random_hex, std.fmt.bytesToHex(secrets.client, .lower) }) catch return;
+        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n", .{ gen, random_hex, std.fmt.bytesToHex(secrets.client, .lower) }) catch return;
         pos += line.len;
 
-        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n",
-            .{ gen, random_hex, std.fmt.bytesToHex(secrets.server, .lower) }) catch return;
+        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n", .{ gen, random_hex, std.fmt.bytesToHex(secrets.server, .lower) }) catch return;
         pos += line.len;
 
         if (pos >= buf.len - 256) break;
@@ -445,22 +440,18 @@ fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
     var pos: usize = 0;
 
     // Write handshake secrets
-    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
+    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
     pos += line.len;
 
-    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
     pos += line.len;
 
     // Write initial application secrets (generation 0)
     const secrets_0 = conn.deriveSecretsForGeneration(0);
-    line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_0 {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(secrets_0.client, .lower) }) catch return;
+    line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_0 {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(secrets_0.client, .lower) }) catch return;
     pos += line.len;
 
-    line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_0 {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(secrets_0.server, .lower) }) catch return;
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_0 {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(secrets_0.server, .lower) }) catch return;
     pos += line.len;
 
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
@@ -486,24 +477,20 @@ fn appendRotatedSecretsToKeyLog(conn: *const quic.Connection, io: std.Io) void {
     }
 
     // Write handshake secrets
-    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
+    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
     pos += line.len;
 
-    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n",
-        .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
+    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
     pos += line.len;
 
     // Write all generations (0 through current)
     var gen: u32 = 0;
     while (gen <= conn.current_key_generation) : (gen += 1) {
         const secrets = conn.deriveSecretsForGeneration(gen);
-        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n",
-            .{ gen, random_hex, std.fmt.bytesToHex(secrets.client, .lower) }) catch return;
+        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n", .{ gen, random_hex, std.fmt.bytesToHex(secrets.client, .lower) }) catch return;
         pos += line.len;
 
-        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n",
-            .{ gen, random_hex, std.fmt.bytesToHex(secrets.server, .lower) }) catch return;
+        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n", .{ gen, random_hex, std.fmt.bytesToHex(secrets.server, .lower) }) catch return;
         pos += line.len;
 
         if (pos >= buf.len - 256) break; // Avoid buffer overflow
