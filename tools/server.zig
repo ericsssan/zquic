@@ -214,17 +214,11 @@ pub fn main(init: std.process.Init) !void {
             // Advance any pending file transfers now that the send window may have grown.
             flushTransfers(&conn, &transfers, www_dir, io);
 
-            // Check if all transfers are complete and close the connection.
-            var all_transfers_done = true;
-            for (transfers) |t| {
-                if (t.active) {
-                    all_transfers_done = false;
-                    break;
-                }
-            }
-            if (all_transfers_done) {
-                conn.close(0, true, "") catch {};
-            }
+            // DO NOT actively close the connection after transfers complete.
+            // The client is responsible for closing the connection when it's done downloading.
+            // For "multiplexing" test with 2000 files but only 8 transfer slots, closing after
+            // the first batch would prematurely terminate the connection. Instead, rely on the
+            // idle timeout (configured by the client) to clean up abandoned connections.
 
             std.debug.print("  sq depth={d}\n", .{conn.sq_tail - conn.sq_head});
             var sent_bytes: usize = 0;

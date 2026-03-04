@@ -821,11 +821,18 @@ pub const Connection = struct {
         // from new connection attempts (which use different SCID).
         if (raw_pkt_type == .initial and self.hot.state == .handshake) {
             // Build a temporary ConnectionId from raw_dcid for comparison.
-            var incoming_dcid: ConnectionId = .{};
-            if (raw_dcid_len > 0) @memcpy(incoming_dcid.bytes[0..raw_dcid_len], raw_dcid);
-            // Check if this Initial targets this connection's local DCID.
-            if (!incoming_dcid.eql(self.local_cid)) {
-                // Different DCID: this packet is for a different connection. Silently drop.
+            // Note: ConnectionId is fixed at 8 bytes; DCIDs can be 0-20 bytes per RFC 9000.
+            // Only compare if the incoming DCID fits in our ConnectionId size.
+            if (raw_dcid_len <= cid_mod.len) {
+                var incoming_dcid: ConnectionId = .{};
+                if (raw_dcid_len > 0) @memcpy(incoming_dcid.bytes[0..raw_dcid_len], raw_dcid);
+                // Check if this Initial targets this connection's local DCID.
+                if (!incoming_dcid.eql(self.local_cid)) {
+                    // Different DCID: this packet is for a different connection. Silently drop.
+                    return data.len;
+                }
+            } else {
+                // DCID too long to fit in ConnectionId — reject to prevent buffer overflow.
                 return data.len;
             }
         }
