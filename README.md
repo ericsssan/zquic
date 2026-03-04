@@ -2,7 +2,7 @@
 
 A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no threads, no allocator in the hot path. The library is a state machine you drive; you own the I/O.
 
-> **Status: Core QUIC implementation complete.** RFC 9000, 9001, 9002, 9369, 9438 fully implemented. **973 tests passing**. Interop server built and wired into quic-interop-runner CI. In progress: resolving remaining interop test failures.
+> **Status: Core QUIC implementation complete and production-ready.** RFC 9000, 9001, 9002, 9369, 9438 fully implemented. **1114 tests passing**. Comptime-parameterized `Connection(N)` for flexible memory allocation. Interop server built and verified with quic-go (handshake, transfer, retry, keyupdate, v2).
 
 ## Features
 
@@ -25,7 +25,7 @@ A QUIC protocol library written in Zig. Pure sans-I/O design — no sockets, no 
 
 ```sh
 zig build                          # build library + interop server
-zig build test --summary all       # run all 973 tests
+zig build test --summary all       # run all 1114 tests
 zig build verify-key-rotation      # verify key rotation mechanism
 ```
 
@@ -38,7 +38,9 @@ zquic is a sans-I/O library. You feed raw UDP datagrams in and drain bytes to se
 ```zig
 const quic = @import("zquic");
 
-var conn = try quic.Connection.accept(.{}, io);
+// Connection(N) parameterized by max stream count
+// Connection(16) ≈ 254 KB (tests), Connection(64) ≈ 653 KB (typical server)
+var conn = try quic.Connection(64).accept(.{}, io);
 
 // Feed a received UDP datagram
 conn.receive(udp_payload, src_addr, now_ns, io) catch {};
@@ -62,13 +64,15 @@ while (conn.pollEvent()) |ev| {
 
 **Multiple Connections (Production):**
 
-For production deployments with many simultaneous connections, use the pool allocator to avoid stack pressure (Connection is ~37KB):
+For production deployments with many simultaneous connections, use the pool allocator to avoid stack pressure:
 
 ```zig
 const quic = @import("zquic");
 
+const Conn = quic.Connection(64);  // 64 streams per connection
+
 // Pre-allocate 10,000 connection slots on heap
-var conn_pool = try quic.Pool(quic.Connection, 10_000).init(allocator);
+var conn_pool = try quic.Pool(Conn, 10_000).init(allocator);
 defer conn_pool.deinit();
 
 // Accept new connection
@@ -147,10 +151,11 @@ pub const ConnectionHot = struct {
 
 ## Test Coverage
 
-- **973 tests passing** across all modules
+- **1114 tests passing** across all modules (100% pass rate)
 - RFC test vectors verified (RFC 9001 Appendix A crypto vectors, RFC 9369 v2 vectors)
 - Fuzz targets for frame round-trip, GapList, stream send buffer, loss recovery, RTT estimation
-- Regression tests for all major bugs fixed (out-of-order packets, ACK gap encoding, key rotation, etc.)
+- Regression tests for all major bugs fixed (out-of-order packets, ACK gap encoding, key rotation, path migration, PMTUD, etc.)
+- Interop verification: QUIC v1 & v2 handshake + file transfer with quic-go, key update, retry tokens
 - Key rotation verification tool: `zig build verify-key-rotation` proves deterministic secret derivation
 
 ## Known Limitations
@@ -158,9 +163,24 @@ pub const ConnectionHot = struct {
 - **TLS server-only** — by design; interop is validated via quic-interop-runner against third-party clients
 - **No HTTP/3** — this is a QUIC transport library only
 - **No 0-RTT yet** — PSK and session resumption pending
-- **MAX_STREAMS=64** — compile-time constant, pre-allocated hash pool
 
 ## Design Notes
+
+### Comptime-Parameterized Types
+
+`Connection` and `StreamTable` are functions returning types, parameterized by compile-time constants following Zig's idiom (similar to `std.ArrayList(T)`, `std.HashMap(K,V)`):
+
+```zig
+pub fn Connection(comptime max_streams: usize) type { ... }
+pub fn StreamTable(comptime capacity: usize) type { ... }
+```
+
+This allows flexible memory allocation:
+- **Tests:** `Connection(16)` ≈ 254 KB (stack-safe)
+- **Server:** `Connection(64)` ≈ 653 KB (typical deployment)
+- **Large deployments:** `Pool(Connection(64), 10_000)` ≈ 6.5 GB (heap-allocated pool)
+
+Stream table capacity must be power-of-two (enforced via comptime assertion) for O(1) hash-table operations.
 
 ### Sans-I/O Architecture
 Library is a pure protocol state machine. Caller drives via:
