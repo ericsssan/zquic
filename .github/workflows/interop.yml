@@ -45,12 +45,6 @@ jobs:
       - name: Install Python dependencies
         run: pip3 install -r runner/requirements.txt
 
-      - name: Register zquic in implementations.json
-        run: |
-          cd runner
-          jq '. + {"zquic": {"image": "ghcr.io/${{ github.repository_owner }}/zquic", "url": "https://github.com/${{ github.repository }}", "role": "server"}}' \
-            implementations.json > tmp.json && mv tmp.json implementations.json
-
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
 
