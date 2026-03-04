@@ -2940,6 +2940,69 @@ test "connection: processAck uses packet epoch not connection epoch" {
     try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
 }
 
+test "ack: buildAckRangesFromBitmap encodes gap values correctly without -1" {
+    const testing = std.testing;
+
+    // Regression test for commit 62e2bde: ACK gap encoding bug
+    // Previously: gap_value = if (gap > 0) gap - 1 else 0 (INCORRECT)
+    // Fix: gap_value = gap (CORRECT per RFC 9000 §19.3.1)
+    //
+    // Test case: packets [5, 4, missing 3, 2, 1, 0]
+    // Bitmap would have bits for 5,4,2,1,0 set (bit 3 missing)
+    // We should encode: gap=1 (not gap=0) between packets 4 and 2
+
+    var bitmap: [3]u64 = undefined;
+    bitmap[0] = 0; // Initial epoch
+    bitmap[1] = 0; // Handshake epoch
+    // 1-RTT: bits 0,1,2,4,5 set (packets 0,1,2,4,5); bit 3 missing (packet 3)
+    bitmap[2] = 0b0011_0111; // bits 0,1,2,4,5
+
+    var ranges: [32]frame.AckRange = undefined;
+    const count = Connection.buildAckRangesFromBitmap(bitmap[2], &ranges);
+
+    // Should have 2 ranges: [5,4] and [2,1,0]
+    try testing.expectEqual(@as(usize, 2), count);
+
+    // First range: packets 5,4
+    try testing.expectEqual(@as(u62, 1), ranges[0].ack_range); // 2 packets = ack_range of 1
+    try testing.expectEqual(@as(u62, 0), ranges[0].gap);
+
+    // Second range: packets 2,1,0 with gap of 1 for missing packet 3
+    try testing.expectEqual(@as(u62, 2), ranges[1].ack_range); // 3 packets = ack_range of 2
+    // CRITICAL: gap must be 1 (the number of missing packets)
+    // With the bug (gap-1), this would be 0, causing quic-go to reject:
+    // "AckFrame: ACK frame contains invalid ACK ranges"
+    try testing.expectEqual(@as(u62, 1), ranges[1].gap);
+}
+
+test "ack: isPnDuplicate and markPnReceived handle out-of-order packets" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Test RFC 9000 §13.2: Out-of-order packet handling with duplicate detection
+    // Scenario: receive packet 5, then 3, then 5 again (retransmit)
+    const epoch: usize = 2; // 1-RTT epoch
+
+    // Receive packet 5 (largest so far)
+    try testing.expect(!conn.isPnDuplicate(epoch, 5));
+    conn.markPnReceived(epoch, 5);
+
+    // Receive packet 3 (out of order, should not be duplicate)
+    try testing.expect(!conn.isPnDuplicate(epoch, 3));
+    conn.markPnReceived(epoch, 3);
+
+    // Receive packet 5 again (should now be duplicate)
+    try testing.expect(conn.isPnDuplicate(epoch, 5));
+
+    // Receive packet 4 (fills gap, should not be duplicate)
+    try testing.expect(!conn.isPnDuplicate(epoch, 4));
+    conn.markPnReceived(epoch, 4);
+
+    // Receive packet 4 again (should now be duplicate)
+    try testing.expect(conn.isPnDuplicate(epoch, 4));
+}
+
 test "connection: version 0 packet is silently ignored" {
     const testing = std.testing;
     const io = std.testing.io;
