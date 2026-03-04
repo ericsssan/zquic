@@ -1090,8 +1090,9 @@ pub const Connection = struct {
             const run: u62 = @as(u62, @intCast(run_raw));
             if (run == 0) break; // Shouldn't happen, but safeguard.
 
-            // RFC 9000: gap value is (unacked_packets - 1) per the decoding formula.
-            const gap_value: u62 = if (gap > 0) gap - 1 else 0;
+            // RFC 9000 §19.3.1: Gap field directly encodes the number of unacked packets
+            // (the decoding formula subtracts 1, so we don't here; @ctz already counts the gap).
+            const gap_value: u62 = gap;
             out[count] = .{ .gap = gap_value, .ack_range = run - 1 };
             count += 1;
 
