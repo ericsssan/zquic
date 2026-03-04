@@ -3225,6 +3225,89 @@ test "close: receive refreshes idle_deadline on active connection" {
     try testing.expect(conn.idle_deadline_ns.? > 500);
 }
 
+test "initial_packet: RFC9000§9 - drop Initial packets in established state" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Transition to established state (simulating a completed handshake).
+    conn.hot.state = .established;
+    conn.current_time_ns = 0;
+
+    // Build a minimal Initial packet (fixed first byte 0xc0 for long header, type=initial).
+    var pkt: [64]u8 = undefined;
+    pkt[0] = 0xc0; // Long header, type=Initial (bits 5-4 = 00)
+    pkt[1] = 0x00; // Version byte 0
+    pkt[2] = 0x00; // Version byte 1
+    pkt[3] = 0x00; // Version byte 2
+    pkt[4] = 0x01; // Version byte 3 (v1)
+    pkt[5] = 8;    // DCID length
+    // DCID = 8 bytes (arbitrary)
+    pkt[6] = 0x00;
+    pkt[7] = 0x01;
+    pkt[8] = 0x02;
+    pkt[9] = 0x03;
+    pkt[10] = 0x04;
+    pkt[11] = 0x05;
+    pkt[12] = 0x06;
+    pkt[13] = 0x07;
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
+
+    // Attempt to receive Initial packet in established state.
+    // Should silently drop (return early without error).
+    conn.receive(&pkt, src, 0, io) catch {
+        // Should not error; Initial in established should be silently dropped.
+        testing.expect(false) catch unreachable;
+        return;
+    };
+
+    // Connection should remain in established state.
+    try testing.expectEqual(ConnState.established, conn.hot.state);
+}
+
+test "initial_packet: RFC9000§9 - drop Initial with mismatched DCID in handshake state" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection.accept(.{}, io);
+
+    // Transition to handshake state.
+    conn.hot.state = .handshake;
+    // Set local_cid to a specific pattern (first byte = 0x01, rest = 0x00)
+    conn.local_cid.bytes[0] = 0x01;
+    @memset(conn.local_cid.bytes[1..], 0x00);
+    conn.current_time_ns = 0;
+
+    // Build Initial packet with DIFFERENT DCID than connection's local_cid.
+    var pkt: [64]u8 = undefined;
+    pkt[0] = 0xc0; // Long header, type=Initial
+    pkt[1] = 0x00;
+    pkt[2] = 0x00;
+    pkt[3] = 0x00;
+    pkt[4] = 0x01; // Version v1
+    pkt[5] = 8;    // DCID length
+    // DCID = 0x10 0x11 ... (different from local_cid)
+    pkt[6] = 0x10;
+    pkt[7] = 0x11;
+    pkt[8] = 0x12;
+    pkt[9] = 0x13;
+    pkt[10] = 0x14;
+    pkt[11] = 0x15;
+    pkt[12] = 0x16;
+    pkt[13] = 0x17;
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
+
+    // Attempt to receive Initial packet with mismatched DCID in handshake state.
+    conn.receive(&pkt, src, 0, io) catch {
+        testing.expect(false) catch unreachable;
+        return;
+    };
+
+    // Connection should remain in handshake state.
+    try testing.expectEqual(ConnState.handshake, conn.hot.state);
+}
+
 // ---------------------------------------------------------------------------
 // New tests — RESET_STREAM / STOP_SENDING (Step 6)
 // ---------------------------------------------------------------------------
