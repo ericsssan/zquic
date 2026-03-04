@@ -45,11 +45,11 @@ jobs:
       - name: Install Python dependencies
         run: pip3 install -r runner/requirements.txt
 
-      - name: Register zquic in implementations_quic.json
+      - name: Register zquic in implementations.json
         run: |
           cd runner
           jq '. + {"zquic": {"image": "ghcr.io/${{ github.repository_owner }}/zquic", "url": "https://github.com/${{ github.repository }}", "role": "server"}}' \
-            implementations_quic.json > tmp.json && mv tmp.json implementations_quic.json
+            implementations.json > tmp.json && mv tmp.json implementations.json
 
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
@@ -62,7 +62,6 @@ jobs:
             --test handshake,transfer,retry,keyupdate,v2 \
             --log-dir logs \
             --json results.json \
-            --implementations implementations_quic.json \
             -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest \
             || true   # runner exits non-zero on any failure; we check below
 
