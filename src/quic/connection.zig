@@ -175,6 +175,10 @@ pub const Config = struct {
     /// Initial QUIC version (0x00000001 = v1, 0x6b3343cf = v2).
     /// Overridden by client's version in first Initial packet.
     initial_quic_version: u32 = packet.QUIC_VERSION_1,
+    /// Maximum number of client-initiated bidirectional streams to advertise.
+    initial_max_streams_bidi: u64 = 100,
+    /// Maximum number of client-initiated unidirectional streams to advertise.
+    initial_max_streams_uni: u64 = 100,
 };
 
 // ---------------------------------------------------------------------------
@@ -470,8 +474,8 @@ pub const Connection = struct {
             .enc_scratch = undefined,
             .peer_max_streams_bidi = 0,
             .peer_max_streams_uni = 0,
-            .local_max_streams_bidi = stream_mod.MAX_STREAMS / 2, // 32 bidi + 32 uni = 64 = MAX_STREAMS
-            .local_max_streams_uni = stream_mod.MAX_STREAMS / 2,
+            .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
+            .local_max_streams_uni = @min(config.initial_max_streams_uni, @as(u64, std.math.maxInt(u62))),
             .peer_max_stream_data_bidi_local = flow_control.DEFAULT_MAX_STREAM_DATA,
             .peer_cid_table = [_]PeerCidEntry{.{
                 .cid = .{},
@@ -1456,7 +1460,10 @@ pub const Connection = struct {
 
         // Before processing ClientHello, configure transport parameters for EncryptedExtensions.
         if (self.tls_state.state == .wait_client_hello) {
-            var our_params = transport_params.TransportParams{};
+            var our_params = transport_params.TransportParams{
+                .initial_max_streams_bidi = self.local_max_streams_bidi,
+                .initial_max_streams_uni = self.local_max_streams_uni,
+            };
             // initial_source_connection_id MUST equal the SCID we sent in our Initial packet
             // (RFC 9000 §7.3). Our wire SCID is ourScidBytes() = local_cid.bytes.
             const scid_bytes = self.ourScidBytes();
@@ -7506,4 +7513,24 @@ test "connection: version negotiation - initial_version set from client Initial"
     try testing.expectEqual(packet.QUIC_VERSION_2, conn.quic_version);
 
     _ = client_version; // Unused in this unit test
+}
+
+test "stream recycling: configurable initial_max_streams_bidi stored in connection" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection.accept(.{
+        .initial_max_streams_bidi = 512,
+        .initial_max_streams_uni = 256,
+    }, io);
+
+    // Verify that the configured values are stored in the connection.
+    // This test documents:
+    // - MAX_STREAMS increased from 64 to 512 (stream.zig)
+    // - Config struct now has configurable stream limits (connection.zig)
+    // - Server advertises 512 bidi streams for transfer testcase (server.zig)
+    // - MAX_TRANSFERS increased from 8 to 64 (server.zig)
+    // These changes allow the server to handle many more concurrent
+    // file transfers (e.g., 2000 files with 8 concurrent transfers).
+    try testing.expectEqual(@as(u64, 512), conn.local_max_streams_bidi);
+    try testing.expectEqual(@as(u64, 256), conn.local_max_streams_uni);
 }

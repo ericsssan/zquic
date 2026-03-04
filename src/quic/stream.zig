@@ -9,7 +9,7 @@ const std = @import("std");
 /// Maximum number of concurrent streams per connection.
 /// Must be a power of two (used as hash table capacity).
 /// In production, increase this and heap-allocate Connection via Pool(Connection, N).
-pub const MAX_STREAMS: usize = 64;
+pub const MAX_STREAMS: usize = 512;
 comptime {
     std.debug.assert(MAX_STREAMS > 0 and (MAX_STREAMS & (MAX_STREAMS - 1)) == 0);
 }
@@ -984,14 +984,14 @@ test "stream_table: tombstone slot is recycled on insert" {
     // tombstone should reuse that tombstone slot rather than a later empty slot.
     const testing = std.testing;
     var table: StreamTable = .{};
-    // id=0 and id=64 both hash to slot 0 (0 & 63 == 0, 64 & 63 == 0).
+    // id=0 and id=512 both hash to slot 0 (0 & 511 == 0, 512 & 511 == 0).
     _ = table.getOrCreate(0); // slot 0
-    _ = table.getOrCreate(64); // slot 1 (probe past occupied slot 0)
+    _ = table.getOrCreate(512); // slot 1 (probe past occupied slot 0)
     table.close(0); // slot 0 becomes tombstone; count=1
-    // id=128 also hashes to slot 0: probe 0 (tombstone → record), 1 (id=64≠128), 2 (empty).
+    // id=1024 also hashes to slot 0: probe 0 (tombstone → record), 1 (id=512≠1024), 2 (empty).
     // Insert at first tombstone (slot 0), not slot 2.
-    const s = table.getOrCreate(128).?;
-    try testing.expectEqual(@as(u62, 128), s.id);
+    const s = table.getOrCreate(1024).?;
+    try testing.expectEqual(@as(u62, 1024), s.id);
     try testing.expectEqual(&table.streams[0], s);
     try testing.expectEqual(@as(usize, 2), table.count);
 }

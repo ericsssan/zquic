@@ -17,7 +17,7 @@ const MAX_DATAGRAM = 1452;
 // short header ~13 + AEAD 16 + STREAM frame header ~17 = ~46 bytes overhead).
 const SEND_CHUNK: usize = 1200;
 // Maximum concurrent file transfers per connection.
-const MAX_TRANSFERS = 8;
+const MAX_TRANSFERS = 64;
 
 const ALPN = "hq-interop";
 
@@ -93,6 +93,8 @@ pub fn main(init: std.process.Init) !void {
             .p256 => .p256,
         },
         .initial_quic_version = if (std.mem.eql(u8, testcase, "v2")) quic.packet.QUIC_VERSION_2 else quic.packet.QUIC_VERSION_1,
+        .initial_max_streams_bidi = if (std.mem.eql(u8, testcase, "transfer")) 512 else 100,
+        .initial_max_streams_uni = if (std.mem.eql(u8, testcase, "transfer")) 100 else 100,
     };
 
     // Bind UDP socket.
