@@ -81,7 +81,7 @@ jobs:
           echo "All interop tests passed."
 
       - name: Update README with results table
-        if: always()
+        if: always() && hashFiles('runner/results.json') != ''
         run: |
           python3 << 'PYEOF'
           import json, re
