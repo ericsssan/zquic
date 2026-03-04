@@ -5,9 +5,9 @@
 //! ## Sans-I/O design
 //!
 //! zquic owns the QUIC state machine; the caller owns the UDP socket.
-//! Drive a connection with:
+//! Drive a connection with (using Connection(64) for a server supporting up to 64 concurrent streams):
 //!
-//!   var conn = try quic.Connection.accept(config, io);
+//!   var conn = try quic.Connection(64).accept(config, io);
 //!   // On datagram receipt:
 //!   try conn.receive(udp_payload, src_addr, now_ns, io);
 //!   // Drain outgoing datagrams:

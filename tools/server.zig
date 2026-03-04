@@ -19,6 +19,9 @@ const SEND_CHUNK: usize = 1200;
 // Maximum concurrent file transfers per connection.
 const MAX_TRANSFERS = 64;
 
+// Connection type: parameterized for 64 concurrent streams (= MAX_TRANSFERS).
+const Conn = quic.Connection(64);
+
 const ALPN = "hq-interop";
 
 const supported_cases = [_][]const u8{
@@ -109,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Accept and handle connections one at a time.
     while (true) {
-        var conn = try quic.Connection.accept(config, io);
+        var conn = try Conn.accept(config, io);
         var peer_addr: ?net.IpAddress = null;
         var last_logged_generation: u32 = 0;
 
@@ -280,7 +283,7 @@ pub fn main(init: std.process.Init) !void {
 
 /// Parse the HTTP/0.9 request from the stream receive buffer and register a FileTransfer.
 /// Does not send any data — flushTransfers() does the actual I/O.
-fn startTransfer(conn: *quic.Connection, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8) void {
+fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8) void {
     const st = conn.streams.get(stream_id) orelse return;
     var req_buf: [256]u8 = undefined;
     const n = st.read(&req_buf);
@@ -331,7 +334,7 @@ fn startTransfer(conn: *quic.Connection, stream_id: u62, transfers: *[MAX_TRANSF
 
 /// Try to advance all active file transfers, sending up to SEND_CHUNK bytes each.
 /// Called every event loop iteration so data flows as the congestion window grows.
-fn flushTransfers(conn: *quic.Connection, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8, io: std.Io) void {
+fn flushTransfers(conn: *Conn, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8, io: std.Io) void {
     _ = www;
     for (transfers) |*t| {
         if (!t.active) continue;
@@ -339,7 +342,7 @@ fn flushTransfers(conn: *quic.Connection, transfers: *[MAX_TRANSFERS]FileTransfe
     }
 }
 
-fn advanceTransfer(conn: *quic.Connection, t: *FileTransfer, io: std.Io) void {
+fn advanceTransfer(conn: *Conn, t: *FileTransfer, io: std.Io) void {
     const path = t.path[0..t.path_len];
     const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch {
         conn.streamSend(t.stream_id, &.{}, true) catch {};
@@ -380,7 +383,7 @@ fn readFileFull(io: std.Io, path: []const u8, out: []u8) !usize {
     return file.readPositionalAll(io, out, 0);
 }
 
-fn drainSend(conn: *quic.Connection, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, buf: *[MAX_DATAGRAM]u8) void {
+fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, buf: *[MAX_DATAGRAM]u8) void {
     while (true) {
         const n = conn.send(buf);
         if (n == 0) break;
@@ -396,7 +399,7 @@ fn computeTimeout(deadline: ?i64) std.Io.Timeout {
 /// Update SSLKEYLOG file with newly rotated keys. Rewrites the entire file
 /// with all generations up to current. Called immediately after key rotation
 /// to ensure Wireshark can decrypt packets before connection closes.
-fn updateKeyLog(conn: *const quic.Connection, io: std.Io, _: u32) void {
+fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
     const tls = &conn.tls_state;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
     var buf: [16384]u8 = undefined;
@@ -433,7 +436,7 @@ fn updateKeyLog(conn: *const quic.Connection, io: std.Io, _: u32) void {
 /// 1-RTT QUIC packets including those with key updates.  Written to /logs/keys.log
 /// (the path the interop runner expects for server logs).
 /// Writes initial secrets at handshake, then appends rotated secrets dynamically.
-fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
+fn writeKeyLog(conn: *const Conn, io: std.Io) void {
     const tls = &conn.tls_state;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
     var buf: [4096]u8 = undefined;
@@ -463,7 +466,7 @@ fn writeKeyLog(conn: *const quic.Connection, io: std.Io) void {
 /// Update SSLKEYLOG file with any new rotated keys. Called after key updates to
 /// ensure Wireshark can decrypt packets with new keys. Rewrites the entire file
 /// with all generations up to the current key generation.
-fn appendRotatedSecretsToKeyLog(conn: *const quic.Connection, io: std.Io) void {
+fn appendRotatedSecretsToKeyLog(conn: *const Conn, io: std.Io) void {
     std.debug.print("appendRotatedSecretsToKeyLog called (gen={d})\n", .{conn.current_key_generation});
     const tls = &conn.tls_state;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);

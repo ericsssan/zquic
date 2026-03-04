@@ -6,13 +6,6 @@
 
 const std = @import("std");
 
-/// Maximum number of concurrent streams per connection.
-/// Must be a power of two (used as hash table capacity).
-/// In production, increase this and heap-allocate Connection via Pool(Connection, N).
-pub const MAX_STREAMS: usize = 512;
-comptime {
-    std.debug.assert(MAX_STREAMS > 0 and (MAX_STREAMS & (MAX_STREAMS - 1)) == 0);
-}
 pub const STREAM_BUF_SIZE: usize = 4096;
 
 pub const StreamState = enum(u8) {
@@ -511,97 +504,101 @@ pub const Stream = struct {
 const SlotState = enum(u8) { empty, occupied, tombstone };
 
 /// Pre-allocated hash table for concurrent streams on a single connection.
-/// Uses linear probing with tombstone deletion; capacity is MAX_STREAMS.
-/// Hash: id & (MAX_STREAMS - 1) — works well because QUIC stream IDs increment
+/// Uses linear probing with tombstone deletion; capacity is the comptime parameter.
+/// Hash: id & (capacity - 1) — works well because QUIC stream IDs increment
 /// by 4 (bits 0-1 encode direction/kind), so consecutive IDs map to distinct slots.
 /// No allocator needed: all memory is inline in the Connection struct.
-pub const StreamTable = struct {
-    streams: [MAX_STREAMS]Stream = undefined,
-    ids: [MAX_STREAMS]u62 = undefined,
-    states: [MAX_STREAMS]SlotState = [_]SlotState{.empty} ** MAX_STREAMS,
-    count: usize = 0,
+pub fn StreamTable(comptime capacity: usize) type {
+    comptime std.debug.assert(capacity > 0 and (capacity & (capacity - 1)) == 0);
+    return struct {
+        const Self = @This();
+        streams: [capacity]Stream = undefined,
+        ids: [capacity]u62 = undefined,
+        states: [capacity]SlotState = [_]SlotState{.empty} ** capacity,
+        count: usize = 0,
 
-    /// Return true if slot i holds a live stream.
-    pub fn occupied(self: *const StreamTable, i: usize) bool {
-        return self.states[i] == .occupied;
-    }
+        /// Return true if slot i holds a live stream.
+        pub fn occupied(self: *const Self, i: usize) bool {
+            return self.states[i] == .occupied;
+        }
 
-    /// Open or retrieve a stream by ID.
-    /// Returns null only when all MAX_STREAMS slots are simultaneously active.
-    pub fn getOrCreate(self: *StreamTable, id: u62) ?*Stream {
-        if (self.count >= MAX_STREAMS) return null;
-        const mask = MAX_STREAMS - 1;
-        const start: usize = @as(usize, @intCast(id)) & mask;
-        var first_tombstone: ?usize = null;
-        var probe: usize = 0;
-        while (probe < MAX_STREAMS) : (probe += 1) {
-            const i = (start + probe) & mask;
-            switch (self.states[i]) {
-                .occupied => {
-                    if (self.ids[i] == id) return &self.streams[i];
-                },
-                .tombstone => {
-                    if (first_tombstone == null) first_tombstone = i;
-                },
-                .empty => {
-                    // ID not present; insert at first tombstone (recycling) or here.
-                    const slot = first_tombstone orelse i;
-                    self.ids[slot] = id;
-                    self.streams[slot] = Stream.init(id);
-                    self.states[slot] = .occupied;
-                    self.count += 1;
-                    return &self.streams[slot];
-                },
+        /// Open or retrieve a stream by ID.
+        /// Returns null only when all capacity slots are simultaneously active.
+        pub fn getOrCreate(self: *Self, id: u62) ?*Stream {
+            if (self.count >= capacity) return null;
+            const mask = capacity - 1;
+            const start: usize = @as(usize, @intCast(id)) & mask;
+            var first_tombstone: ?usize = null;
+            var probe: usize = 0;
+            while (probe < capacity) : (probe += 1) {
+                const i = (start + probe) & mask;
+                switch (self.states[i]) {
+                    .occupied => {
+                        if (self.ids[i] == id) return &self.streams[i];
+                    },
+                    .tombstone => {
+                        if (first_tombstone == null) first_tombstone = i;
+                    },
+                    .empty => {
+                        // ID not present; insert at first tombstone (recycling) or here.
+                        const slot = first_tombstone orelse i;
+                        self.ids[slot] = id;
+                        self.streams[slot] = Stream.init(id);
+                        self.states[slot] = .occupied;
+                        self.count += 1;
+                        return &self.streams[slot];
+                    },
+                }
+            }
+            // No empty slot — table is tombstone-saturated but count < capacity.
+            if (first_tombstone) |slot| {
+                self.ids[slot] = id;
+                self.streams[slot] = Stream.init(id);
+                self.states[slot] = .occupied;
+                self.count += 1;
+                return &self.streams[slot];
+            }
+            return null;
+        }
+
+        pub fn get(self: *Self, id: u62) ?*Stream {
+            const mask = capacity - 1;
+            const start: usize = @as(usize, @intCast(id)) & mask;
+            var probe: usize = 0;
+            while (probe < capacity) : (probe += 1) {
+                const i = (start + probe) & mask;
+                switch (self.states[i]) {
+                    .occupied => {
+                        if (self.ids[i] == id) return &self.streams[i];
+                    },
+                    .tombstone => {}, // keep probing
+                    .empty => return null, // id cannot be past an empty slot
+                }
+            }
+            return null;
+        }
+
+        pub fn close(self: *Self, id: u62) void {
+            const mask = capacity - 1;
+            const start: usize = @as(usize, @intCast(id)) & mask;
+            var probe: usize = 0;
+            while (probe < capacity) : (probe += 1) {
+                const i = (start + probe) & mask;
+                switch (self.states[i]) {
+                    .occupied => {
+                        if (self.ids[i] == id) {
+                            self.states[i] = .tombstone;
+                            self.count -= 1;
+                            return;
+                        }
+                    },
+                    .tombstone => {}, // keep probing
+                    .empty => return, // not found
+                }
             }
         }
-        // No empty slot — table is tombstone-saturated but count < MAX_STREAMS.
-        if (first_tombstone) |slot| {
-            self.ids[slot] = id;
-            self.streams[slot] = Stream.init(id);
-            self.states[slot] = .occupied;
-            self.count += 1;
-            return &self.streams[slot];
-        }
-        return null;
-    }
-
-    pub fn get(self: *StreamTable, id: u62) ?*Stream {
-        const mask = MAX_STREAMS - 1;
-        const start: usize = @as(usize, @intCast(id)) & mask;
-        var probe: usize = 0;
-        while (probe < MAX_STREAMS) : (probe += 1) {
-            const i = (start + probe) & mask;
-            switch (self.states[i]) {
-                .occupied => {
-                    if (self.ids[i] == id) return &self.streams[i];
-                },
-                .tombstone => {}, // keep probing
-                .empty => return null, // id cannot be past an empty slot
-            }
-        }
-        return null;
-    }
-
-    pub fn close(self: *StreamTable, id: u62) void {
-        const mask = MAX_STREAMS - 1;
-        const start: usize = @as(usize, @intCast(id)) & mask;
-        var probe: usize = 0;
-        while (probe < MAX_STREAMS) : (probe += 1) {
-            const i = (start + probe) & mask;
-            switch (self.states[i]) {
-                .occupied => {
-                    if (self.ids[i] == id) {
-                        self.states[i] = .tombstone;
-                        self.count -= 1;
-                        return;
-                    }
-                },
-                .tombstone => {}, // keep probing
-                .empty => return, // not found
-            }
-        }
-    }
-};
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -634,7 +631,7 @@ test "stream: flow control violation" {
 
 test "stream_table: getOrCreate and get" {
     const testing = std.testing;
-    var table: StreamTable = .{};
+    var table: StreamTable(64) = .{};
     const s = table.getOrCreate(0).?;
     s.send_offset = 42;
     const s2 = table.get(0).?;
@@ -642,13 +639,14 @@ test "stream_table: getOrCreate and get" {
 }
 
 test "stream_table: capacity limit" {
-    var table: StreamTable = .{};
+    const capacity = 64;
+    var table: StreamTable(capacity) = .{};
     var i: u62 = 0;
-    while (i < MAX_STREAMS) : (i += 1) {
+    while (i < capacity) : (i += 1) {
         _ = table.getOrCreate(i * 4);
     }
     // Next allocation should fail
-    const overflow = table.getOrCreate(@intCast(MAX_STREAMS * 4));
+    const overflow = table.getOrCreate(@intCast(capacity * 4));
     const testing = std.testing;
     try testing.expectEqual(@as(?*Stream, null), overflow);
 }
@@ -961,7 +959,7 @@ test "ringbuf: two-segment peek crossing wrap boundary" {
 test "stream_table: getOrCreate after close still finds correct stream" {
     // Verify that a stream closed (tombstone) does not block retrieval of others.
     const testing = std.testing;
-    var table: StreamTable = .{};
+    var table: StreamTable(64) = .{};
     _ = table.getOrCreate(10);
     _ = table.getOrCreate(20);
     _ = table.getOrCreate(30);
@@ -983,7 +981,7 @@ test "stream_table: tombstone slot is recycled on insert" {
     // Tombstone recycling: inserting an id that hashes to the same bucket as a
     // tombstone should reuse that tombstone slot rather than a later empty slot.
     const testing = std.testing;
-    var table: StreamTable = .{};
+    var table: StreamTable(64) = .{};
     // id=0 and id=512 both hash to slot 0 (0 & 511 == 0, 512 & 511 == 0).
     _ = table.getOrCreate(0); // slot 0
     _ = table.getOrCreate(512); // slot 1 (probe past occupied slot 0)
@@ -996,11 +994,12 @@ test "stream_table: tombstone slot is recycled on insert" {
     try testing.expectEqual(@as(usize, 2), table.count);
 }
 
-test "stream_table: reuse after cycling MAX_STREAMS streams" {
-    // Open and close MAX_STREAMS streams one at a time; table must stay usable.
-    var table: StreamTable = .{};
+test "stream_table: reuse after cycling capacity streams" {
+    // Open and close capacity streams one at a time; table must stay usable.
+    const capacity = 64;
+    var table: StreamTable(capacity) = .{};
     var i: u62 = 0;
-    while (i < MAX_STREAMS) : (i += 1) {
+    while (i < capacity) : (i += 1) {
         const s = table.getOrCreate(i * 4).?;
         _ = s;
         table.close(i * 4);

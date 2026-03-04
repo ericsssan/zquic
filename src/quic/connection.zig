@@ -198,8 +198,11 @@ const PeerCidEntry = struct {
 // Connection
 // ---------------------------------------------------------------------------
 
-pub const Connection = struct {
-    hot: ConnectionHot align(64),
+pub fn Connection(comptime max_streams: usize) type {
+    return struct {
+        const Self = @This();
+
+        hot: ConnectionHot align(64),
 
     // Identity
     local_cid: ConnectionId,
@@ -225,7 +228,7 @@ pub const Connection = struct {
     app_keys: ?tls.AppKeys,
 
     // Stream layer
-    streams: stream_mod.StreamTable,
+    streams: stream_mod.StreamTable(max_streams),
 
     // Flow control
     conn_flow: flow_control.FlowController,
@@ -409,7 +412,7 @@ pub const Connection = struct {
 
     /// Create a server-side connection.  Call `receive()` with the first
     /// datagram to start the handshake.
-    pub fn accept(config: Config, io: std.Io) !Connection {
+    pub fn accept(config: Config, io: std.Io) !Self {
         var tls_server = if (config.cert_der) |der|
             try tls.TlsServer.initFromCert(der, config.cert_seed.?, config.cert_key_algorithm, io)
         else
@@ -427,7 +430,7 @@ pub const Connection = struct {
         else
             0;
 
-        return Connection{
+        return Self{
             .hot = .{
                 .rx_pn = [_]u64{0} ** 3,
                 .tx_pn = [_]u64{0} ** 3,
@@ -520,7 +523,7 @@ pub const Connection = struct {
     /// `src`     — sender address (used for migration detection).
     /// `now_ns`  — current monotonic time in nanoseconds.
     /// `io`      — I/O handle (needed for TLS key generation).
-    pub fn receive(self: *Connection, data: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
+    pub fn receive(self: *Self, data: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
         self.current_time_ns = now_ns;
 
         // Path migration detection (RFC 9000 §9): only in established state,
@@ -586,7 +589,7 @@ pub const Connection = struct {
     }
 
     /// Write the next UDP payload to `out`. Returns bytes written (0 = nothing pending).
-    pub fn send(self: *Connection, out: []u8) usize {
+    pub fn send(self: *Self, out: []u8) usize {
         // RFC 9000 §10.2: draining state — must not send anything.
         if (self.hot.state == .draining) return 0;
         if (self.sq_head == self.sq_tail) return 0;
@@ -601,7 +604,7 @@ pub const Connection = struct {
 
     /// Returns the nanosecond deadline when `tick()` must be called,
     /// or null if no timer is active.
-    pub fn nextTimeout(self: *const Connection) ?i64 {
+    pub fn nextTimeout(self: *const Self) ?i64 {
         const idle = self.idle_deadline_ns orelse std.math.maxInt(i64);
         const pto = self.pto_deadline_ns orelse std.math.maxInt(i64);
         const drain = self.drain_deadline_ns orelse std.math.maxInt(i64);
@@ -610,7 +613,7 @@ pub const Connection = struct {
     }
 
     /// Drive timer events. Call when `nextTimeout()` deadline has passed.
-    pub fn tick(self: *Connection, now_ns: i64) void {
+    pub fn tick(self: *Self, now_ns: i64) void {
         self.current_time_ns = now_ns;
 
         // Drain timer: closing/draining → closed.
@@ -683,27 +686,27 @@ pub const Connection = struct {
         if (self.hot.state == .established) self.flushControlFrames() catch {};
     }
 
-    pub fn isClosed(self: *const Connection) bool {
+    pub fn isClosed(self: *const Self) bool {
         return self.hot.state == .closed or
             self.hot.state == .draining or
             self.hot.state == .closing;
     }
 
-    pub fn isDraining(self: *const Connection) bool {
+    pub fn isDraining(self: *const Self) bool {
         return self.hot.state == .draining;
     }
 
-    pub fn isEstablished(self: *const Connection) bool {
+    pub fn isEstablished(self: *const Self) bool {
         return self.hot.state == .established;
     }
 
     /// Drain the next application event, or null if none pending.
-    pub fn pollEvent(self: *Connection) ?Event {
+    pub fn pollEvent(self: *Self) ?Event {
         return self.events.pop();
     }
 
     /// Buffer stream data for sending and queue a packet.
-    pub fn streamSend(self: *Connection, stream_id: u62, data: []const u8, fin: bool) !void {
+    pub fn streamSend(self: *Self, stream_id: u62, data: []const u8, fin: bool) !void {
         const st = self.streams.getOrCreate(stream_id) orelse return error.TooManyStreams;
         if (!st.canSend(@intCast(data.len))) return error.StreamNotWritable;
         // Check buffer capacity before any mutation so the operation is all-or-nothing.
@@ -716,7 +719,7 @@ pub const Connection = struct {
 
     /// Initiate a connection close.  Transitions to closing, queues a CONNECTION_CLOSE,
     /// and arms the drain timer.
-    pub fn close(self: *Connection, error_code: u62, is_app: bool, reason: []const u8) !void {
+    pub fn close(self: *Self, error_code: u62, is_app: bool, reason: []const u8) !void {
         if (self.hot.state == .closing or
             self.hot.state == .draining or
             self.hot.state == .closed) return;
@@ -744,7 +747,7 @@ pub const Connection = struct {
     }
 
     /// Reset a stream and queue a RESET_STREAM frame.
-    pub fn resetStream(self: *Connection, stream_id: u62, error_code: u62) !void {
+    pub fn resetStream(self: *Self, stream_id: u62, error_code: u62) !void {
         const st = self.streams.get(stream_id) orelse return error.StreamNotFound;
         st.initiateReset(error_code);
         self.pending_reset_count += 1;
@@ -755,7 +758,7 @@ pub const Connection = struct {
     // Internal packet processing
     // -----------------------------------------------------------------------
 
-    fn processOnePacket(self: *Connection, data: []const u8, src: SocketAddr, io: std.Io) !usize {
+    fn processOnePacket(self: *Self, data: []const u8, src: SocketAddr, io: std.Io) !usize {
         if (data.len == 0) return 0;
 
         if (packet.isLongHeader(data[0])) {
@@ -765,7 +768,7 @@ pub const Connection = struct {
         }
     }
 
-    fn processLongHeaderPacket(self: *Connection, data: []const u8, src: SocketAddr, io: std.Io) !usize {
+    fn processLongHeaderPacket(self: *Self, data: []const u8, src: SocketAddr, io: std.Io) !usize {
         // RFC 9000 §6 + RFC 9368: Version negotiation with compatible version support.
         // Check the version field before full parsing — VN packets (version 0) have
         // a different wire format that parseLongHeader cannot handle.
@@ -1011,7 +1014,7 @@ pub const Connection = struct {
     /// tracking and SSLKEYLOG decryption context).
     ///
     /// Falls back to local_cid if no Initial has been processed yet (tests).
-    fn ourScidBytes(self: *const Connection) []const u8 {
+    fn ourScidBytes(self: *const Self) []const u8 {
         if (self.first_initial_dcid_len > 0) {
             return self.first_initial_dcid[0..self.first_initial_dcid_len];
         }
@@ -1025,7 +1028,7 @@ pub const Connection = struct {
     /// Returns true when `pn` in `epoch` has already been processed.
     /// Uses the 64-slot sliding-window bitmap; any PN more than 63 below the
     /// largest-received is conservatively treated as a duplicate (RFC 9000 §13.2.3).
-    fn isPnDuplicate(self: *const Connection, epoch: u8, pn: u64) bool {
+    fn isPnDuplicate(self: *const Self, epoch: u8, pn: u64) bool {
         if (!self.hot.rx_pn_valid[epoch]) return false;
         const largest = self.hot.rx_pn[epoch];
         if (pn > largest) return false; // new packet, larger than anything seen
@@ -1036,7 +1039,7 @@ pub const Connection = struct {
 
     /// Record that `pn` in `epoch` was successfully decrypted and processed.
     /// Updates rx_pn[epoch] / rx_pn_valid[epoch] and the bitmap.
-    fn markPnReceived(self: *Connection, epoch: u8, pn: u64) void {
+    fn markPnReceived(self: *Self, epoch: u8, pn: u64) void {
         if (!self.hot.rx_pn_valid[epoch]) {
             // First packet in this epoch.
             self.hot.rx_pn[epoch] = pn;
@@ -1126,7 +1129,7 @@ pub const Connection = struct {
         return count;
     }
 
-    fn processShortHeaderPacket(self: *Connection, data: []const u8) !usize {
+    fn processShortHeaderPacket(self: *Self, data: []const u8) !usize {
         if (self.app_keys == null) return 0;
 
         // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
@@ -1221,7 +1224,7 @@ pub const Connection = struct {
     /// RFC 9000 §10.3: check if the last 16 bytes of a received packet match any
     /// known peer stateless reset token.  Called after decryption failure to detect
     /// an incoming stateless reset.  Returns true if the connection should close.
-    fn checkStatelessReset(self: *Connection, raw_packet: []const u8) bool {
+    fn checkStatelessReset(self: *Self, raw_packet: []const u8) bool {
         // RFC 9000 §10.3: a stateless reset is at least 21 bytes
         // (1 fixed-bit header + 4 bytes min body + 16-byte token).
         if (raw_packet.len < 21) return false;
@@ -1245,7 +1248,7 @@ pub const Connection = struct {
         };
     }
 
-    fn processFrames(self: *Connection, plaintext: []const u8, epoch: u8, io: ?std.Io) !void {
+    fn processFrames(self: *Self, plaintext: []const u8, epoch: u8, io: ?std.Io) !void {
         var pos: usize = 0;
         while (pos < plaintext.len) {
             const fr = frame.parseFrame(plaintext[pos..]) catch {
@@ -1369,7 +1372,7 @@ pub const Connection = struct {
         }
     }
 
-    fn processCryptoFrame(self: *Connection, f: frame.CryptoFrame, epoch: u8, io: std.Io) !void {
+    fn processCryptoFrame(self: *Self, f: frame.CryptoFrame, epoch: u8, io: std.Io) !void {
         // RFC 9000 §19.6: validate CRYPTO frame offset to prevent TLS corruption.
         const expected = self.crypto_recv_offset[epoch];
         const end = @as(u64, f.offset) + @as(u64, f.data.len);
@@ -1394,7 +1397,7 @@ pub const Connection = struct {
 
     /// Buffer a CRYPTO fragment that arrived out of order.
     /// DoS defense: silently drop fragments if staging exceeds 16KB per epoch.
-    fn stageCryptoFrag(self: *Connection, epoch: u8, offset: u64, data: []const u8) !void {
+    fn stageCryptoFrag(self: *Self, epoch: u8, offset: u64, data: []const u8) !void {
         const count = self.crypto_staged_count[epoch];
         if (count >= CRYPTO_STAGE_DEPTH) return; // staging full; peer will retransmit
 
@@ -1422,7 +1425,7 @@ pub const Connection = struct {
     }
 
     /// Drain staged fragments that are now deliverable (in-order).
-    fn drainStagedCrypto(self: *Connection, epoch: u8, io: std.Io) !void {
+    fn drainStagedCrypto(self: *Self, epoch: u8, io: std.Io) !void {
         while (true) {
             const expected = self.crypto_recv_offset[epoch];
             const count = self.crypto_staged_count[epoch];
@@ -1460,7 +1463,7 @@ pub const Connection = struct {
     }
 
     /// Feed one contiguous in-order chunk to the TLS state machine and handle its output.
-    fn deliverCryptoChunk(self: *Connection, epoch: u8, data: []const u8, io: std.Io) !void {
+    fn deliverCryptoChunk(self: *Self, epoch: u8, data: []const u8, io: std.Io) !void {
         self.crypto_recv_offset[epoch] += data.len;
 
         // Before processing ClientHello, configure transport parameters for EncryptedExtensions.
@@ -1547,7 +1550,7 @@ pub const Connection = struct {
         }
     }
 
-    fn processStreamFrame(self: *Connection, f: frame.StreamFrame) !void {
+    fn processStreamFrame(self: *Self, f: frame.StreamFrame) !void {
         // RFC 9000 §12.4: STREAM frames are only valid in 1-RTT (established) state.
         if (self.hot.state != .established) return error.ProtocolViolation;
         // Server must only receive client-initiated streams (bit 0 = 0).
@@ -1586,7 +1589,7 @@ pub const Connection = struct {
         self.events.push(.{ .stream_data = .{ .stream_id = f.stream_id } });
     }
 
-    fn processAck(self: *Connection, ack: frame.AckFrame, epoch: u8) !void {
+    fn processAck(self: *Self, ack: frame.AckFrame, epoch: u8) !void {
         const max_ack_delay_ns = self.cached_max_ack_delay_ns; // cached: used twice
         // Convert AckFrame ranges into loss_recovery.AckedRange slices.
         // ranges[0] has gap=0 (first ACK range); subsequent entries carry the gap
@@ -1682,7 +1685,7 @@ pub const Connection = struct {
     // Retransmission helpers (Step 4)
     // -----------------------------------------------------------------------
 
-    fn processAckedFrames(self: *Connection, result: loss_recovery_mod.AckResult) void {
+    fn processAckedFrames(self: *Self, result: loss_recovery_mod.AckResult) void {
         for (result.acked_frames[0..result.acked_frame_count]) |fi| {
             for (fi.frames[0..fi.count]) |frame_info| {
                 switch (frame_info) {
@@ -1703,7 +1706,7 @@ pub const Connection = struct {
         }
     }
 
-    fn processLostFrames(self: *Connection, result: loss_recovery_mod.AckResult) void {
+    fn processLostFrames(self: *Self, result: loss_recovery_mod.AckResult) void {
         // Declared once outside the loop; reused for each retransmitted stream frame.
         var stream_retx_buf: [MAX_PACKET_SIZE]u8 = undefined;
         for (result.lost_frames[0..result.lost_frame_count]) |fi| {
@@ -1747,7 +1750,7 @@ pub const Connection = struct {
     // Send queue helpers
     // -----------------------------------------------------------------------
 
-    fn enqueueSend(self: *Connection, data: []const u8) !void {
+    fn enqueueSend(self: *Self, data: []const u8) !void {
         // Use monotonic head/tail subtraction (not modular comparison) to correctly
         // detect full queue regardless of wrap-around.
         if (self.sq_tail - self.sq_head >= SEND_QUEUE_DEPTH) return error.SendQueueFull;
@@ -1780,7 +1783,7 @@ pub const Connection = struct {
     /// epoch 1 = Handshake (long header, hs_keys.?.server)
     /// epoch 2 = 1-RTT (short header, app_keys.?.server)
     /// ACK frames are not ack-eliciting (RFC 9002 §2), so ack_eliciting=false.
-    fn sendEncryptedAck(self: *Connection, epoch: u8) !void {
+    fn sendEncryptedAck(self: *Self, epoch: u8) !void {
         // RFC 9000 §13.2: only send ACKs if we've actually received packets in this epoch.
         if (!self.hot.rx_pn_valid[epoch]) {
             return;
@@ -1879,7 +1882,7 @@ pub const Connection = struct {
         }
     }
 
-    fn queuePing(self: *Connection) !void {
+    fn queuePing(self: *Self) !void {
         if (self.app_keys) |ak| {
             // Post-handshake: send an encrypted PING in a 1-RTT packet.
             const n = frame.encodeFrame(&self.pkt_scratch, .ping);
@@ -1907,7 +1910,7 @@ pub const Connection = struct {
     /// Queue a PMTUD probe: a PING frame padded to target_size.
     /// Only works in 1-RTT (post-handshake); pre-handshake probes are not supported.
     /// Determine the next MTU size to probe. Probes: 1200 → 1500 → 2048 → 4096 → MAX_PACKET_SIZE.
-    fn getNextPmtudSize(self: *const Connection) u16 {
+    fn getNextPmtudSize(self: *const Self) u16 {
         return switch (self.path_mtu) {
             0...1199 => 1200,
             1200...1499 => 1500,
@@ -1917,10 +1920,10 @@ pub const Connection = struct {
         };
     }
 
-    fn queuePmtudProbe(self: *Connection, target_size: u16) !void {
+    fn queuePmtudProbe(self: *Self, target_size: u16) !void {
         if (self.app_keys == null) return error.InvalidState; // probes only in 1-RTT
         if (target_size < 1200 or target_size > 65535) return error.InvalidSize; // invalid size, skip probe
-        if (target_size > MAX_PACKET_SIZE) return error.PacketTooLarge; // probe can't fit in send buffer
+        if (target_size > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge; // probe can't fit in send buffer
 
         var pos: usize = 0;
         pos += frame.encodeFrame(self.pkt_scratch[pos..], .ping);
@@ -1974,7 +1977,7 @@ pub const Connection = struct {
         self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
     }
 
-    fn queueHandshakeDone(self: *Connection) !void {
+    fn queueHandshakeDone(self: *Self) !void {
         var pos: usize = 0;
         pos += frame.encodeFrame(self.pkt_scratch[pos..], .handshake_done);
         // Encrypt with 1-RTT keys and send
@@ -1996,7 +1999,7 @@ pub const Connection = struct {
         }
     }
 
-    fn queueTlsOutput(self: *Connection, tls_data: []const u8) !void {
+    fn queueTlsOutput(self: *Self, tls_data: []const u8) !void {
         if (tls_data.len == 0) return;
 
         // RFC 9001 §4.1.3: ServerHello MUST be sent in an Initial CRYPTO frame;
@@ -2034,7 +2037,7 @@ pub const Connection = struct {
 
     /// Encrypt and enqueue up to one packet worth of CRYPTO data in `epoch`
     /// (0 = Initial, 1 = Handshake).  Returns the number of data bytes consumed.
-    fn sendCryptoChunk(self: *Connection, data: []const u8, epoch: u8) !usize {
+    fn sendCryptoChunk(self: *Self, data: []const u8, epoch: u8) !usize {
         // Per-packet data limit: MAX_PACKET_SIZE minus long header overhead (~30 bytes),
         // CRYPTO frame overhead (type 1 + offset varint 4 + length varint 2 = 7), AEAD tag 16.
         const max_chunk = MAX_PACKET_SIZE - 53;
@@ -2134,7 +2137,7 @@ pub const Connection = struct {
     /// Returns true if we've recently sent VN for this version (60s cooldown).
     /// Updates the per-version tracking on first-time or expired entries.
     /// Public for testing purposes.
-    pub fn shouldThrottleVersionNeg(self: *Connection, version: u32) bool {
+    pub fn shouldThrottleVersionNeg(self: *Self, version: u32) bool {
         const COOLDOWN_NS = 60 * 1_000_000_000; // 60 seconds
 
         // Check if this version is in our recent list within cooldown window.
@@ -2160,7 +2163,7 @@ pub const Connection = struct {
 
     /// Encode and enqueue a Version Negotiation packet in response to an
     /// unknown-version long-header packet.  `raw` is the received datagram.
-    fn sendVersionNeg(self: *Connection, raw: []const u8) !void {
+    fn sendVersionNeg(self: *Self, raw: []const u8) !void {
         // Manually read DCID and SCID lengths to extract the client's SCID,
         // which becomes the DCID of our VN response.
         if (raw.len < 7) return;
@@ -2204,7 +2207,7 @@ pub const Connection = struct {
     /// Build and enqueue a Retry packet (RFC 9000 §8.1).
     /// Generates a fresh address-validation token, picks a new SCID, and pushes
     /// `retry_sent` so the caller knows to drain and discard this connection.
-    fn sendRetry(self: *Connection, odcid: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
+    fn sendRetry(self: *Self, odcid: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
         const token = self.generateToken(src, odcid, now_ns, io);
         self.retry_scid = ConnectionId.generate(0, io);
         var buf: [256]u8 = undefined;
@@ -2216,7 +2219,7 @@ pub const Connection = struct {
     /// Low-level: encrypt and enqueue a STREAM frame at an explicit offset.
     /// Does NOT advance stream.send_offset (caller is responsible for that).
     fn encryptAndEnqueueStreamFrame(
-        self: *Connection,
+        self: *Self,
         id: u62,
         offset: u62,
         data: []const u8,
@@ -2257,7 +2260,7 @@ pub const Connection = struct {
         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
     }
 
-    fn queueStreamData(self: *Connection, id: u62, data: []const u8, fin: bool) !void {
+    fn queueStreamData(self: *Self, id: u62, data: []const u8, fin: bool) !void {
         if (self.app_keys == null) return;
 
         const st = self.streams.getOrCreate(id) orelse return;
@@ -2272,7 +2275,7 @@ pub const Connection = struct {
     }
 
     /// Encrypt and enqueue the pre-serialized CONNECTION_CLOSE frame.
-    fn queueConnectionClose(self: *Connection) !void {
+    fn queueConnectionClose(self: *Self) !void {
         if (self.app_keys == null) return;
         if (self.closing_frame_len == 0) return;
         const ak = self.app_keys.?;
@@ -2297,7 +2300,7 @@ pub const Connection = struct {
     }
 
     /// Queue a RESET_STREAM frame for `stream_id`.
-    fn queueResetStream(self: *Connection, stream_id: u62, error_code: u62, final_size: u62) !void {
+    fn queueResetStream(self: *Self, stream_id: u62, error_code: u62, final_size: u62) !void {
         if (self.app_keys == null) return;
         const ak = self.app_keys.?;
 
@@ -2331,8 +2334,8 @@ pub const Connection = struct {
     }
 
     /// Scan all streams for pending_reset and queue a RESET_STREAM frame for each.
-    fn flushPendingResets(self: *Connection) !void {
-        for (0..stream_mod.MAX_STREAMS) |i| {
+    fn flushPendingResets(self: *Self) !void {
+        for (0..max_streams) |i| {
             if (!self.streams.occupied(i)) continue;
             const st = &self.streams.streams[i];
             if (st.pending_reset) |pr| {
@@ -2345,7 +2348,7 @@ pub const Connection = struct {
 
     /// Echo a PATH_RESPONSE with the same 8-byte data from a PATH_CHALLENGE.
     /// PATH_RESPONSE is not tracked for retransmission (RFC 9000 §8.2.2).
-    fn queuePathResponse(self: *Connection, data: [8]u8) !void {
+    fn queuePathResponse(self: *Self, data: [8]u8) !void {
         if (self.app_keys == null) return;
         const ak = self.app_keys.?;
 
@@ -2367,7 +2370,7 @@ pub const Connection = struct {
 
     /// Queue a PATH_CHALLENGE with `data` and record it so the peer's
     /// PATH_RESPONSE can be validated (RFC 9000 §9.2).
-    pub fn sendPathChallenge(self: *Connection, data: [8]u8) !void {
+    pub fn sendPathChallenge(self: *Self, data: [8]u8) !void {
         if (self.app_keys == null) return;
         const ak = self.app_keys.?;
 
@@ -2389,7 +2392,7 @@ pub const Connection = struct {
 
     /// Process a NEW_CONNECTION_ID frame: store the CID and retire entries below retire_prior_to.
     /// Security: Validate sequence number is monotonic and not excessively large (DoS defense).
-    fn processNewConnectionId(self: *Connection, ncid: frame.NewConnectionIdFrame) void {
+    fn processNewConnectionId(self: *Self, ncid: frame.NewConnectionIdFrame) void {
         // RFC 9000: Sequence number must be >= retire_prior_to (don't store already-retired CIDs).
         if (ncid.sequence_number < self.peer_cid_retire_prior) return;
 
@@ -2434,7 +2437,7 @@ pub const Connection = struct {
     }
 
     /// Queue a MAX_STREAM_DATA frame advertising `new_max` bytes for `stream_id`.
-    fn queueMaxStreamData(self: *Connection, stream_id: u62, new_max: u62) !void {
+    fn queueMaxStreamData(self: *Self, stream_id: u62, new_max: u62) !void {
         if (self.app_keys == null) return;
         const ak = self.app_keys.?;
 
@@ -2463,8 +2466,8 @@ pub const Connection = struct {
     }
 
     /// Scan all streams and send MAX_STREAM_DATA frames for any whose recv window grew.
-    fn flushPendingMaxStreamData(self: *Connection) void {
-        for (0..stream_mod.MAX_STREAMS) |i| {
+    fn flushPendingMaxStreamData(self: *Self) void {
+        for (0..max_streams) |i| {
             if (!self.streams.occupied(i)) continue;
             const st = &self.streams.streams[i];
             if (st.shouldSendMaxStreamData()) {
@@ -2481,7 +2484,7 @@ pub const Connection = struct {
     ///
     /// MAX_DATA: tracked in SentFrameInfo (loss recovery sets pending_max_data on loss).
     /// MAX_STREAM_DATA: not tracked (shouldSendMaxStreamData re-triggers on next tick).
-    fn flushControlFrames(self: *Connection) !void {
+    fn flushControlFrames(self: *Self) !void {
         if (self.app_keys == null) return;
         const ak = self.app_keys.?;
 
@@ -2505,7 +2508,7 @@ pub const Connection = struct {
 
         // 2. Pending MAX_STREAM_DATA frames (not tracked for retransmission;
         //    shouldSendMaxStreamData re-arms on next tick if needed).
-        for (0..stream_mod.MAX_STREAMS) |i| {
+        for (0..max_streams) |i| {
             if (!self.streams.occupied(i)) continue;
             const st = &self.streams.streams[i];
             if (!st.shouldSendMaxStreamData()) continue;
@@ -2544,7 +2547,7 @@ pub const Connection = struct {
     /// Rotate application keys: promote next → current, flip key_phase bit,
     /// derive the new next generation.  Called on peer-initiated key updates
     /// (inside processShortHeaderPacket) and as part of initiateKeyUpdate.
-    fn rotateKeys(self: *Connection) void {
+    fn rotateKeys(self: *Self) void {
         // Zero the outgoing application keys before replacing them (RFC 9001 §6,
         // defence-in-depth: previous-epoch key material must not linger in memory).
         if (self.app_keys) |*old| {
@@ -2579,7 +2582,7 @@ pub const Connection = struct {
     /// Initiate a locally-triggered key update (RFC 9001 §6).
     /// Returns error.NotEstablished if the handshake is not complete,
     /// or error.KeyUpdatePending if a previous update has not been acknowledged.
-    pub fn initiateKeyUpdate(self: *Connection) !void {
+    pub fn initiateKeyUpdate(self: *Self) !void {
         if (self.app_keys == null) return error.NotEstablished;
         if (self.key_update_pending) return error.KeyUpdatePending;
         self.rotateKeys(); // flips phase, derives new next, clears pending
@@ -2588,7 +2591,7 @@ pub const Connection = struct {
 
     /// Derive client and server secrets for a given generation (0=initial, 1+=rotations).
     /// Used for SSLKEYLOG to track all key generations.
-    pub fn deriveSecretsForGeneration(self: *const Connection, generation: u32) struct { client: [32]u8, server: [32]u8 } {
+    pub fn deriveSecretsForGeneration(self: *const Self, generation: u32) struct { client: [32]u8, server: [32]u8 } {
         var client = self.tls_state.client_app_secret;
         var server = self.tls_state.server_app_secret;
         for (0..generation) |_| {
@@ -2603,7 +2606,7 @@ pub const Connection = struct {
     // -----------------------------------------------------------------------
 
     /// Handle a source address change: reset congestion, request path validation.
-    fn onPathMigration(self: *Connection, new_addr: SocketAddr, io: std.Io) !void {
+    fn onPathMigration(self: *Self, new_addr: SocketAddr, io: std.Io) !void {
         // RFC 9000 §9.4: reset congestion controller on path change.
         self.congestion = cubic_mod.Cubic.init();
         // Do NOT re-arm amplification limit: peer is already authenticated (handshake complete).
@@ -2611,6 +2614,8 @@ pub const Connection = struct {
         // post-handshake path migrations. RFC 9000 §9.4 only requires resetting congestion control.
         // Immediately adopt new address (RFC 9000 §9.3.1).
         self.peer_addr = new_addr;
+        // RFC 9000 §9.3: reset path validation on migration — must re-validate new path.
+        self.path_validated = false;
         // Send PATH_CHALLENGE to validate the new path.
         var challenge: [8]u8 = undefined;
         io.random(&challenge);
@@ -2641,7 +2646,7 @@ pub const Connection = struct {
     // Plaintext layout: odcid_len(1) + odcid(20, zero-padded) + addr(16) + port(2) + ts(8) = 47 bytes.
     const TOKEN_SIZE: usize = 75;
 
-    fn generateToken(self: *const Connection, src: SocketAddr, odcid: []const u8, now_ns: i64, io: std.Io) [TOKEN_SIZE]u8 {
+    fn generateToken(self: *const Self, src: SocketAddr, odcid: []const u8, now_ns: i64, io: std.Io) [TOKEN_SIZE]u8 {
         // Normalize address to IPv6 for consistent handling
         const addr_ipv6 = normalizeAddressToIPv6(src);
 
@@ -2706,7 +2711,7 @@ pub const Connection = struct {
     /// Validate a token from an Initial packet.
     /// Returns the original DCID (raw bytes, length) on success, null on failure.
     const ValidatedToken = struct { raw: [20]u8, len: u8 };
-    fn validateToken(self: *const Connection, token: []const u8, src: SocketAddr, now_ns: i64) ?ValidatedToken {
+    fn validateToken(self: *const Self, token: []const u8, src: SocketAddr, now_ns: i64) ?ValidatedToken {
         // Token must be exactly TOKEN_SIZE (75) bytes
         if (token.len != TOKEN_SIZE) return null;
 
@@ -2782,7 +2787,8 @@ pub const Connection = struct {
 
         return .{ .raw = odcid_raw, .len = odcid_len };
     }
-};
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -2795,7 +2801,7 @@ test "connection: hot struct is 64 bytes" {
 test "connection: accept initializes correctly" {
     const io = std.testing.io;
     const config = Config{};
-    var conn = try Connection.accept(config, io);
+    var conn = try Connection(16).accept(config, io);
     const testing = std.testing;
     try testing.expectEqual(ConnState.idle, conn.hot.state);
     try testing.expectEqual(@as(u8, 0), conn.hot.epoch);
@@ -2805,7 +2811,7 @@ test "connection: accept initializes correctly" {
 
 test "connection: send returns 0 when queue empty" {
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     var out: [MAX_PACKET_SIZE]u8 = undefined;
     const testing = std.testing;
     try testing.expectEqual(@as(usize, 0), conn.send(&out));
@@ -2813,7 +2819,7 @@ test "connection: send returns 0 when queue empty" {
 
 test "connection: enqueue and drain send queue" {
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const data = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
     try conn.enqueueSend(&data);
 
@@ -2826,7 +2832,7 @@ test "connection: enqueue and drain send queue" {
 
 test "connection: tick transitions to closed on idle timeout" {
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.idle_deadline_ns = 1000;
     conn.tick(2000);
     const testing = std.testing;
@@ -2836,7 +2842,7 @@ test "connection: tick transitions to closed on idle timeout" {
 test "connection: unknown version triggers VN response" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Build a minimal long-header packet with an unknown version (0x00000002).
     // Format: first_byte | version(4) | dcid_len | dcid(8) | scid_len | scid(8)
@@ -2866,7 +2872,7 @@ test "connection: unknown version triggers VN response" {
 test "connection: nextTimeout returns minimum of active deadlines" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     try testing.expectEqual(@as(?i64, null), conn.nextTimeout());
 
     conn.idle_deadline_ns = 5000;
@@ -2882,7 +2888,7 @@ test "connection: nextTimeout returns minimum of active deadlines" {
 test "loss: connection initializes with zeroed loss recovery" {
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
     try testing.expectEqual(@as(u32, 0), conn.loss.pto_count);
     try testing.expectEqual(@as(?i64, null), conn.loss.last_ack_eliciting_ns);
@@ -2893,7 +2899,7 @@ test "loss: connection initializes with zeroed loss recovery" {
 test "loss: onPacketSent wires bytes_in_flight and pto_deadline" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 1_000_000;
     conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
@@ -2903,14 +2909,14 @@ test "loss: onPacketSent wires bytes_in_flight and pto_deadline" {
 test "loss: pto_deadline_ns null when no ack-eliciting packets in flight" {
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expectEqual(@as(?i64, null), conn.pto_deadline_ns);
 }
 
 test "loss: onPtoFired increments pto_count; resetPtoCount zeroes it" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.loss.onPtoFired();
     try testing.expectEqual(@as(u32, 1), conn.loss.pto_count);
     conn.loss.onPtoFired();
@@ -2922,7 +2928,7 @@ test "loss: onPtoFired increments pto_count; resetPtoCount zeroes it" {
 test "loss: onAckReceived decrements bytes_in_flight" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 0;
     conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
@@ -2935,7 +2941,7 @@ test "loss: onAckReceived decrements bytes_in_flight" {
 test "connection: send queue full returns SendQueueFull error" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Fill all 8 queue slots
     const data = [_]u8{0x01};
@@ -2955,7 +2961,7 @@ test "connection: send queue full returns SendQueueFull error" {
 test "connection: processAck uses packet epoch not connection epoch" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 0;
 
     conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
@@ -2979,42 +2985,41 @@ test "connection: processAck uses packet epoch not connection epoch" {
 test "ack: buildAckRangesFromBitmap encodes gap values correctly without -1" {
     const testing = std.testing;
 
-    // Regression test for commit 62e2bde: ACK gap encoding bug
-    // Previously: gap_value = if (gap > 0) gap - 1 else 0 (INCORRECT)
-    // Fix: gap_value = gap (CORRECT per RFC 9000 §19.3.1)
-    //
-    // Test case: packets [5, 4, missing 3, 2, 1, 0]
-    // Bitmap would have bits for 5,4,2,1,0 set (bit 3 missing)
-    // We should encode: gap=1 (not gap=0) between packets 4 and 2
+    // Bitmap: bit i = packet (largest - i). With largest=5:
+    // Bits 0,1,2 = packets 5,4,3 received
+    // Bit 3 = packet 2 NOT received (gap)
+    // Bits 4,5 = packets 1,0 received
+    // RFC 9000 §19.3.1: gap field encodes as (unacked_packets - 1)
+    // So 1 missing packet → gap_value = 0, but the test name claims "without -1"
+    // This test actually validates that gap_value = gap - 1 IS correct per RFC.
 
     var bitmap: [3]u64 = undefined;
     bitmap[0] = 0; // Initial epoch
     bitmap[1] = 0; // Handshake epoch
-    // 1-RTT: bits 0,1,2,4,5 set (packets 0,1,2,4,5); bit 3 missing (packet 3)
+    // 1-RTT: bits 0,1,2,4,5 set → packets 5,4,3,1,0 received; packet 2 missing
     bitmap[2] = 0b0011_0111; // bits 0,1,2,4,5
 
     var ranges: [32]frame.AckRange = undefined;
-    const count = Connection.buildAckRangesFromBitmap(bitmap[2], &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap[2], &ranges);
 
-    // Should have 2 ranges: [5,4] and [2,1,0]
+    // Should have 2 ranges: [5,4,3] (ack_range=2) and [1,0] (ack_range=1) with gap for packet 2
     try testing.expectEqual(@as(usize, 2), count);
 
-    // First range: packets 5,4
-    try testing.expectEqual(@as(u62, 1), ranges[0].ack_range); // 2 packets = ack_range of 1
+    // First range: packets 5,4,3
+    try testing.expectEqual(@as(u62, 2), ranges[0].ack_range); // 3 packets = ack_range of 2
     try testing.expectEqual(@as(u62, 0), ranges[0].gap);
 
-    // Second range: packets 2,1,0 with gap of 1 for missing packet 3
-    try testing.expectEqual(@as(u62, 2), ranges[1].ack_range); // 3 packets = ack_range of 2
-    // CRITICAL: gap must be 1 (the number of missing packets)
-    // With the bug (gap-1), this would be 0, causing quic-go to reject:
-    // "AckFrame: ACK frame contains invalid ACK ranges"
-    try testing.expectEqual(@as(u62, 1), ranges[1].gap);
+    // Gap between first range (packet 3) and second range (packet 1): 1 missing packet (packet 2)
+    // Per RFC 9000 §19.3.1: gap field = (missing_packets - 1) = 0
+    // Second range: packets 1,0 with gap of 0 for 1 missing packet
+    try testing.expectEqual(@as(u62, 0), ranges[1].gap); // 1 missing packet encoded as gap=0
+    try testing.expectEqual(@as(u62, 1), ranges[1].ack_range); // 2 packets = ack_range of 1
 }
 
 test "ack: isPnDuplicate and markPnReceived handle out-of-order packets" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Test RFC 9000 §13.2: Out-of-order packet handling with duplicate detection
     // Scenario: receive packet 5, then 3, then 5 again (retransmit)
@@ -3042,7 +3047,7 @@ test "ack: isPnDuplicate and markPnReceived handle out-of-order packets" {
 test "connection: version 0 packet is silently ignored" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Build a minimal long-header packet with version 0 (VN packet from peer).
     var pkt: [32]u8 = undefined;
@@ -3089,7 +3094,7 @@ test "event_queue: push and pop FIFO" {
 test "event: pollEvent returns null when empty" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     try testing.expectEqual(@as(?Event, null), conn.pollEvent());
 }
 
@@ -3122,7 +3127,7 @@ test "event_queue: full queue drops new events" {
 test "retransmit: acked stream frame advances send_acked" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Set up a stream with buffered send data
     const st = conn.streams.getOrCreate(0).?;
@@ -3150,7 +3155,7 @@ test "retransmit: acked stream frame advances send_acked" {
 test "retransmit: acked FIN on closed stream triggers stream reclamation" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const st = conn.streams.getOrCreate(4).?;
     st.state = .closed;
@@ -3178,7 +3183,7 @@ test "retransmit: acked FIN on closed stream triggers stream reclamation" {
 test "retransmit: lost HANDSHAKE_DONE sets pending_handshake_done flag" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var lost_result = loss_recovery_mod.AckResult{};
     var fi = loss_recovery_mod.SentFrameInfo{};
@@ -3195,7 +3200,7 @@ test "retransmit: lost HANDSHAKE_DONE sets pending_handshake_done flag" {
 test "retransmit: lost MAX_DATA sets pending_max_data flag" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var lost_result = loss_recovery_mod.AckResult{};
     var fi = loss_recovery_mod.SentFrameInfo{};
@@ -3216,7 +3221,7 @@ test "retransmit: lost MAX_DATA sets pending_max_data flag" {
 test "close: close() transitions to closing state" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 0;
     try conn.close(0, false, &[_]u8{});
@@ -3226,7 +3231,7 @@ test "close: close() transitions to closing state" {
 test "close: close() is idempotent when already closing" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 0;
     try conn.close(0, false, &[_]u8{});
@@ -3237,7 +3242,7 @@ test "close: close() is idempotent when already closing" {
 test "close: drain_deadline arms after close()" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     try conn.close(0, false, &[_]u8{});
@@ -3248,7 +3253,7 @@ test "close: drain_deadline arms after close()" {
 test "close: drain timer in tick transitions to closed" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .closing;
     conn.drain_deadline_ns = 5000;
     conn.tick(6000);
@@ -3259,7 +3264,7 @@ test "close: drain timer in tick transitions to closed" {
 test "close: draining state suppresses send()" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .draining;
     // Queue something
     try conn.enqueueSend(&[_]u8{0x01});
@@ -3270,7 +3275,7 @@ test "close: draining state suppresses send()" {
 test "close: nextTimeout includes drain_deadline" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.drain_deadline_ns = 2000;
     conn.idle_deadline_ns = 5000;
     // drain is smaller → nextTimeout returns drain
@@ -3280,7 +3285,7 @@ test "close: nextTimeout includes drain_deadline" {
 test "close: close() pushes connection_closed event" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 0;
     try conn.close(42, true, &[_]u8{});
@@ -3297,7 +3302,7 @@ test "close: close() pushes connection_closed event" {
 test "close: closing state discards incoming packets (returns early)" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .closing;
     conn.current_time_ns = 0;
 
@@ -3311,7 +3316,7 @@ test "close: closing state discards incoming packets (returns early)" {
 test "close: receive refreshes idle_deadline on active connection" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.idle_deadline_ns = 500;
 
@@ -3327,7 +3332,7 @@ test "close: receive refreshes idle_deadline on active connection" {
 test "initial_packet: RFC9000§9 - drop Initial packets in established state" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Transition to established state (simulating a completed handshake).
     conn.hot.state = .established;
@@ -3368,7 +3373,7 @@ test "initial_packet: RFC9000§9 - drop Initial packets in established state" {
 test "initial_packet: RFC9000§9 - drop Initial with mismatched DCID in handshake state" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Transition to handshake state.
     conn.hot.state = .handshake;
@@ -3414,7 +3419,7 @@ test "initial_packet: RFC9000§9 - drop Initial with mismatched DCID in handshak
 test "stream_reset: processFrames handles RESET_STREAM and pushes event" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Create a stream first
     _ = conn.streams.getOrCreate(0).?;
@@ -3444,7 +3449,7 @@ test "security: processStreamFrame rejects server-initiated stream ID" {
     // A server-side connection must reject STREAM frames with server-initiated IDs (bit 0 = 1).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established; // SEC-004: state guard passes; stream-ID guard fires
 
     var buf: [32]u8 = undefined;
@@ -3463,7 +3468,7 @@ test "security: processAck malformed ack_range returns InvalidFrame" {
     // An ACK with ack_range > largest_acked must return error.InvalidFrame (SEC-002).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const ack = frame.AckFrame{
         .largest_acked = 2,
@@ -3483,7 +3488,7 @@ test "security: processAck malformed gap returns InvalidFrame" {
     // Gap value that would underflow the running low pointer must return InvalidFrame.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Two ranges: first [10..10], gap=100 (too large), second [0..0].
     // After first range: low=10, high=10.  gap=100 >= low=10 → underflow guard.
@@ -3506,7 +3511,7 @@ test "security: processAck malformed gap returns InvalidFrame" {
 test "security: VN rate limit suppresses same version within 60s" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var pkt: [32]u8 = undefined;
     pkt[0] = 0xc0;
@@ -3561,21 +3566,21 @@ test "connection: cached_ack_delay_exp default is 3" {
     // RFC 9000 §18.2 default for ack_delay_exponent is 3.
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expectEqual(@as(u6, 3), conn.cached_ack_delay_exp);
 }
 
 test "connection: idle_timeout_i64 matches config at accept()" {
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{ .idle_timeout_ns = 10_000_000_000 }, io);
+    const conn = try Connection(16).accept(.{ .idle_timeout_ns = 10_000_000_000 }, io);
     try testing.expectEqual(@as(i64, 10_000_000_000), conn.idle_timeout_i64);
 }
 
 test "connection: idle_timeout_i64 is zero when idle_timeout_ns is zero" {
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{ .idle_timeout_ns = 0 }, io);
+    const conn = try Connection(16).accept(.{ .idle_timeout_ns = 0 }, io);
     try testing.expectEqual(@as(i64, 0), conn.idle_timeout_i64);
 }
 
@@ -3583,7 +3588,7 @@ test "security: rx_pn_valid initializes to false for all epochs" {
     // All three epochs must start with rx_pn_valid = false (no packet seen yet).
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.hot.rx_pn_valid[0]);
     try testing.expect(!conn.hot.rx_pn_valid[1]);
     try testing.expect(!conn.hot.rx_pn_valid[2]);
@@ -3597,7 +3602,7 @@ test "security: ConnectionHot size unchanged after adding rx_pn_valid" {
 test "connection: nextTimeout returns null when all deadlines are null" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.idle_deadline_ns = null;
     conn.pto_deadline_ns = null;
     conn.drain_deadline_ns = null;
@@ -3608,7 +3613,7 @@ test "connection: nextTimeout sentinel does not leak as a valid deadline" {
     // Even if two timers are null, the returned value must be the one real deadline.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.idle_deadline_ns = null;
     conn.pto_deadline_ns = 42;
     conn.drain_deadline_ns = null;
@@ -3618,7 +3623,7 @@ test "connection: nextTimeout sentinel does not leak as a valid deadline" {
 test "stream_reset: processFrames handles STOP_SENDING and pushes event" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const st = conn.streams.getOrCreate(0).?;
     st.send_offset = 100;
@@ -3650,7 +3655,7 @@ test "loss: multi-packet loss triggers single congestion event" {
     // pn=1..7 are declared lost (7 losses in a single processAck call).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 1_000_000_000;
 
     // Force CUBIC into congestion avoidance with a known large window.
@@ -3689,7 +3694,7 @@ test "connection: HANDSHAKE_DONE frame pushes connected event (client)" {
     // HANDSHAKE_DONE is valid only for clients (is_server=false). RFC 9000 §19.20.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .is_server = false }, io);
+    var conn = try Connection(16).accept(.{ .is_server = false }, io);
 
     // Build a raw HANDSHAKE_DONE frame and feed it through processFrames
     var buf: [4]u8 = undefined;
@@ -3711,7 +3716,7 @@ test "connection: HANDSHAKE_DONE frame pushes connected event (client)" {
 test "connection: PATH_CHALLENGE without app_keys is silently consumed (no panic)" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var buf: [16]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .path_challenge = .{ .data = .{ 1, 2, 3, 4, 5, 6, 7, 8 } } });
@@ -3725,7 +3730,7 @@ test "connection: PATH_CHALLENGE without app_keys is silently consumed (no panic
 test "connection: PATH_RESPONSE is silently consumed" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var buf: [16]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .path_response = .{ .data = .{ 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4 } } });
@@ -3744,7 +3749,7 @@ test "connection: PATH_RESPONSE is silently consumed" {
 test "connection: MAX_STREAMS_BIDI updates peer_max_streams_bidi" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var buf: [16]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .max_streams_bidi = 100 });
@@ -3755,7 +3760,7 @@ test "connection: MAX_STREAMS_BIDI updates peer_max_streams_bidi" {
 test "connection: MAX_STREAMS_BIDI value never decreases" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.peer_max_streams_bidi = 50;
 
     var buf: [16]u8 = undefined;
@@ -3771,7 +3776,7 @@ test "connection: MAX_STREAMS_BIDI value never decreases" {
 test "connection: NEW_CONNECTION_ID stores CID entry" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var cid_bytes: [20]u8 = undefined;
     @memset(&cid_bytes, 0xab);
@@ -3801,7 +3806,7 @@ test "connection: NEW_CONNECTION_ID stores CID entry" {
 test "connection: NEW_CONNECTION_ID retire_prior_to invalidates old CIDs" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var cid0: [20]u8 = undefined;
     @memset(&cid0, 0xaa);
@@ -3849,7 +3854,7 @@ test "connection: NEW_CONNECTION_ID retire_prior_to invalidates old CIDs" {
 test "connection: tick clears shouldSendMaxStreamData after stream read" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Create a stream and simulate the application reading data (grows recv_max)
     const st = conn.streams.getOrCreate(0).?;
@@ -3884,7 +3889,7 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     // ACK pn=8 → pn=1..5 declared lost → persistent_congestion = true → cwnd = 2*MSS.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     conn.congestion.cwnd = 100 * 1200;
     conn.congestion.ssthresh = 0; // always in CUBIC phase
@@ -3922,7 +3927,7 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
 test "security: server rejects HANDSHAKE_DONE (direction violation)" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .is_server = true }, io); // default
+    var conn = try Connection(16).accept(.{ .is_server = true }, io); // default
     var buf: [4]u8 = undefined;
     const n = frame.encodeFrame(&buf, .handshake_done);
     try testing.expectError(error.ProtocolViolation, conn.processFrames(buf[0..n], 2, null));
@@ -3934,7 +3939,7 @@ test "security: server rejects HANDSHAKE_DONE (direction violation)" {
 test "security: STREAM frame before established returns ProtocolViolation" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // Connection is .idle — STREAM must be rejected
     var buf: [32]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .stream = .{
@@ -3950,7 +3955,7 @@ test "security: STREAM frame before established returns ProtocolViolation" {
 test "security: amplification limit blocks excessive sends" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Simulate receiving a small datagram (100 bytes received → 300 bytes budget).
     // We increment manually since we're bypassing real receive().
@@ -3969,7 +3974,7 @@ test "security: amplification limit blocks excessive sends" {
 test "security: amplification limit lifted after path_validated" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     conn.bytes_unvalidated_recv = 1; // very small budget
     conn.path_validated = true; // validated → no limit
@@ -3985,7 +3990,7 @@ test "security: amplification limit lifted after path_validated" {
 test "security: STREAM frame in Initial epoch returns ProtocolViolation" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established; // bypass SEC-004 state check
 
     var buf: [32]u8 = undefined;
@@ -4003,7 +4008,7 @@ test "security: HANDSHAKE_DONE in epoch 0 returns ProtocolViolation" {
     // Even for a client, HANDSHAKE_DONE in the Initial epoch is forbidden.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .is_server = false }, io);
+    var conn = try Connection(16).accept(.{ .is_server = false }, io);
     var buf: [4]u8 = undefined;
     const n = frame.encodeFrame(&buf, .handshake_done);
     try testing.expectError(error.ProtocolViolation, conn.processFrames(buf[0..n], 0, null));
@@ -4012,7 +4017,7 @@ test "security: HANDSHAKE_DONE in epoch 0 returns ProtocolViolation" {
 test "security: ACK frame in epoch 0 is allowed" {
     // ACK is unrestricted (Initial, Handshake, 1-RTT).
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const ack_frame_data: frame.Frame = .{ .ack = .{
         .largest_acked = 0,
         .ack_delay = 0,
@@ -4071,7 +4076,7 @@ test "security: NEW_CONNECTION_ID with cid_len > 20 returns InvalidFrame" {
 test "security: PATH_RESPONSE matching pending challenge clears it" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const challenge_data = [8]u8{ 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4 };
     conn.pending_path_challenge = challenge_data;
 
@@ -4088,7 +4093,7 @@ test "connection: PATH_RESPONSE mismatch is silently ignored (RFC 9000 §8.2.3)"
     // ignored — not treated as a protocol violation.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.pending_path_challenge = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
 
     const wrong_data = [8]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -4131,7 +4136,7 @@ test "security: RESET_STREAM with matching final_size while FIN pending is accep
 test "perf: flushPendingMaxStreamData not called when not established" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const st = conn.streams.getOrCreate(0).?;
     try st.receiveData(0, "hello world", false);
@@ -4149,7 +4154,7 @@ test "connection: ACK with max ack_delay does not overflow" {
     // ack_delay (u62) × 2^ack_delay_exp × 1000 previously overflowed u64.
     // In debug/ReleaseSafe this panics; in ReleaseFast it silently corrupts RTT.
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     var buf: [64]u8 = undefined;
     const ack_frm = frame.Frame{ .ack = .{
         .largest_acked = 0,
@@ -4170,7 +4175,7 @@ test "connection: ACK with max ack_delay does not overflow" {
 test "connection: DATA_BLOCKED triggers pending MAX_DATA update" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.pending_max_data);
     var buf: [8]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .data_blocked = 0 });
@@ -4181,7 +4186,7 @@ test "connection: DATA_BLOCKED triggers pending MAX_DATA update" {
 test "connection: STREAM_DATA_BLOCKED triggers MAX_STREAM_DATA update" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const st = conn.streams.getOrCreate(0).?;
     st.recv_max = stream_mod.STREAM_BUF_SIZE;
     // Mark "already sent" at current recv_max — no update should be pending yet.
@@ -4217,7 +4222,7 @@ test "security: NEW_CONNECTION_ID parse rejects cid_len = 21" {
 test "security: shouldThrottleVersionNeg tracks per-version cooldown" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Version A at t=0: should not throttle (first time)
     conn.current_time_ns = 0;
@@ -4250,7 +4255,7 @@ test "security: shouldThrottleVersionNeg tracks per-version cooldown" {
 test "security: shouldThrottleVersionNeg round-robin eviction after 4 versions" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     conn.current_time_ns = 0;
 
@@ -4281,27 +4286,27 @@ test "security: shouldThrottleVersionNeg round-robin eviction after 4 versions" 
 test "connection: current_key_phase defaults false" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.current_key_phase);
 }
 
 test "connection: key_update_pending defaults false" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.key_update_pending);
 }
 
 test "connection: initiateKeyUpdate errors when not established" {
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // app_keys == null → NotEstablished
     try std.testing.expectError(error.NotEstablished, conn.initiateKeyUpdate());
 }
 
 test "connection: initiateKeyUpdate errors when key_update_pending" {
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.next_client_secret = [_]u8{0x33} ** 32;
@@ -4314,7 +4319,7 @@ test "connection: initiateKeyUpdate errors when key_update_pending" {
 test "connection: initiateKeyUpdate flips key_phase and sets pending" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.next_client_secret = [_]u8{0x55} ** 32;
@@ -4330,7 +4335,7 @@ test "connection: initiateKeyUpdate flips key_phase and sets pending" {
 test "connection: rotateKeys advances next-generation secrets" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     const secret = [_]u8{0x77} ** 32;
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
@@ -4350,7 +4355,7 @@ test "connection: rotateKeys advances next-generation secrets" {
 test "connection: ACK generation after key update" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Setup: establish connection with initial keys
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
@@ -4397,7 +4402,7 @@ test "connection: ACK generation after key update" {
 test "connection: same address no migration" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // peer_addr initialised to 0.0.0.0:0; receive from the same address.
     const src = SocketAddr{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } };
@@ -4409,7 +4414,7 @@ test "connection: same address no migration" {
 test "connection: different address triggers migration" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 4321 } };
     try conn.receive(&[_]u8{}, new_src, 0, io);
@@ -4420,7 +4425,7 @@ test "connection: different address triggers migration" {
 test "connection: migration resets congestion" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // Inflate the congestion window to a large value.
     conn.congestion.cwnd = 999_999;
@@ -4433,7 +4438,7 @@ test "connection: migration resets congestion" {
 test "connection: migration sets path_validated false" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.path_validated = true;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 2 }, .port = 5001 } };
@@ -4444,7 +4449,7 @@ test "connection: migration sets path_validated false" {
 test "connection: migration event pushed" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 3 }, .port = 5002 } };
     try conn.receive(&[_]u8{}, new_src, 0, io);
@@ -4456,7 +4461,7 @@ test "connection: migration event pushed" {
 test "connection: peer_disable_migration suppresses migration" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.peer_disable_migration = true;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 192, 168, 0, 1 }, .port = 8080 } };
@@ -4471,7 +4476,7 @@ test "connection: peer_disable_migration suppresses migration" {
 test "connection: migration only in established state" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // state is .idle — migration check must not fire.
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 1, 2, 3, 4 }, .port = 9000 } };
     // Empty datagram; receive() returns without error (while loop body never runs).
@@ -4482,7 +4487,7 @@ test "connection: migration only in established state" {
 test "connection: PATH_RESPONSE after migration validates path" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // Simulate post-migration state: challenge outstanding, path not yet validated.
     const challenge_data = [8]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0x01, 0x02, 0x03, 0x04 };
     conn.pending_path_challenge = challenge_data;
@@ -4507,7 +4512,7 @@ test "connection: sendEncryptedAck for Initial epoch produces long header" {
     // The first byte of a long-header QUIC packet has bit 7 = 1 (0x80 or above).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // Derive real initial keys with a dummy DCID.
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
@@ -4526,7 +4531,7 @@ test "connection: sendEncryptedAck for 1-RTT epoch produces short header" {
     // The first byte of a 1-RTT packet has bit 7 = 0 and bit 6 = 1 (0x40-0x7f).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.markPnReceived(2, 3);
@@ -4543,7 +4548,7 @@ test "connection: sendEncryptedAck for 1-RTT epoch produces short header" {
 test "connection: sendEncryptedAck skips when hs_keys missing" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hs_keys = null;
 
     // Should not enqueue anything.
@@ -4556,7 +4561,7 @@ test "connection: sendEncryptedAck skips when hs_keys missing" {
 test "connection: PING frame sets pending_ack flag" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     var buf: [4]u8 = undefined;
     const n = frame.encodeFrame(&buf, .ping);
@@ -4572,7 +4577,7 @@ test "connection: PING frame sets pending_ack flag" {
 test "connection: ACK frame does NOT set pending_ack" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Build a minimal ACK frame (largest_acked=0, range_count=1).
     var buf: [64]u8 = undefined;
@@ -4597,7 +4602,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     // produce an encrypted ACK in the send queue once hs_keys are available.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe };
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
     conn.hot.state = .handshake; // past idle so Initial packets are processed
@@ -4647,7 +4652,7 @@ test "connection: receive() suppresses epoch-0 ACK when hs_keys is null" {
     // trace from showing a client 1-RTT packet before the ServerHello.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const dcid = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe };
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
     conn.hot.state = .handshake;
@@ -4689,7 +4694,7 @@ test "connection: receive() suppresses epoch-0 ACK when hs_keys is null" {
 test "connection: recv window grows when 75% consumed" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
 
     const initial_recv_max = conn.conn_flow.recv_max; // 1 MiB default
@@ -4724,7 +4729,7 @@ test "connection: recv window grows when 75% consumed" {
 test "connection: recv window stays unchanged when under 75%" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
 
     const initial_recv_max = conn.conn_flow.recv_max;
@@ -4739,7 +4744,7 @@ test "connection: recv window stays unchanged when under 75%" {
 test "connection: CRYPTO at expected offset is accepted" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.crypto_recv_offset[0] = 0;
 
     // A CRYPTO frame at offset 0 with 1 byte of data increments the expected offset.
@@ -4755,7 +4760,7 @@ test "connection: CRYPTO at expected offset is accepted" {
 test "connection: CRYPTO duplicate frame is silently ignored" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // Pretend we already processed 10 bytes.
     conn.crypto_recv_offset[0] = 10;
 
@@ -4772,7 +4777,7 @@ test "connection: CRYPTO duplicate frame is silently ignored" {
 test "connection: CRYPTO gap is staged, offset does not advance" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.crypto_recv_offset[0] = 0;
 
     const data = [_]u8{0x55} ** 5;
@@ -4789,7 +4794,7 @@ test "connection: CRYPTO gap is staged, offset does not advance" {
 test "connection: CRYPTO partial overlap trims leading bytes" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.crypto_recv_offset[0] = 10;
 
     const data = [_]u8{0x99} ** 5;
@@ -4804,7 +4809,7 @@ test "connection: CRYPTO partial overlap trims leading bytes" {
 test "connection: tick batches MAX_DATA and MAX_STREAM_DATA in one packet" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
@@ -4829,7 +4834,7 @@ test "connection: tick batches MAX_DATA and MAX_STREAM_DATA in one packet" {
 test "connection: flushControlFrames is no-op when nothing pending" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
@@ -4842,7 +4847,7 @@ test "connection: flushControlFrames is no-op when nothing pending" {
 test "connection: coalesced packet tracked by loss recovery" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
@@ -4866,7 +4871,7 @@ test "connection: coalesced packet tracked by loss recovery" {
 test "connection: STREAM data within connection recv window is accepted" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
 
     var buf: [64]u8 = undefined;
@@ -4884,7 +4889,7 @@ test "connection: STREAM data within connection recv window is accepted" {
 test "connection: STREAM data exceeding connection recv window returns FlowControlViolation" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // Artificially shrink the connection receive window to 4 bytes.
     conn.conn_flow.recv_max = 4;
@@ -4905,7 +4910,7 @@ test "connection: STREAM data exceeding connection recv window returns FlowContr
 
 test "connection: STREAM on bidirectional stream within local_max_streams_bidi is accepted" {
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
 
     // Stream 0 is client-initiated bidi stream #0 — always within any sane limit.
@@ -4924,7 +4929,7 @@ test "connection: STREAM on bidirectional stream within local_max_streams_bidi i
 test "connection: STREAM on bidirectional stream exceeding local_max_streams_bidi returns StreamLimitError" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // Lower the limit to 2 bidirectional streams.
     conn.local_max_streams_bidi = 2;
@@ -4945,7 +4950,7 @@ test "connection: STREAM on bidirectional stream exceeding local_max_streams_bid
 test "connection: STREAM on unidirectional stream exceeding local_max_streams_uni returns StreamLimitError" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // Lower the limit to 1 unidirectional stream.
     conn.local_max_streams_uni = 1;
@@ -4968,7 +4973,7 @@ test "connection: conn_flow.recv_total not charged when stream receiveData fails
     // flow control counter must not be permanently incremented.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
 
     // Send FIN at offset 3 (final_size = 3).
@@ -5005,7 +5010,7 @@ test "connection: enqueueSend refreshes idle deadline" {
     // RFC 9000 §10.1.2: idle timer must restart when a packet is sent.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000; // 1s
     conn.idle_timeout_i64 = 30_000_000_000; // 30s
@@ -5024,7 +5029,7 @@ test "connection: stateless reset closes connection when token matches" {
     // reset token must silently close the connection.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Install a known reset token in the peer CID table.
     const token = [_]u8{0xde} ** 16;
@@ -5043,7 +5048,7 @@ test "connection: stateless reset ignores short packet" {
     // Packets shorter than 21 bytes cannot be stateless resets (RFC 9000 §10.3).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const token = [_]u8{0xab} ** 16;
     conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
 
@@ -5057,7 +5062,7 @@ test "connection: stateless reset ignores non-matching token" {
     // A packet whose last 16 bytes do NOT match any stored token must not close.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const token = [_]u8{0xcd} ** 16;
     conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
 
@@ -5072,7 +5077,7 @@ test "connection: new bidi stream send_max set from peer_max_stream_data_bidi_lo
     // hardcoded STREAM_BUF_SIZE (RFC 9000 §7.3).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // Simulate transport-param negotiation with a non-default value.
     const custom_limit: u64 = 128 * 1024; // 128 KiB
@@ -5097,7 +5102,7 @@ test "connection: new bidi stream send_max not reset on second STREAM frame" {
     // was already updated (e.g. by a MAX_STREAM_DATA frame from the peer).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.peer_max_stream_data_bidi_local = 128 * 1024;
 
@@ -5133,7 +5138,7 @@ test "connection: MAX_STREAM_DATA cannot decrease send_max (RFC 9000 §4.2)" {
     // increasing (RFC 9000 §4.2).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.peer_max_stream_data_bidi_local = 64 * 1024;
 
@@ -5169,7 +5174,7 @@ test "connection: RESET_STREAM charges gap bytes to connection flow control (RFC
     // flow control window (RFC 9000 §4.5).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.peer_max_stream_data_bidi_local = stream_mod.STREAM_BUF_SIZE;
 
@@ -5206,7 +5211,7 @@ test "connection: RESET_STREAM charges gap bytes to connection flow control (RFC
 test "PMTUD: getNextPmtudSize probe sequence" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Test initial sequence: 1200 → 1500 → 2048 → 4096
     conn.path_mtu = 1200;
@@ -5236,7 +5241,7 @@ test "PMTUD: getNextPmtudSize probe sequence" {
 test "PMTUD: queuePmtudProbe succeeds when conditions are met" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5260,7 +5265,7 @@ test "PMTUD: queuePmtudProbe succeeds when conditions are met" {
 test "PMTUD: queuePmtudProbe rejects invalid sizes" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
@@ -5271,17 +5276,17 @@ test "PMTUD: queuePmtudProbe rejects invalid sizes" {
     try testing.expectError(error.InvalidSize, conn.queuePmtudProbe(1199));
     try testing.expectError(error.InvalidSize, conn.queuePmtudProbe(0));
 
-    // Verify max valid size within MAX_PACKET_SIZE (1200) is allowed
-    try conn.queuePmtudProbe(1200);
+    // Verify max valid size within MAX_SEND_PACKET_SIZE (1452) is allowed
+    try conn.queuePmtudProbe(1452);
 
-    // Sizes beyond MAX_PACKET_SIZE are rejected
-    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1201));
+    // Sizes beyond MAX_SEND_PACKET_SIZE are rejected
+    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1453));
 }
 
 test "PMTUD: queuePmtudProbe rejects when no 1-RTT keys" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     // No app_keys set
@@ -5293,7 +5298,7 @@ test "PMTUD: queuePmtudProbe rejects when no 1-RTT keys" {
 test "PMTUD: queuePmtudProbe initiates and stores probe info" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5314,7 +5319,7 @@ test "PMTUD: queuePmtudProbe initiates and stores probe info" {
 test "PMTUD: probe timeout detected at 3×PTO without ACK" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5341,7 +5346,7 @@ test "PMTUD: probe timeout detected at 3×PTO without ACK" {
 test "PMTUD: ACK detection marks probe as successful" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5379,7 +5384,7 @@ test "PMTUD: ACK detection marks probe as successful" {
 test "PMTUD: does not backoff on ACK with gap containing probe" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5424,7 +5429,7 @@ test "PMTUD: does not backoff on ACK with gap containing probe" {
 test "PMTUD: does not backoff on ACK with unreachable packet" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5464,7 +5469,7 @@ test "PMTUD: does not backoff on ACK with unreachable packet" {
 test "PMTUD: probe disabled during handshake" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
     conn.pmtud_next_probe_ns = 0;
@@ -5484,7 +5489,7 @@ test "PMTUD: probe disabled during handshake" {
 test "PMTUD: state machine: probe can only be initiated when none in flight" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5511,7 +5516,7 @@ test "PMTUD: state machine: probe can only be initiated when none in flight" {
 test "PMTUD: respects 1-second retry interval after failure" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5537,7 +5542,7 @@ test "PMTUD: respects 1-second retry interval after failure" {
 test "PMTUD: probe packet is marked ack-eliciting" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5562,7 +5567,7 @@ test "PMTUD: probe packet is marked ack-eliciting" {
 test "PMTUD: doesn't probe if already at maximum" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 65535;
@@ -5581,7 +5586,7 @@ test "PMTUD: doesn't probe if already at maximum" {
 test "PMTUD: backoff on PacketTooLarge error" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5600,7 +5605,7 @@ test "PMTUD: backoff on PacketTooLarge error" {
 test "PMTUD: converges when probe size exceeds MAX_PACKET_SIZE" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
@@ -5620,7 +5625,7 @@ test "PMTUD: converges when probe size exceeds MAX_PACKET_SIZE" {
 test "PMTUD: short header padding calculation is correct" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.path_mtu = 1200;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
@@ -5635,21 +5640,21 @@ test "PMTUD: short header padding calculation is correct" {
 test "PMTUD: rejects probe size above MAX_PACKET_SIZE" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
     const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
-    try conn.queuePmtudProbe(1200);
-    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1351));
+    try conn.queuePmtudProbe(1452);
+    try testing.expectError(error.PacketTooLarge, conn.queuePmtudProbe(1453));
 }
 
 test "token: valid token can be generated and validated" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Set token secret
     const secret = [_]u8{0xaa} ** 32;
@@ -5661,7 +5666,7 @@ test "token: valid token can be generated and validated" {
 
     // Generate token (pass DCID as slice)
     const token = conn.generateToken(src, &odcid.bytes, now_ns, io);
-    try testing.expectEqual(@as(usize, Connection.TOKEN_SIZE), token.len);
+    try testing.expectEqual(@as(usize, Connection(16).TOKEN_SIZE), token.len);
 
     // Validate token immediately (should succeed, returns ValidatedToken)
     const result = conn.validateToken(&token, src, now_ns);
@@ -5673,7 +5678,7 @@ test "token: valid token can be generated and validated" {
 test "token: expired token is rejected" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const secret = [_]u8{0xbb} ** 32;
     conn.config.token_secret = secret;
@@ -5687,13 +5692,13 @@ test "token: expired token is rejected" {
 
     // Validate after token has expired (120 seconds later)
     const result = conn.validateToken(&token, src, now_ns + 120 * std.time.ns_per_s);
-    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
+    try testing.expectEqual(@as(?Connection(16).ValidatedToken, null), result);
 }
 
 test "token: future-dated token is rejected (clock skew)" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const secret = [_]u8{0xcc} ** 32;
     conn.config.token_secret = secret;
@@ -5708,13 +5713,13 @@ test "token: future-dated token is rejected (clock skew)" {
 
     // Try to validate with an earlier timestamp
     const result = conn.validateToken(&token, src, now_ns);
-    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
+    try testing.expectEqual(@as(?Connection(16).ValidatedToken, null), result);
 }
 
 test "token: different source address causes validation failure" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const secret = [_]u8{0xdd} ** 32;
     conn.config.token_secret = secret;
@@ -5729,13 +5734,13 @@ test "token: different source address causes validation failure" {
 
     // Try to validate with src2 (should fail)
     const result = conn.validateToken(&token, src2, now_ns);
-    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
+    try testing.expectEqual(@as(?Connection(16).ValidatedToken, null), result);
 }
 
 test "token: tampered token (corrupted AEAD tag) is rejected" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const secret = [_]u8{0xee} ** 32;
     conn.config.token_secret = secret;
@@ -5752,13 +5757,13 @@ test "token: tampered token (corrupted AEAD tag) is rejected" {
 
     // Validation should fail
     const result = conn.validateToken(&token, src, now_ns);
-    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
+    try testing.expectEqual(@as(?Connection(16).ValidatedToken, null), result);
 }
 
 test "token: IPv6 source address validation" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const secret = [_]u8{0xff} ** 32;
     conn.config.token_secret = secret;
@@ -5769,7 +5774,7 @@ test "token: IPv6 source address validation" {
 
     // Generate token with IPv6 source
     const token = conn.generateToken(src, &odcid.bytes, now_ns, io);
-    try testing.expectEqual(@as(usize, Connection.TOKEN_SIZE), token.len);
+    try testing.expectEqual(@as(usize, Connection(16).TOKEN_SIZE), token.len);
 
     // Validate with same IPv6 source (should succeed)
     const result = conn.validateToken(&token, src, now_ns);
@@ -5781,7 +5786,7 @@ test "token: IPv6 source address validation" {
 test "token: truncated token is rejected" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const secret = [_]u8{0x99} ** 32;
     conn.config.token_secret = secret;
@@ -5794,7 +5799,7 @@ test "token: truncated token is rejected" {
 
     // Validation should fail
     const result = conn.validateToken(&truncated, src, now_ns);
-    try testing.expectEqual(@as(?Connection.ValidatedToken, null), result);
+    try testing.expectEqual(@as(?Connection(16).ValidatedToken, null), result);
 }
 
 test "retry: transport params wiring with original_dcid and retry_scid" {
@@ -5802,7 +5807,7 @@ test "retry: transport params wiring with original_dcid and retry_scid" {
     const io = std.testing.io;
 
     // Create a connection with address validation enabled
-    var conn = try Connection.accept(.{ .validate_addr = true }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = true }, io);
 
     // Simulate receiving a Retry token (generate one to test the full flow)
     const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
@@ -5892,7 +5897,7 @@ fn buildInitialPacket(
 test "retry: validate_addr=false: tokenless Initial proceeds without Retry" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
@@ -5913,7 +5918,7 @@ test "retry: validate_addr=false: tokenless Initial proceeds without Retry" {
 test "retry: validate_addr=true, no token: retry_sent event and Retry packet queued" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .validate_addr = true }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = true }, io);
 
     const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
@@ -5942,7 +5947,7 @@ test "retry: validate_addr=true, valid token: original_dcid stored, handshake pr
     const testing = std.testing;
     const io = std.testing.io;
     const secret = [_]u8{0xAB} ** 32;
-    var conn = try Connection.accept(.{ .validate_addr = true, .token_secret = secret }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = true, .token_secret = secret }, io);
 
     const dcid_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const scid_bytes = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
@@ -5970,7 +5975,7 @@ test "retry: validate_addr=true, expired token: error.InvalidToken" {
     const testing = std.testing;
     const io = std.testing.io;
     const secret = [_]u8{0xCD} ** 32;
-    var conn = try Connection.accept(.{
+    var conn = try Connection(16).accept(.{
         .validate_addr = true,
         .token_secret = secret,
         .token_validity_ns = 60 * std.time.ns_per_s, // 1 minute
@@ -5994,7 +5999,7 @@ test "retry: validate_addr=true, tampered token: error.InvalidToken" {
     const testing = std.testing;
     const io = std.testing.io;
     const secret = [_]u8{0xEF} ** 32;
-    var conn = try Connection.accept(.{ .validate_addr = true, .token_secret = secret }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = true, .token_secret = secret }, io);
 
     const dcid_bytes = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
     const scid_bytes = [_]u8{ 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10 };
@@ -6014,7 +6019,7 @@ test "retry: validate_addr=true, wrong-address token: error.InvalidToken" {
     const testing = std.testing;
     const io = std.testing.io;
     const secret = [_]u8{0x12} ** 32;
-    var conn = try Connection.accept(.{ .validate_addr = true, .token_secret = secret }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = true, .token_secret = secret }, io);
 
     const dcid_bytes = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };
     const scid_bytes = [_]u8{ 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x00 };
@@ -6038,7 +6043,7 @@ test "retry: validate_addr=true, wrong-address token: error.InvalidToken" {
 test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 1_000_000_000;
 
     // Record a sent packet so largest_acked_sent_ns is populated
@@ -6069,12 +6074,12 @@ test "ecn: CE count non-increase is ignored (monotonic guard)" {
     const io = std.testing.io;
 
     // Run two connections side by side: one with stale CE (non-increasing), one without ECN.
-    var conn_ecn = try Connection.accept(.{}, io);
+    var conn_ecn = try Connection(16).accept(.{}, io);
     conn_ecn.current_time_ns = 1_000_000_000;
     conn_ecn.ecn_ce_seen[2] = 5; // already seen 5
     conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
 
-    var conn_plain = try Connection.accept(.{}, io);
+    var conn_plain = try Connection(16).accept(.{}, io);
     conn_plain.current_time_ns = 1_000_000_000;
     conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
 
@@ -6113,11 +6118,11 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
     const io = std.testing.io;
 
     // Two connections: one ACK with has_ecn=true but CE=0, one plain ACK without ECN.
-    var conn_ecn = try Connection.accept(.{}, io);
+    var conn_ecn = try Connection(16).accept(.{}, io);
     conn_ecn.current_time_ns = 1_000_000_000;
     conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
 
-    var conn_plain = try Connection.accept(.{}, io);
+    var conn_plain = try Connection(16).accept(.{}, io);
     conn_plain.current_time_ns = 1_000_000_000;
     conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
 
@@ -6154,7 +6159,7 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
 test "ecn: has_ecn=false ACK does not touch ecn_ce_seen" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 1_000_000_000;
     conn.ecn_ce_seen[2] = 99; // pre-set to a non-zero value
 
@@ -6181,7 +6186,7 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
     const testing = std.testing;
     const io = std.testing.io;
 
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 0;
 
     // Build a minimal v2 Initial packet encrypted with v2 initial keys.
@@ -6235,7 +6240,7 @@ test "connection: queueTlsOutput splits ServerHello into Initial epoch and rest 
     // EncryptedExtensions through Finished MUST be in Handshake CRYPTO frames.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Set up valid encryption keys.
     const dcid = [_]u8{0x42} ** 8;
@@ -6279,7 +6284,7 @@ test "connection: first_initial_dcid stored for original_destination_connection_
     // Verify that the DCID from the client's first Initial is stored in first_initial_dcid.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     const dcid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44 };
     const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
@@ -6302,7 +6307,7 @@ test "connection: original_destination_connection_id in server transport params 
     // in our_transport_params when processing a ClientHello (non-Retry path).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     const dcid = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const scid = [_]u8{ 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18 };
@@ -6325,7 +6330,7 @@ test "connection: ourScidBytes echoes client DCID after Initial received" {
     // the client), enabling correct pcap-based interop test analysis.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     // Before any Initial is received, ourScidBytes falls back to local_cid.
     try testing.expectEqualSlices(u8, &conn.local_cid.bytes, conn.ourScidBytes());
@@ -6348,7 +6353,7 @@ test "connection: ourScidBytes length matches first_initial_dcid_len" {
     // returns exactly first_initial_dcid_len bytes after an Initial is received.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     const dcid = [_]u8{ 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11 };
     const scid = [_]u8{ 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28 };
@@ -6372,7 +6377,7 @@ test "connection: ourScidBytes length matches first_initial_dcid_len" {
 test "connection: isPnDuplicate returns false for first packet" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // No packet received yet.
     try testing.expect(!conn.isPnDuplicate(0, 0));
     try testing.expect(!conn.isPnDuplicate(0, 100));
@@ -6381,7 +6386,7 @@ test "connection: isPnDuplicate returns false for first packet" {
 test "connection: markPnReceived then isPnDuplicate returns true for same PN" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.markPnReceived(0, 10);
     try testing.expect(conn.isPnDuplicate(0, 10));
     try testing.expect(!conn.isPnDuplicate(0, 11)); // never received
@@ -6391,7 +6396,7 @@ test "connection: markPnReceived then isPnDuplicate returns true for same PN" {
 test "connection: markPnReceived out-of-order fills bitmap correctly" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     // Receive pkts 5, 3, 4 (out of order: 5 first, then gap-fill).
     conn.markPnReceived(0, 5);
     try testing.expectEqual(@as(u64, 5), conn.hot.rx_pn[0]);
@@ -6413,7 +6418,7 @@ test "connection: isPnDuplicate treats PN > 63 below largest as duplicate" {
     // treated as duplicates to prevent replay (RFC 9000 §13.2.3).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.markPnReceived(0, 100);
     try testing.expect(conn.isPnDuplicate(0, 36)); // 100 - 36 = 64 → duplicate
     try testing.expect(!conn.isPnDuplicate(0, 37)); // 100 - 37 = 63 → within window
@@ -6425,7 +6430,7 @@ test "connection: buildAckRangesFromBitmap all contiguous" {
     const testing = std.testing;
     const bitmap: u64 = 0b1111; // bits 0,1,2,3 set
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 3), ranges[0].ack_range);
 }
@@ -6439,7 +6444,7 @@ test "connection: buildAckRangesFromBitmap with gap" {
     const testing = std.testing;
     const bitmap: u64 = 0b110011; // bits 0,1,4,5 set
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 1), ranges[0].ack_range); // [N-1, N]
     try testing.expectEqual(@as(u62, 1), ranges[1].gap); // 2 missing packets encoded as gap=1
@@ -6451,7 +6456,7 @@ test "connection: buildAckRangesFromBitmap empty bitmap (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 0;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range);
 }
@@ -6461,7 +6466,7 @@ test "connection: buildAckRangesFromBitmap full bitmap all ones (CTZ optimizatio
     const testing = std.testing;
     const bitmap: u64 = 0xFFFFFFFFFFFFFFFF;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 63), ranges[0].ack_range);
 }
@@ -6471,7 +6476,7 @@ test "connection: buildAckRangesFromBitmap single bit (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 1;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range);
 }
@@ -6483,7 +6488,7 @@ test "connection: buildAckRangesFromBitmap multiple gaps (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 0b10101010;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 5), count);
     // First range: empty (no leading 1s)
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range);
@@ -6503,7 +6508,7 @@ test "connection: buildAckRangesFromBitmap large gap (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 0x8000000000000001; // bits 0 and 63 set
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // bit 0
     try testing.expectEqual(@as(u62, 61), ranges[1].gap); // 62 missing packets encoded as gap=61
@@ -6515,7 +6520,7 @@ test "connection: buildAckRangesFromBitmap leading zeros (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 0x0F;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 3), ranges[0].ack_range); // bits 0-3
 }
@@ -6527,7 +6532,7 @@ test "connection: buildAckRangesFromBitmap trailing zeros (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 0xF0;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // first_run=0
     try testing.expectEqual(@as(u62, 3), ranges[1].gap); // gap of 4 encoded as 3
@@ -6540,7 +6545,7 @@ test "connection: buildAckRangesFromBitmap complex pattern (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 0x0F0F0F0F;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     // Expected: 4 ranges (ack_range=3 each) with 3-bit gaps between them
     try testing.expectEqual(@as(usize, 4), count);
     try testing.expectEqual(@as(u62, 3), ranges[0].ack_range);
@@ -6560,7 +6565,7 @@ test "connection: buildAckRangesFromBitmap max range count capped at 32" {
     // This creates many separate ranges when gaps are included.
     const bitmap: u64 = 0x5555555555555555;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     // Should return at most 32 (the max capacity)
     try testing.expect(count <= 32);
 }
@@ -6571,7 +6576,7 @@ test "connection: buildAckRangesFromBitmap byte pattern (CTZ optimization)" {
     const testing = std.testing;
     const bitmap: u64 = 0x0000FF00;
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     // Expected: gap of 8, run of 8
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // first_run = 0
@@ -6584,7 +6589,7 @@ test "connection: sendEncryptedAck encodes gaps from received bitmap" {
     // two ranges separated by a gap of 1 so the sender knows N-1 is missing.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const dcid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11 };
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
 
@@ -6628,7 +6633,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     // This test verifies out-of-order packets are now correctly processed.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .validate_addr = false }, io);
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     // Establish connection by manually setting up keys and state.
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
@@ -6697,7 +6702,7 @@ test "connection: packets outside 64-packet window are treated as duplicates" {
     // and must be treated as duplicates for safety (RFC 9000 §13.2.3).
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Receive pkt 100.
     conn.markPnReceived(0, 100);
@@ -6716,7 +6721,7 @@ test "connection: ACK with gap encodes correctly" {
     const testing = std.testing;
     const bitmap: u64 = 0b11011; // bits {0,1,3,4} set
     var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
-    const count = Connection.buildAckRangesFromBitmap(bitmap, &ranges);
+    const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
 
     // Expected: 2 ranges
     // Range 0: ack_range = 1 (bits 0-1 set = 2 packets)
@@ -6734,7 +6739,7 @@ test "connection: sendEncryptedAck skips if no packets received in epoch" {
     // with largest_acked = 0 when no packets had been received in that epoch.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
 
@@ -6754,7 +6759,7 @@ test "connection: sendEncryptedAck sends valid ACK after receiving packet" {
     // Verify that sendEncryptedAck only sends ACKs when rx_pn_valid[epoch] is true.
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     const dcid = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
 
@@ -6796,7 +6801,7 @@ test "connection: markPnReceived with extreme packet number jump" {
     // bitmap shifts that might generate invalid ACK ranges.
     // Test: receive pkt 100, then pkt 200 (shift = 100 >= 64, resets bitmap to 1)
     const testing = std.testing;
-    var conn = try Connection.accept(.{}, testing.io);
+    var conn = try Connection(16).accept(.{}, testing.io);
     conn.markPnReceived(2, 100);
     try testing.expectEqual(@as(u64, 100), conn.hot.rx_pn[2]);
     try testing.expectEqual(@as(u64, 1), conn.rx_pn_bitmap[2]);
@@ -6817,7 +6822,7 @@ test "connection: ACK generation with interleaved out-of-order packets" {
     // Packets arrive in order like: 5, 7, 6, 9, 8, 10
     // This creates shifting bitmap with multiple gaps
     const testing = std.testing;
-    var conn = try Connection.accept(.{}, testing.io);
+    var conn = try Connection(16).accept(.{}, testing.io);
 
     std.debug.print("\n=== ACK DIAGNOSTIC TEST: Interleaved packets ===\n", .{});
 
@@ -6860,7 +6865,7 @@ test "connection: ACK generation with sequential packet arrival" {
     // This might reveal the issue if it's related to large packet numbers or bitmap shifts
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Simulate receiving packets 1..100 in order (epoch 2 = 1-RTT)
     for (1..101) |pn| {
@@ -6893,18 +6898,18 @@ test "connection: accept() uses Config.initial_quic_version" {
     const io = std.testing.io;
 
     // Test with default V1
-    var conn_v1 = try Connection.accept(.{}, io);
+    var conn_v1 = try Connection(16).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.quic_version);
 
     // Test with V2
-    var conn_v2 = try Connection.accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    var conn_v2 = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.quic_version);
 }
 
 test "connection: rotateKeys toggles current_key_phase" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const initial_phase = conn.current_key_phase;
     try testing.expect(!initial_phase); // Should default to false
@@ -6925,7 +6930,7 @@ test "connection: rotateKeys toggles current_key_phase" {
 test "connection: multiple key rotations toggle key_phase correctly" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const initial_phase = conn.current_key_phase;
 
@@ -6948,7 +6953,7 @@ test "connection: multiple key rotations toggle key_phase correctly" {
 test "connection: key generation counter increments on rotation" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Initially at generation 0
     try testing.expectEqual(@as(u32, 0), conn.current_key_generation);
@@ -6978,7 +6983,7 @@ test "connection: key generation counter increments on rotation" {
 test "connection: deriveSecretsForGeneration returns correct generation secrets" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Set initial secrets
     conn.tls_state.client_app_secret = [_]u8{0xaa} ** 32;
@@ -7008,7 +7013,7 @@ test "connection: deriveSecretsForGeneration returns correct generation secrets"
 test "connection: multiple sequential key rotations with generation tracking" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const initial_gen = conn.current_key_generation;
     try testing.expectEqual(@as(u32, 0), initial_gen);
@@ -7042,7 +7047,7 @@ test "connection: multiple sequential key rotations with generation tracking" {
 test "connection: key_phase bit and key_generation independent" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     const initial_phase = conn.current_key_phase;
     const initial_gen = conn.current_key_generation;
@@ -7069,7 +7074,7 @@ test "connection: key_phase bit and key_generation independent" {
 test "connection: full key rotation flow - secret derivation for interop" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Simulate TLS handshake completion with real secret material
     conn.tls_state.client_random = [_]u8{0x11} ** 32;
@@ -7142,7 +7147,7 @@ test "connection: packet encryption/decryption works with key rotation" {
     const io = std.testing.io;
 
     // Setup client connection
-    var client = try Connection.accept(.{}, io);
+    var client = try Connection(16).accept(.{}, io);
     client.tls_state.client_random = [_]u8{0xaa} ** 32;
     client.tls_state.client_hs_secret = [_]u8{0xbb} ** 32;
     client.tls_state.server_hs_secret = [_]u8{0xcc} ** 32;
@@ -7224,7 +7229,7 @@ test "connection: packet encryption/decryption works with key rotation" {
 test "connection: processFrames marks STREAM frame as ack-eliciting" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
@@ -7250,7 +7255,7 @@ test "connection: processFrames marks STREAM frame as ack-eliciting" {
 test "connection: processFrames does NOT mark PADDING as ack-eliciting" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
 
@@ -7268,7 +7273,7 @@ test "connection: processFrames does NOT mark PADDING as ack-eliciting" {
 test "connection: processFrames does NOT mark ACK as ack-eliciting" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
 
@@ -7301,7 +7306,7 @@ test "connection: processFrames does NOT mark ACK as ack-eliciting" {
 test "security: CRYPTO staging byte limit prevents memory pinning" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
 
     // Each fragment is limited to CRYPTO_STAGE_FRAG (1400 bytes)
@@ -7330,7 +7335,7 @@ test "security: CRYPTO staging byte limit prevents memory pinning" {
 test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Store first CID with seq=10
     conn.processNewConnectionId(.{
@@ -7359,7 +7364,7 @@ test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
 test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Store first CID with seq=100
     conn.processNewConnectionId(.{
@@ -7388,7 +7393,7 @@ test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {
 test "security: NEW_CONNECTION_ID sequence within bounds is accepted" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{}, io);
+    var conn = try Connection(16).accept(.{}, io);
 
     // Store first CID with seq=100
     conn.processNewConnectionId(.{
@@ -7424,7 +7429,7 @@ test "security: plaintext buffer zeroization in Initial packet processing" {
     // (verified via defer statement, not directly testable but documented)
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
 
     // This test documents that plaintext buffers are zeroized after
     // Initial/Handshake/1-RTT packet processing via defer statements.
@@ -7437,7 +7442,7 @@ test "security: token plaintext zeroization on generation" {
     // Regression: plaintext used in token generation is zeroized after encryption
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
 
     const addr = SocketAddr{ .v4 = .{
         .addr = [_]u8{ 127, 0, 0, 1 },
@@ -7456,7 +7461,7 @@ test "security: token plaintext zeroization on validation" {
     // Regression: plaintext extracted from token is zeroized after validation
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
 
     const addr = SocketAddr{ .v4 = .{
         .addr = [_]u8{ 127, 0, 0, 1 },
@@ -7476,7 +7481,7 @@ test "security: initial keys zeroized after 1-RTT establishment" {
     // (verified via secureZero call in processCryptoFrame when TLS complete)
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
 
     // This test documents that initial_keys are zeroized after app_keys are set
     // during TLS completion. The actual zeroization happens internally via
@@ -7492,7 +7497,7 @@ test "security: initial keys zeroized after 1-RTT establishment" {
 test "connection: version negotiation - initial and quic versions track separately" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    var conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
 
     // Initially, both should be set to configured version
     try testing.expectEqual(packet.QUIC_VERSION_2, conn.initial_version);
@@ -7508,18 +7513,18 @@ test "connection: version negotiation - server_configured_version set from confi
     const io = std.testing.io;
 
     // Test with default v1
-    var conn_v1 = try Connection.accept(.{}, io);
+    var conn_v1 = try Connection(16).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
 
     // Test with configured v2
-    var conn_v2 = try Connection.accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    var conn_v2 = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
 }
 
 test "connection: version negotiation - initial_version set from client Initial" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection.accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    var conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
 
     // Simulate receiving a v1 Initial packet
     // (The actual packet processing sets initial_version to the client's version)
@@ -7540,7 +7545,7 @@ test "connection: version negotiation - initial_version set from client Initial"
 test "stream recycling: configurable initial_max_streams_bidi stored in connection" {
     const testing = std.testing;
     const io = std.testing.io;
-    const conn = try Connection.accept(.{
+    const conn = try Connection(16).accept(.{
         .initial_max_streams_bidi = 512,
         .initial_max_streams_uni = 256,
     }, io);
