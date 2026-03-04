@@ -45,6 +45,22 @@ jobs:
       - name: Install Python dependencies
         run: pip3 install -r runner/requirements.txt
 
+      - name: Add zquic to implementations
+        run: |
+          cd runner
+          python3 << 'PYEOF'
+          import json
+          with open('implementations.json') as f:
+              impls = json.load(f)
+          impls['zquic'] = {
+              'image': 'ghcr.io/${{ github.repository_owner }}/zquic:latest',
+              'url': 'https://github.com/${{ github.repository }}',
+              'role': 'server'
+          }
+          with open('implementations.json', 'w') as f:
+              json.dump(impls, f)
+          PYEOF
+
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
 
