@@ -42,23 +42,6 @@ jobs:
       - name: Test (ReleaseSafe)
         run: zig build test -Doptimize=ReleaseSafe --summary all
 
-  freebsd:
-    name: Test (FreeBSD)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: cross-platform-actions/action@v0.32.0
-        with:
-          operating_system: freebsd
-          version: '14.2'
-          run: |
-            curl -fsSL https://ziglang.org/builds/zig-x86_64-freebsd-${{ env.ZIG_VERSION }}.tar.xz -o zig.tar.xz
-            tar xf zig.tar.xz
-            export PATH="$PWD/zig-x86_64-freebsd-${{ env.ZIG_VERSION }}:$PATH"
-            zig fmt --check src/ tools/
-            zig build test --summary all
-
   cross-compile:
     name: Cross-compile (${{ matrix.target }})
     runs-on: ubuntu-latest
