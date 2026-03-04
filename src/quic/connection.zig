@@ -124,7 +124,7 @@ pub const ConnectionHot = struct {
 // Send queue
 // ---------------------------------------------------------------------------
 
-const MAX_PACKET_SIZE = 1200;  // RFC 9000: minimum initial packet size for receiving
+const MAX_PACKET_SIZE = 1500;  // Maximum received packet size (standard MTU)
 const MAX_SEND_PACKET_SIZE = 1452;  // Maximum packet size for sending (UDP datagram limit)
 const SEND_QUEUE_DEPTH = 16;
 
