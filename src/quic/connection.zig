@@ -809,6 +809,20 @@ pub const Connection = struct {
         // Packet type bits 5–4 are NOT header-protected (RFC 9001 §5.4.1).
         const raw_pkt_type = packet.longHeaderType(data[0], ver);
 
+        // DCID validation: Initial packets must target this connection's local_cid.
+        // When in handshake/established state, an Initial with a different DCID is for
+        // a different connection and must be silently dropped (RFC 9000 §9).
+        if (raw_pkt_type == .initial and self.hot.state != .idle) {
+            // Build a temporary ConnectionId from raw_dcid for comparison.
+            var incoming_dcid: ConnectionId = .{};
+            if (raw_dcid_len > 0) @memcpy(incoming_dcid.bytes[0..raw_dcid_len], raw_dcid);
+            // Check if this Initial targets this connection's local DCID.
+            if (!incoming_dcid.eql(self.local_cid)) {
+                // Different DCID: this packet is for a different connection. Silently drop.
+                return data.len;
+            }
+        }
+
         // On the first Initial, derive initial keys from the client's DCID before HP removal.
         // Keys are required to select the HP key and remove header protection.
         if (raw_pkt_type == .initial and self.hot.state == .idle) {
