@@ -2018,13 +2018,17 @@ pub const Connection = struct {
 
         // Initial epoch: ServerHello.
         if (sh_end > 0) {
-            _ = try self.sendCryptoChunk(tls_data[0..sh_end], 0);
+            const sent_initial = try self.sendCryptoChunk(tls_data[0..sh_end], 0);
+            // If amplification limit prevents sending, buffer will retry when limit lifts
+            _ = sent_initial;
         }
 
         // Handshake epoch: EncryptedExtensions + Certificate + CertificateVerify + Finished.
         var sent: usize = sh_end;
         while (sent < tls_data.len) {
+            const prev_sent = sent;
             sent += try self.sendCryptoChunk(tls_data[sent..], 1);
+            if (sent == prev_sent) break; // No progress due to amplification limit; retry later
         }
     }
 
@@ -2066,7 +2070,14 @@ pub const Connection = struct {
                 if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
                 crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+                self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch |err| {
+                    // If amplification limit exceeded, revert packet number and return 0 to retry later
+                    if (err == error.AmplificationLimitExceeded) {
+                        self.hot.tx_pn[0] -= 1;
+                        return 0;
+                    }
+                    return err;
+                };
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.frames[0] = .{ .crypto_frame = .{
                     .offset = @intCast(tls_offset),
@@ -2096,7 +2107,14 @@ pub const Connection = struct {
                 if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
                 crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
                 crypto.applyHeaderProtection(hk.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+                self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch |err| {
+                    // If amplification limit exceeded, revert packet number and return 0 to retry later
+                    if (err == error.AmplificationLimitExceeded) {
+                        self.hot.tx_pn[1] -= 1;
+                        return 0;
+                    }
+                    return err;
+                };
                 var fi = loss_recovery_mod.SentFrameInfo{};
                 fi.frames[0] = .{ .crypto_frame = .{
                     .offset = @intCast(tls_offset),
