@@ -3,6 +3,10 @@ name: Docker
 on:
   push:
     branches: [main]
+    paths:
+      - '**/*.zig'
+      - 'build.zig.zon'
+      - 'tools/Dockerfile'
   workflow_dispatch:
 
 jobs:

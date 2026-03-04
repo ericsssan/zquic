@@ -1,8 +1,6 @@
 name: Interop
 
 on:
-  schedule:
-    - cron: '0 3 * * *' # 03:00 UTC daily
   workflow_dispatch:
   workflow_run:
     workflows: [Docker]
@@ -13,12 +11,18 @@ jobs:
     name: quic-interop-runner
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    # When triggered by Docker workflow, only run if the image built successfully.
+    permissions:
+      contents: write
+    # Only run if Docker workflow succeeded (or triggered manually).
     if: >
       github.event_name != 'workflow_run' ||
       github.event.workflow_run.conclusion == 'success'
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
       - name: Install Docker Engine 28.1+
         run: |
           sudo apt-get update
@@ -75,6 +79,75 @@ jobs:
             exit 1
           fi
           echo "All interop tests passed."
+
+      - name: Update README with results table
+        if: always()
+        run: |
+          python3 << 'PYEOF'
+          import json, re
+
+          with open('runner/results.json') as f:
+              data = json.load(f)
+
+          servers = data.get('servers', [])
+          clients = data.get('clients', [])
+          results_data = data.get('results', [])
+
+          # Collect all test names across all pairs
+          tests_set = set()
+          for s_results in results_data:
+              for c_results in s_results:
+                  for r in c_results:
+                      tests_set.add(r['name'])
+          tests = sorted(tests_set)
+
+          zquic_idx = servers.index('zquic') if 'zquic' in servers else 0
+
+          # Build markdown table
+          header = '| Test | ' + ' | '.join(clients) + ' |'
+          divider = '| --- |' + ' :---: |' * len(clients)
+          rows = []
+          for test in tests:
+              row = f'| {test} |'
+              for c_idx in range(len(clients)):
+                  symbol = '—'
+                  try:
+                      for tr in results_data[zquic_idx][c_idx]:
+                          if tr['name'] == test:
+                              symbol = '✅' if tr['result'] == 'succeeded' else '❌'
+                              break
+                  except (IndexError, KeyError):
+                      pass
+                  row += f' {symbol} |'
+              rows.append(row)
+
+          table = '\n'.join([header, divider] + rows)
+
+          with open('README.md') as f:
+              readme = f.read()
+
+          new_section = f'<!-- INTEROP_START -->\n{table}\n<!-- INTEROP_END -->'
+          updated = re.sub(
+              r'<!-- INTEROP_START -->.*?<!-- INTEROP_END -->',
+              new_section,
+              readme,
+              flags=re.DOTALL,
+          )
+
+          with open('README.md', 'w') as f:
+              f.write(updated)
+
+          print(f"Updated README: {len(tests)} tests × {len(clients)} clients")
+          PYEOF
+
+      - name: Commit results
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet || git commit -m "Update interop results [skip ci]"
+          git push
 
       - name: Upload logs
         if: always()
