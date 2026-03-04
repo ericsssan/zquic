@@ -48,12 +48,8 @@ jobs:
       - name: Add zquic to implementations
         run: |
           cd runner
-          # Create implementations.json with zquic if it doesn't exist
-          if [ ! -f implementations.json ]; then
-            echo '{}' > implementations.json
-          fi
-          jq '. + {"zquic": {"image": "ghcr.io/${{ github.repository_owner }}/zquic:latest", "url": "https://github.com/${{ github.repository }}", "role": "server"}}' implementations.json > implementations.json.tmp
-          mv implementations.json.tmp implementations.json
+          jq '. + {"zquic": {"image": "ghcr.io/${{ github.repository_owner }}/zquic:latest", "url": "https://github.com/${{ github.repository }}", "role": "server"}}' implementations_quic.json > implementations_quic.json.tmp
+          mv implementations_quic.json.tmp implementations_quic.json
 
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
