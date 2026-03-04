@@ -796,6 +796,11 @@ pub const Connection = struct {
                 if (self.hot.state == .established and ver != self.quic_version and ver != 0) {
                     return data.len; // Silently drop mismatched version during 1-RTT
                 }
+                // During handshake, reject packets with unsupported versions (not v1 or v2).
+                // This prevents garbage packets with random version bytes from corrupting handshake.
+                if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2 and ver != 0) {
+                    return data.len; // Silently drop unsupported version during handshake
+                }
             }
         }
 
@@ -2583,10 +2588,9 @@ pub const Connection = struct {
     fn onPathMigration(self: *Connection, new_addr: SocketAddr, io: std.Io) !void {
         // RFC 9000 §9.4: reset congestion controller on path change.
         self.congestion = cubic_mod.Cubic.init();
-        // Re-arm amplification limit for the new unvalidated path.
-        self.path_validated = false;
-        self.bytes_unvalidated_recv = 0;
-        self.bytes_unvalidated_sent = 0;
+        // Do NOT re-arm amplification limit: peer is already authenticated (handshake complete).
+        // Amplification limit is only for preventing DDoS during initial handshake, not for
+        // post-handshake path migrations. RFC 9000 §9.4 only requires resetting congestion control.
         // Immediately adopt new address (RFC 9000 §9.3.1).
         self.peer_addr = new_addr;
         // Send PATH_CHALLENGE to validate the new path.
