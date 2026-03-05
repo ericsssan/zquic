@@ -830,23 +830,17 @@ pub fn Connection(comptime max_streams: usize) type {
                 return data.len;
             }
 
-            // For handshake state Initial packets, validate DCID to distinguish retransmits
-            // from new connection attempts (which use different SCID).
-            if (raw_pkt_type == .initial and self.hot.state == .handshake) {
-                // Build a temporary ConnectionId from raw_dcid for comparison.
-                // Note: ConnectionId is fixed at 8 bytes; DCIDs can be 0-20 bytes per RFC 9000.
-                // Only compare if the incoming DCID fits in our ConnectionId size.
-                if (raw_dcid_len <= cid_mod.len) {
-                    var incoming_dcid: ConnectionId = .{};
-                    if (raw_dcid_len > 0) @memcpy(incoming_dcid.bytes[0..raw_dcid_len], raw_dcid);
-                    // Check if this Initial targets this connection's local DCID.
-                    if (!incoming_dcid.eql(self.local_cid)) {
-                        // Different DCID: this packet is for a different connection. Silently drop.
-                        return data.len;
-                    }
-                } else {
-                    // DCID too long to fit in ConnectionId — reject to prevent buffer overflow.
-                    return data.len;
+            // For handshake state Initial packets, validate DCID against the client's original
+            // DCID stored from the first Initial.  RFC 9000 §7.2: a client MUST NOT change its
+            // Destination CID before receiving the server's first Initial packet, so all Initial
+            // retransmissions (including those carrying fragmented ClientHello bytes) must carry
+            // the same variable-length DCID.  The old check compared against local_cid (fixed
+            // 8 bytes) and silently dropped every packet whose dcid_len > 8.
+            if (raw_pkt_type == .initial and self.hot.state == .handshake and
+                self.first_initial_dcid_len > 0)
+            {
+                if (!std.mem.eql(u8, raw_dcid, self.first_initial_dcid[0..self.first_initial_dcid_len])) {
+                    return data.len; // Different DCID: belongs to a different connection.
                 }
             }
 
@@ -7561,4 +7555,91 @@ test "stream recycling: configurable initial_max_streams_bidi stored in connecti
     // file transfers (e.g., 2000 files with 8 concurrent transfers).
     try testing.expectEqual(@as(u64, 512), conn.local_max_streams_bidi);
     try testing.expectEqual(@as(u64, 256), conn.local_max_streams_uni);
+}
+
+test "DCID check: variable-length DCID accepted on Initial retransmission at state=handshake" {
+    // Regression test: before the fix, any Initial with dcid_len > 8 was silently
+    // dropped at state=handshake because the check compared against the fixed-size
+    // local_cid (8 bytes).  quic-go uses a 14-byte DCID and sends its ClientHello
+    // across two Initial packets; the second packet was dropped, preventing the
+    // handshake from completing.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+
+    // 14-byte DCID (same length as quic-go uses in CI).
+    const dcid14 = [_]u8{ 0xf6, 0xad, 0xb2, 0xc5, 0x65, 0xc1, 0xfe, 0x16, 0xb2, 0xec, 0xf8, 0xc8, 0x3e, 0x95 };
+    const keys = crypto.deriveInitialKeys(&dcid14, packet.QUIC_VERSION_1);
+    conn.initial_keys = keys;
+    conn.hot.state = .handshake;
+    // Simulate what receive() stores when it processes the first Initial.
+    @memcpy(conn.first_initial_dcid[0..dcid14.len], &dcid14);
+    conn.first_initial_dcid_len = dcid14.len;
+
+    // Build a valid encrypted Initial with the same 14-byte DCID (simulates packet 2
+    // of a fragmented ClientHello, or any retransmission from the same client).
+    var pt: [4]u8 = undefined;
+    const pt_len = frame.encodeFrame(&pt, .ping);
+    var enc_buf: [512]u8 = undefined;
+    const pn: u64 = 1;
+    const ct_len = pt_len + 16;
+    const hdr_len = packet.encodeLongHeader(
+        &enc_buf,
+        .initial,
+        packet.QUIC_VERSION_1,
+        &dcid14,
+        &.{},
+        &.{},
+        @intCast(pn),
+        ct_len,
+    );
+    crypto.encryptPayload(keys.client, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
+    crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+
+    const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
+    try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, io);
+
+    // Packet must have been processed (not dropped by DCID check).
+    try testing.expect(conn.pkts_recv > 0);
+}
+
+test "DCID check: Initial with wrong DCID silently dropped at state=handshake" {
+    // Regression test: packets targeting a different connection (different DCID)
+    // must still be dropped even after the variable-length DCID fix.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+
+    const dcid_a = [_]u8{ 0xf6, 0xad, 0xb2, 0xc5, 0x65, 0xc1, 0xfe, 0x16, 0xb2, 0xec, 0xf8, 0xc8, 0x3e, 0x95 };
+    @memcpy(conn.first_initial_dcid[0..dcid_a.len], &dcid_a);
+    conn.first_initial_dcid_len = dcid_a.len;
+    conn.hot.state = .handshake;
+
+    // Build packet addressed to a DIFFERENT 14-byte DCID.
+    const dcid_b = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee };
+    const keys_b = crypto.deriveInitialKeys(&dcid_b, packet.QUIC_VERSION_1);
+    conn.initial_keys = keys_b;
+    var pt: [4]u8 = undefined;
+    const pt_len = frame.encodeFrame(&pt, .ping);
+    var enc_buf: [512]u8 = undefined;
+    const pn: u64 = 1;
+    const ct_len = pt_len + 16;
+    const hdr_len = packet.encodeLongHeader(
+        &enc_buf,
+        .initial,
+        packet.QUIC_VERSION_1,
+        &dcid_b,
+        &.{},
+        &.{},
+        @intCast(pn),
+        ct_len,
+    );
+    crypto.encryptPayload(keys_b.client, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
+    crypto.applyHeaderProtection(keys_b.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+
+    const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
+    try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, io);
+
+    // Packet must have been silently dropped (wrong DCID).
+    try testing.expectEqual(@as(u64, 0), conn.pkts_recv);
 }
