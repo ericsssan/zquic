@@ -85,58 +85,87 @@ jobs:
           python3 << 'PYEOF'
           import json, re
 
-          with open('runner/results.json') as f:
-              data = json.load(f)
+          try:
+              with open('runner/results.json') as f:
+                  data = json.load(f)
 
-          servers = data.get('servers', [])
-          clients = data.get('clients', [])
-          results_data = data.get('results', [])
+              # Handle both flat and nested results formats
+              if isinstance(data, dict):
+                  servers = data.get('servers', [])
+                  clients = data.get('clients', [])
+                  results_data = data.get('results', [])
+              else:
+                  print("Warning: results.json has unexpected format, skipping README update")
+                  exit(0)
 
-          # Collect all test names across all pairs
-          tests_set = set()
-          for s_results in results_data:
-              for c_results in s_results:
-                  for r in c_results:
-                      tests_set.add(r['name'])
-          tests = sorted(tests_set)
+              if not servers or not clients or not results_data:
+                  print("Warning: incomplete results data, skipping README update")
+                  exit(0)
 
-          zquic_idx = servers.index('zquic') if 'zquic' in servers else 0
+              # Collect all test names - handle various result structures
+              tests_set = set()
+              try:
+                  for s_results in results_data:
+                      if isinstance(s_results, list):
+                          for c_results in s_results:
+                              if isinstance(c_results, list):
+                                  for r in c_results:
+                                      if isinstance(r, dict) and 'name' in r:
+                                          tests_set.add(r['name'])
+              except (TypeError, KeyError) as e:
+                  print(f"Warning: could not parse results structure: {e}, skipping table generation")
+                  exit(0)
 
-          # Build markdown table
-          header = '| Test | ' + ' | '.join(clients) + ' |'
-          divider = '| --- |' + ' :---: |' * len(clients)
-          rows = []
-          for test in tests:
-              row = f'| {test} |'
-              for c_idx in range(len(clients)):
-                  symbol = '—'
-                  try:
-                      for tr in results_data[zquic_idx][c_idx]:
-                          if tr['name'] == test:
-                              symbol = '✅' if tr['result'] == 'succeeded' else '❌'
-                              break
-                  except (IndexError, KeyError):
-                      pass
-                  row += f' {symbol} |'
-              rows.append(row)
+              if not tests_set:
+                  print("No test results found, skipping README update")
+                  exit(0)
 
-          table = '\n'.join([header, divider] + rows)
+              tests = sorted(tests_set)
+              zquic_idx = servers.index('zquic') if 'zquic' in servers else None
 
-          with open('README.md') as f:
-              readme = f.read()
+              if zquic_idx is None:
+                  print("Warning: zquic not found in servers, skipping README update")
+                  exit(0)
 
-          new_section = f'<!-- INTEROP_START -->\n{table}\n<!-- INTEROP_END -->'
-          updated = re.sub(
-              r'<!-- INTEROP_START -->.*?<!-- INTEROP_END -->',
-              new_section,
-              readme,
-              flags=re.DOTALL,
-          )
+              # Build markdown table
+              header = '| Test | ' + ' | '.join(clients) + ' |'
+              divider = '| --- |' + ' :---: |' * len(clients)
+              rows = []
+              for test in tests:
+                  row = f'| {test} |'
+                  for c_idx in range(len(clients)):
+                      symbol = '—'
+                      try:
+                          if zquic_idx < len(results_data) and c_idx < len(results_data[zquic_idx]):
+                              for tr in results_data[zquic_idx][c_idx]:
+                                  if isinstance(tr, dict) and tr.get('name') == test:
+                                      symbol = '✅' if tr.get('result') == 'succeeded' else '❌'
+                                      break
+                      except (IndexError, KeyError, TypeError):
+                          pass
+                      row += f' {symbol} |'
+                  rows.append(row)
 
-          with open('README.md', 'w') as f:
-              f.write(updated)
+              table = '\n'.join([header, divider] + rows)
 
-          print(f"Updated README: {len(tests)} tests × {len(clients)} clients")
+              with open('README.md') as f:
+                  readme = f.read()
+
+              new_section = f'<!-- INTEROP_START -->\n{table}\n<!-- INTEROP_END -->'
+              updated = re.sub(
+                  r'<!-- INTEROP_START -->.*?<!-- INTEROP_END -->',
+                  new_section,
+                  readme,
+                  flags=re.DOTALL,
+              )
+
+              with open('README.md', 'w') as f:
+                  f.write(updated)
+
+              print(f"Updated README: {len(tests)} tests × {len(clients)} clients")
+          except Exception as e:
+              print(f"Error updating README: {e}")
+              exit(0)
           PYEOF
 
       - name: Commit results
