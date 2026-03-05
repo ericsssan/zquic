@@ -792,6 +792,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     // v1 and v2 are compatible; adopt client's version for this connection.
                     if (ver != 0) {
                         self.quic_version = ver;
+                        self.tls_state.server_configured_version = ver;
                     }
                 } else {
                     // RFC 9369: During handshake, allow version changes for compatible version negotiation.
