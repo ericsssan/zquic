@@ -89,4 +89,14 @@ pub fn build(b: *std.Build) void {
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);
     }
+
+    // tools/server.zig needs the zquic import
+    const server_test_mod = b.createModule(.{
+        .root_source_file = b.path("tools/server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    server_test_mod.addImport("zquic", zquic_mod);
+    const server_test = b.addTest(.{ .root_module = server_test_mod });
+    test_step.dependOn(&b.addRunArtifact(server_test).step);
 }

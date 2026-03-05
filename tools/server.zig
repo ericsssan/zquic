@@ -100,8 +100,10 @@ pub fn main(init: std.process.Init) !void {
         .initial_max_streams_uni = 100,
     };
 
-    // Bind UDP socket.
-    const bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(port) };
+    // Bind UDP socket on IPv4 0.0.0.0 so the interop runner can reach us via
+    // server4 (193.167.100.100). An IPv6 :: bind would require explicit dual-stack
+    // configuration (IPV6_V6ONLY=0) which Zig's default net.bind does not set.
+    const bind_addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(port) };
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
 
@@ -468,4 +470,37 @@ fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {
         .ip4 => |a| .{ .v4 = .{ .addr = a.bytes, .port = a.port } },
         .ip6 => |a| .{ .v6 = .{ .addr = a.bytes, .port = a.port } },
     };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "server: ipToSocketAddr maps IPv4 address to v4 socket addr" {
+    const ip4 = net.IpAddress{ .ip4 = .{ .bytes = .{ 193, 167, 100, 100 }, .port = 443 } };
+    const sa = ipToSocketAddr(ip4);
+    try std.testing.expectEqual(
+        quic.SocketAddr{ .v4 = .{ .addr = .{ 193, 167, 100, 100 }, .port = 443 } },
+        sa,
+    );
+}
+
+test "server: ipToSocketAddr maps IPv6 address to v6 socket addr" {
+    const ipv6_bytes = [16]u8{ 0xfd, 0, 0xca, 0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+    const ip6 = net.IpAddress{ .ip6 = .{ .bytes = ipv6_bytes, .port = 1234 } };
+    const sa = ipToSocketAddr(ip6);
+    try std.testing.expectEqual(
+        quic.SocketAddr{ .v6 = .{ .addr = ipv6_bytes, .port = 1234 } },
+        sa,
+    );
+}
+
+test "server: computeTimeout with null returns none" {
+    const t = computeTimeout(null);
+    try std.testing.expect(t == .none);
+}
+
+test "server: computeTimeout with deadline returns deadline timeout" {
+    const t = computeTimeout(1_000_000_000);
+    try std.testing.expect(t == .deadline);
 }
