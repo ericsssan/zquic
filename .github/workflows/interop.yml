@@ -54,7 +54,19 @@ jobs:
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
 
+      - name: Generate test certificates
+        run: |
+          mkdir -p certs
+          cd runner
+          bash ../certs.sh ../certs 1 || bash certs.sh certs 1 || (
+            # Fallback: generate with openssl directly
+            openssl ecparam -name prime256v1 -genkey -out ../certs/priv.key
+            openssl req -new -x509 -key ../certs/priv.key -out ../certs/cert.pem -days 365 -subj "/O=interop server/"
+          )
+
       - name: Run interop tests (zquic server × all clients)
+        env:
+          CERTS: ${{ github.workspace }}/certs
         run: |
           cd runner
           python3 run.py \
