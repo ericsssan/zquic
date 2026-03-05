@@ -48,11 +48,11 @@ jobs:
       - name: Add zquic to implementations
         run: |
           cd runner
-          jq '. + {"zquic": {"image": "ghcr.io/${{ github.repository_owner }}/zquic:latest", "url": "https://github.com/${{ github.repository }}", "role": "server"}}' implementations_quic.json > implementations_quic.json.tmp
+          jq '. + {"zquic": {"image": "ghcr.io/${{ github.repository_owner }}/zquic-interop:latest", "url": "https://github.com/${{ github.repository }}", "role": "server"}}' implementations_quic.json > implementations_quic.json.tmp
           mv implementations_quic.json.tmp implementations_quic.json
 
       - name: Pull zquic image
-        run: docker pull ghcr.io/${{ github.repository_owner }}/zquic:latest
+        run: docker pull ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
 
       - name: Generate test certificates
         run: |
@@ -76,7 +76,7 @@ jobs:
             --test handshake \
             --log-dir logs \
             --json results.json \
-            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
 
           # Run transfer, retry, keyupdate against all clients
           python3 run.py \
@@ -84,7 +84,7 @@ jobs:
             --test transfer,retry,keyupdate \
             --log-dir logs \
             --json results.json \
-            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
 
           # v2 only works with quiche (only RFC 9369-compliant client)
           python3 run.py \
@@ -93,7 +93,7 @@ jobs:
             --test v2 \
             --log-dir logs \
             --json results.json \
-            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
 
       - name: Check results
         run: |

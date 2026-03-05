@@ -44,6 +44,11 @@ RUN set -e; \
 # Stage 2: Minimal runtime image.
 FROM alpine:3.19
 
+LABEL org.opencontainers.image.title="zquic-interop" \
+      org.opencontainers.image.description="zquic interop testing image for quic-interop-runner. Not intended for production use." \
+      org.opencontainers.image.source="https://github.com/ericsssan/zquic" \
+      org.opencontainers.image.licenses="MIT"
+
 RUN apk add --no-cache iptables ip6tables iproute2
 
 COPY --from=builder /build/zig-out/bin/server /server

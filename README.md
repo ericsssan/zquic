@@ -88,6 +88,8 @@ tools/
 
 ## Interop Results
 
+> **Note:** [`ghcr.io/ericsssan/zquic-interop:latest`](https://github.com/ericsssan/zquic/pkgs/container/zquic-interop) is built solely for use with [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner). It is not a general-purpose or production image.
+
 <!-- INTEROP_START -->
 | Test | (pending first run) |
 | --- | :---: |
