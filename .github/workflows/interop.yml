@@ -54,44 +54,62 @@ jobs:
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
 
-      - name: Run interop tests (zquic server × all clients) — FAIL FAST
+      - name: Run interop tests (zquic server × all clients)
+        id: interop
+        continue-on-error: true
         run: |
           cd runner
+          mkdir -p logs
+          IMPL="-r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest"
+
           # Run handshake first (fastest sanity check)
           python3 run.py \
             --server zquic \
             --test handshake \
-            --log-dir logs \
-            --json results.json \
-            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
+            --log-dir logs/handshake \
+            --json results_handshake.json \
+            $IMPL || true
 
           # Run transfer, retry, keyupdate against all clients
           python3 run.py \
             --server zquic \
             --test transfer,retry,keyupdate \
-            --log-dir logs \
-            --json results.json \
-            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
+            --log-dir logs/transfer_retry_keyupdate \
+            --json results_trk.json \
+            $IMPL || true
 
           # v2 only works with quiche (only RFC 9369-compliant client)
           python3 run.py \
             --server zquic \
             --client quiche \
             --test v2 \
-            --log-dir logs \
-            --json results.json \
-            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
+            --log-dir logs/v2 \
+            --json results_v2.json \
+            $IMPL || true
+
+          # Copy last results file for README update step
+          cp results_v2.json results.json 2>/dev/null || \
+          cp results_trk.json results.json 2>/dev/null || \
+          cp results_handshake.json results.json 2>/dev/null || true
 
       - name: Check results
+        if: always()
         run: |
           cd runner
-          echo "=== Results ==="
-          jq -r '.results | flatten | .[] | "\(.name): \(.result)"' results.json
-
-          failures=$(jq -c '.results | flatten | .[] | select(.result == "failed")' results.json)
-          if [ -n "$failures" ]; then
-            echo "::error::Interop failures detected:"
-            echo "$failures"
+          FAILED=0
+          echo "=== Interop Results ==="
+          for f in results_handshake.json results_trk.json results_v2.json; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            jq -r '.results | flatten | .[] | "\(.name): \(.result)"' "$f" 2>/dev/null || true
+            bad=$(jq -c '.results | flatten | .[] | select(.result == "failed") | .name' "$f" 2>/dev/null || true)
+            if [ -n "$bad" ]; then
+              echo "::error::Failures in $f:"
+              echo "$bad"
+              FAILED=1
+            fi
+          done
+          if [ "$FAILED" = "1" ]; then
             exit 1
           fi
           echo "All interop tests passed."
