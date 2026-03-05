@@ -139,6 +139,9 @@ pub fn main(init: std.process.Init) !void {
 
             peer_addr = msg.from;
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+            // Drive timers on every packet, not just on timeout, so the PTO fires
+            // even when a stream of client retransmits keeps the receive path busy.
+            conn.tick(now_ns);
             if (msg.data.len >= 1) {
                 const is_long = (msg.data[0] & 0x80) != 0;
                 if (is_long and msg.data.len >= 6) {

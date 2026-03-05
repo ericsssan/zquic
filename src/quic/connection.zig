@@ -385,6 +385,10 @@ pub fn Connection(comptime max_streams: usize) type {
 
         // Per-epoch TLS send offset (for FrameInfo tracking)
         crypto_send_offset: [3]u64,
+        /// Buffer storing outgoing CRYPTO data (epochs 0 and 1) for PTO retransmission.
+        /// Populated by sendCryptoChunk; retransmitted by the PTO handler in tick().
+        crypto_send_saved: [2][2048]u8,
+        crypto_send_saved_len: [2]u16,
         /// Per-epoch expected CRYPTO receive offset (RFC 9000 §19.6).
         /// Out-of-order/duplicate CRYPTO frames are rejected or trimmed against this.
         crypto_recv_offset: [3]u64,
@@ -500,6 +504,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .unknown_version_times = [_]i64{std.math.minInt(i64)} ** 4,
                 .unknown_version_idx = 0,
                 .crypto_send_offset = .{ 0, 0, 0 },
+                .crypto_send_saved = @import("std").mem.zeroes([2][2048]u8),
+                .crypto_send_saved_len = .{ 0, 0 },
                 .crypto_recv_offset = .{ 0, 0, 0 },
                 .crypto_staged = @import("std").mem.zeroes([3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag),
                 .crypto_staged_count = .{ 0, 0, 0 },
@@ -633,9 +639,16 @@ pub fn Connection(comptime max_streams: usize) type {
             {
                 if (self.pto_deadline_ns) |d| {
                     if (now_ns >= d) {
-                        // PTO: send a PING probe, then double the backoff
                         self.loss.onPtoFired();
-                        self.queuePing() catch {};
+                        if (self.app_keys != null) {
+                            // Post-handshake: send a 1-RTT PING probe.
+                            self.queuePing() catch {};
+                        } else {
+                            // During handshake: retransmit CRYPTO data (RFC 9002 §6.2.4).
+                            // The client may not have received our Handshake flight; resend it.
+                            self.retransmitCryptoSaved(0);
+                            self.retransmitCryptoSaved(1);
+                        }
                         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
                     }
                 }
@@ -2150,8 +2163,79 @@ pub fn Connection(comptime max_streams: usize) type {
                 },
                 else => unreachable,
             }
+            // Save chunk for potential PTO retransmission (epochs 0 and 1 only).
+            if (epoch < 2) {
+                const old: usize = self.crypto_send_saved_len[epoch];
+                const end: usize = old + chunk_len;
+                if (end <= self.crypto_send_saved[epoch].len) {
+                    @memcpy(self.crypto_send_saved[epoch][old..end], chunk);
+                    self.crypto_send_saved_len[epoch] = @intCast(end);
+                }
+            }
             self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
             return chunk_len;
+        }
+
+        /// Retransmit saved CRYPTO data for the given epoch as a new probe packet.
+        /// Called by the PTO handler when the handshake stalls (app_keys == null).
+        pub fn retransmitCryptoSaved(self: *Self, comptime epoch: u8) void {
+            comptime std.debug.assert(epoch < 2);
+            const data_len = self.crypto_send_saved_len[epoch];
+            if (data_len == 0) return;
+            const data = self.crypto_send_saved[epoch][0..data_len];
+
+            const crypto_frame_val: frame.Frame = .{ .crypto = .{ .offset = 0, .data = data } };
+            var fpos: usize = 0;
+            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
+
+            if (epoch == 0) {
+                const ik = self.initial_keys.server;
+                const pn = self.hot.tx_pn[0];
+                self.hot.tx_pn[0] += 1;
+                const ct_len = fpos + 16;
+                const hdr_len = packet.encodeLongHeader(
+                    &self.enc_scratch,
+                    .initial,
+                    self.tls_state.server_configured_version,
+                    self.peer_scid[0..self.peer_scid_len],
+                    self.ourScidBytes(),
+                    &.{},
+                    @intCast(pn),
+                    ct_len,
+                );
+                if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return;
+                crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+                self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch return;
+                var fi = loss_recovery_mod.SentFrameInfo{};
+                fi.frames[0] = .{ .crypto_frame = .{ .offset = 0, .len = @intCast(data_len) } };
+                fi.count = 1;
+                self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
+            } else {
+                const hk = self.hs_keys orelse return;
+                const pn = self.hot.tx_pn[1];
+                self.hot.tx_pn[1] += 1;
+                const ct_len = fpos + 16;
+                const hdr_len = packet.encodeLongHeader(
+                    &self.enc_scratch,
+                    .handshake,
+                    self.tls_state.server_configured_version,
+                    self.peer_scid[0..self.peer_scid_len],
+                    self.ourScidBytes(),
+                    &.{},
+                    @intCast(pn),
+                    ct_len,
+                );
+                if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return;
+                crypto.encryptPayload(hk.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                crypto.applyHeaderProtection(hk.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+                self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch return;
+                var fi = loss_recovery_mod.SentFrameInfo{};
+                fi.frames[0] = .{ .crypto_frame = .{ .offset = 0, .len = @intCast(data_len) } };
+                fi.count = 1;
+                self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
+            }
+            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
         }
 
         /// Check whether we should throttle sending a VN packet for this version.
