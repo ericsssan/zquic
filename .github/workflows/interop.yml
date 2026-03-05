@@ -54,20 +54,7 @@ jobs:
       - name: Pull zquic image
         run: docker pull ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
 
-      - name: Generate test certificates
-        run: |
-          mkdir -p certs
-          # certs.sh is in runner directory
-          bash runner/certs.sh certs 1 || (
-            # Fallback: generate with openssl directly
-            openssl ecparam -name prime256v1 -genkey -out certs/priv.key
-            openssl req -new -x509 -key certs/priv.key -out certs/cert.pem -days 365 -subj "/O=interop server/"
-          )
-          ls -la certs/
-
       - name: Run interop tests (zquic server × all clients) — FAIL FAST
-        env:
-          CERTS: ${{ github.workspace }}/certs
         run: |
           cd runner
           # Run handshake first (fastest sanity check)

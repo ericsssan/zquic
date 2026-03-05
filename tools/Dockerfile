@@ -57,13 +57,6 @@ RUN chmod +x /run_server.sh
 
 RUN mkdir -p /logs /certs
 
-# Generate self-signed certificates for QUIC testing
-RUN apk add --no-cache openssl && \
-    openssl ecparam -name prime256v1 -genkey -out /certs/priv.key && \
-    openssl req -new -x509 -key /certs/priv.key -out /certs/cert.pem -days 365 \
-      -subj "/O=zquic interop server/" && \
-    apk del openssl
-
 EXPOSE 443/udp
 
 ENV PORT=443
