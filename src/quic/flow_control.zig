@@ -48,7 +48,7 @@ pub const FlowController = struct {
     /// Safe from overflow because recv_total <= recv_max <= (1<<62)-1,
     /// so *4 stays within u64.
     pub fn shouldSendMaxData(self: *const FlowController) bool {
-        if (self.recv_max == 0) return false; // guard: avoid divide-by-zero
+        if (self.recv_max == 0) return false; // guard: uninitialized controller must not fire MAX_DATA
         return self.recv_total * 4 >= self.recv_max * 3;
     }
 

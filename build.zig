@@ -71,6 +71,10 @@ pub fn build(b: *std.Build) void {
         "src/quic/loss_recovery.zig",
         "src/quic/tls.zig",
         "src/quic/connection.zig",
+        "src/quic/connection_test_basic.zig",
+        "src/quic/connection_test_frames.zig",
+        "src/quic/connection_test_pmtud.zig",
+        "src/quic/connection_test_crypto.zig",
         "src/quic/fuzz.zig",
         "tools/pem.zig",
     };

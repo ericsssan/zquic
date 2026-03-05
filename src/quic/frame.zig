@@ -211,7 +211,8 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             const count_vi = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += count_vi.len;
             const range_count: usize = @intCast(count_vi.value);
-            if (range_count > 32) return error.InvalidFrame;
+            // ranges[0] holds first_range; up to 31 additional ranges fit in ranges[1..31].
+            if (range_count > 31) return error.InvalidFrame;
 
             var ack: AckFrame = .{
                 .largest_acked = la.value,
@@ -844,6 +845,49 @@ test "frame: ACK with multiple ranges encode/parse round-trip" {
     try testing.expectEqual(n, result.consumed);
 }
 
+test "frame: ACK range count boundary: 31 additional accepted, 32 rejected" {
+    // Regression: the limit was `> 32` but ranges[0] holds first_range, leaving
+    // only 31 slots for additional ranges. `> 32` would silently drop the 32nd
+    // extra range instead of rejecting. Correct check is `> 31`.
+    const testing = std.testing;
+
+    // --- Boundary case: 31 additional ranges accepted (32 total, fills array exactly) ---
+    var ranges: [32]AckRange = [_]AckRange{.{ .gap = 1, .ack_range = 0 }} ** 32;
+    ranges[0] = .{ .gap = 0, .ack_range = 0 };
+    const ack_max = AckFrame{
+        .largest_acked = 100,
+        .ack_delay = 0,
+        .ranges = ranges,
+        .range_count = 32, // encodes extra_ranges=31 on the wire
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
+    };
+    var enc_buf: [256]u8 = undefined;
+    const enc_n = encodeFrame(&enc_buf, .{ .ack = ack_max });
+    const ok = try parseFrame(enc_buf[0..enc_n]);
+    switch (ok.frame) {
+        .ack => |a| try testing.expectEqual(@as(usize, 32), a.range_count),
+        else => return error.WrongFrameType,
+    }
+
+    // --- Overflow case: 32 additional ranges rejected (33 total, overflows array) ---
+    // Hand-craft wire bytes with extra_ranges = 32.
+    var wire: [256]u8 = undefined;
+    var wpos: usize = 0;
+    wire[wpos] = 0x02; wpos += 1; // ACK type
+    wire[wpos] = 0x00; wpos += 1; // largest_acked = 0
+    wire[wpos] = 0x00; wpos += 1; // ack_delay = 0
+    wire[wpos] = 0x20; wpos += 1; // extra range_count = 32 (1-byte varint)
+    wire[wpos] = 0x00; wpos += 1; // first_range = 0
+    for (0..32) |_| {             // 32 additional (gap, ack_range) pairs
+        wire[wpos] = 0x01; wpos += 1; // gap = 1
+        wire[wpos] = 0x00; wpos += 1; // ack_range = 0
+    }
+    try testing.expectError(error.InvalidFrame, parseFrame(wire[0..wpos]));
+}
+
 test "frame: MAX_STREAMS_BIDI encode/parse round-trip" {
     const testing = std.testing;
     var buf: [16]u8 = undefined;
@@ -931,27 +975,46 @@ test "frame: ACK range_count 33 returns InvalidFrame" {
     try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
-test "frame: ACK range_count exactly 32 is accepted" {
-    // 32 is the storage cap — must parse successfully (only > 32 is rejected).
+test "frame: ACK range_count exactly 31 additional is accepted (fills array)" {
+    // 31 additional ranges + 1 first_range = 32 total, which fills the array exactly.
+    // This is the maximum accepted value (> 31 is rejected).
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 0x02;
     pos += 1; // ACK type
-    pos += varint.encode(buf[pos..], 63); // largest_acked (needs room for 32 ranges)
+    pos += varint.encode(buf[pos..], 63); // largest_acked
     pos += varint.encode(buf[pos..], 0); // ack_delay
-    pos += varint.encode(buf[pos..], 32); // range_count = 32
-    pos += varint.encode(buf[pos..], 0); // first ACK range (ack_range=0)
-    // range_count=32 means 32 additional (gap, ack_range) pairs after the first ACK range.
+    pos += varint.encode(buf[pos..], 31); // 31 additional ranges on the wire
+    pos += varint.encode(buf[pos..], 0); // first ACK range
     var i: usize = 0;
-    while (i < 32) : (i += 1) {
+    while (i < 31) : (i += 1) {
         pos += varint.encode(buf[pos..], 0); // gap
         pos += varint.encode(buf[pos..], 0); // ack_range
     }
     const result = try parseFrame(buf[0..pos]);
     switch (result.frame) {
-        .ack => |a| try std.testing.expect(a.range_count > 0),
+        .ack => |a| try std.testing.expectEqual(@as(usize, 32), a.range_count),
         else => return error.WrongFrameType,
     }
+}
+
+test "frame: ACK range_count 32 additional rejected (would overflow array)" {
+    // 32 additional + 1 first_range = 33 total, exceeds the 32-entry array.
+    // Was previously accepted (silent truncation). Now correctly rejected.
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    buf[pos] = 0x02;
+    pos += 1;
+    pos += varint.encode(buf[pos..], 63);
+    pos += varint.encode(buf[pos..], 0);
+    pos += varint.encode(buf[pos..], 32); // 32 additional — one too many
+    pos += varint.encode(buf[pos..], 0); // first ACK range
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        pos += varint.encode(buf[pos..], 0);
+        pos += varint.encode(buf[pos..], 0);
+    }
+    try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
 test "frame: parseFrame empty buffer returns BufferEmpty" {

@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .initial_quic_version = if (std.mem.eql(u8, testcase, "v2")) quic.packet.QUIC_VERSION_2 else quic.packet.QUIC_VERSION_1,
         .initial_max_streams_bidi = if (std.mem.eql(u8, testcase, "transfer")) 512 else 100,
-        .initial_max_streams_uni = if (std.mem.eql(u8, testcase, "transfer")) 100 else 100,
+        .initial_max_streams_uni = 100,
     };
 
     // Bind UDP socket.
@@ -461,49 +461,6 @@ fn writeKeyLog(conn: *const Conn, io: std.Io) void {
     defer file.close(io);
     file.writePositionalAll(io, buf[0..pos], 0) catch {};
     std.debug.print("keylog written ({d} bytes)\n", .{pos});
-}
-
-/// Update SSLKEYLOG file with any new rotated keys. Called after key updates to
-/// ensure Wireshark can decrypt packets with new keys. Rewrites the entire file
-/// with all generations up to the current key generation.
-fn appendRotatedSecretsToKeyLog(conn: *const Conn, io: std.Io) void {
-    std.debug.print("appendRotatedSecretsToKeyLog called (gen={d})\n", .{conn.current_key_generation});
-    const tls = &conn.tls_state;
-    const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
-    var buf: [16384]u8 = undefined;
-    var pos: usize = 0;
-
-    // Skip if no key rotations occurred
-    if (conn.current_key_generation == 0) {
-        std.debug.print("  -> skipping (no rotations)\n", .{});
-        return;
-    }
-
-    // Write handshake secrets
-    var line = std.fmt.bufPrint(buf[pos..], "CLIENT_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.client_hs_secret, .lower) }) catch return;
-    pos += line.len;
-
-    line = std.fmt.bufPrint(buf[pos..], "SERVER_HANDSHAKE_TRAFFIC_SECRET {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(tls.server_hs_secret, .lower) }) catch return;
-    pos += line.len;
-
-    // Write all generations (0 through current)
-    var gen: u32 = 0;
-    while (gen <= conn.current_key_generation) : (gen += 1) {
-        const secrets = conn.deriveSecretsForGeneration(gen);
-        line = std.fmt.bufPrint(buf[pos..], "CLIENT_TRAFFIC_SECRET_{d} {s} {s}\n", .{ gen, random_hex, std.fmt.bytesToHex(secrets.client, .lower) }) catch return;
-        pos += line.len;
-
-        line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_{d} {s} {s}\n", .{ gen, random_hex, std.fmt.bytesToHex(secrets.server, .lower) }) catch return;
-        pos += line.len;
-
-        if (pos >= buf.len - 256) break; // Avoid buffer overflow
-    }
-
-    // Overwrite the keylog file with all generations
-    const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
-    defer file.close(io);
-    file.writePositionalAll(io, buf[0..pos], 0) catch {};
-    std.debug.print("keylog updated ({d} bytes with generations 0..{d})\n", .{ pos, conn.current_key_generation });
 }
 
 fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {

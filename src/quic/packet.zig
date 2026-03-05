@@ -317,12 +317,13 @@ pub fn encodeShortHeader(
 ///
 /// `dcid` is echoed from the client's SCID so the client can demultiplex.
 /// `scid` is the server's own connection ID.
-/// The packet advertises QUIC version 1 as the single supported version.
+/// Both CIDs are variable-length slices (0–20 bytes per RFC 9000 §17.2).
+/// The packet advertises QUIC v1 and v2 as supported versions.
 /// Returns the number of bytes written.
 pub fn encodeVersionNegotiation(
     buf: []u8,
-    dcid: ConnectionId,
-    scid: ConnectionId,
+    dcid: []const u8,
+    scid: []const u8,
 ) usize {
     var pos: usize = 0;
 
@@ -335,16 +336,16 @@ pub fn encodeVersionNegotiation(
     pos += 4;
 
     // Destination Connection ID (echoed client SCID).
-    buf[pos] = cid.len;
+    buf[pos] = @intCast(dcid.len);
     pos += 1;
-    @memcpy(buf[pos..][0..cid.len], &dcid.bytes);
-    pos += cid.len;
+    @memcpy(buf[pos..][0..dcid.len], dcid);
+    pos += dcid.len;
 
     // Source Connection ID (our CID).
-    buf[pos] = cid.len;
+    buf[pos] = @intCast(scid.len);
     pos += 1;
-    @memcpy(buf[pos..][0..cid.len], &scid.bytes);
-    pos += cid.len;
+    @memcpy(buf[pos..][0..scid.len], scid);
+    pos += scid.len;
 
     // Supported Versions: QUIC v1 and v2.
     std.mem.writeInt(u32, buf[pos..][0..4], QUIC_VERSION_1, .big);
@@ -586,9 +587,9 @@ test "packet: encodeVersionNegotiation structure" {
     const testing = std.testing;
     var buf: [64]u8 = undefined;
 
-    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
-    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
-    const n = encodeVersionNegotiation(&buf, dcid, scid);
+    const dcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const scid = [_]u8{ 9, 10, 11, 12, 13, 14, 15, 16 };
+    const n = encodeVersionNegotiation(&buf, &dcid, &scid);
 
     // Exact wire size: 1 + 4 + 1 + 8 + 1 + 8 + 4 + 4 = 31 bytes (v1 + v2).
     try testing.expectEqual(@as(usize, 31), n);
@@ -600,12 +601,12 @@ test "packet: encodeVersionNegotiation structure" {
     try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[1..5], .big));
 
     // DCID length and bytes.
-    try testing.expectEqual(@as(u8, cid.len), buf[5]);
-    try testing.expectEqualSlices(u8, &dcid.bytes, buf[6..14]);
+    try testing.expectEqual(@as(u8, 8), buf[5]);
+    try testing.expectEqualSlices(u8, &dcid, buf[6..14]);
 
     // SCID length and bytes.
-    try testing.expectEqual(@as(u8, cid.len), buf[14]);
-    try testing.expectEqualSlices(u8, &scid.bytes, buf[15..23]);
+    try testing.expectEqual(@as(u8, 8), buf[14]);
+    try testing.expectEqualSlices(u8, &scid, buf[15..23]);
 
     // Supported versions: QUIC v1 then v2.
     try testing.expectEqual(QUIC_VERSION_1, std.mem.readInt(u32, buf[23..27], .big));
@@ -769,9 +770,9 @@ test "packet: encodeLongHeader v2 encodes Initial with raw bits 0b01" {
 test "packet: encodeVersionNegotiation lists v1 and v2" {
     const testing = std.testing;
     var buf: [64]u8 = undefined;
-    const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
-    const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
-    const n = encodeVersionNegotiation(&buf, dcid, scid);
+    const dcid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const scid = [_]u8{ 9, 10, 11, 12, 13, 14, 15, 16 };
+    const n = encodeVersionNegotiation(&buf, &dcid, &scid);
 
     // Wire size: 1 + 4 + 1 + 8 + 1 + 8 + 4 (v1) + 4 (v2) = 31 bytes.
     try testing.expectEqual(@as(usize, 31), n);
@@ -784,9 +785,7 @@ test "packet: encodeVersionNegotiation lists v1 and v2" {
 // ---------------------------------------------------------------------------
 
 test "regression: decodePacketNumberBytes all lengths (pn_len 1-4)" {
-    // Regression test for packet number decoding optimization (switch unrolling).
-    // Verifies that the switch statement implementation correctly decodes
-    // packet numbers of all 4 possible lengths.
+    // Verifies that packet number decoding correctly handles all 4 valid pn_len values.
     const testing = std.testing;
 
     // pn_len = 1: single byte
@@ -834,37 +833,8 @@ test "regression: decodePacketNumberBytes offset positioning" {
     try testing.expectEqual(@as(u32, 0x12345678), pn4);
 }
 
-test "regression: decodePacketNumberBytes values match pattern" {
-    // Regression test verifying that decodePacketNumberBytes produces
-    // correct packet number values for various inputs and pn_len values.
-    const testing = std.testing;
-
-    // Test encoding then decoding different packet numbers
-    var buf: [8]u8 = undefined;
-
-    // pn_len = 1: single byte (0x42)
-    std.mem.writeInt(u32, buf[0..4], 0x42000000, .big); // Only first byte matters
-    const pn1 = decodePacketNumberBytes(&buf, 0, 1);
-    try testing.expectEqual(@as(u32, 0x42), pn1);
-
-    // pn_len = 2: two bytes (0x1234)
-    std.mem.writeInt(u32, buf[0..4], 0x12340000, .big);
-    const pn2 = decodePacketNumberBytes(&buf, 0, 2);
-    try testing.expectEqual(@as(u32, 0x1234), pn2);
-
-    // pn_len = 3: three bytes (0x123456)
-    std.mem.writeInt(u32, buf[0..4], 0x12345600, .big);
-    const pn3 = decodePacketNumberBytes(&buf, 0, 3);
-    try testing.expectEqual(@as(u32, 0x123456), pn3);
-
-    // pn_len = 4: four bytes (0x12345678)
-    std.mem.writeInt(u32, buf[0..4], 0x12345678, .big);
-    const pn4 = decodePacketNumberBytes(&buf, 0, 4);
-    try testing.expectEqual(@as(u32, 0x12345678), pn4);
-}
-
 // ============================================================================
-// Regression tests for packet parsing optimizations
+// Regression tests for packet parsing
 // ============================================================================
 
 test "packet: parseLongHeader with minimal Initial packet" {

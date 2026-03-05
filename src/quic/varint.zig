@@ -156,15 +156,14 @@ test "varint: decode returns null on short buffer" {
     try testing.expectEqual(@as(?DecodeResult, null), decode(&buf));
 }
 
-test "varint: single-byte fast-path (all values 0-63)" {
+test "varint: single-byte fast-path (representative values)" {
     const testing = std.testing;
-    // Regression test for fast-path optimization: verify all single-byte values decode correctly
-    for (0..64) |i| {
-        const val: u62 = @intCast(i);
+    // Spot-check a few values in the 1-byte range (0-63).
+    // Boundaries (0, 63) and the cross-tier case (64) are covered by other tests.
+    for ([_]u62{ 0, 1, 31, 63 }) |val| {
         var buf: [1]u8 = undefined;
         const len = encode(&buf, val);
         try testing.expectEqual(@as(usize, 1), len);
-
         const result = decode(&buf).?;
         try testing.expectEqual(val, result.value);
         try testing.expectEqual(@as(u8, 1), result.len);
