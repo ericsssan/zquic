@@ -50,7 +50,14 @@ COPY --from=builder /build/zig-out/bin/server /server
 COPY tools/run_server.sh /run_server.sh
 RUN chmod +x /run_server.sh
 
-RUN mkdir -p /logs
+RUN mkdir -p /logs /certs
+
+# Generate self-signed certificates for QUIC testing
+RUN apk add --no-cache openssl && \
+    openssl ecparam -name prime256v1 -genkey -out /certs/priv.key && \
+    openssl req -new -x509 -key /certs/priv.key -out /certs/cert.pem -days 365 \
+      -subj "/O=zquic interop server/" && \
+    apk del openssl
 
 EXPOSE 443/udp
 

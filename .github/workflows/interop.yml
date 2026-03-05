@@ -78,10 +78,19 @@ jobs:
             --json results.json \
             -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
 
-          # If handshake passed, run remaining tests
+          # Run transfer, retry, keyupdate against all clients
           python3 run.py \
             --server zquic \
-            --test transfer,retry,keyupdate,v2 \
+            --test transfer,retry,keyupdate \
+            --log-dir logs \
+            --json results.json \
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
+
+          # v2 only works with quiche (only RFC 9369-compliant client)
+          python3 run.py \
+            --server zquic \
+            --client quiche \
+            --test v2 \
             --log-dir logs \
             --json results.json \
             -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
