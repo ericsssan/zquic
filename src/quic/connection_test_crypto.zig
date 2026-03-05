@@ -1678,12 +1678,14 @@ test "security: APPLICATION_CLOSE (0x1d) in Initial epoch returns ProtocolViolat
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     var buf: [64]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .connection_close = .{
-        .error_code = 0,
-        .frame_type = 0,
-        .reason = "",
-        .is_app = true, // type 0x1d — APPLICATION_CLOSE
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .connection_close = .{
+            .error_code = 0,
+            .frame_type = 0,
+            .reason = "",
+            .is_app = true, // type 0x1d — APPLICATION_CLOSE
+        },
+    });
     try testing.expectError(error.ProtocolViolation, conn.processFrames(buf[0..n], 0, null));
 }
 
@@ -1692,12 +1694,14 @@ test "security: APPLICATION_CLOSE (0x1d) in Handshake epoch returns ProtocolViol
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     var buf: [64]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .connection_close = .{
-        .error_code = 0,
-        .frame_type = 0,
-        .reason = "",
-        .is_app = true, // type 0x1d
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .connection_close = .{
+            .error_code = 0,
+            .frame_type = 0,
+            .reason = "",
+            .is_app = true, // type 0x1d
+        },
+    });
     try testing.expectError(error.ProtocolViolation, conn.processFrames(buf[0..n], 1, null));
 }
 
@@ -1724,12 +1728,14 @@ test "security: CONNECTION_CLOSE (0x1c) in Initial epoch is allowed" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     var buf: [64]u8 = undefined;
-    const n = frame.encodeFrame(&buf, .{ .connection_close = .{
-        .error_code = 0,
-        .frame_type = 0,
-        .reason = "",
-        .is_app = false, // type 0x1c — transport CONNECTION_CLOSE
-    } });
+    const n = frame.encodeFrame(&buf, .{
+        .connection_close = .{
+            .error_code = 0,
+            .frame_type = 0,
+            .reason = "",
+            .is_app = false, // type 0x1c — transport CONNECTION_CLOSE
+        },
+    });
     // Must not return ProtocolViolation for epoch 0.
     conn.processFrames(buf[0..n], 0, null) catch |err| {
         try testing.expect(err != error.ProtocolViolation);
@@ -1862,16 +1868,18 @@ test "connection: ACK ack_delay scaled by cached_ack_delay_exp" {
     const fi = loss_recovery_mod.SentFrameInfo{};
     conn.loss.onPacketSent(0, 2, 100, true, 0, fi);
 
-    const ack_f: frame.Frame = .{ .ack = .{
-        .largest_acked = 0,
-        .ack_delay = 10, // 10 * 2^5 µs = 320 µs
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
-        .range_count = 1,
-        .ect0 = 0,
-        .ect1 = 0,
-        .ecn_ce = 0,
-        .has_ecn = false,
-    } };
+    const ack_f: frame.Frame = .{
+        .ack = .{
+            .largest_acked = 0,
+            .ack_delay = 10, // 10 * 2^5 µs = 320 µs
+            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+            .range_count = 1,
+            .ect0 = 0,
+            .ect1 = 0,
+            .ecn_ce = 0,
+            .has_ecn = false,
+        },
+    };
     var buf: [64]u8 = undefined;
     const n = frame.encodeFrame(&buf, ack_f);
     conn.current_time_ns = 1_000_000; // 1ms after send

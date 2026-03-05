@@ -2794,4 +2794,3 @@ pub fn Connection(comptime max_streams: usize) type {
         }
     };
 }
-

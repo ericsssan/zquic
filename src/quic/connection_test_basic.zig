@@ -1115,14 +1115,21 @@ test "connection: Version Negotiation DCID echoes full client SCID (RFC 9000 §6
     const client_scid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 }; // 12 bytes
     var raw: [64]u8 = undefined;
     var pos: usize = 0;
-    raw[pos] = 0x80; pos += 1;
-    std.mem.writeInt(u32, raw[pos..][0..4], unknown_version, .big); pos += 4;
-    raw[pos] = client_dcid.len; pos += 1;
-    @memcpy(raw[pos..][0..client_dcid.len], &client_dcid); pos += client_dcid.len;
-    raw[pos] = client_scid.len; pos += 1;
-    @memcpy(raw[pos..][0..client_scid.len], &client_scid); pos += client_scid.len;
+    raw[pos] = 0x80;
+    pos += 1;
+    std.mem.writeInt(u32, raw[pos..][0..4], unknown_version, .big);
+    pos += 4;
+    raw[pos] = client_dcid.len;
+    pos += 1;
+    @memcpy(raw[pos..][0..client_dcid.len], &client_dcid);
+    pos += client_dcid.len;
+    raw[pos] = client_scid.len;
+    pos += 1;
+    @memcpy(raw[pos..][0..client_scid.len], &client_scid);
+    pos += client_scid.len;
     // Minimal payload so the packet isn't rejected for being too short.
-    raw[pos] = 0x01; pos += 1; // PING frame byte
+    raw[pos] = 0x01;
+    pos += 1; // PING frame byte
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
     try conn.receive(raw[0..pos], src, 1_000_000_000, io);
@@ -1173,4 +1180,3 @@ test "connection: deinit zeroes all key material" {
     try testing.expectEqual([_]u8{0} ** 32, conn.next_client_secret);
     try testing.expectEqual([_]u8{0} ** 32, conn.next_server_secret);
 }
-

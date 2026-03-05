@@ -1475,4 +1475,3 @@ test "connection: 1-RTT protocol violation closes connection, not silently ignor
 // ============================================================================
 // PMTUD (Path MTU Discovery) Regression Tests
 // ============================================================================
-

@@ -876,14 +876,21 @@ test "frame: ACK range count boundary: 31 additional accepted, 32 rejected" {
     // Hand-craft wire bytes with extra_ranges = 32.
     var wire: [256]u8 = undefined;
     var wpos: usize = 0;
-    wire[wpos] = 0x02; wpos += 1; // ACK type
-    wire[wpos] = 0x00; wpos += 1; // largest_acked = 0
-    wire[wpos] = 0x00; wpos += 1; // ack_delay = 0
-    wire[wpos] = 0x20; wpos += 1; // extra range_count = 32 (1-byte varint)
-    wire[wpos] = 0x00; wpos += 1; // first_range = 0
-    for (0..32) |_| {             // 32 additional (gap, ack_range) pairs
-        wire[wpos] = 0x01; wpos += 1; // gap = 1
-        wire[wpos] = 0x00; wpos += 1; // ack_range = 0
+    wire[wpos] = 0x02;
+    wpos += 1; // ACK type
+    wire[wpos] = 0x00;
+    wpos += 1; // largest_acked = 0
+    wire[wpos] = 0x00;
+    wpos += 1; // ack_delay = 0
+    wire[wpos] = 0x20;
+    wpos += 1; // extra range_count = 32 (1-byte varint)
+    wire[wpos] = 0x00;
+    wpos += 1; // first_range = 0
+    for (0..32) |_| { // 32 additional (gap, ack_range) pairs
+        wire[wpos] = 0x01;
+        wpos += 1; // gap = 1
+        wire[wpos] = 0x00;
+        wpos += 1; // ack_range = 0
     }
     try testing.expectError(error.InvalidFrame, parseFrame(wire[0..wpos]));
 }

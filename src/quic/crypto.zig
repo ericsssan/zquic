@@ -577,4 +577,3 @@ test "crypto: v2 derivePacketKeys uses quicv2 labels" {
     try testing.expect(!std.mem.eql(u8, &k_v1.iv, &k_v2.iv));
     try testing.expect(!std.mem.eql(u8, &k_v1.hp, &k_v2.hp));
 }
-
