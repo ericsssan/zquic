@@ -64,18 +64,26 @@ jobs:
             openssl req -new -x509 -key ../certs/priv.key -out ../certs/cert.pem -days 365 -subj "/O=interop server/"
           )
 
-      - name: Run interop tests (zquic server × all clients)
+      - name: Run interop tests (zquic server × all clients) — FAIL FAST
         env:
           CERTS: ${{ github.workspace }}/certs
         run: |
           cd runner
+          # Run handshake first (fastest sanity check)
           python3 run.py \
             --server zquic \
-            --test handshake,transfer,retry,keyupdate,v2 \
+            --test handshake \
             --log-dir logs \
             --json results.json \
-            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest \
-            || true   # runner exits non-zero on any failure; we check below
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
+
+          # If handshake passed, run remaining tests
+          python3 run.py \
+            --server zquic \
+            --test transfer,retry,keyupdate,v2 \
+            --log-dir logs \
+            --json results.json \
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic:latest
 
       - name: Check results
         run: |
