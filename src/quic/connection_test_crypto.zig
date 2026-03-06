@@ -339,15 +339,13 @@ test "connection: original_destination_connection_id in server transport params 
     try testing.expectEqualSlices(u8, &dcid, conn.first_initial_dcid[0..8]);
 }
 
-test "connection: ourScidBytes echoes client DCID after Initial received" {
-    // DCID echo: the server advertises the client's original DCID as its own SCID.
-    // This keeps all packets in a single Wireshark connection (no DCID change by
-    // the client), enabling correct pcap-based interop test analysis.
+test "connection: ourScidBytes always returns local_cid (RFC 9000 §7.2)" {
+    // RFC 9000 §7.2: server MUST use its own chosen CID as SCID, not echo the client's DCID.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
-    // Before any Initial is received, ourScidBytes falls back to local_cid.
+    // Before any Initial: returns local_cid.
     try testing.expectEqualSlices(u8, &conn.local_cid.bytes, conn.ourScidBytes());
 
     const dcid = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0x00, 0x01 };
@@ -358,14 +356,14 @@ test "connection: ourScidBytes echoes client DCID after Initial received" {
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
     _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
 
-    // After Initial received, ourScidBytes must equal the client's DCID.
-    try testing.expectEqualSlices(u8, &dcid, conn.ourScidBytes());
+    // After Initial received, ourScidBytes must still be local_cid, not the client's DCID.
+    try testing.expectEqualSlices(u8, &conn.local_cid.bytes, conn.ourScidBytes());
+    // first_initial_dcid stores the ODCID for transport params, independent of our SCID.
+    try testing.expectEqualSlices(u8, &dcid, conn.first_initial_dcid[0..conn.first_initial_dcid_len]);
 }
 
-test "connection: ourScidBytes length matches first_initial_dcid_len" {
-    // Regression: processShortHeaderPacket computes short-header DCID offset using
-    // first_initial_dcid_len (not the fixed cid_mod.len).  Verify that ourScidBytes()
-    // returns exactly first_initial_dcid_len bytes after an Initial is received.
+test "connection: ourScidBytes length is always cid_mod.len" {
+    // Short-header DCID offset uses cid_mod.len (fixed 8 bytes), not first_initial_dcid_len.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
@@ -378,11 +376,9 @@ test "connection: ourScidBytes length matches first_initial_dcid_len" {
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 4433 } };
     _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
 
-    // ourScidBytes() length must equal first_initial_dcid_len (both 8 here).
+    // ourScidBytes() is always local_cid (cid_mod.len = 8 bytes).
     try testing.expectEqual(@as(usize, 8), conn.ourScidBytes().len);
-    try testing.expectEqual(conn.first_initial_dcid_len, @as(u8, @intCast(conn.ourScidBytes().len)));
-    // The bytes must match the client's original DCID.
-    try testing.expectEqualSlices(u8, &dcid, conn.ourScidBytes());
+    try testing.expectEqualSlices(u8, &conn.local_cid.bytes, conn.ourScidBytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +660,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
         .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
     };
     conn.peer_cid = conn.local_cid;
+    conn.peer_scid_len = 8;
 
     // Build and process packet 5 first.
     var pkt5: [256]u8 = undefined;

@@ -1401,6 +1401,7 @@ test "connection: 1-RTT malformed frame closes connection with FRAME_ENCODING_ER
         .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
     };
     conn.peer_cid = conn.local_cid;
+    conn.peer_scid_len = 8;
 
     // Build a 1-RTT packet whose payload decrypts to 0xff — an invalid varint that
     // will cause parseFrame to return error.InvalidFrame.
@@ -1444,6 +1445,7 @@ test "connection: 1-RTT protocol violation closes connection, not silently ignor
         .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
     };
     conn.peer_cid = conn.local_cid;
+    conn.peer_scid_len = 8;
 
     // Build an encrypted 1-RTT short-header packet containing HANDSHAKE_DONE.
     // Servers must never receive HANDSHAKE_DONE — it's a ProtocolViolation.

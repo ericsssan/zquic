@@ -1029,20 +1029,8 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         /// Returns the bytes we send as our SCID in long-header packets.
-        ///
-        /// We echo the client's original DCID so that the client never needs to
-        /// change its own DCID (the "new" server SCID equals the client's current
-        /// DCID).  This keeps all packets in a single Wireshark connection, which
-        /// is required for pcap-based interop test analysis (the NS-3 left-pcap
-        /// capture delay can otherwise cause the server's Initial to appear after
-        /// the client's DCID-change packet, breaking Wireshark's connection
-        /// tracking and SSLKEYLOG decryption context).
-        ///
-        /// Falls back to local_cid if no Initial has been processed yet (tests).
+        /// RFC 9000 §7.2: server MUST use its own chosen connection ID, not echo the client's DCID.
         pub fn ourScidBytes(self: *const Self) []const u8 {
-            if (self.first_initial_dcid_len > 0) {
-                return self.first_initial_dcid[0..self.first_initial_dcid_len];
-            }
             return &self.local_cid.bytes;
         }
 
@@ -1160,17 +1148,12 @@ pub fn Connection(comptime max_streams: usize) type {
             // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
             if (data.len > MAX_PACKET_SIZE) return 0;
 
-            // DCID in short headers = client's DCID in all subsequent packets = our SCID.
-            // RFC 9000 §7.2: client uses server's SCID as its DCID.
-            // Since we echo the client's original DCID as our SCID (DCID echo), the client
-            // keeps its original DCID.  Fall back to cid_mod.len for unit tests.
-            const our_scid_len: usize = if (self.first_initial_dcid_len > 0)
-                self.first_initial_dcid_len
-            else
-                cid_mod.len;
+            // DCID in short headers = client's DCID = client's SCID from Initial packet.
+            // RFC 9000 §7.2: client uses the SCID we sent in our Initial as its DCID.
+            const client_dcid_len: usize = self.peer_scid_len;
 
             // Remove header protection before parsing.
-            const pn_off = packet.shortHeaderPnOffset(our_scid_len);
+            const pn_off = packet.shortHeaderPnOffset(client_dcid_len);
             if (pn_off + 4 + 16 > data.len) {
                 return 0;
             }
@@ -1178,7 +1161,7 @@ pub fn Connection(comptime max_streams: usize) type {
             @memcpy(hp_buf[0..data.len], data);
             _ = crypto.removeHeaderProtection(self.app_keys.?.client.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
-            const result = try packet.parseShortHeader(hp_buf[0..data.len], our_scid_len);
+            const result = try packet.parseShortHeader(hp_buf[0..data.len], client_dcid_len);
             const hdr = result.header;
             const pn = packet.decodePacketNumber(
                 self.hot.rx_pn[2],
