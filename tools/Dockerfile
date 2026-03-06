@@ -49,11 +49,7 @@ LABEL org.opencontainers.image.title="zquic-interop" \
       org.opencontainers.image.source="https://github.com/ericsssan/zquic" \
       org.opencontainers.image.licenses="MIT"
 
-RUN apk add --no-cache iptables ip6tables iproute2
-
 COPY --from=builder /build/zig-out/bin/server /server
-COPY tools/run_server.sh /run_server.sh
-RUN chmod +x /run_server.sh
 
 RUN mkdir -p /logs /certs
 
@@ -64,4 +60,4 @@ ENV TESTCASE=transfer
 ENV CERTS=/certs
 ENV WWW=/www
 
-ENTRYPOINT ["/run_server.sh"]
+ENTRYPOINT ["/server"]
