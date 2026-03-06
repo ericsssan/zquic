@@ -41,8 +41,8 @@ RUN set -e; \
     . /build_env.sh; \
     zig build -Doptimize=ReleaseSafe -Dtarget="${TARGET}"
 
-# Stage 2: Minimal runtime image.
-FROM alpine:3.19
+# Stage 2: Runtime image with network simulator support.
+FROM martenseemann/quic-network-simulator-endpoint:latest
 
 LABEL org.opencontainers.image.title="zquic-interop" \
       org.opencontainers.image.description="zquic interop testing image for quic-interop-runner. Not intended for production use." \
@@ -50,8 +50,9 @@ LABEL org.opencontainers.image.title="zquic-interop" \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=builder /build/zig-out/bin/server /server
+COPY tools/run_endpoint.sh /run_endpoint.sh
 
-RUN mkdir -p /logs /certs
+RUN chmod +x /run_endpoint.sh && mkdir -p /logs /certs
 
 EXPOSE 443/udp
 
@@ -60,4 +61,4 @@ ENV TESTCASE=transfer
 ENV CERTS=/certs
 ENV WWW=/www
 
-ENTRYPOINT ["/server"]
+ENTRYPOINT ["/run_endpoint.sh"]
