@@ -25,6 +25,7 @@ const Hmac256 = std.crypto.auth.hmac.sha2.HmacSha256;
 const X25519 = std.crypto.dh.X25519;
 const Ed25519 = std.crypto.sign.Ed25519;
 const EcdsaP256Sha256 = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+const P256 = std.crypto.ecc.P256;
 
 /// Private-key algorithm used for CertificateVerify.
 pub const KeyAlgorithm = enum { ed25519, p256 };
@@ -92,6 +93,8 @@ const ClientHelloData = struct {
     session_id_len: u8,
     client_x25519_pub: [32]u8,
     has_x25519: bool,
+    client_p256_pub: [65]u8,
+    has_p256: bool,
     peer_transport_params: transport_params.TransportParams,
     alpn_names: [4][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 4,
     alpn_lens: [4]u8 = [_]u8{0} ** 4,
@@ -103,6 +106,9 @@ pub const TlsServer = struct {
 
     // Our X25519 key pair (ephemeral per-connection)
     ecdh_kp: X25519.KeyPair,
+    // Our P-256 ephemeral key pair (used when client offers secp256r1 but not X25519)
+    p256_secret: [32]u8,
+    p256_pub: [65]u8,
     // Our signing key (Ed25519 or P-256 ECDSA depending on certificate)
     sign_key: SignKey,
     // DER-encoded certificate (self-signed or external)
@@ -166,10 +172,14 @@ pub const TlsServer = struct {
     pub fn init(io: std.Io) !TlsServer {
         const ecdh_kp = X25519.KeyPair.generate(io);
         const sign_kp = Ed25519.KeyPair.generate(io);
+        const p256_secret = P256.scalar.random(io, .little);
+        const p256_pub = (P256.basePoint.mul(p256_secret, .little) catch unreachable).toUncompressedSec1();
 
         var self: TlsServer = .{
             .state = .wait_client_hello,
             .ecdh_kp = ecdh_kp,
+            .p256_secret = p256_secret,
+            .p256_pub = p256_pub,
             .sign_key = .{ .ed25519 = sign_kp },
             .cert_buf = undefined,
             .cert_len = 0,
@@ -213,6 +223,8 @@ pub const TlsServer = struct {
     pub fn initFromCert(cert_der: []const u8, seed: [32]u8, algorithm: KeyAlgorithm, io: std.Io) !TlsServer {
         if (cert_der.len > 65536) return error.CertTooLarge;
         const ecdh_kp = X25519.KeyPair.generate(io);
+        const p256_secret = P256.scalar.random(io, .little);
+        const p256_pub = (P256.basePoint.mul(p256_secret, .little) catch unreachable).toUncompressedSec1();
         const sign_key: SignKey = switch (algorithm) {
             .ed25519 => .{ .ed25519 = try Ed25519.KeyPair.generateDeterministic(seed) },
             .p256 => blk: {
@@ -223,6 +235,8 @@ pub const TlsServer = struct {
         var self: TlsServer = .{
             .state = .wait_client_hello,
             .ecdh_kp = ecdh_kp,
+            .p256_secret = p256_secret,
+            .p256_pub = p256_pub,
             .sign_key = sign_key,
             .cert_buf = undefined,
             .cert_len = cert_der.len,
@@ -259,6 +273,7 @@ pub const TlsServer = struct {
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.client_app_secret)));
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.server_app_secret)));
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.ecdh_kp.secret_key)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.p256_secret)));
         switch (self.sign_key) {
             .ed25519 => |*kp| std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&kp.secret_key))),
             .p256 => |*kp| std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&kp.secret_key.bytes))),
@@ -325,7 +340,8 @@ pub const TlsServer = struct {
     }
 
     fn handleClientHello(self: *TlsServer, ch: ClientHelloData, out: []u8, io: std.Io) !usize {
-        if (!ch.has_x25519) return error.NoX25519KeyShare;
+        if (!ch.has_x25519 and !ch.has_p256) return error.NoSupportedKeyShare;
+        const use_p256 = !ch.has_x25519 and ch.has_p256;
 
         // ALPN negotiation: if we require a protocol, the client must offer it.
         if (self.required_alpn_len > 0) {
@@ -372,7 +388,13 @@ pub const TlsServer = struct {
         self.client_random = ch.random;
 
         // 1. ECDH shared secret
-        const shared = try X25519.scalarmult(self.ecdh_kp.secret_key, ch.client_x25519_pub);
+        const shared: [32]u8 = if (use_p256) blk: {
+            const client_point = try P256.fromSec1(&ch.client_p256_pub);
+            const shared_point = try client_point.mul(self.p256_secret, .little);
+            break :blk shared_point.affineCoordinates().x.toBytes(.big);
+        } else blk: {
+            break :blk try X25519.scalarmult(self.ecdh_kp.secret_key, ch.client_x25519_pub);
+        };
 
         // 2. Server random
         var server_random: [32]u8 = undefined;
@@ -386,6 +408,7 @@ pub const TlsServer = struct {
             out[pos..],
             server_random,
             ch.legacy_session_id[0..ch.session_id_len],
+            use_p256,
         );
 
         // 4. Hash ServerHello into transcript (transcript now has H(CH || SH)).
@@ -542,6 +565,7 @@ pub const TlsServer = struct {
         out: []u8,
         server_random: [32]u8,
         session_id: []const u8,
+        use_p256: bool,
     ) !usize {
         var pos: usize = 4; // skip handshake header, fill in later
 
@@ -579,17 +603,28 @@ pub const TlsServer = struct {
         std.mem.writeInt(u16, out[pos..][0..2], TLS_VERSION_1_3, .big);
         pos += 2;
 
-        // key_share extension: server's X25519 public key
+        // key_share extension: server's ephemeral public key (X25519 or P-256)
         std.mem.writeInt(u16, out[pos..][0..2], EXT_KEY_SHARE, .big);
         pos += 2;
-        std.mem.writeInt(u16, out[pos..][0..2], 4 + 32, .big); // ext length
-        pos += 2;
-        std.mem.writeInt(u16, out[pos..][0..2], GROUP_X25519, .big);
-        pos += 2;
-        std.mem.writeInt(u16, out[pos..][0..2], 32, .big); // key length
-        pos += 2;
-        @memcpy(out[pos..][0..32], &self.ecdh_kp.public_key);
-        pos += 32;
+        if (use_p256) {
+            std.mem.writeInt(u16, out[pos..][0..2], 4 + 65, .big); // ext length
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], GROUP_SECP256R1, .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], 65, .big); // key length
+            pos += 2;
+            @memcpy(out[pos..][0..65], &self.p256_pub);
+            pos += 65;
+        } else {
+            std.mem.writeInt(u16, out[pos..][0..2], 4 + 32, .big); // ext length
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], GROUP_X25519, .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], 32, .big); // key length
+            pos += 2;
+            @memcpy(out[pos..][0..32], &self.ecdh_kp.public_key);
+            pos += 32;
+        }
 
         // Fill in extensions length
         const ext_len = pos - ext_start - 2;
@@ -727,6 +762,8 @@ fn parseClientHello(data: []const u8) !ClientHelloData {
         .session_id_len = 0,
         .client_x25519_pub = [_]u8{0} ** 32,
         .has_x25519 = false,
+        .client_p256_pub = [_]u8{0} ** 65,
+        .has_p256 = false,
         .peer_transport_params = .{},
     };
     pos += 32;
@@ -780,6 +817,9 @@ fn parseClientHello(data: []const u8) !ClientHelloData {
                 if (group == GROUP_X25519 and key_len == 32 and ksp + 32 <= ext_data.len) {
                     @memcpy(&ch.client_x25519_pub, ext_data[ksp..][0..32]);
                     ch.has_x25519 = true;
+                } else if (group == GROUP_SECP256R1 and key_len == 65 and ksp + 65 <= ext_data.len) {
+                    @memcpy(&ch.client_p256_pub, ext_data[ksp..][0..65]);
+                    ch.has_p256 = true;
                 }
                 ksp += key_len;
             }
@@ -1344,6 +1384,8 @@ test "tls: ALPN: matching protocol selected" {
         .session_id_len = 0,
         .client_x25519_pub = [_]u8{0} ** 32,
         .has_x25519 = true,
+        .client_p256_pub = [_]u8{0} ** 65,
+        .has_p256 = false,
         .peer_transport_params = .{},
     };
     @memcpy(ch.alpn_names[0][0..name_len], alpn_name);
@@ -1391,6 +1433,8 @@ test "tls: ALPN: mismatch returns AlpnMismatch" {
         .session_id_len = 0,
         .client_x25519_pub = [_]u8{0x42} ** 32, // non-zero key share
         .has_x25519 = true,
+        .client_p256_pub = [_]u8{0} ** 65,
+        .has_p256 = false,
         .peer_transport_params = .{},
     };
     @memcpy(ch.alpn_names[0][0..2], "h3");
@@ -1468,6 +1512,8 @@ test "tls: full handshake roundtrip: client Finished verifies correctly" {
         .session_id_len = 0,
         .client_x25519_pub = [_]u8{0x42} ** 32,
         .has_x25519 = true,
+        .client_p256_pub = [_]u8{0} ** 65,
+        .has_p256 = false,
         .peer_transport_params = .{},
     };
     @memcpy(ch.alpn_names[0][0..10], "hq-interop");
@@ -1552,4 +1598,137 @@ test "security: CRYPTO read_buf cleared after ClientFinished" {
 
     // Verify that read_buf exists and is large enough for security operations
     try std.testing.expect(server.read_buf.len >= 8192);
+}
+
+test "tls: P-256 ECDH: server accepts P-256-only client and produces handshake keys" {
+    const io = std.testing.io;
+    var server = try TlsServer.init(io);
+
+    // Generate a client-side P-256 ephemeral key pair
+    const client_secret = P256.scalar.random(io, .little);
+    const client_pub_pt = P256.basePoint.mul(client_secret, .little) catch unreachable;
+    const client_pub = client_pub_pt.toUncompressedSec1();
+
+    // Build ClientHelloData with only P-256 key share (no X25519)
+    const ch: ClientHelloData = .{
+        .random = [_]u8{0x33} ** 32,
+        .legacy_session_id = [_]u8{0} ** 32,
+        .session_id_len = 0,
+        .client_x25519_pub = [_]u8{0} ** 32,
+        .has_x25519 = false,
+        .client_p256_pub = client_pub,
+        .has_p256 = true,
+        .peer_transport_params = .{},
+    };
+
+    var out: [4096]u8 = undefined;
+    const written = try server.handleClientHello(ch, &out, io);
+
+    // Server must have produced a non-empty ServerHello + handshake messages
+    try std.testing.expect(written > 0);
+    // State transitions to wait_client_finished (handshake keys derived)
+    try std.testing.expectEqual(TlsState.wait_client_finished, server.state);
+    // ServerHello starts with HS_SERVER_HELLO (0x02)
+    try std.testing.expectEqual(@as(u8, HS_SERVER_HELLO), out[0]);
+    // Handshake keys are non-zero (key schedule ran)
+    const zero32 = [_]u8{0} ** 32;
+    try std.testing.expect(!std.mem.eql(u8, &server.handshake_keys.server.key, &zero32));
+}
+
+test "tls: P-256 parseClientHello extracts P-256 key share" {
+    // Build a minimal ClientHello byte buffer with only a secp256r1 key share
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+
+    // Handshake header (filled in at end)
+    const hdr_pos = pos;
+    pos += 4;
+
+    // legacy_version
+    std.mem.writeInt(u16, buf[pos..][0..2], TLS_VERSION_LEGACY, .big);
+    pos += 2;
+
+    // random
+    @memset(buf[pos..][0..32], 0x11);
+    pos += 32;
+
+    // session_id (empty)
+    buf[pos] = 0;
+    pos += 1;
+
+    // cipher suites (TLS_AES_128_GCM_SHA256 only)
+    std.mem.writeInt(u16, buf[pos..][0..2], 2, .big);
+    pos += 2;
+    std.mem.writeInt(u16, buf[pos..][0..2], CIPHER_TLS_AES_128_GCM_SHA256, .big);
+    pos += 2;
+
+    // compression methods (null)
+    buf[pos] = 1;
+    pos += 1;
+    buf[pos] = 0;
+    pos += 1;
+
+    // extensions length (placeholder)
+    const ext_total_pos = pos;
+    pos += 2;
+    const ext_start = pos;
+
+    // key_share extension with P-256 only
+    std.mem.writeInt(u16, buf[pos..][0..2], EXT_KEY_SHARE, .big);
+    pos += 2;
+    const ks_ext_len_pos = pos;
+    pos += 2;
+    const ks_ext_start = pos;
+    // key_share list length (placeholder)
+    const ks_list_len_pos = pos;
+    pos += 2;
+    const ks_list_start = pos;
+    // secp256r1 entry: group + key_len + 65 bytes
+    std.mem.writeInt(u16, buf[pos..][0..2], GROUP_SECP256R1, .big);
+    pos += 2;
+    std.mem.writeInt(u16, buf[pos..][0..2], 65, .big);
+    pos += 2;
+    @memset(buf[pos..][0..65], 0x04); // 0x04-prefixed uncompressed point (placeholder)
+    pos += 65;
+    std.mem.writeInt(u16, buf[ks_list_len_pos..][0..2], @intCast(pos - ks_list_start), .big);
+    std.mem.writeInt(u16, buf[ks_ext_len_pos..][0..2], @intCast(pos - ks_ext_start), .big);
+
+    // quic transport params extension (empty)
+    std.mem.writeInt(u16, buf[pos..][0..2], EXT_QUIC_TRANSPORT_PARAMS, .big);
+    pos += 2;
+    std.mem.writeInt(u16, buf[pos..][0..2], 0, .big);
+    pos += 2;
+
+    // Fill extensions total length
+    std.mem.writeInt(u16, buf[ext_total_pos..][0..2], @intCast(pos - ext_start), .big);
+
+    // Fill handshake header
+    buf[hdr_pos] = HS_CLIENT_HELLO;
+    const body_len = pos - hdr_pos - 4;
+    buf[hdr_pos + 1] = @intCast((body_len >> 16) & 0xff);
+    buf[hdr_pos + 2] = @intCast((body_len >> 8) & 0xff);
+    buf[hdr_pos + 3] = @intCast(body_len & 0xff);
+
+    const ch = try parseClientHello(buf[0..pos]);
+    try std.testing.expect(!ch.has_x25519);
+    try std.testing.expect(ch.has_p256);
+    // First byte of P-256 key should be 0x04 (uncompressed point marker)
+    try std.testing.expectEqual(@as(u8, 0x04), ch.client_p256_pub[0]);
+}
+
+test "tls: no key share returns NoSupportedKeyShare" {
+    const io = std.testing.io;
+    var server = try TlsServer.init(io);
+    const ch: ClientHelloData = .{
+        .random = [_]u8{0} ** 32,
+        .legacy_session_id = [_]u8{0} ** 32,
+        .session_id_len = 0,
+        .client_x25519_pub = [_]u8{0} ** 32,
+        .has_x25519 = false,
+        .client_p256_pub = [_]u8{0} ** 65,
+        .has_p256 = false,
+        .peer_transport_params = .{},
+    };
+    var out: [4096]u8 = undefined;
+    try std.testing.expectError(error.NoSupportedKeyShare, server.handleClientHello(ch, &out, io));
 }
