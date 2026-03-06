@@ -1180,3 +1180,21 @@ test "connection: deinit zeroes all key material" {
     try testing.expectEqual([_]u8{0} ** 32, conn.next_client_secret);
     try testing.expectEqual([_]u8{0} ** 32, conn.next_server_secret);
 }
+
+// ---------------------------------------------------------------------------
+// NEW_CONNECTION_ID coalesced in HANDSHAKE_DONE (tshark session tracking)
+// ---------------------------------------------------------------------------
+
+test "connection: alt_local_cid is distinct from primary local_cid" {
+    // Verify that accept() generates two distinct CIDs so that the
+    // NEW_CONNECTION_ID frame in HANDSHAKE_DONE advertises a CID different
+    // from the primary one, allowing tshark to track the 1-RTT session.
+    const testing = std.testing;
+    const io = std.testing.io;
+    const conn = try Connection(16).accept(.{}, io);
+
+    // The alt CID must not be all-zero (it's randomly generated).
+    try testing.expect(!std.mem.eql(u8, &conn.alt_local_cid.bytes, &[_]u8{0} ** 8));
+    // The two CIDs must differ so tshark session tracking benefits from the extra CID.
+    try testing.expect(!std.mem.eql(u8, &conn.local_cid.bytes, &conn.alt_local_cid.bytes));
+}

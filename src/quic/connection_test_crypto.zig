@@ -660,7 +660,6 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
         .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
     };
     conn.peer_cid = conn.local_cid;
-    conn.peer_scid_len = 8;
 
     // Build and process packet 5 first.
     var pkt5: [256]u8 = undefined;

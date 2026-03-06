@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
 
     const config: quic.Config = .{
         .alpn = ALPN,
-        .validate_addr = std.mem.eql(u8, testcase, "retry"),
+        .validate_addr = true,
         .cert_der = cert_der_buf[0..cert_der_len],
         .cert_seed = key_material.seed,
         .cert_key_algorithm = switch (key_material.algorithm) {

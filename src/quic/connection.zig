@@ -372,6 +372,13 @@ pub fn Connection(comptime max_streams: usize) type {
         first_initial_dcid: [20]u8 = [_]u8{0} ** 20,
         first_initial_dcid_len: u8 = 0,
 
+        /// Alternative local CID advertised to peer via NEW_CONNECTION_ID (sequence=1).
+        /// Helps tshark track 1-RTT packets when the primary CID appears in client
+        /// long-header DCID before the server's Initial SCID in the trace.
+        alt_local_cid: ConnectionId,
+        /// Stateless reset token for alt_local_cid (RFC 9000 §10.3.1).
+        alt_local_reset_token: [16]u8,
+
         // Pending retransmit flags
         pending_handshake_done: bool,
         pending_max_data: bool,
@@ -427,6 +434,9 @@ pub fn Connection(comptime max_streams: usize) type {
                 tls_server.required_alpn_len = @intCast(n);
             }
             const local_cid = ConnectionId.generate(0, io);
+            const alt_local_cid = ConnectionId.generate(0, io);
+            var alt_local_reset_token: [16]u8 = undefined;
+            io.random(&alt_local_reset_token);
             const idle_timeout_i64: i64 = if (config.idle_timeout_ns > 0)
                 @intCast(@min(config.idle_timeout_ns, @as(u64, std.math.maxInt(i64))))
             else
@@ -442,6 +452,8 @@ pub fn Connection(comptime max_streams: usize) type {
                     ._pad = [_]u8{0} ** 11,
                 },
                 .local_cid = local_cid,
+                .alt_local_cid = alt_local_cid,
+                .alt_local_reset_token = alt_local_reset_token,
                 .peer_cid = ConnectionId.zero,
                 .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
                 .initial_keys = undefined,
@@ -1148,12 +1160,13 @@ pub fn Connection(comptime max_streams: usize) type {
             // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
             if (data.len > MAX_PACKET_SIZE) return 0;
 
-            // DCID in short headers = client's DCID = client's SCID from Initial packet.
-            // RFC 9000 §7.2: client uses the SCID we sent in our Initial as its DCID.
-            const client_dcid_len: usize = self.peer_scid_len;
+            // DCID in short headers = server's SCID = local_cid (always cid_mod.len bytes).
+            // The client uses the SCID we sent in our Initial packet as its DCID.
+            // This is always cid_mod.len (8 bytes) regardless of what the peer sent as SCID.
+            const our_scid_len: usize = cid_mod.len;
 
             // Remove header protection before parsing.
-            const pn_off = packet.shortHeaderPnOffset(client_dcid_len);
+            const pn_off = packet.shortHeaderPnOffset(our_scid_len);
             if (pn_off + 4 + 16 > data.len) {
                 return 0;
             }
@@ -1161,7 +1174,7 @@ pub fn Connection(comptime max_streams: usize) type {
             @memcpy(hp_buf[0..data.len], data);
             _ = crypto.removeHeaderProtection(self.app_keys.?.client.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
-            const result = try packet.parseShortHeader(hp_buf[0..data.len], client_dcid_len);
+            const result = try packet.parseShortHeader(hp_buf[0..data.len], our_scid_len);
             const hdr = result.header;
             const pn = packet.decodePacketNumber(
                 self.hot.rx_pn[2],
@@ -2000,6 +2013,19 @@ pub fn Connection(comptime max_streams: usize) type {
         fn queueHandshakeDone(self: *Self) !void {
             var pos: usize = 0;
             pos += frame.encodeFrame(self.pkt_scratch[pos..], .handshake_done);
+            // RFC 9000 §5.1.1: advertise an alternative CID so the peer can use it
+            // for subsequent packets. This lets tshark correctly track the 1-RTT
+            // session when the client's long-header DCID appears before the server's
+            // Initial SCID in the left pcap.
+            var ncid_frame = frame.NewConnectionIdFrame{
+                .sequence_number = 1,
+                .retire_prior_to = 0,
+                .cid = undefined,
+                .cid_len = @intCast(self.alt_local_cid.bytes.len),
+                .stateless_reset_token = self.alt_local_reset_token,
+            };
+            @memcpy(ncid_frame.cid[0..self.alt_local_cid.bytes.len], &self.alt_local_cid.bytes);
+            pos += frame.encodeFrame(self.pkt_scratch[pos..], .{ .new_connection_id = ncid_frame });
             // Encrypt with 1-RTT keys and send
             if (self.app_keys) |ak| {
                 const pn = self.hot.tx_pn[2];
