@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
 
     const config: quic.Config = .{
         .alpn = ALPN,
-        .validate_addr = true,
+        .validate_addr = std.mem.eql(u8, testcase, "retry"),
         .cert_der = cert_der_buf[0..cert_der_len],
         .cert_seed = key_material.seed,
         .cert_key_algorithm = switch (key_material.algorithm) {
@@ -142,67 +142,19 @@ pub fn main(init: std.process.Init) !void {
             // Drive timers on every packet, not just on timeout, so the PTO fires
             // even when a stream of client retransmits keeps the receive path busy.
             conn.tick(now_ns);
-            if (msg.data.len >= 1) {
-                const is_long = (msg.data[0] & 0x80) != 0;
-                if (is_long and msg.data.len >= 6) {
-                    const ver = std.mem.readInt(u32, msg.data[1..5], .big);
-                    const dcid_len = msg.data[5];
-                    const pkt_type_str = switch ((msg.data[0] >> 4) & 0x03) {
-                        0 => "Initial",
-                        1 => "0-RTT",
-                        2 => "Handshake",
-                        3 => "Retry",
-                        else => "?",
-                    };
-                    std.debug.print("recv LONG pkt: len={d} type={s} first=0x{x:0>2} ver=0x{x:0>8} dcid_len={d}\n", .{ msg.data.len, pkt_type_str, msg.data[0], ver, dcid_len });
-                    if (dcid_len > 0 and msg.data.len >= 6 + dcid_len) {
-                        std.debug.print("  dcid=", .{});
-                        for (msg.data[6..][0..dcid_len]) |b| std.debug.print("{x:0>2}", .{b});
-                        std.debug.print("\n", .{});
-                    }
-                    const scid_off: usize = 6 + dcid_len;
-                    if (msg.data.len > scid_off) {
-                        const scid_len = msg.data[scid_off];
-                        std.debug.print("  scid_len={d}", .{scid_len});
-                        if (scid_len > 0 and msg.data.len >= scid_off + 1 + scid_len) {
-                            std.debug.print(" scid=", .{});
-                            for (msg.data[scid_off + 1 ..][0..scid_len]) |b| std.debug.print("{x:0>2}", .{b});
-                        }
-                        std.debug.print("\n", .{});
-                    }
-                } else if (!is_long) {
-                    // Short header: byte 0 layout: 0 1 spin reserved reserved key_phase pn_len[1:0]
-                    const key_phase = (msg.data[0] >> 2) & 1;
-                    // DCID = our SCID = local_cid (8 bytes after first byte)
-                    std.debug.print("recv 1-RTT pkt: len={d} first=0x{x:0>2} key_phase={d}", .{ msg.data.len, msg.data[0], key_phase });
-                    if (msg.data.len >= 9) { // 1 + 8
-                        std.debug.print(" dcid=", .{});
-                        for (msg.data[1..9]) |b| std.debug.print("{x:0>2}", .{b});
-                    }
-                    std.debug.print("\n", .{});
-                }
-            }
             conn.receive(msg.data, ipToSocketAddr(msg.from), now_ns, io) catch |err| {
                 std.debug.print("receive error: {}\n", .{err});
             };
-            std.debug.print("  -> state={s} key_phase={d} gen={d}/{d} peer_scid=", .{ @tagName(conn.hot.state), @intFromBool(conn.current_key_phase), conn.current_key_generation, last_logged_generation });
-            for (conn.peer_scid[0..conn.peer_scid_len]) |b| std.debug.print("{x:0>2}", .{b});
-            std.debug.print(" local_cid=", .{});
-            for (conn.local_cid.bytes) |b| std.debug.print("{x:0>2}", .{b});
-            std.debug.print("\n", .{});
 
             // If key rotation occurred, update keylog immediately (don't wait for connection_closed)
             if (conn.current_key_generation > last_logged_generation) {
-                std.debug.print("[keylog] updating keylog (gen was {d}, now {d})\n", .{ last_logged_generation, conn.current_key_generation });
                 updateKeyLog(&conn, io, last_logged_generation);
                 last_logged_generation = conn.current_key_generation;
             }
 
             while (conn.pollEvent()) |ev| {
-                std.debug.print("  -> event: {s}\n", .{@tagName(ev)});
                 switch (ev) {
                     .connected => {
-                        std.debug.print("handshake complete\n", .{});
                         writeKeyLog(&conn, io);
                         last_logged_generation = 0; // Mark that gen 0 has been written
                     },
@@ -229,59 +181,7 @@ pub fn main(init: std.process.Init) !void {
             // the first batch would prematurely terminate the connection. Instead, rely on the
             // idle timeout (configured by the client) to clean up abandoned connections.
 
-            std.debug.print("  sq depth={d}\n", .{conn.sq_tail - conn.sq_head});
-            var sent_bytes: usize = 0;
-            var pkt_count: usize = 0;
-            while (true) {
-                const n = conn.send(&send_buf);
-                if (n == 0) break;
-                pkt_count += 1;
-                if (n >= 1 and (send_buf[0] & 0x80) != 0 and n >= 6) {
-                    // Long header: print type, ver, dcid, scid
-                    const ver = std.mem.readInt(u32, send_buf[1..5], .big);
-                    const dcid_len = send_buf[5];
-                    const pkt_type_str = switch ((send_buf[0] >> 4) & 0x03) {
-                        0 => "Initial",
-                        1 => "0-RTT",
-                        2 => "Handshake",
-                        3 => "Retry",
-                        else => "?",
-                    };
-                    std.debug.print("  send[{d}] LONG {s}: len={d} first=0x{x:0>2} ver=0x{x:0>8}", .{ pkt_count, pkt_type_str, n, send_buf[0], ver });
-                    if (n >= 6 + dcid_len + 1) {
-                        if (dcid_len > 0) {
-                            std.debug.print(" dcid=", .{});
-                            for (send_buf[6..][0..dcid_len]) |b| std.debug.print("{x:0>2}", .{b});
-                        } else {
-                            std.debug.print(" dcid=(empty)", .{});
-                        }
-                        const scid_len = send_buf[6 + dcid_len];
-                        std.debug.print(" scid_len={d}", .{scid_len});
-                        const scid_off: usize = 6 + dcid_len + 1;
-                        if (scid_len > 0 and n >= scid_off + scid_len) {
-                            std.debug.print(" scid=", .{});
-                            for (send_buf[scid_off..][0..scid_len]) |b| std.debug.print("{x:0>2}", .{b});
-                        }
-                    }
-                    std.debug.print("\n", .{});
-                } else if (n >= 1 and (send_buf[0] & 0x80) == 0) {
-                    // Short header 1-RTT
-                    const key_phase = (send_buf[0] >> 2) & 1;
-                    std.debug.print("  send[{d}] 1-RTT: len={d} first=0x{x:0>2} key_phase={d}", .{ pkt_count, n, send_buf[0], key_phase });
-                    if (n >= 9) {
-                        std.debug.print(" dcid=", .{});
-                        for (send_buf[1..9]) |b| std.debug.print("{x:0>2}", .{b});
-                    }
-                    std.debug.print("\n", .{});
-                } else {
-                    std.debug.print("  send[{d}]: len={d} first=0x{x:0>2}\n", .{ pkt_count, n, send_buf[0] });
-                }
-                sock.send(io, &msg.from, send_buf[0..n]) catch |e| {
-                    std.debug.print("  send error: {}\n", .{e});
-                };
-                sent_bytes += n;
-            }
-            if (sent_bytes > 0) std.debug.print("  -> sent {d} bytes in {d} pkts\n", .{ sent_bytes, pkt_count });
+            drainSend(&conn, &sock, io, &msg.from, &send_buf);
         }
     }
 }
@@ -445,7 +345,6 @@ fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
     file.writePositionalAll(io, buf[0..pos], 0) catch {};
-    std.debug.print("keylog updated (generations 0..{d}, {d} bytes)\n", .{ conn.current_key_generation, pos });
 }
 
 /// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
@@ -476,7 +375,6 @@ fn writeKeyLog(conn: *const Conn, io: std.Io) void {
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
     file.writePositionalAll(io, buf[0..pos], 0) catch {};
-    std.debug.print("keylog written ({d} bytes)\n", .{pos});
 }
 
 fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {
