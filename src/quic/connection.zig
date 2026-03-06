@@ -387,7 +387,10 @@ pub fn Connection(comptime max_streams: usize) type {
         crypto_send_offset: [3]u64,
         /// Buffer storing outgoing CRYPTO data (epochs 0 and 1) for PTO retransmission.
         /// Populated by sendCryptoChunk; retransmitted by the PTO handler in tick().
-        crypto_send_saved: [2][2048]u8,
+        /// Sized to match the TLS output buffer (8192 bytes) so overflow is structurally
+        /// impossible: processCrypto writes into an [8192]u8 out_buf, meaning the sum of
+        /// all sendCryptoChunk calls for a single handshake flight cannot exceed 8192 bytes.
+        crypto_send_saved: [2][8192]u8,
         crypto_send_saved_len: [2]u16,
         /// Per-epoch expected CRYPTO receive offset (RFC 9000 §19.6).
         /// Out-of-order/duplicate CRYPTO frames are rejected or trimmed against this.
@@ -504,7 +507,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .unknown_version_times = [_]i64{std.math.minInt(i64)} ** 4,
                 .unknown_version_idx = 0,
                 .crypto_send_offset = .{ 0, 0, 0 },
-                .crypto_send_saved = @import("std").mem.zeroes([2][2048]u8),
+                .crypto_send_saved = @import("std").mem.zeroes([2][8192]u8),
                 .crypto_send_saved_len = .{ 0, 0 },
                 .crypto_recv_offset = .{ 0, 0, 0 },
                 .crypto_staged = @import("std").mem.zeroes([3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag),
@@ -2164,13 +2167,14 @@ pub fn Connection(comptime max_streams: usize) type {
                 else => unreachable,
             }
             // Save chunk for potential PTO retransmission (epochs 0 and 1 only).
+            // The buffer is sized to match the TLS out_buf (8192 bytes); overflow is impossible
+            // as long as processCrypto writes into an [8192]u8 output buffer (see processCryptoFrame).
             if (epoch < 2) {
                 const old: usize = self.crypto_send_saved_len[epoch];
                 const end: usize = old + chunk_len;
-                if (end <= self.crypto_send_saved[epoch].len) {
-                    @memcpy(self.crypto_send_saved[epoch][old..end], chunk);
-                    self.crypto_send_saved_len[epoch] = @intCast(end);
-                }
+                std.debug.assert(end <= self.crypto_send_saved[epoch].len);
+                @memcpy(self.crypto_send_saved[epoch][old..end], chunk);
+                self.crypto_send_saved_len[epoch] = @intCast(end);
             }
             self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
             return chunk_len;
