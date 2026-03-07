@@ -635,6 +635,50 @@ test "connection: sendEncryptedAck encodes gaps from received bitmap" {
 }
 
 // ---------------------------------------------------------------------------
+// Regression test: ACK range gap decoding (RFC 9000 §19.3.1)
+// ---------------------------------------------------------------------------
+
+test "connection: processAck multi-range gap decoding does not ack gap packets" {
+    // Regression: ACK range gap decoding was off by 1, causing the packet
+    // immediately below the gap to be incorrectly marked as acked, so the
+    // sender never retransmitted it. Fix: high = low - 2 - gap_val.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+    conn.current_time_ns = 1_000_000;
+
+    // Register 8 in-flight packets (pn 0-7) in epoch 2 (1-RTT).
+    conn.hot.tx_pn[2] = 8; // pretend pn 0-7 were sent
+    for (0..8) |pn| {
+        conn.loss.onPacketSent(@intCast(pn), 2, 1200, true, conn.current_time_ns, .{});
+    }
+    try testing.expectEqual(@as(u64, 8 * 1200), conn.loss.bytes_in_flight);
+
+    // ACK: largest=7, two ranges {5-7} and {0-3}; packet 4 is in the gap.
+    // Wire encoding: first_ack_range=2 (covers 5,6,7), gap=0 (1 missing packet;
+    // RFC wire gap = unacked_count - 1 = 1 - 1 = 0), second_ack_range=3 (covers 0,1,2,3).
+    const ack = frame.AckFrame{
+        .largest_acked = 7,
+        .ack_delay = 0,
+        .ranges = [_]frame.AckRange{
+            .{ .gap = 0, .ack_range = 2 }, // first range: [5, 7]
+            .{ .gap = 0, .ack_range = 3 }, // gap=0 means 1 unacked; second range: [0, 3]
+        } ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 30,
+        .range_count = 2,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
+    };
+    try conn.processAck(ack, 2);
+
+    // Packet 4 must NOT have been acked. With largest_acked=7, pn 4 satisfies
+    // 4+3=7 <= 7, so it must be declared lost by packet threshold.
+    // All bytes_in_flight must clear (7 acked + 1 lost = 8 total).
+    try testing.expectEqual(@as(u64, 0), conn.loss.bytes_in_flight);
+}
+
+// ---------------------------------------------------------------------------
 // Regression tests: out-of-order packet handling (RFC 9000 §13.2)
 // ---------------------------------------------------------------------------
 

@@ -25,7 +25,7 @@ const Conn = quic.Connection(64);
 const ALPN = "hq-interop";
 
 const supported_cases = [_][]const u8{
-    "handshake", "transfer", "multiconnect", "retry", "keyupdate", "v2",
+    "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2",
 };
 
 /// State for one in-progress file transfer.
@@ -96,13 +96,12 @@ pub fn main(init: std.process.Init) !void {
             .p256 => .p256,
         },
         .initial_quic_version = if (std.mem.eql(u8, testcase, "v2")) quic.packet.QUIC_VERSION_2 else quic.packet.QUIC_VERSION_1,
-        .initial_max_streams_bidi = if (std.mem.eql(u8, testcase, "transfer")) 512 else 100,
+        .initial_max_streams_bidi = 64, // Match MAX_TRANSFERS; grows as streams close
         .initial_max_streams_uni = 100,
     };
 
-    // Bind UDP socket on IPv4 0.0.0.0 so the interop runner can reach us via
-    // server4 (193.167.100.100). An IPv6 :: bind would require explicit dual-stack
-    // configuration (IPV6_V6ONLY=0) which Zig's default net.bind does not set.
+    // Bind to all IPv4 interfaces. The NS-3 interop network uses IPv4 for all
+    // standard tests; the dedicated ipv6 test also works via IPv4-mapped addresses.
     const bind_addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(port) };
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
@@ -123,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
 
         conn_loop: while (true) {
             const timeout = computeTimeout(conn.nextTimeout());
+
             const msg = sock.receiveTimeout(io, &recv_buf, timeout) catch |err| {
                 if (err == error.Timeout) {
                     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
@@ -177,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
 
             // DO NOT actively close the connection after transfers complete.
             // The client is responsible for closing the connection when it's done downloading.
-            // For "multiplexing" test with 2000 files but only 8 transfer slots, closing after
+            // For "multiplexing" test with 1999 files but only 64 transfer slots, closing after
             // the first batch would prematurely terminate the connection. Instead, rely on the
             // idle timeout (configured by the client) to clean up abandoned connections.
 
@@ -248,48 +248,63 @@ fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTra
     t.path_len = full_path.len;
 }
 
-/// Try to advance all active file transfers, sending up to SEND_CHUNK bytes each.
-/// Called every event loop iteration so data flows as the congestion window grows.
+/// Try to advance all active file transfers using round-robin interleaving.
+/// Each pass sends one chunk per active stream; repeats until CC or queue blocks.
+/// Round-robin ensures every stream gets its first packet early — critical when
+/// the congestion window is small (e.g. initial cwnd = 10 packets): without
+/// interleaving, stream 0 would fill the window and streams 4/8 would get no
+/// packets at all, stalling their offset-0 delivery.
 fn flushTransfers(conn: *Conn, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8, io: std.Io) void {
     _ = www;
-    for (transfers) |*t| {
-        if (!t.active) continue;
-        advanceTransfer(conn, t, io);
+    // Outer loop: repeat passes until nothing was sent (CC/queue fully blocked).
+    while (true) {
+        var sent_any = false;
+        for (transfers) |*t| {
+            if (!t.active) continue;
+            if (advanceTransferOne(conn, t, io)) sent_any = true;
+        }
+        if (!sent_any) break;
     }
 }
 
-fn advanceTransfer(conn: *Conn, t: *FileTransfer, io: std.Io) void {
+/// Send exactly one SEND_CHUNK from the transfer. Returns true if a chunk was sent.
+fn advanceTransferOne(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
     const path = t.path[0..t.path_len];
     const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch {
         conn.streamSend(t.stream_id, &.{}, true) catch {};
         t.active = false;
-        return;
+        return false;
     };
     defer file.close(io);
 
-    // Loop until the send queue is full or EOF is reached so we fill the
-    // congestion window on every event rather than sending one chunk at a time.
-    while (true) {
-        var data_buf: [SEND_CHUNK]u8 = undefined;
-        const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
-            conn.streamSend(t.stream_id, &.{}, true) catch {};
-            t.active = false;
-            return;
-        };
+    var data_buf: [SEND_CHUNK]u8 = undefined;
+    const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
+        conn.streamSend(t.stream_id, &.{}, true) catch {};
+        t.active = false;
+        return false;
+    };
 
-        if (r == 0) {
-            // EOF — send FIN.
-            conn.streamSend(t.stream_id, &.{}, true) catch {};
-            t.active = false;
-            return;
-        }
-
-        conn.streamSend(t.stream_id, data_buf[0..r], false) catch {
-            // Send queue or flow-control window full — retry next tick.
-            return;
+    if (r == 0) {
+        // EOF — send FIN. If the send queue is full, retry next tick.
+        conn.streamSend(t.stream_id, &.{}, true) catch {
+            return false;
         };
-        t.offset += r;
+        t.active = false;
+        return true;
     }
+
+    // Combine data + FIN into one packet when this is the last chunk.
+    // A partial read (r < SEND_CHUNK) means we reached EOF, so we can piggyback
+    // the FIN bit on the data frame rather than sending a separate FIN packet.
+    // This halves the packet count for small files and reduces NS-3 queue pressure.
+    const is_last_chunk = r < SEND_CHUNK;
+    conn.streamSend(t.stream_id, data_buf[0..r], is_last_chunk) catch {
+        // Send queue, CC window, or flow-control window full — retry next tick.
+        return false;
+    };
+    t.offset += r;
+    if (is_last_chunk) t.active = false;
+    return true;
 }
 
 /// Read an entire file into `out`. Returns number of bytes read.

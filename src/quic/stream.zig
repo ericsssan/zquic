@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-pub const STREAM_BUF_SIZE: usize = 4096;
+pub const STREAM_BUF_SIZE: usize = 16384;
 
 pub const StreamState = enum(u8) {
     open,
@@ -249,6 +249,10 @@ pub const Stream = struct {
     send_buf: RingBuf(STREAM_BUF_SIZE),
     /// Cumulative bytes acknowledged on the send side.
     send_acked: u64,
+    /// Out-of-order (SACK) acknowledged ranges waiting for the gap to be filled.
+    /// Bounded by STREAM_BUF_SIZE / min_chunk ≈ 32 entries in practice.
+    sack_ranges: [32]struct { offset: u64, end: u64 },
+    sack_count: u8,
     /// FIN has been queued for sending.
     send_fin: bool,
     /// FIN has been acknowledged by the remote.
@@ -278,6 +282,8 @@ pub const Stream = struct {
             .send_max = STREAM_BUF_SIZE,
             .send_buf = .{},
             .send_acked = 0,
+            .sack_ranges = undefined,
+            .sack_count = 0,
             .send_fin = false,
             .fin_acked = false,
             .pending_reset = null,
@@ -440,10 +446,53 @@ pub const Stream = struct {
 
     /// Called when the remote acknowledges bytes [offset, offset+len).
     /// Advances send_acked and frees the corresponding space in send_buf.
+    /// Out-of-order ACKs (gaps due to packet loss + reordering) are stored and
+    /// applied when the gap is filled, preventing the ring buffer from stalling.
     pub fn onAcked(self: *Stream, offset: u64, len: u16) void {
-        if (offset != self.send_acked) return; // only handle contiguous acks
-        _ = self.send_buf.discard(len);
-        self.send_acked += len;
+        if (len == 0) return;
+        const end = offset + len;
+        if (end <= self.send_acked) return; // fully before send_acked: already freed
+        if (offset == self.send_acked) {
+            // Contiguous: advance immediately.
+            const advance: usize = @intCast(end - self.send_acked);
+            _ = self.send_buf.discard(advance);
+            self.send_acked = end;
+            // Drain any SACK ranges that are now contiguous.
+            self.flushSackRanges();
+        } else {
+            // Out-of-order: save for when the gap is filled.
+            if (self.sack_count < self.sack_ranges.len) {
+                self.sack_ranges[self.sack_count] = .{ .offset = offset, .end = end };
+                self.sack_count += 1;
+            }
+        }
+    }
+
+    /// Apply buffered SACK ranges that are now contiguous with send_acked.
+    fn flushSackRanges(self: *Stream) void {
+        var progress = true;
+        while (progress) {
+            progress = false;
+            var i: usize = 0;
+            while (i < self.sack_count) {
+                const r = self.sack_ranges[i];
+                if (r.end <= self.send_acked) {
+                    // Stale: already covered by send_acked — remove.
+                    self.sack_count -= 1;
+                    self.sack_ranges[i] = self.sack_ranges[self.sack_count];
+                } else if (r.offset <= self.send_acked) {
+                    // Overlaps with send_acked: extend past the acked region.
+                    const advance: usize = @intCast(r.end - self.send_acked);
+                    _ = self.send_buf.discard(advance);
+                    self.send_acked = r.end;
+                    self.sack_count -= 1;
+                    self.sack_ranges[i] = self.sack_ranges[self.sack_count];
+                    progress = true; // restart: new send_acked might unlock another range
+                } else {
+                    i += 1;
+                }
+            }
+        }
     }
 
     /// Return a peek of buffered send data starting at `offset`.
@@ -784,6 +833,69 @@ test "stream_send: getSendData returns 0 for already-acked offset" {
     try testing.expectEqual(@as(usize, 0), n);
 }
 
+test "stream_send: out-of-order onAcked (SACK) frees ring buffer when gap filled" {
+    // Simulates: pkt at offset 0 sent, then out-of-order ACK for offset 1200 arrives
+    // before ACK for offset 0. When offset 0 is finally acked, the ring buffer should
+    // advance through both ranges (0-1200 and 1200-2400) in one flush.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    // Buffer 2400 bytes (two 1200-byte chunks)
+    var data: [2400]u8 = undefined;
+    _ = s.bufferSendData(&data);
+    s.send_offset = 2400;
+
+    // Out-of-order: ACK for offset 1200 arrives first (gap at 0)
+    s.onAcked(1200, 1200);
+    try testing.expectEqual(@as(u64, 0), s.send_acked); // gap not filled yet
+    try testing.expectEqual(@as(usize, 1), s.sack_count); // stored in SACK buffer
+
+    // Now ACK for offset 0 arrives — fills the gap
+    s.onAcked(0, 1200);
+    // send_acked should advance through both ranges: 0→1200→2400
+    try testing.expectEqual(@as(u64, 2400), s.send_acked);
+    try testing.expectEqual(@as(usize, 0), s.sack_count); // SACK buffer drained
+    // Ring buffer should be fully freed (2400 bytes written, 2400 discarded)
+    try testing.expectEqual(@as(usize, STREAM_BUF_SIZE), s.send_buf.writable());
+}
+
+test "stream_send: multiple out-of-order SACK ranges resolved in one flush" {
+    // Three chunks: offsets 0, 1200, 2400. Chunks 1200 and 2400 acked before 0.
+    const testing = std.testing;
+    var s = Stream.init(0);
+    var data: [3600]u8 = undefined;
+    _ = s.bufferSendData(&data);
+    s.send_offset = 3600;
+
+    s.onAcked(1200, 1200); // out-of-order
+    s.onAcked(2400, 1200); // out-of-order
+    try testing.expectEqual(@as(u64, 0), s.send_acked);
+    try testing.expectEqual(@as(usize, 2), s.sack_count);
+
+    s.onAcked(0, 1200); // fills gap → cascades through 1200 and 2400
+    try testing.expectEqual(@as(u64, 3600), s.send_acked);
+    try testing.expectEqual(@as(usize, 0), s.sack_count);
+    // Ring buffer fully freed (3600 bytes written, 3600 discarded)
+    try testing.expectEqual(@as(usize, STREAM_BUF_SIZE), s.send_buf.writable());
+}
+
+test "stream_send: stale SACK ranges (before send_acked) are discarded" {
+    const testing = std.testing;
+    var s = Stream.init(0);
+    var data: [1200]u8 = undefined;
+    _ = s.bufferSendData(&data);
+    s.send_offset = 1200;
+
+    // Contiguous ACK advances send_acked to 1200
+    s.onAcked(0, 1200);
+    try testing.expectEqual(@as(u64, 1200), s.send_acked);
+
+    // Stale duplicate ACK for offset 0 (already past send_acked)
+    s.onAcked(0, 1200);
+    // Should not corrupt state or double-free
+    try testing.expectEqual(@as(u64, 1200), s.send_acked);
+    try testing.expectEqual(@as(usize, 0), s.sack_count);
+}
+
 test "stream_send: send_fin and fin_acked flags" {
     const testing = std.testing;
     var s = Stream.init(0);
@@ -1069,15 +1181,21 @@ test "stream: canSend returns false when window exhausted" {
     try testing.expect(!s.canSend(STREAM_BUF_SIZE + 1));
 }
 
-test "stream: onAcked with non-consecutive offset is a no-op" {
+test "stream: onAcked with non-consecutive offset buffers for later" {
     const testing = std.testing;
     var s = Stream.init(0);
     const data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     _ = s.bufferSendData(&data);
     s.onSent(data.len);
-    // send_acked = 0, send_offset = 8; ack for offset=4 (non-consecutive) → no-op
+    // send_acked = 0, send_offset = 8; ack for offset=4 (non-consecutive)
+    // New behavior: store in SACK buffer, don't advance send_acked yet.
     s.onAcked(4, 4);
-    try testing.expectEqual(@as(u64, 0), s.send_acked); // must not advance
+    try testing.expectEqual(@as(u64, 0), s.send_acked); // not contiguous, deferred
+    try testing.expectEqual(@as(usize, 1), s.sack_count); // buffered in SACK
+    // When offset=0 is acked, both ranges drain
+    s.onAcked(0, 4);
+    try testing.expectEqual(@as(u64, 8), s.send_acked); // cascades through saved range
+    try testing.expectEqual(@as(usize, 0), s.sack_count);
 }
 
 // ---------------------------------------------------------------------------

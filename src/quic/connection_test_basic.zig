@@ -431,6 +431,46 @@ test "retransmit: acked FIN on closed stream triggers stream reclamation" {
     try testing.expectEqual(@as(?*stream_mod.Stream, null), conn.streams.get(4));
 }
 
+test "retransmit: lost data retransmitted before FIN ACK frees stream" {
+    // Regression: when a data packet is lost and the FIN is ACKed in the same ACK
+    // processing round, processLostFrames must run BEFORE processAckedFrames so that
+    // the stream slot is still alive during the retransmission attempt. Without this
+    // ordering, processAckedFrames would free the slot (on FIN ACK) and processLostFrames
+    // would silently drop the retransmit, leaving the peer's stream incomplete.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+
+    const st = conn.streams.getOrCreate(4).?;
+    st.state = .closed;
+    _ = st.bufferSendData("hi"); // 2 bytes at offset 0 (unsent/lost)
+    st.send_offset = 2;
+
+    // Build a combined result: lost data frame + acked FIN frame (same ACK round).
+    var result = loss_recovery_mod.AckResult{};
+    // Lost: data at offset 0
+    var lost_fi = loss_recovery_mod.SentFrameInfo{};
+    lost_fi.frames[0] = .{ .stream = .{ .stream_id = 4, .offset = 0, .len = 2, .fin = false } };
+    lost_fi.count = 1;
+    result.lost_frames[0] = lost_fi;
+    result.lost_frame_count = 1;
+    // Acked: FIN at offset 2
+    var acked_fi = loss_recovery_mod.SentFrameInfo{};
+    acked_fi.frames[0] = .{ .stream = .{ .stream_id = 4, .offset = 2, .len = 0, .fin = true } };
+    acked_fi.count = 1;
+    result.acked_frames[0] = acked_fi;
+    result.acked_frame_count = 1;
+
+    // Step 1: processLostFrames must see the stream (app_keys==null so retransmit
+    // silently no-ops, but the lookup must succeed — stream must not be freed yet).
+    conn.processLostFrames(result);
+    try testing.expect(conn.streams.get(4) != null); // stream still alive
+
+    // Step 2: processAckedFrames frees the stream on FIN ACK (state == .closed).
+    conn.processAckedFrames(result);
+    try testing.expectEqual(@as(?*stream_mod.Stream, null), conn.streams.get(4));
+}
+
 test "retransmit: lost HANDSHAKE_DONE sets pending_handshake_done flag" {
     const testing = std.testing;
     const io = std.testing.io;

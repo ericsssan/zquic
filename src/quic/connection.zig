@@ -51,7 +51,7 @@ pub const SocketAddr = union(enum(u1)) {
 // Event queue
 // ---------------------------------------------------------------------------
 
-pub const EVENT_QUEUE_DEPTH = 16;
+pub const EVENT_QUEUE_DEPTH = 256;
 
 pub const Event = union(enum) {
     stream_data: struct { stream_id: u62 },
@@ -126,7 +126,7 @@ pub const ConnectionHot = struct {
 
 pub const MAX_PACKET_SIZE = 1500; // Maximum received packet size (standard MTU)
 pub const MAX_SEND_PACKET_SIZE = 1452; // Maximum packet size for sending (UDP datagram limit)
-pub const SEND_QUEUE_DEPTH = 16;
+pub const SEND_QUEUE_DEPTH = 64;
 
 /// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
 const CRYPTO_STAGE_DEPTH = 8;
@@ -255,6 +255,9 @@ pub fn Connection(comptime max_streams: usize) type {
         pto_deadline_ns: ?i64,
         /// Deadline for transitioning out of closing/draining state.
         drain_deadline_ns: ?i64,
+        /// RFC 9002 §6.1.2 time-threshold loss detection alarm.
+        /// Fires when unacked packets behind largest_acked have aged past the time threshold.
+        time_loss_alarm_ns: ?i64,
 
         // Stats
         bytes_sent: u64,
@@ -287,6 +290,10 @@ pub fn Connection(comptime max_streams: usize) type {
         // Initialized from TransportParams defaults; must match what we advertise in TLS.
         local_max_streams_bidi: u62,
         local_max_streams_uni: u62,
+
+        // Pending MAX_STREAMS frames to send when slots become available (RFC 9000 §4.6)
+        pending_max_streams_bidi: ?u62 = null,
+        pending_max_streams_uni: ?u62 = null,
 
         // Per-stream flow control limits advertised by the peer (RFC 9000 §7.3, §18.2).
         // initial_max_stream_data_bidi_local: the peer's send limit on bidi streams they initiate
@@ -479,6 +486,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .idle_deadline_ns = null,
                 .pto_deadline_ns = null,
                 .drain_deadline_ns = null,
+                .time_loss_alarm_ns = null,
                 .bytes_sent = 0,
                 .bytes_recv = 0,
                 .pkts_sent = 0,
@@ -623,7 +631,8 @@ pub fn Connection(comptime max_streams: usize) type {
             const idle = self.idle_deadline_ns orelse std.math.maxInt(i64);
             const pto = self.pto_deadline_ns orelse std.math.maxInt(i64);
             const drain = self.drain_deadline_ns orelse std.math.maxInt(i64);
-            const m = @min(@min(idle, pto), drain);
+            const tl = self.time_loss_alarm_ns orelse std.math.maxInt(i64);
+            const m = @min(@min(@min(idle, pto), drain), tl);
             return if (m == std.math.maxInt(i64)) null else m;
         }
 
@@ -656,8 +665,13 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (now_ns >= d) {
                         self.loss.onPtoFired();
                         if (self.app_keys != null) {
-                            // Post-handshake: send a 1-RTT PING probe.
-                            self.queuePing() catch {};
+                            // Post-handshake: retransmit PATH_CHALLENGE if pending (RFC 9000 §9.2),
+                            // otherwise send a 1-RTT PING probe.
+                            if (self.pending_path_challenge) |challenge| {
+                                self.sendPathChallenge(challenge) catch {};
+                            } else {
+                                self.queuePing() catch {};
+                            }
                         } else {
                             // During handshake: retransmit CRYPTO data (RFC 9002 §6.2.4).
                             // The client may not have received our Handshake flight; resend it.
@@ -665,6 +679,39 @@ pub fn Connection(comptime max_streams: usize) type {
                             self.retransmitCryptoSaved(1);
                         }
                         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                    }
+                }
+            }
+
+            // Time-threshold loss alarm (RFC 9002 §6.1.2): fire when unacked packets
+            // behind largest_acked have aged past 9/8×RTT, without waiting for PTO.
+            if (self.hot.state != .closing and
+                self.hot.state != .draining and
+                self.hot.state != .closed)
+            {
+                if (self.time_loss_alarm_ns) |tl| {
+                    if (now_ns >= tl) {
+                        self.time_loss_alarm_ns = null;
+                        const tns = self.loss.timeThresholdNs();
+                        var tl_result = loss_recovery_mod.AckResult{};
+                        for (0..3) |epoch_idx| {
+                            const la = self.loss.largest_acked[epoch_idx];
+                            if (la == 0) continue;
+                            self.loss.sent.detectLoss(
+                                la,
+                                tns,
+                                now_ns,
+                                @intCast(epoch_idx),
+                                &tl_result,
+                                &self.loss.bytes_in_flight,
+                            );
+                        }
+                        if (tl_result.newly_lost > 0) {
+                            self.congestion.onPacketLost(now_ns);
+                            self.processLostFrames(tl_result);
+                        }
+                        // Reschedule if there are still candidates.
+                        self.time_loss_alarm_ns = self.loss.timeLossAlarmNs(self.cached_max_ack_delay_ns);
                     }
                 }
             }
@@ -730,11 +777,23 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Buffer stream data for sending and queue a packet.
         pub fn streamSend(self: *Self, stream_id: u62, data: []const u8, fin: bool) !void {
             const st = self.streams.getOrCreate(stream_id) orelse return error.TooManyStreams;
-            if (!st.canSend(@intCast(data.len))) return error.StreamNotWritable;
+            if (!st.canSend(@intCast(data.len))) {
+                // RFC 9000 §19.13 SHOULD: signal peer to increase the flow control window.
+                if (self.hot.state == .established) {
+                    self.queueStreamDataBlocked(stream_id, @intCast(st.send_max)) catch {};
+                }
+                return error.StreamNotWritable;
+            }
             // Check buffer capacity before any mutation so the operation is all-or-nothing.
             if (st.sendBufferFree() < data.len) return error.BufferFull;
-            if (fin) st.send_fin = true;
             if (self.hot.state == .established) {
+                // Congestion window gate for new sends only (RFC 9002 §7).
+                // Retransmissions (processLostFrames) bypass this check so loss recovery
+                // is never blocked by a temporarily-reduced cwnd after a loss event.
+                // Estimate packet size as data.len + 64 bytes of header/AEAD overhead.
+                if (self.loss.bytes_in_flight + data.len + 64 > self.congestion.cwnd) {
+                    return error.CongestionWindowFull;
+                }
                 try self.queueStreamData(stream_id, data, fin);
             }
         }
@@ -1642,8 +1701,10 @@ pub fn Connection(comptime max_streams: usize) type {
                 range_count += 1;
                 if (i + 1 < ack.range_count) {
                     const gap_val = @as(u64, ack.ranges[i + 1].gap);
-                    if (low == 0 or gap_val >= low) return error.InvalidFrame; // malformed: would underflow
-                    high = low - 1 - gap_val;
+                    // RFC 9000 §19.3.1: Gap field = (unacked_count - 1), so:
+                    // next_high = prev_low - 1 - (gap_val + 1) = prev_low - 2 - gap_val
+                    if (low < gap_val + 2) return error.InvalidFrame; // malformed: would underflow
+                    high = low - 2 - gap_val;
                 }
             }
 
@@ -1710,12 +1771,16 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
 
-            // Process acked / lost frames for retransmission.
-            self.processAckedFrames(result);
+            // Process lost frames before acked frames: retransmit while streams are
+            // still alive, then close streams whose FIN was acknowledged. Without this
+            // ordering, processAckedFrames would free a stream slot (on FIN ACK) before
+            // processLostFrames could retransmit an earlier lost data packet for that stream.
             self.processLostFrames(result);
+            self.processAckedFrames(result);
 
-            // Refresh PTO timer after any ACK
+            // Refresh PTO timer and time-loss alarm after any ACK.
             self.pto_deadline_ns = self.loss.ptoDeadline(max_ack_delay_ns);
+            self.time_loss_alarm_ns = self.loss.timeLossAlarmNs(max_ack_delay_ns);
         }
 
         // -----------------------------------------------------------------------
@@ -1733,6 +1798,15 @@ pub fn Connection(comptime max_streams: usize) type {
                                     st.fin_acked = true;
                                     if (st.state == .closed) {
                                         self.streams.close(s.stream_id);
+                                        // Increment local stream limit as slots become available (RFC 9000 §4.6)
+                                        const is_bidi = (s.stream_id & 2) == 0;
+                                        if (is_bidi) {
+                                            self.local_max_streams_bidi +|= 1;
+                                            self.pending_max_streams_bidi = self.local_max_streams_bidi;
+                                        } else {
+                                            self.local_max_streams_uni +|= 1;
+                                            self.pending_max_streams_uni = self.local_max_streams_uni;
+                                        }
                                     }
                                 }
                             }
@@ -1744,14 +1818,18 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         pub fn processLostFrames(self: *Self, result: loss_recovery_mod.AckResult) void {
-            // Declared once outside the loop; reused for each retransmitted stream frame.
-            var stream_retx_buf: [MAX_PACKET_SIZE]u8 = undefined;
+            // Sized to MAX_SEND_PACKET_SIZE so getSendData never returns more bytes than
+            // encryptAndEnqueueStreamFrame can encode into pkt_scratch without overflow.
+            var stream_retx_buf: [MAX_SEND_PACKET_SIZE]u8 = undefined;
             for (result.lost_frames[0..result.lost_frame_count]) |fi| {
                 for (fi.frames[0..fi.count]) |frame_info| {
                     switch (frame_info) {
                         .stream => |s| {
                             if (self.streams.get(s.stream_id)) |st| {
-                                const n = st.getSendData(s.offset, &stream_retx_buf);
+                                // Cap read to the original frame length to avoid encoding
+                                // more than was originally sent (getSendData may return
+                                // adjacent buffered data beyond the lost frame boundary).
+                                const n = @min(st.getSendData(s.offset, &stream_retx_buf), s.len);
                                 if (n > 0 or s.fin) {
                                     self.encryptAndEnqueueStreamFrame(
                                         s.stream_id,
@@ -1767,6 +1845,12 @@ pub fn Connection(comptime max_streams: usize) type {
                         },
                         .max_data => {
                             self.pending_max_data = true;
+                        },
+                        .max_streams_bidi => |max_bidi| {
+                            self.pending_max_streams_bidi = max_bidi;
+                        },
+                        .max_streams_uni => |max_uni| {
+                            self.pending_max_streams_uni = max_uni;
                         },
                         .ping => {
                             self.queuePing() catch {};
@@ -2374,6 +2458,13 @@ pub fn Connection(comptime max_streams: usize) type {
             // and advance the send offset.
             _ = st.bufferSendData(data);
             st.onSent(data.len);
+            // Transition stream state after successful FIN enqueue — only on first call,
+            // not during retransmission (processLostFrames calls encryptAndEnqueueStreamFrame
+            // directly and must not re-trigger the state transition).
+            if (fin and !st.send_fin) {
+                st.send_fin = true;
+                st.sendFin();
+            }
         }
 
         /// Encrypt and enqueue the pre-serialized CONNECTION_CLOSE frame.
@@ -2567,6 +2658,31 @@ pub fn Connection(comptime max_streams: usize) type {
             self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
         }
 
+        /// Queue a STREAM_DATA_BLOCKED frame (RFC 9000 §19.13) for the given stream.
+        /// Sent when the sender is blocked by flow control at `max` bytes.
+        fn queueStreamDataBlocked(self: *Self, stream_id: u62, max: u62) !void {
+            if (self.app_keys == null) return;
+            const ak = self.app_keys.?;
+
+            var fpos: usize = 0;
+            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream_data_blocked = .{
+                .stream_id = stream_id,
+                .max = max,
+            } });
+
+            const pn = self.hot.tx_pn[2];
+            self.hot.tx_pn[2] += 1;
+
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
+            const ct_len = fpos + 16;
+            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
+            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(ak.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+            const out_len = hdr_len + ct_len;
+            try self.enqueueSend(self.enc_scratch[0..out_len]);
+            // STREAM_DATA_BLOCKED is informational; not tracked for loss recovery.
+        }
+
         /// Scan all streams and send MAX_STREAM_DATA frames for any whose recv window grew.
         fn flushPendingMaxStreamData(self: *Self) void {
             for (0..max_streams) |i| {
@@ -2606,6 +2722,36 @@ pub fn Connection(comptime max_streams: usize) type {
                     fi.count += 1;
                 }
                 has_ack_eliciting = true;
+            }
+
+            // 1b. Pending MAX_STREAMS_BIDI frame
+            if (self.pending_max_streams_bidi) |max_bidi| {
+                self.pending_max_streams_bidi = null;
+                const f_frame: frame.Frame = .{ .max_streams_bidi = max_bidi };
+                const encoded_len = frame.encodeFrame(self.pkt_scratch[fpos..], f_frame);
+                if (fpos + encoded_len <= frame_budget) {
+                    fpos += encoded_len;
+                    if (fi.count < loss_recovery_mod.MAX_FRAMES_PER_PACKET) {
+                        fi.frames[fi.count] = .{ .max_streams_bidi = max_bidi };
+                        fi.count += 1;
+                    }
+                    has_ack_eliciting = true;
+                }
+            }
+
+            // 1c. Pending MAX_STREAMS_UNI frame
+            if (self.pending_max_streams_uni) |max_uni| {
+                self.pending_max_streams_uni = null;
+                const f_frame: frame.Frame = .{ .max_streams_uni = max_uni };
+                const encoded_len = frame.encodeFrame(self.pkt_scratch[fpos..], f_frame);
+                if (fpos + encoded_len <= frame_budget) {
+                    fpos += encoded_len;
+                    if (fi.count < loss_recovery_mod.MAX_FRAMES_PER_PACKET) {
+                        fi.frames[fi.count] = .{ .max_streams_uni = max_uni };
+                        fi.count += 1;
+                    }
+                    has_ack_eliciting = true;
+                }
             }
 
             // 2. Pending MAX_STREAM_DATA frames (not tracked for retransmission;
@@ -2711,9 +2857,10 @@ pub fn Connection(comptime max_streams: usize) type {
         fn onPathMigration(self: *Self, new_addr: SocketAddr, io: std.Io) !void {
             // RFC 9000 §9.4: reset congestion controller on path change.
             self.congestion = cubic_mod.Cubic.init();
-            // Do NOT re-arm amplification limit: peer is already authenticated (handshake complete).
-            // Amplification limit is only for preventing DDoS during initial handshake, not for
-            // post-handshake path migrations. RFC 9000 §9.4 only requires resetting congestion control.
+            // RFC 9000 §9.4: reset amplification limit for the new path (separate from old path tracking).
+            // Each path must independently satisfy the 3x amplification limit until validated.
+            self.bytes_unvalidated_recv = 0;
+            self.bytes_unvalidated_sent = 0;
             // Immediately adopt new address (RFC 9000 §9.3.1).
             self.peer_addr = new_addr;
             // RFC 9000 §9.3: reset path validation on migration — must re-validate new path.

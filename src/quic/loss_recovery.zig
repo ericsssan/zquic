@@ -19,7 +19,12 @@ pub const K_GRANULARITY_NS: u64 = 1_000_000; // 1ms minimum timer granularity
 pub const K_INITIAL_RTT_NS: u64 = 333_000_000; // 333ms per §5.3
 pub const MAX_SENT: usize = 256; // Ring buffer capacity
 pub const MAX_FRAMES_PER_PACKET: usize = 4;
-pub const MAX_LOSS_EVENTS: usize = 16;
+// Per-ACK capacity for acked/lost frame tracking.
+// Lost frames: detectLoss defers packets that don't fit to the next alarm round
+// (see detectLoss — skips eviction instead of silently dropping retransmit info).
+// Acked frames: each ACK typically covers only a few newly-acked packets in
+// practice, so 64 is sufficient for acked_frames.
+pub const MAX_LOSS_EVENTS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // FrameInfo — per-frame metadata for retransmission
@@ -35,6 +40,8 @@ pub const FrameInfo = union(enum) {
     handshake_done,
     max_data: u62,
     max_stream_data: struct { stream_id: u62, max_data: u62 },
+    max_streams_bidi: u62,
+    max_streams_uni: u62,
     reset_stream: struct { stream_id: u62, error_code: u62, final_size: u62 },
     connection_close,
 };
@@ -245,6 +252,10 @@ pub const SentPacketTable = struct {
             const time_threshold_lost = elapsed >= time_threshold_ns;
 
             if (pkt_threshold_lost or time_threshold_lost) {
+                // If the retransmit buffer is full, leave this packet in the sent
+                // table so the next PTO or time-loss alarm re-detects and retransmits
+                // it. Evicting without retransmitting would permanently lose the data.
+                if (result.lost_frame_count >= MAX_LOSS_EVENTS) continue;
                 slot.valid = false;
                 if (epoch < 3) self.valid_per_epoch[epoch] -|= 1;
                 result.newly_lost += 1;
@@ -252,10 +263,8 @@ pub const SentPacketTable = struct {
                 if (slot.in_flight) {
                     bif.* -|= slot.size;
                 }
-                if (result.lost_frame_count < MAX_LOSS_EVENTS) {
-                    result.lost_frames[result.lost_frame_count] = self.frame_info[idx];
-                    result.lost_frame_count += 1;
-                }
+                result.lost_frames[result.lost_frame_count] = self.frame_info[idx];
+                result.lost_frame_count += 1;
                 // Track earliest/latest sent_ns for persistent congestion detection.
                 if (slot.ack_eliciting) {
                     if (result.earliest_lost_sent_ns == null or slot.sent_ns < result.earliest_lost_sent_ns.?) {
@@ -267,6 +276,33 @@ pub const SentPacketTable = struct {
                 }
             }
         }
+    }
+
+    /// Return the earliest alarm time at which time-threshold loss detection could
+    /// fire for unacked packets in `epoch` that have pn < largest_acked.
+    /// Returns null if no such packets exist in the table.
+    pub fn earliestTimeLossNs(
+        self: *const SentPacketTable,
+        largest_acked: u64,
+        time_threshold_ns: u64,
+        epoch: u8,
+    ) ?i64 {
+        const to_find: u16 = if (epoch < 3) self.valid_per_epoch[epoch] else 0;
+        if (to_find == 0) return null;
+        var found: u16 = 0;
+        var earliest: ?i64 = null;
+        const tns_capped: i64 = @intCast(@min(time_threshold_ns, @as(u64, std.math.maxInt(i64))));
+        for (self.slots) |slot| {
+            if (found >= to_find) break;
+            if (!slot.valid or slot.epoch != epoch) continue;
+            found += 1;
+            // Only packets behind largest_acked are candidates for time-threshold loss.
+            if (slot.pn < largest_acked) {
+                const alarm = slot.sent_ns +| tns_capped;
+                if (earliest == null or alarm < earliest.?) earliest = alarm;
+            }
+        }
+        return earliest;
     }
 
     /// Return the sent_ns of the in-flight ack-eliciting packet with the highest pn,
@@ -444,6 +480,33 @@ pub const LossRecovery = struct {
         const max_i64: u64 = @as(u64, std.math.maxInt(i64));
         const clamped: i64 = @intCast(@min(backoff, max_i64));
         return base_ns +| clamped;
+    }
+
+    /// Compute the time threshold (RFC 9002 §6.1.2): max(9/8 × max(srtt, latest_rtt), kGranularity).
+    pub fn timeThresholdNs(self: *const LossRecovery) u64 {
+        const max_rtt = @max(self.rtt.smoothed_rtt, self.rtt.latest_rtt);
+        return @max(
+            (max_rtt * K_TIME_THRESHOLD_NUM + K_TIME_THRESHOLD_DEN - 1) / K_TIME_THRESHOLD_DEN,
+            K_GRANULARITY_NS,
+        );
+    }
+
+    /// Earliest deadline at which the time-threshold loss alarm should fire across all epochs.
+    /// Returns null if no alarm is needed (no unacked packets behind largest_acked).
+    ///
+    /// We add max_ack_delay_ns to the deadline so the alarm does not fire before delayed
+    /// ACKs can arrive.  The peer may delay ACKs by up to max_ack_delay; firing before
+    /// that window closes causes spurious retransmissions that waste NS-3 queue budget.
+    pub fn timeLossAlarmNs(self: *const LossRecovery, max_ack_delay_ns: u64) ?i64 {
+        const tns = self.timeThresholdNs() + max_ack_delay_ns;
+        var earliest: ?i64 = null;
+        for (0..3) |epoch_idx| {
+            const la = self.largest_acked[epoch_idx];
+            if (la == 0) continue;
+            const alarm = self.sent.earliestTimeLossNs(la, tns, @intCast(epoch_idx)) orelse continue;
+            if (earliest == null or alarm < earliest.?) earliest = alarm;
+        }
+        return earliest;
     }
 
     pub fn onPtoFired(self: *LossRecovery) void {
@@ -825,9 +888,12 @@ test "frame_info: MAX_LOSS_EVENTS caps lost_frames output" {
     const ranges = [_]AckedRange{.{ .low = top_pn, .high = top_pn }};
     const result = lr.onAckReceived(top_pn, 0, &ranges, 0, 0, 25_000_000);
 
-    // lost_frame_count capped at MAX_LOSS_EVENTS, newly_lost exceeds it
+    // lost_frame_count and newly_lost are both capped at MAX_LOSS_EVENTS.
+    // The one packet that doesn't fit is deferred (kept valid) for the next alarm round.
     try testing.expectEqual(@as(usize, MAX_LOSS_EVENTS), result.lost_frame_count);
-    try testing.expect(result.newly_lost > @as(u32, MAX_LOSS_EVENTS));
+    try testing.expectEqual(@as(u32, MAX_LOSS_EVENTS), result.newly_lost);
+    // Packets beyond the buffer are kept valid (deferred), so valid_per_epoch > 0.
+    try testing.expect(lr.sent.valid_per_epoch[0] > 0);
 }
 
 test "sent_table: power-of-two slot collision evicts correctly" {
@@ -1094,4 +1160,75 @@ test "loss_recovery: detectLoss partial in-flight decrement" {
 
     // 200 - 50 = 150 (normal subtraction, no underflow)
     try testing.expectEqual(@as(u64, 150), bif);
+}
+
+// ---------------------------------------------------------------------------
+// Time-threshold loss alarm tests (RFC 9002 §6.1.2)
+// ---------------------------------------------------------------------------
+
+test "time_loss_alarm: earliestTimeLossNs returns null when no unacked packets behind largest_acked" {
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    // Packet with pn=5, largest_acked=3 — pn is AHEAD of largest_acked, not behind it.
+    _ = table.add(.{ .pn = 5, .sent_ns = 0, .size = 100, .epoch = 2, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+
+    const alarm = table.earliestTimeLossNs(3, 50_000_000, 2);
+    try testing.expectEqual(@as(?i64, null), alarm);
+}
+
+test "time_loss_alarm: earliestTimeLossNs returns sent_ns + time_threshold for packet behind largest_acked" {
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    // pn=2 sent at t=100ms, largest_acked=5, time_threshold=50ms → alarm at 150ms
+    _ = table.add(.{ .pn = 2, .sent_ns = 100_000_000, .size = 100, .epoch = 2, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+
+    const alarm = table.earliestTimeLossNs(5, 50_000_000, 2);
+    try testing.expectEqual(@as(?i64, 150_000_000), alarm);
+}
+
+test "time_loss_alarm: earliestTimeLossNs returns minimum across multiple candidates" {
+    const testing = std.testing;
+    var table = SentPacketTable.init();
+
+    // pn=1 sent at t=0, pn=2 sent at t=50ms — both behind largest_acked=10.
+    // Alarm for pn=1 fires at 0 + 40ms = 40ms (earlier).
+    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 2, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = 2, .sent_ns = 50_000_000, .size = 100, .epoch = 2, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+
+    const alarm = table.earliestTimeLossNs(10, 40_000_000, 2);
+    try testing.expectEqual(@as(?i64, 40_000_000), alarm); // pn=1: 0 + 40ms = 40ms
+}
+
+test "time_loss_alarm: timeLossAlarmNs returns null when largest_acked is 0 in all epochs" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // No packets have been acked yet → largest_acked = 0 for all epochs
+    lr.onPacketSent(1, 2, 100, true, 0, .{});
+    try testing.expectEqual(@as(?i64, null), lr.timeLossAlarmNs(25_000_000));
+}
+
+test "time_loss_alarm: timeLossAlarmNs fires after time threshold + max_ack_delay when packet is behind largest_acked" {
+    const testing = std.testing;
+    var lr = LossRecovery.init();
+
+    // Send pn=1 at t=0, pn=2 at t=0 (epoch 2).
+    // ACK pn=2 at t=40ms: RTT sample = 40ms.
+    // pn=1 packet threshold check: 1+3=4 > 2 → NOT lost by pkt threshold.
+    // time_threshold ≈ 9/8 × 40ms = 45ms; max_ack_delay = 25ms.
+    // Alarm fires at 0 + 45ms + 25ms = 70ms.
+    lr.onPacketSent(1, 2, 100, true, 0, .{});
+    lr.onPacketSent(2, 2, 100, true, 0, .{});
+
+    const ranges = [_]AckedRange{.{ .low = 2, .high = 2 }};
+    _ = lr.onAckReceived(2, 0, &ranges, 2, 40_000_000, 25_000_000);
+
+    // pn=1 should still be in the table (not lost yet)
+    const alarm = lr.timeLossAlarmNs(25_000_000);
+    try testing.expect(alarm != null);
+    // Alarm = sent_ns(0) + time_threshold(~45ms) + max_ack_delay(25ms) ≈ 70ms
+    try testing.expect(alarm.? >= 65_000_000); // at least 65ms
+    try testing.expect(alarm.? <= 85_000_000); // at most 85ms
 }

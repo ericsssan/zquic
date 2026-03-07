@@ -112,7 +112,7 @@ pub const TlsServer = struct {
     // Our signing key (Ed25519 or P-256 ECDSA depending on certificate)
     sign_key: SignKey,
     // DER-encoded certificate (self-signed or external)
-    cert_buf: [4096]u8,
+    cert_buf: [16384]u8,
     cert_len: usize,
 
     // Handshake transcript hash state
