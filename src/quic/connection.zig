@@ -1034,7 +1034,9 @@ pub fn Connection(comptime max_streams: usize) type {
                             if (copy_len > 0) @memcpy(rs.bytes[0..copy_len], raw_dcid[0..copy_len]);
                             self.retry_scid = rs;
                         } else {
-                            return error.InvalidToken;
+                            // RFC 9000 §8.1.3: "A server MUST drop any Initial packet that
+                            // does not contain a valid token." Silent drop — do not error.
+                            return result.consumed;
                         }
                     }
 
@@ -1303,6 +1305,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 const code: u62 = switch (err) {
                     error.FlowControlViolation => 0x03,
                     error.StreamLimitError => 0x04,
+                    error.StreamStateError => 0x05, // RFC 9000 §20.1 STREAM_STATE_ERROR
                     error.FrameEncodingError => 0x07,
                     else => 0x0a, // PROTOCOL_VIOLATION
                 };
@@ -1406,16 +1409,16 @@ pub fn Connection(comptime max_streams: usize) type {
                     },
                     .reset_stream => |rs| {
                         if (self.streams.get(rs.stream_id)) |st| {
-                            const prev_recv = st.recv_offset;
-                            st.onResetReceived(rs.error_code, rs.final_size) catch {};
                             // RFC 9000 §4.5: bytes promised by the sender (up to final_size)
                             // must be charged against the connection-level flow control window
-                            // even if they were never received.  Bytes already received via
-                            // STREAM frames were charged in processStreamFrame; only the gap
-                            // between what we received and the stream's final_size is new.
+                            // even if they were never received.  STREAM frames already charged
+                            // processStreamFrame via highest_recv_offset; only charge the delta
+                            // from the highest offset we've seen to the stream's final_size.
+                            const prev_hwm = st.highest_recv_offset;
+                            st.onResetReceived(rs.error_code, rs.final_size) catch {};
                             const final: u64 = rs.final_size;
-                            if (final > prev_recv) {
-                                self.conn_flow.onReceived(final - prev_recv);
+                            if (final > prev_hwm) {
+                                self.conn_flow.onReceived(final - prev_hwm);
                             }
                         }
                         self.events.push(.{ .stream_reset = .{
@@ -1657,9 +1660,15 @@ pub fn Connection(comptime max_streams: usize) type {
                 // Client-initiated unidirectional (type bits = 0b10)
                 if (stream_num >= self.local_max_streams_uni) return error.StreamLimitError;
             }
-            // RFC 9000 §4.1: reject data that would exceed the connection receive window.
-            if (!self.conn_flow.canReceive(@intCast(f.data.len))) return error.FlowControlViolation;
-            const is_new = self.streams.get(f.stream_id) == null;
+            // RFC 9000 §4.1: connection-level flow control tracks the sum of per-stream
+            // high-water marks, not raw bytes per frame. Only charge for bytes that advance
+            // the stream's highest received offset (retransmissions cost nothing).
+            const new_end = std.math.add(u64, f.offset, f.data.len) catch return error.OffsetOverflow;
+            const existing_st = self.streams.get(f.stream_id);
+            const old_hwm: u64 = if (existing_st) |est| est.highest_recv_offset else 0;
+            const fc_delta: u64 = if (new_end > old_hwm) new_end - old_hwm else 0;
+            if (!self.conn_flow.canReceive(fc_delta)) return error.FlowControlViolation;
+            const is_new = existing_st == null;
             const st = self.streams.getOrCreate(f.stream_id) orelse return error.TooManyStreams;
             // Apply the peer's per-stream send limit on first access (RFC 9000 §7.3).
             // Stream.init() defaults send_max to STREAM_BUF_SIZE; override with the negotiated value
@@ -1672,7 +1681,8 @@ pub fn Connection(comptime max_streams: usize) type {
             // Charging before receiveData would permanently shrink recv_total on failure
             // (e.g., FinalSizeError, BufferFull, stream-level FlowControlViolation).
             try st.receiveData(f.offset, f.data, f.fin);
-            self.conn_flow.onReceived(@intCast(f.data.len));
+            self.conn_flow.onReceived(fc_delta);
+            if (new_end > old_hwm) st.highest_recv_offset = new_end;
             // Grow connection receive window when 75% consumed (RFC 9000 §4.2).
             if (self.conn_flow.shouldSendMaxData()) {
                 self.conn_flow.recv_max = self.conn_flow.nextMaxData();
@@ -2586,15 +2596,13 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Process a NEW_CONNECTION_ID frame: store the CID and retire entries below retire_prior_to.
         /// Security: Validate sequence number is monotonic and not excessively large (DoS defense).
         pub fn processNewConnectionId(self: *Self, ncid: frame.NewConnectionIdFrame) void {
-            // RFC 9000: Sequence number must be >= retire_prior_to (don't store already-retired CIDs).
+            // RFC 9000 §19.15: reject CIDs that are already retired.
             if (ncid.sequence_number < self.peer_cid_retire_prior) return;
-
-            // Security: Sequence number must be >= previously seen max (monotonic constraint).
-            // Prevents probing attacks where attacker sends decreasing sequence numbers.
-            if (ncid.sequence_number < self.peer_cid_highest_seq) return;
 
             // Security: Sequence number must not exceed current_max + 1000 (DoS defense).
             // This prevents attacker from causing unbounded sequence space exploration.
+            // Note: we do NOT reject seq < peer_cid_highest_seq because frames may arrive
+            // out-of-order; RFC 9000 only requires rejection when seq < retire_prior_to.
             const max_allowed_seq = self.peer_cid_highest_seq +| 1000;
             if (ncid.sequence_number > max_allowed_seq) return;
 
@@ -2707,7 +2715,10 @@ pub fn Connection(comptime max_streams: usize) type {
             const ak = self.app_keys.?;
 
             // Leave room for Short Header (~13 bytes) + AEAD tag (16 bytes).
-            const frame_budget = MAX_PACKET_SIZE - 30;
+            // Use MAX_SEND_PACKET_SIZE (not MAX_PACKET_SIZE) since pkt_scratch is
+            // sized to MAX_SEND_PACKET_SIZE; using the larger incoming value would
+            // allow fpos to exceed the scratch buffer bounds.
+            const frame_budget = MAX_SEND_PACKET_SIZE - 30;
             var fpos: usize = 0;
             var fi = loss_recovery_mod.SentFrameInfo{};
             var has_ack_eliciting = false;
@@ -2726,11 +2737,11 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // 1b. Pending MAX_STREAMS_BIDI frame
             if (self.pending_max_streams_bidi) |max_bidi| {
-                self.pending_max_streams_bidi = null;
                 const f_frame: frame.Frame = .{ .max_streams_bidi = max_bidi };
                 const encoded_len = frame.encodeFrame(self.pkt_scratch[fpos..], f_frame);
                 if (fpos + encoded_len <= frame_budget) {
                     fpos += encoded_len;
+                    self.pending_max_streams_bidi = null;
                     if (fi.count < loss_recovery_mod.MAX_FRAMES_PER_PACKET) {
                         fi.frames[fi.count] = .{ .max_streams_bidi = max_bidi };
                         fi.count += 1;
@@ -2741,11 +2752,11 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // 1c. Pending MAX_STREAMS_UNI frame
             if (self.pending_max_streams_uni) |max_uni| {
-                self.pending_max_streams_uni = null;
                 const f_frame: frame.Frame = .{ .max_streams_uni = max_uni };
                 const encoded_len = frame.encodeFrame(self.pkt_scratch[fpos..], f_frame);
                 if (fpos + encoded_len <= frame_budget) {
                     fpos += encoded_len;
+                    self.pending_max_streams_uni = null;
                     if (fi.count < loss_recovery_mod.MAX_FRAMES_PER_PACKET) {
                         fi.frames[fi.count] = .{ .max_streams_uni = max_uni };
                         fi.count += 1;

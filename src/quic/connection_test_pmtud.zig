@@ -813,7 +813,7 @@ test "retry: validate_addr=true, valid token: original_dcid stored, handshake pr
     try testing.expect(!got_retry);
 }
 
-test "retry: validate_addr=true, expired token: error.InvalidToken" {
+test "retry: validate_addr=true, expired token: silent drop (RFC 9000 §8.1.3)" {
     const testing = std.testing;
     const io = std.testing.io;
     const secret = [_]u8{0xCD} ** 32;
@@ -834,10 +834,15 @@ test "retry: validate_addr=true, expired token: error.InvalidToken" {
 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
-    try testing.expectError(error.InvalidToken, conn.receive(buf[0..r.pkt_len], src, now_ns, io));
+    // RFC 9000 §8.1.3: MUST silently drop — no error, connection not established.
+    try conn.receive(buf[0..r.pkt_len], src, now_ns, io);
+    // original_dcid must be null — token was rejected, handshake was not accepted.
+    // app_keys must be null — TLS did not complete.
+    try testing.expect(conn.original_dcid == null);
+    try testing.expect(conn.app_keys == null);
 }
 
-test "retry: validate_addr=true, tampered token: error.InvalidToken" {
+test "retry: validate_addr=true, tampered token: silent drop (RFC 9000 §8.1.3)" {
     const testing = std.testing;
     const io = std.testing.io;
     const secret = [_]u8{0xEF} ** 32;
@@ -854,10 +859,15 @@ test "retry: validate_addr=true, tampered token: error.InvalidToken" {
 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
-    try testing.expectError(error.InvalidToken, conn.receive(buf[0..r.pkt_len], src, now_ns, io));
+    // RFC 9000 §8.1.3: MUST silently drop — no error, connection not established.
+    try conn.receive(buf[0..r.pkt_len], src, now_ns, io);
+    // original_dcid must be null — token was rejected, handshake was not accepted.
+    // app_keys must be null — TLS did not complete.
+    try testing.expect(conn.original_dcid == null);
+    try testing.expect(conn.app_keys == null);
 }
 
-test "retry: validate_addr=true, wrong-address token: error.InvalidToken" {
+test "retry: validate_addr=true, wrong-address token: silent drop (RFC 9000 §8.1.3)" {
     const testing = std.testing;
     const io = std.testing.io;
     const secret = [_]u8{0x12} ** 32;
@@ -874,8 +884,12 @@ test "retry: validate_addr=true, wrong-address token: error.InvalidToken" {
 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
-    // Present with src2 — address mismatch must fail
-    try testing.expectError(error.InvalidToken, conn.receive(buf[0..r.pkt_len], src2, now_ns, io));
+    // RFC 9000 §8.1.3: MUST silently drop — no error, connection not established.
+    _ = try conn.receive(buf[0..r.pkt_len], src2, now_ns, io);
+    // original_dcid must be null — token was rejected, handshake was not accepted.
+    // app_keys must be null — TLS did not complete.
+    try testing.expect(conn.original_dcid == null);
+    try testing.expect(conn.app_keys == null);
 }
 
 // ---------------------------------------------------------------------------

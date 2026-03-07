@@ -1389,7 +1389,10 @@ test "security: CRYPTO staging byte limit prevents memory pinning" {
     }
 }
 
-test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
+test "security: NEW_CONNECTION_ID out-of-order frames accepted (RFC 9000 §19.15)" {
+    // RFC 9000 §19.15 only requires rejecting CIDs with seq < retire_prior_to.
+    // Frames arriving out-of-order (lower seq than previously seen but >= retire_prior_to)
+    // MUST be accepted since QUIC frames can arrive out of order.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
@@ -1403,7 +1406,8 @@ test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
-    // Try to store CID with seq=9 (non-monotonic, should be rejected)
+    // CID with seq=9 arrives out of order (seq < highest-seen but >= retire_prior_to=0):
+    // RFC 9000 does NOT require rejection here — must be stored.
     conn.processNewConnectionId(.{
         .sequence_number = 9,
         .retire_prior_to = 0,
@@ -1412,10 +1416,11 @@ test "security: NEW_CONNECTION_ID sequence validation rejects non-monotonic" {
         .stateless_reset_token = [_]u8{0} ** 16,
     });
 
-    // Only the first CID should be stored
+    // Both CIDs must be stored (seq=9 was valid — not yet retired).
     try testing.expectEqual(true, conn.peer_cid_table[0].valid);
     try testing.expectEqual(@as(u62, 10), conn.peer_cid_table[0].seq);
-    try testing.expectEqual(false, conn.peer_cid_table[1].valid);
+    try testing.expectEqual(true, conn.peer_cid_table[1].valid);
+    try testing.expectEqual(@as(u62, 9), conn.peer_cid_table[1].seq);
 }
 
 test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {

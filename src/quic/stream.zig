@@ -270,6 +270,10 @@ pub const Stream = struct {
     /// Gap list for out-of-order reassembly (RFC 9000 §2.2).
     /// Tracks missing byte ranges within the current receive window.
     gap_list: GapList,
+    /// Highest byte offset (exclusive end) ever seen on this stream's receive side.
+    /// RFC 9000 §4.1: connection-level flow control tracks the sum of per-stream
+    /// high-water marks, not raw bytes per frame. Updated by processStreamFrame.
+    highest_recv_offset: u64,
 
     pub fn init(id: u62) Stream {
         return .{
@@ -291,6 +295,7 @@ pub const Stream = struct {
             .fin_recv_offset = null,
             .last_sent_max_stream_data = STREAM_BUF_SIZE,
             .gap_list = GapList.init(0, STREAM_BUF_SIZE),
+            .highest_recv_offset = 0,
         };
     }
 

@@ -91,8 +91,13 @@ tools/
 > **Note:** [`ghcr.io/ericsssan/zquic-interop:latest`](https://github.com/ericsssan/zquic/pkgs/container/zquic-interop) is built solely for use with [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner). It is not a general-purpose or production image.
 
 <!-- INTEROP_START -->
-| Test | (pending first run) |
-| --- | :---: |
+Tested against **quic-go** client (2026-03-08):
+
+| Result | Test cases |
+| :---: | --- |
+| ✅ Pass | handshake, transfer, longrtt, multiplexing, retry, keyupdate, ecn |
+| ❓ Unsupported | chacha20, resumption, zerortt, http3, v2, connectionmigration |
+| ❌ Fail | amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, ipv6, rebind-port, rebind-addr |
 <!-- INTEROP_END -->
 
 ## Limitations
