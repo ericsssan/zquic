@@ -890,10 +890,13 @@ pub fn Connection(comptime max_streams: usize) type {
                         }
                         return data.len;
                     }
-                    // v1 and v2 are compatible; adopt client's version for this connection.
+                    // RFC 9368: Compatible version negotiation.
+                    // For idle connections, respond with our configured version,
+                    // not the client's version. The client's version was used to decrypt this Initial
+                    // (initial keys are version-specific), but our response uses our configured version.
+                    // This allows v2-configured servers to respond with v2 to v1 clients.
                     if (ver != 0) {
-                        self.quic_version = ver;
-                        self.tls_state.server_configured_version = ver;
+                        self.quic_version = self.tls_state.server_configured_version;
                     }
                 } else {
                     // RFC 9369: During handshake, allow version changes for compatible version negotiation.

@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-pub const STREAM_BUF_SIZE: usize = 16384;
+pub const STREAM_BUF_SIZE: usize = 32768;
 
 pub const StreamState = enum(u8) {
     open,

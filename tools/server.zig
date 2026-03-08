@@ -1,6 +1,6 @@
 //! zquic interop server — quic-interop-runner compatible UDP server.
 //!
-//! Supported TESTCASE values: handshake, transfer, multiconnect, retry, keyupdate, v2.
+//! Supported TESTCASE values: handshake, transfer, multiconnect, retry, keyupdate, v2, ecn.
 //! All other values cause exit(127) as required by the interop runner.
 //! HTTP/0.9: accepts "GET /path\r\n" and serves files from ${WWW} directory.
 //! File serving is event-driven: data is pushed in chunks each event loop tick
@@ -15,7 +15,7 @@ const DEFAULT_PORT: u16 = 443;
 const MAX_DATAGRAM = 1452;
 // Chunk size must fit inside a single QUIC packet (MAX_DATAGRAM=1452 minus
 // short header ~13 + AEAD 16 + STREAM frame header ~17 = ~46 bytes overhead).
-const SEND_CHUNK: usize = 1200;
+const SEND_CHUNK: usize = 1380;
 // Maximum concurrent file transfers per connection.
 const MAX_TRANSFERS = 64;
 
@@ -25,7 +25,7 @@ const Conn = quic.Connection(64);
 const ALPN = "hq-interop";
 
 const supported_cases = [_][]const u8{
-    "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2",
+    "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2", "ecn",
 };
 
 /// State for one in-progress file transfer.
@@ -37,6 +37,8 @@ const FileTransfer = struct {
     path_len: usize = 0,
     /// Next byte offset to read from.
     offset: u64 = 0,
+    /// Cached file handle (open once per transfer, closed on completion or error).
+    file: ?std.Io.File = null,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -162,7 +164,7 @@ pub fn main(init: std.process.Init) !void {
                         drainSend(&conn, &sock, io, &msg.from, &send_buf);
                         break :conn_loop;
                     },
-                    .stream_data => |s| startTransfer(&conn, s.stream_id, &transfers, www_dir),
+                    .stream_data => |s| startTransfer(&conn, s.stream_id, &transfers, www_dir, io),
                     .connection_closed => {
                         // Note: appendRotatedSecretsToKeyLog is not called here because
                         // keylog updates now happen incrementally in the main loop above
@@ -183,12 +185,19 @@ pub fn main(init: std.process.Init) !void {
 
             drainSend(&conn, &sock, io, &msg.from, &send_buf);
         }
+
+        // Cleanup: close any open file handles before exiting the connection.
+        for (&transfers) |*t| {
+            if (t.file) |file| {
+                file.close(io);
+            }
+        }
     }
 }
 
 /// Parse the HTTP/0.9 request from the stream receive buffer and register a FileTransfer.
 /// Does not send any data — flushTransfers() does the actual I/O.
-fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8) void {
+fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8, io: std.Io) void {
     const st = conn.streams.get(stream_id) orelse return;
     var req_buf: [256]u8 = undefined;
     const n = st.read(&req_buf);
@@ -246,6 +255,8 @@ fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTra
     t.offset = 0;
     @memcpy(t.path[0..full_path.len], full_path);
     t.path_len = full_path.len;
+    // Open the file once at transfer start; keep it open across multiple chunks.
+    t.file = std.Io.Dir.openFileAbsolute(io, t.path[0..t.path_len], .{}) catch null;
 }
 
 /// Try to advance all active file transfers using round-robin interleaving.
@@ -269,26 +280,30 @@ fn flushTransfers(conn: *Conn, transfers: *[MAX_TRANSFERS]FileTransfer, www: []c
 
 /// Send exactly one SEND_CHUNK from the transfer. Returns true if a chunk was sent.
 fn advanceTransferOne(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
-    const path = t.path[0..t.path_len];
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch {
-        conn.streamSend(t.stream_id, &.{}, true) catch {};
+    // Use cached file handle; if not open (null), transfer is already closed.
+    const file = t.file orelse {
         t.active = false;
         return false;
     };
-    defer file.close(io);
 
     var data_buf: [SEND_CHUNK]u8 = undefined;
     const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
+        // Read error; close file and send FIN to signal error to client.
+        file.close(io);
+        t.file = null;
         conn.streamSend(t.stream_id, &.{}, true) catch {};
         t.active = false;
         return false;
     };
 
     if (r == 0) {
-        // EOF — send FIN. If the send queue is full, retry next tick.
+        // EOF — send FIN and close file handle. If the send queue is full, retry next tick.
         conn.streamSend(t.stream_id, &.{}, true) catch {
+            // Send queue, CC window, or flow-control window full — retry next tick.
             return false;
         };
+        file.close(io);
+        t.file = null;
         t.active = false;
         return true;
     }
@@ -303,7 +318,11 @@ fn advanceTransferOne(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
         return false;
     };
     t.offset += r;
-    if (is_last_chunk) t.active = false;
+    if (is_last_chunk) {
+        file.close(io);
+        t.file = null;
+        t.active = false;
+    }
     return true;
 }
 
