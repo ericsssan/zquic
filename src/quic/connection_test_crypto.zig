@@ -975,17 +975,24 @@ test "connection: Config.initial_quic_version can be set to V2" {
     try testing.expectEqual(packet.QUIC_VERSION_2, config.initial_quic_version);
 }
 
-test "connection: accept() uses Config.initial_quic_version" {
+test "connection: accept() initializes quic_version to V1 for client version echoing" {
     const testing = std.testing;
     const io = std.testing.io;
 
-    // Test with default V1
+    // Regardless of initial_quic_version config, connections always start with V1
+    // This allows echoing the client's version in Initial/Handshake packets.
+    // After receiving an Initial packet, quic_version is set to the client's version.
+    // TLS layer may then negotiate to the configured version via version_information.
+
+    // Test with default V1 config
     var conn_v1 = try Connection(16).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.quic_version);
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
 
-    // Test with V2
+    // Test with V2 config - still starts with V1, configured version is stored separately
     var conn_v2 = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.quic_version);
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn_v2.quic_version);
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
 }
 
 test "connection: rotateKeys toggles current_key_phase" {
@@ -1588,12 +1595,13 @@ test "connection: version negotiation - initial and quic versions track separate
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
 
-    // Initially, both should be set to configured version
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn.initial_version);
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn.quic_version);
+    // Initially, both are set to V1 (not the configured version)
+    // When a client Initial packet arrives, both get set to the client's version
+    // TLS layer may then negotiate to a different version via version_information
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn.initial_version);
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn.quic_version);
 
-    // After receiving a v1 Initial packet, initial_version should be v1
-    // but quic_version could be negotiated to something else
+    // Server's configured version is stored separately
     try testing.expectEqual(packet.QUIC_VERSION_2, conn.tls_state.server_configured_version);
 }
 
@@ -1615,20 +1623,15 @@ test "connection: version negotiation - initial_version set from client Initial"
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
 
-    // Simulate receiving a v1 Initial packet
-    // (The actual packet processing sets initial_version to the client's version)
-    const client_version = packet.QUIC_VERSION_1;
+    // At initialization, both are set to V1 (default)
+    // When a client Initial packet arrives in processLongHeaderPacket:
+    // self.initial_version = ver;  (set to client's version)
+    // self.quic_version = ver;     (set to client's version)
+    // TLS may later negotiate to server_configured_version via version_information
 
-    // In processLongHeaderPacket, the code sets:
-    // self.initial_version = ver;
-    // self.quic_version = ver;
-    // self.tls_state.quic_version = ver;
-
-    // We verify these would be set correctly by checking the initial state
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn.initial_version);
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn.quic_version);
-
-    _ = client_version; // Unused in this unit test
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn.initial_version);
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn.quic_version);
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn.tls_state.server_configured_version);
 }
 
 test "stream recycling: configurable initial_max_streams_bidi stored in connection" {

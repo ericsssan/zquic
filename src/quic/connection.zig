@@ -467,8 +467,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
                 .initial_keys = undefined,
                 .tls_state = tls_server,
-                .initial_version = config.initial_quic_version,
-                .quic_version = config.initial_quic_version,
+                .initial_version = packet.QUIC_VERSION_1,
+                .quic_version = packet.QUIC_VERSION_1,
                 .hs_keys = null,
                 .app_keys = null,
                 .streams = .{},
@@ -958,10 +958,10 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.initial_version = ver;
                 self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
 
-                // RFC 9368/9369: Always respond with client's version in Initial.
-                // If server is configured for a different version, the TLS layer will
-                // negotiate it via version_information transport parameter.
-                // The client may respond with its configured version if it supports the negotiation.
+                // RFC 9368/9369: Echo client's version in Initial/Handshake packets.
+                // This supports both:
+                // - Native V2 mode: client sends V2, server echoes V2 (no TLS negotiation needed)
+                // - Compatible VN: client sends V1, server echoes V1, both negotiate V2 via TLS
                 self.quic_version = ver;
                 // NOTE: Do NOT set tls_state.quic_version here. deliverCryptoChunk pushes
                 // conn.quic_version into TLS before processCrypto, allowing TLS to upgrade it
