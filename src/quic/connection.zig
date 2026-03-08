@@ -433,7 +433,9 @@ pub fn Connection(comptime max_streams: usize) type {
                 try tls.TlsServer.initFromCert(der, config.cert_seed.?, config.cert_key_algorithm, io)
             else
                 try tls.TlsServer.init(io);
-            tls_server.quic_version = config.initial_quic_version;
+            // NOTE: Do NOT set tls_server.quic_version here. Let it default to V1.
+            // The connection layer will set it to the client's Initial version (line 962).
+            // TLS will only switch versions if version_information indicates support (RFC 9368).
             tls_server.server_configured_version = config.initial_quic_version;
             if (config.alpn.len > 0) {
                 const n = @min(config.alpn.len, 32);
@@ -894,19 +896,11 @@ pub fn Connection(comptime max_streams: usize) type {
                     // For idle connections, respond with our configured version,
                     // not the client's version. The client's version was used to decrypt this Initial
                     // (initial keys are version-specific), but our response uses our configured version.
-                    // This allows v2-configured servers to respond with v2 to v1 clients.
-                    if (ver != 0) {
-                        const old_version = self.quic_version;
-                        self.quic_version = self.tls_state.server_configured_version;
-                        // If version changed (compatible VN), re-derive initial keys for the new version.
-                        // Response packets will be encrypted with keys matching the version in the header.
-                        if (old_version != self.quic_version and self.first_initial_dcid_len > 0) {
-                            self.initial_keys = crypto.deriveInitialKeys(
-                                self.first_initial_dcid[0..self.first_initial_dcid_len],
-                                self.quic_version,
-                            );
-                        }
-                    }
+                    // Version negotiation for idle connections happens in the Initial packet
+                    // block below (line ~987), where we set quic_version = ver (client's version).
+                    // The quic_version tracks the version being used for the handshake and will
+                    // be updated by the TLS layer if compatible version negotiation negotiates a
+                    // different version via version_information transport parameter.
                 } else {
                     // RFC 9369: During handshake, allow version changes for compatible version negotiation.
                     // Only reject version mismatches after the handshake is complete (connection established).
@@ -935,6 +929,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Packet type bits 5–4 are NOT header-protected (RFC 9001 §5.4.1).
             const raw_pkt_type = packet.longHeaderType(data[0], ver);
 
+
             // RFC 9000 §9: Discard Initial packets in established state.
             // In established state, all Initial packets (even with matching DCID) must be
             // silently dropped. This handles late/retransmitted Initial packets and new
@@ -960,17 +955,17 @@ pub fn Connection(comptime max_streams: usize) type {
             // On the first Initial, derive initial keys from the client's DCID before HP removal.
             // Keys are required to select the HP key and remove header protection.
             if (raw_pkt_type == .initial and self.hot.state == .idle) {
-                // RFC 9368: Compatible version negotiation.
-                // Use the client's version for initial keys (must match for decryption).
-                // This enables compatible version negotiation where client sends v1 and
-                // we can eventually respond in v2 after handshake.
                 self.initial_version = ver;
-                self.quic_version = ver;
-                // NOTE: DO NOT overwrite self.tls_state.quic_version here.
-                // TLS server may negotiate a different version based on version_information.
-                // After ClientHello processing, deliverCryptoChunk will sync quic_version from TLS.
-
                 self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
+
+                // RFC 9368/9369: Always respond with client's version in Initial.
+                // If server is configured for a different version, the TLS layer will
+                // negotiate it via version_information transport parameter.
+                // The client may respond with its configured version if it supports the negotiation.
+                self.quic_version = ver;
+                // NOTE: Do NOT set tls_state.quic_version here. deliverCryptoChunk pushes
+                // conn.quic_version into TLS before processCrypto, allowing TLS to upgrade it
+                // via version_information. conn.quic_version then adopts TLS's result.
                 self.hot.state = .handshake;
                 // Record the client's address now so the first post-handshake 1-RTT
                 // packet does not trigger a false path migration (RFC 9000 §9).
@@ -1012,14 +1007,18 @@ pub fn Connection(comptime max_streams: usize) type {
             const pn_off = packet.longHeaderPnOffset(data, ver) catch return data.len;
             if (pn_off + 4 + 16 > data.len) return error.PacketTooShort;
 
+
             // Copy packet to a mutable buffer and remove header protection in place.
             // Buffer sized to MAX_PACKET_SIZE; packets larger than this were already rejected above.
             var hp_buf: [MAX_PACKET_SIZE]u8 = undefined;
             @memcpy(hp_buf[0..data.len], data);
             _ = crypto.removeHeaderProtection(hp_key, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
+
             // Parse with header protection removed.
             const result = try packet.parseLongHeader(hp_buf[0..data.len]);
+
+
             const hdr = result.header;
 
             switch (hdr.packet_type) {
@@ -1060,8 +1059,11 @@ pub fn Connection(comptime max_streams: usize) type {
                         @as(u8, hdr.pn_len) * 8,
                     );
 
+
                     // Replay / duplicate protection (RFC 9000 §13.2).
-                    if (self.isPnDuplicate(0, pn)) return result.consumed;
+                    if (self.isPnDuplicate(0, pn)) {
+                        return result.consumed;
+                    }
 
                     // AAD = HP-removed header bytes (before payload, per RFC 9001 §5.3).
                     const payload_start = result.consumed - hdr.payload.len;
@@ -1073,7 +1075,11 @@ pub fn Connection(comptime max_streams: usize) type {
                     // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
                     defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&plaintext)));
                     if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-                    try crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]);
+
+
+                    crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch |err| {
+                        return err;
+                    };
 
                     self.markPnReceived(0, pn);
                     self.bytes_recv += result.consumed;
@@ -1104,7 +1110,10 @@ pub fn Connection(comptime max_streams: usize) type {
                     // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
                     defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&plaintext)));
                     if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-                    try crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]);
+
+                    crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch |err| {
+                        return err;
+                    };
                     self.markPnReceived(1, pn);
                     try self.processFrames(plaintext[0..pt_len], 1, io);
                     return result.consumed;
@@ -1605,14 +1614,19 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.tls_state.our_transport_params = our_params;
             }
 
+            // Push client's Initial version into TLS as baseline BEFORE processing ClientHello.
+            // TLS may upgrade it to server_configured_version via version_information (RFC 9369).
+            // Guard ensures this only fires on ClientHello call, not again on ClientFinished.
+            if (self.tls_state.state == .wait_client_hello) {
+                self.tls_state.quic_version = self.quic_version;
+            }
+
             var out_buf: [8192]u8 = undefined;
             const out_len = try self.tls_state.processCrypto(data, &out_buf, io);
 
             if (self.hs_keys == null and self.tls_state.state != .wait_client_hello) {
-                // RFC 9369: Sync the negotiated version from TLS layer (compatible version negotiation)
-                if (self.quic_version != self.tls_state.quic_version) {
-                    self.quic_version = self.tls_state.quic_version;
-                }
+                // Adopt whatever version TLS negotiated (V1 unchanged, or V2 if version_info matched).
+                self.quic_version = self.tls_state.quic_version;
                 self.hs_keys = self.tls_state.handshake_keys;
             }
 
@@ -1968,7 +1982,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        self.tls_state.server_configured_version,
+                        self.quic_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
@@ -2213,12 +2227,12 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
-                    // RFC 9369: Send Initial packet with server's configured version in header.
+                    // RFC 9369: Send Initial packet with negotiated version in header.
                     // Keys are derived from client's version for compatibility.
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        self.tls_state.server_configured_version,
+                        self.quic_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
@@ -2250,12 +2264,12 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[1];
                     self.hot.tx_pn[1] += 1;
                     const ct_len = fpos + 16;
-                    // RFC 9369: Send Handshake packet with server's configured version.
+                    // RFC 9369: Send Handshake packet with negotiated version.
                     // Keys are derived from client's version for compatibility.
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .handshake,
-                        self.tls_state.server_configured_version,
+                        self.quic_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
@@ -2318,7 +2332,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 const hdr_len = packet.encodeLongHeader(
                     &self.enc_scratch,
                     .initial,
-                    self.tls_state.server_configured_version,
+                    self.quic_version,
                     self.peer_scid[0..self.peer_scid_len],
                     self.ourScidBytes(),
                     &.{},
@@ -2341,7 +2355,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 const hdr_len = packet.encodeLongHeader(
                     &self.enc_scratch,
                     .handshake,
-                    self.tls_state.server_configured_version,
+                    self.quic_version,
                     self.peer_scid[0..self.peer_scid_len],
                     self.ourScidBytes(),
                     &.{},

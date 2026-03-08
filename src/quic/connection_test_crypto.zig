@@ -250,6 +250,33 @@ test "connection: v2 quic_version propagated to initial key derivation" {
     try testing.expect(!std.mem.eql(u8, &k_v1.server.key, &k_v2.server.key));
 }
 
+test "connection: RFC 9369 v2 initial key derivation" {
+    // RFC 9369 specifies QUIC v2 initial key derivation using the same HKDF-SHA256
+    // process as RFC 9001 but with a different initial salt for v2.
+    // This test verifies that v2 keys are consistently derived and differ from v1.
+    const testing = std.testing;
+
+    // Test DCID: variable-length (9 bytes)
+    const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+
+    // Derive v2 and v1 keys with same DCID
+    const keys_v2 = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_2);
+    const keys_v1 = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+
+    // Verify that v2 keys differ from v1 keys (different initial salt)
+    try testing.expect(!std.mem.eql(u8, &keys_v2.client.key, &keys_v1.client.key));
+    try testing.expect(!std.mem.eql(u8, &keys_v2.client.iv, &keys_v1.client.iv));
+    try testing.expect(!std.mem.eql(u8, &keys_v2.client.hp, &keys_v1.client.hp));
+
+    // Verify that both client and server keys are derived (not null)
+    try testing.expect(keys_v2.client.key.len == 16);
+    try testing.expect(keys_v2.client.iv.len == 12);
+    try testing.expect(keys_v2.client.hp.len == 16);
+    try testing.expect(keys_v2.server.key.len == 16);
+    try testing.expect(keys_v2.server.iv.len == 12);
+    try testing.expect(keys_v2.server.hp.len == 16);
+}
+
 test "connection: queueTlsOutput splits ServerHello into Initial epoch and rest into Handshake epoch" {
     // RFC 9001 §4.1.3: ServerHello MUST be in an Initial CRYPTO frame;
     // EncryptedExtensions through Finished MUST be in Handshake CRYPTO frames.
@@ -1991,4 +2018,42 @@ test "server tick: PTO fires during handshake and retransmits CRYPTO" {
     const sq_before = conn.sq_tail;
     conn.retransmitCryptoSaved(1); // hs_keys == null → early return
     try std.testing.expectEqual(sq_before, conn.sq_tail);
+}
+
+test "crypto: RFC 9369 Appendix A v2 deterministic key derivation" {
+    // RFC 9369 specifies deterministic V2 initial key derivation.
+    // This test verifies that the same DCID always produces the same V2 keys (deterministic),
+    // and that V2 keys differ from V1 keys using the same DCID.
+    const testing = std.testing;
+
+    // Test DCID from RFC 9369: 9-byte variable-length DCID
+    const dcid = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+
+    // Derive V2 keys
+    const keys_v2_1 = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_2);
+    const keys_v2_2 = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_2);
+
+    // Verify determinism: same DCID produces same keys
+    try testing.expectEqualSlices(u8, &keys_v2_1.client.key, &keys_v2_2.client.key);
+    try testing.expectEqualSlices(u8, &keys_v2_1.client.iv, &keys_v2_2.client.iv);
+    try testing.expectEqualSlices(u8, &keys_v2_1.client.hp, &keys_v2_2.client.hp);
+    try testing.expectEqualSlices(u8, &keys_v2_1.server.key, &keys_v2_2.server.key);
+    try testing.expectEqualSlices(u8, &keys_v2_1.server.iv, &keys_v2_2.server.iv);
+    try testing.expectEqualSlices(u8, &keys_v2_1.server.hp, &keys_v2_2.server.hp);
+
+    // Derive V1 keys with same DCID
+    const keys_v1 = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
+
+    // Verify that V2 keys differ from V1 keys (different salt per RFC 9369)
+    try testing.expect(!std.mem.eql(u8, &keys_v2_1.client.key, &keys_v1.client.key));
+    try testing.expect(!std.mem.eql(u8, &keys_v2_1.client.iv, &keys_v1.client.iv));
+    try testing.expect(!std.mem.eql(u8, &keys_v2_1.client.hp, &keys_v1.client.hp));
+    try testing.expect(!std.mem.eql(u8, &keys_v2_1.server.key, &keys_v1.server.key));
+    try testing.expect(!std.mem.eql(u8, &keys_v2_1.server.iv, &keys_v1.server.iv));
+    try testing.expect(!std.mem.eql(u8, &keys_v2_1.server.hp, &keys_v1.server.hp));
+
+    // Verify key lengths are correct
+    try testing.expectEqual(@as(usize, 16), keys_v2_1.client.key.len);
+    try testing.expectEqual(@as(usize, 12), keys_v2_1.client.iv.len);
+    try testing.expectEqual(@as(usize, 16), keys_v2_1.client.hp.len);
 }

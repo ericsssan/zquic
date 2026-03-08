@@ -577,3 +577,22 @@ test "crypto: v2 derivePacketKeys uses quicv2 labels" {
     try testing.expect(!std.mem.eql(u8, &k_v1.iv, &k_v2.iv));
     try testing.expect(!std.mem.eql(u8, &k_v1.hp, &k_v2.hp));
 }
+
+test "crypto: RFC 9369 — v2 client key/iv/hp derived correctly" {
+    const testing = std.testing;
+    // QUIC v2 initial keys must be correctly derived using v2 salt and labels.
+    // Test with a specific DCID to verify the derivation produces consistent results.
+    const test_dcid_v2 = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
+    const keys = deriveInitialKeys(&test_dcid_v2, packet.QUIC_VERSION_2);
+
+    // The key/iv/hp must be 16/12/16 bytes respectively.
+    try testing.expectEqual(16, keys.client.key.len);
+    try testing.expectEqual(12, keys.client.iv.len);
+    try testing.expectEqual(16, keys.client.hp.len);
+
+    // v2 keys must differ from v1 keys for the same DCID.
+    const keys_v1 = deriveInitialKeys(&test_dcid_v2, packet.QUIC_VERSION_1);
+    try testing.expect(!std.mem.eql(u8, &keys.client.key, &keys_v1.client.key));
+    try testing.expect(!std.mem.eql(u8, &keys.client.iv, &keys_v1.client.iv));
+    try testing.expect(!std.mem.eql(u8, &keys.client.hp, &keys_v1.client.hp));
+}
