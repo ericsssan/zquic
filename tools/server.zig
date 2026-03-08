@@ -118,6 +118,7 @@ pub fn main(init: std.process.Init) !void {
         var conn = try Conn.accept(config, io);
         var peer_addr: ?net.IpAddress = null;
         var last_logged_generation: u32 = 0;
+        var keylog_written: bool = false;
 
         // Per-connection file transfer state.
         var transfers = [_]FileTransfer{.{}} ** MAX_TRANSFERS;
@@ -148,6 +149,14 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("receive error: {}\n", .{err});
             };
 
+            // Write initial keylog as soon as we have 1-RTT secrets (app_keys).
+            // This ensures the keylog is available even if the server is killed during handshake.
+            if (!keylog_written and conn.app_keys != null) {
+                writeKeyLog(&conn, io);
+                keylog_written = true;
+                last_logged_generation = 0;
+            }
+
             // If key rotation occurred, update keylog immediately (don't wait for connection_closed)
             if (conn.current_key_generation > last_logged_generation) {
                 updateKeyLog(&conn, io, last_logged_generation);
@@ -157,8 +166,12 @@ pub fn main(init: std.process.Init) !void {
             while (conn.pollEvent()) |ev| {
                 switch (ev) {
                     .connected => {
-                        writeKeyLog(&conn, io);
-                        last_logged_generation = 0; // Mark that gen 0 has been written
+                        // Ensure keylog is written and synced even if writeKeyLog above was called early
+                        if (!keylog_written) {
+                            writeKeyLog(&conn, io);
+                            last_logged_generation = 0;
+                        }
+                        keylog_written = true;
                     },
                     .retry_sent => {
                         drainSend(&conn, &sock, io, &msg.from, &send_buf);
@@ -379,6 +392,7 @@ fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
     file.writePositionalAll(io, buf[0..pos], 0) catch {};
+    file.sync(io) catch {};
 }
 
 /// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
@@ -409,6 +423,7 @@ fn writeKeyLog(conn: *const Conn, io: std.Io) void {
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
     file.writePositionalAll(io, buf[0..pos], 0) catch {};
+    file.sync(io) catch {};
 }
 
 fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {
