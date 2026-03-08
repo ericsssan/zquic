@@ -896,7 +896,16 @@ pub fn Connection(comptime max_streams: usize) type {
                     // (initial keys are version-specific), but our response uses our configured version.
                     // This allows v2-configured servers to respond with v2 to v1 clients.
                     if (ver != 0) {
+                        const old_version = self.quic_version;
                         self.quic_version = self.tls_state.server_configured_version;
+                        // If version changed (compatible VN), re-derive initial keys for the new version.
+                        // Response packets will be encrypted with keys matching the version in the header.
+                        if (old_version != self.quic_version and self.first_initial_dcid_len > 0) {
+                            self.initial_keys = crypto.deriveInitialKeys(
+                                self.first_initial_dcid[0..self.first_initial_dcid_len],
+                                self.quic_version,
+                            );
+                        }
                     }
                 } else {
                     // RFC 9369: During handshake, allow version changes for compatible version negotiation.
