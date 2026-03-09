@@ -1606,9 +1606,21 @@ pub fn Connection(comptime max_streams: usize) type {
                     our_params.original_destination_connection_id_len = self.first_initial_dcid_len;
                 }
 
-                // RFC 9369: version_information - for v2 negotiation
-                // NOTE: Will be set in TLS layer after version negotiation
-                // our_params.version_information is left null for now
+                // RFC 9369: version_information - advertise supported versions
+                // Server always supports V1, optionally V2 if configured
+                if (self.config.initial_quic_version == packet.QUIC_VERSION_2) {
+                    // Server supports both V1 and V2: advertise in version_information
+                    var vi: [20]u8 = undefined;
+                    std.mem.writeInt(u32, vi[0..4], packet.QUIC_VERSION_1, .big);
+                    std.mem.writeInt(u32, vi[4..8], packet.QUIC_VERSION_2, .big);
+                    our_params.version_information = vi;
+                    our_params.version_information_len = 8; // 2 versions * 4 bytes each
+                } else {
+                    // Server only supports V1 (default)
+                    // RFC 9369 requires version_information for servers supporting V2.
+                    // V1-only servers can omit it.
+                    our_params.version_information = null;
+                }
 
                 self.tls_state.our_transport_params = our_params;
             }
