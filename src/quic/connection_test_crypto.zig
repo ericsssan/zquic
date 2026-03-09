@@ -334,7 +334,7 @@ test "connection: first_initial_dcid stored for original_destination_connection_
     const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io);
+    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, 0, io);
 
     // first_initial_dcid must be set to the DCID from the client's Initial.
     try testing.expectEqual(@as(u8, 8), conn.first_initial_dcid_len);
@@ -359,7 +359,7 @@ test "connection: original_destination_connection_id in server transport params 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
     // receive() will fail on TLS (no valid ClientHello), but it must store
     // first_initial_dcid before reaching TLS processing.
-    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
+    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, 0, io) catch {};
 
     // The DCID must be stored for use in transport params.
     try testing.expectEqual(@as(u8, 8), conn.first_initial_dcid_len);
@@ -381,7 +381,7 @@ test "connection: ourScidBytes always returns local_cid (RFC 9000 §7.2)" {
     const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
+    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, 0, io) catch {};
 
     // After Initial received, ourScidBytes must still be local_cid, not the client's DCID.
     try testing.expectEqualSlices(u8, &conn.local_cid.bytes, conn.ourScidBytes());
@@ -401,7 +401,7 @@ test "connection: ourScidBytes length is always cid_mod.len" {
     const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 4433 } };
-    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io) catch {};
+    _ = conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, 0, io) catch {};
 
     // ourScidBytes() is always local_cid (cid_mod.len = 8 bytes).
     try testing.expectEqual(@as(usize, 8), conn.ourScidBytes().len);
@@ -742,7 +742,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt5[0], pkt5[pkt5_len - 4 ..][0..4], pkt5[pkt5_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(pkt5[0 .. pkt5_len + ct5_len], src, 1_000_000_000, io);
+    try conn.receive(pkt5[0 .. pkt5_len + ct5_len], src, 1_000_000_000, 0, io);
     // After pkt 5: rx_pn[2] = 5, bitmap has bit 0 set.
     try testing.expectEqual(@as(u64, 5), conn.hot.rx_pn[2]);
     try testing.expect(conn.isPnDuplicate(2, 5)); // pkt 5 received
@@ -758,7 +758,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt3[0], pkt3[pkt3_len - 4 ..][0..4], pkt3[pkt3_len..][0..16]);
 
     // This should NOT be dropped (before the fix, it would have been).
-    try conn.receive(pkt3[0 .. pkt3_len + ct3_len], src, 1_000_000_001, io);
+    try conn.receive(pkt3[0 .. pkt3_len + ct3_len], src, 1_000_000_001, 0, io);
     try testing.expect(conn.isPnDuplicate(2, 3)); // pkt 3 is now marked as received
     try testing.expect(conn.isPnDuplicate(2, 5)); // pkt 5 still received
     try testing.expect(!conn.isPnDuplicate(2, 4)); // pkt 4 still missing
@@ -772,7 +772,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     crypto.encryptPayload(conn.app_keys.?.client, 4, pkt4[0..pkt4_len], pt4[0..pt4_len], pkt4[pkt4_len..][0..ct4_len]);
     crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt4[0], pkt4[pkt4_len - 4 ..][0..4], pkt4[pkt4_len..][0..16]);
 
-    _ = try conn.receive(pkt4[0 .. pkt4_len + ct4_len], src, 1_000_000_002, io);
+    _ = try conn.receive(pkt4[0 .. pkt4_len + ct4_len], src, 1_000_000_002, 0, io);
     // Now all three packets are marked as received.
     try testing.expect(conn.isPnDuplicate(2, 3));
     try testing.expect(conn.isPnDuplicate(2, 4));
@@ -1692,7 +1692,7 @@ test "DCID check: variable-length DCID accepted on Initial retransmission at sta
     crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
-    try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, io);
+    try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, 0, io);
 
     // Packet must have been processed (not dropped by DCID check).
     try testing.expect(conn.pkts_recv > 0);
@@ -1733,7 +1733,7 @@ test "DCID check: Initial with wrong DCID silently dropped at state=handshake" {
     crypto.applyHeaderProtection(keys_b.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
-    try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, io);
+    try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, 0, io);
 
     // Packet must have been silently dropped (wrong DCID).
     try testing.expectEqual(@as(u64, 0), conn.pkts_recv);

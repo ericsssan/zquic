@@ -313,6 +313,12 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Bytes sent to the unvalidated peer (stops counting post-validation).
         bytes_unvalidated_sent: u64,
 
+        // ECN (Explicit Congestion Notification) tracking (RFC 9001 Appendix A).
+        /// Count of ECT(0) packets received in each epoch [Initial, Handshake, 1-RTT].
+        ecn_ect0_recv: [3]u64,
+        /// Count of CE (Congestion Experienced) packets received in each epoch.
+        ecn_ce_recv: [3]u64,
+
         /// Outstanding PATH_CHALLENGE data we sent; null if none pending (RFC 9000 §9.2).
         pending_path_challenge: ?[8]u8,
 
@@ -522,6 +528,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .path_validated = false,
                 .bytes_unvalidated_recv = 0,
                 .bytes_unvalidated_sent = 0,
+                .ecn_ect0_recv = .{ 0, 0, 0 },
+                .ecn_ce_recv = .{ 0, 0, 0 },
                 .pending_path_challenge = null,
                 .key_update_pending = false,
                 .current_key_phase = false,
@@ -560,8 +568,25 @@ pub fn Connection(comptime max_streams: usize) type {
         /// `src`     — sender address (used for migration detection).
         /// `now_ns`  — current monotonic time in nanoseconds.
         /// `io`      — I/O handle (needed for TLS key generation).
-        pub fn receive(self: *Self, data: []const u8, src: SocketAddr, now_ns: i64, io: std.Io) !void {
+        pub fn receive(self: *Self, data: []const u8, src: SocketAddr, now_ns: i64, ecn_bits: u2, io: std.Io) !void {
             self.current_time_ns = now_ns;
+
+            // Track ECN bits if present (RFC 9001 Appendix A)
+            // ecn_bits: 0=not-ECT, 1=ECT(1), 2=ECT(0), 3=CE
+            if (ecn_bits != 0) {
+                const epoch: usize = self.hot.epoch;
+                if (ecn_bits == 2) {
+                    // ECT(0) - increment ECT(0) counter for this epoch
+                    if (epoch < self.ecn_ect0_recv.len) {
+                        self.ecn_ect0_recv[epoch] +|= 1;
+                    }
+                } else if (ecn_bits == 3) {
+                    // CE - increment CE counter for this epoch
+                    if (epoch < self.ecn_ce_recv.len) {
+                        self.ecn_ce_recv[epoch] +|= 1;
+                    }
+                }
+            }
 
             // Path migration detection (RFC 9000 §9): only in established state,
             // and only when the peer has not disabled active migration.

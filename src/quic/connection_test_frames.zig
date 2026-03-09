@@ -581,7 +581,7 @@ test "connection: same address no migration" {
     conn.hot.state = .established;
     // peer_addr initialised to 0.0.0.0:0; receive from the same address.
     const src = SocketAddr{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } };
-    try conn.receive(&[_]u8{}, src, 0, io);
+    try conn.receive(&[_]u8{}, src, 0, 0, io);
     // No migration event must have been pushed.
     try testing.expect(conn.pollEvent() == null);
 }
@@ -592,7 +592,7 @@ test "connection: different address triggers migration" {
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 4321 } };
-    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try conn.receive(&[_]u8{}, new_src, 0, 0, io);
     // peer_addr must be updated to the new address.
     try testing.expect(conn.peer_addr.eql(new_src));
 }
@@ -605,7 +605,7 @@ test "connection: migration resets congestion" {
     // Inflate the congestion window to a large value.
     conn.congestion.cwnd = 999_999;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try conn.receive(&[_]u8{}, new_src, 0, 0, io);
     // RFC 9000 §9.4: congestion controller reset on migration.
     try testing.expectEqual(@as(u64, 10 * 1200), conn.congestion.cwnd);
 }
@@ -617,7 +617,7 @@ test "connection: migration sets path_validated false" {
     conn.hot.state = .established;
     conn.path_validated = true;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 2 }, .port = 5001 } };
-    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try conn.receive(&[_]u8{}, new_src, 0, 0, io);
     try testing.expect(!conn.path_validated);
 }
 
@@ -627,7 +627,7 @@ test "connection: migration event pushed" {
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 3 }, .port = 5002 } };
-    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try conn.receive(&[_]u8{}, new_src, 0, 0, io);
     const ev = conn.pollEvent();
     try testing.expect(ev != null);
     try testing.expect(std.meta.activeTag(ev.?) == .path_migrated);
@@ -640,7 +640,7 @@ test "connection: peer_disable_migration suppresses migration" {
     conn.hot.state = .established;
     conn.peer_disable_migration = true;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 192, 168, 0, 1 }, .port = 8080 } };
-    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try conn.receive(&[_]u8{}, new_src, 0, 0, io);
     // peer_addr must NOT be updated when migration is disabled.
     const original = SocketAddr{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } };
     try testing.expect(conn.peer_addr.eql(original));
@@ -655,7 +655,7 @@ test "connection: migration only in established state" {
     // state is .idle — migration check must not fire.
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 1, 2, 3, 4 }, .port = 9000 } };
     // Empty datagram; receive() returns without error (while loop body never runs).
-    try conn.receive(&[_]u8{}, new_src, 0, io);
+    try conn.receive(&[_]u8{}, new_src, 0, 0, io);
     try testing.expect(conn.pollEvent() == null);
 }
 
@@ -814,7 +814,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     const pkt = enc_buf[0 .. hdr_len + ct_len];
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
-    try conn.receive(pkt, src, 0, io);
+    try conn.receive(pkt, src, 0, 0, io);
 
     // An encrypted ACK must have been queued (sq_tail > 0).
     try testing.expect(conn.sq_tail > 0);
@@ -857,7 +857,7 @@ test "connection: receive() suppresses epoch-0 ACK when hs_keys is null" {
     const pkt = enc_buf[0 .. hdr_len + ct_len];
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
-    try conn.receive(pkt, src, 0, io);
+    try conn.receive(pkt, src, 0, 0, io);
 
     // No packet must be enqueued — ACK is suppressed until ServerHello is ready.
     try testing.expectEqual(@as(usize, 0), conn.sq_tail);
@@ -1413,7 +1413,7 @@ test "connection: 1-RTT malformed frame closes connection with FRAME_ENCODING_ER
     crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5001 } };
-    try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, io);
+    try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, 0, io);
 
     // Connection must be closing with FRAME_ENCODING_ERROR (0x07).
     try testing.expectEqual(ConnState.closing, conn.hot.state);
@@ -1457,7 +1457,7 @@ test "connection: 1-RTT protocol violation closes connection, not silently ignor
     crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, io);
+    try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, 0, io);
 
     // Connection must now be closing (not still established and not silently OK).
     try testing.expectEqual(ConnState.closing, conn.hot.state);
@@ -1617,7 +1617,7 @@ test "connection: server-initiated stream ID in STREAM frame closes with STREAM_
     crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, io);
+    try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, 0, io);
 
     // Connection must be closing with STREAM_STATE_ERROR (0x05).
     try testing.expectEqual(ConnState.closing, conn.hot.state);

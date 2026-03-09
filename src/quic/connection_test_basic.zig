@@ -80,7 +80,7 @@ test "connection: unknown version triggers VN response" {
     @memset(pkt[15..23], 0xbb); // SCID (becomes DCID in the VN response)
 
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
-    conn.receive(&pkt, src, 0, io) catch {};
+    conn.receive(&pkt, src, 0, 0, io) catch {};
 
     // A Version Negotiation packet should be queued.
     var out: [64]u8 = undefined;
@@ -111,7 +111,7 @@ test "connection: ver=0 packet does not trigger VN response" {
     @memset(pkt[15..23], 0xbb);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
-    conn.receive(&pkt, src, 0, io) catch {};
+    conn.receive(&pkt, src, 0, 0, io) catch {};
 
     // No VN response must be queued for a ver=0 packet.
     var out: [64]u8 = undefined;
@@ -310,7 +310,7 @@ test "connection: version 0 packet is silently ignored" {
     @memset(pkt[15..23], 0xdd); // SCID
 
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
-    conn.receive(&pkt, src, 0, io) catch {};
+    conn.receive(&pkt, src, 0, 0, io) catch {};
 
     // No packet should be queued (VN response is NOT sent for version-0 packets).
     var out: [64]u8 = undefined;
@@ -600,7 +600,7 @@ test "close: closing state discards incoming packets (returns early)" {
     // Feed a dummy packet — should not panic and connection stays closing.
     const dummy = [_]u8{0x00} ** 10;
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
-    conn.receive(&dummy, src, 0, io) catch {};
+    conn.receive(&dummy, src, 0, 0, io) catch {};
     try testing.expectEqual(ConnState.closing, conn.hot.state);
 }
 
@@ -614,7 +614,7 @@ test "close: receive refreshes idle_deadline on active connection" {
     // Feed a (malformed but non-empty) packet at time 1000.
     const dummy = [_]u8{0x00} ** 5;
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
-    conn.receive(&dummy, src, 1_000_000_000, io) catch {};
+    conn.receive(&dummy, src, 1_000_000_000, 0, io) catch {};
 
     // idle_deadline should be refreshed beyond 500.
     try testing.expect(conn.idle_deadline_ns.? > 500);
@@ -651,7 +651,7 @@ test "initial_packet: RFC9000§9 - drop Initial packets in established state" {
 
     // Attempt to receive Initial packet in established state.
     // Should silently drop (return early without error).
-    conn.receive(&pkt, src, 0, io) catch {
+    conn.receive(&pkt, src, 0, 0, io) catch {
         // Should not error; Initial in established should be silently dropped.
         testing.expect(false) catch unreachable;
         return;
@@ -694,7 +694,7 @@ test "initial_packet: RFC9000§9 - drop Initial with mismatched DCID in handshak
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
 
     // Attempt to receive Initial packet with mismatched DCID in handshake state.
-    conn.receive(&pkt, src, 0, io) catch {
+    conn.receive(&pkt, src, 0, 0, io) catch {
         testing.expect(false) catch unreachable;
         return;
     };
@@ -816,22 +816,22 @@ test "security: VN rate limit suppresses same version within 60s" {
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
 
     // First unknown version: send VN
-    conn.receive(&pkt, src, 0, io) catch {};
+    conn.receive(&pkt, src, 0, 0, io) catch {};
     var out: [64]u8 = undefined;
     try testing.expect(conn.send(&out) > 0);
 
     // Same version within 60s: throttle (no VN)
-    conn.receive(&pkt, src, 30_000_000_000, io) catch {}; // +30s
+    conn.receive(&pkt, src, 30_000_000_000, 0, io) catch {}; // +30s
     try testing.expectEqual(@as(usize, 0), conn.send(&out));
 
     // Different unknown version within 60s of first: send VN (different version)
     std.mem.writeInt(u32, pkt[1..5], 0x00000003, .big); // different version
-    conn.receive(&pkt, src, 35_000_000_000, io) catch {};
+    conn.receive(&pkt, src, 35_000_000_000, 0, io) catch {};
     try testing.expect(conn.send(&out) > 0);
 
     // First version after 60s: send VN again (cooldown expired)
     std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big);
-    conn.receive(&pkt, src, 61_000_000_000, io) catch {}; // +61s
+    conn.receive(&pkt, src, 61_000_000_000, 0, io) catch {}; // +61s
     try testing.expect(conn.send(&out) > 0);
 }
 
@@ -1172,7 +1172,7 @@ test "connection: Version Negotiation DCID echoes full client SCID (RFC 9000 §6
     pos += 1; // PING frame byte
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(raw[0..pos], src, 1_000_000_000, io);
+    try conn.receive(raw[0..pos], src, 1_000_000_000, 0, io);
 
     // Grab the VN packet from the send queue.
     var out: [256]u8 = undefined;

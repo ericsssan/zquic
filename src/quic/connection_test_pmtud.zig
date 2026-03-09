@@ -747,7 +747,7 @@ test "retry: validate_addr=false: tokenless Initial proceeds without Retry" {
     const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io);
+    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, 0, io);
 
     // No retry_sent event
     var got_retry = false;
@@ -768,7 +768,7 @@ test "retry: validate_addr=true, no token: retry_sent event and Retry packet que
     const r = buildInitialPacket(&buf, dcid, scid, &.{}, 1);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, io);
+    try conn.receive(buf[0..r.pkt_len], src, 1_000_000_000, 0, io);
 
     // retry_sent event must be present
     var got_retry = false;
@@ -802,7 +802,7 @@ test "retry: validate_addr=true, valid token: original_dcid stored, handshake pr
 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
-    try conn.receive(buf[0..r.pkt_len], src, now_ns, io);
+    try conn.receive(buf[0..r.pkt_len], src, now_ns, 0, io);
 
     // original_dcid must be set (no retry sent)
     try testing.expect(conn.original_dcid != null);
@@ -835,7 +835,7 @@ test "retry: validate_addr=true, expired token: silent drop (RFC 9000 §8.1.3)" 
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
     // RFC 9000 §8.1.3: MUST silently drop — no error, connection not established.
-    try conn.receive(buf[0..r.pkt_len], src, now_ns, io);
+    try conn.receive(buf[0..r.pkt_len], src, now_ns, 0, io);
     // original_dcid must be null — token was rejected, handshake was not accepted.
     // app_keys must be null — TLS did not complete.
     try testing.expect(conn.original_dcid == null);
@@ -860,7 +860,7 @@ test "retry: validate_addr=true, tampered token: silent drop (RFC 9000 §8.1.3)"
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
     // RFC 9000 §8.1.3: MUST silently drop — no error, connection not established.
-    try conn.receive(buf[0..r.pkt_len], src, now_ns, io);
+    try conn.receive(buf[0..r.pkt_len], src, now_ns, 0, io);
     // original_dcid must be null — token was rejected, handshake was not accepted.
     // app_keys must be null — TLS did not complete.
     try testing.expect(conn.original_dcid == null);
@@ -885,7 +885,7 @@ test "retry: validate_addr=true, wrong-address token: silent drop (RFC 9000 §8.
     var buf: [256]u8 = undefined;
     const r = buildInitialPacket(&buf, dcid_bytes, scid_bytes, &token, 1);
     // RFC 9000 §8.1.3: MUST silently drop — no error, connection not established.
-    _ = try conn.receive(buf[0..r.pkt_len], src2, now_ns, io);
+    _ = try conn.receive(buf[0..r.pkt_len], src2, now_ns, 0, io);
     // original_dcid must be null — token was rejected, handshake was not accepted.
     // app_keys must be null — TLS did not complete.
     try testing.expect(conn.original_dcid == null);

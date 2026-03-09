@@ -11,6 +11,7 @@ const quic = @import("zquic");
 const pem = @import("pem.zig");
 
 const net = std.Io.net;
+const os = std.os;
 const DEFAULT_PORT: u16 = 443;
 const MAX_DATAGRAM = 1452;
 // Chunk size must fit inside a single QUIC packet (MAX_DATAGRAM=1452 minus
@@ -108,6 +109,11 @@ pub fn main(init: std.process.Init) !void {
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
 
+    // Enable ECN (Explicit Congestion Notification) if testcase is "ecn"
+    if (std.mem.eql(u8, testcase, "ecn")) {
+        try configureEcn(&sock);
+    }
+
     std.debug.print("zquic interop server: testcase={s} port={d}\n", .{ testcase, port });
 
     var recv_buf: [MAX_DATAGRAM]u8 = undefined;
@@ -155,7 +161,9 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             peer_addr = new_addr;
-            conn.receive(msg.data, ipToSocketAddr(new_addr), now_ns, io) catch |err| {
+            // TODO: Extract ECN bits from IP header via recvmsg cmsg when ECN is enabled
+            const ecn_bits: u2 = 0;  // 0=not-ECT, 1=ECT(1), 2=ECT(0), 3=CE
+            conn.receive(msg.data, ipToSocketAddr(new_addr), now_ns, ecn_bits, io) catch |err| {
                 std.debug.print("receive error: {}\n", .{err});
             };
 
@@ -366,6 +374,57 @@ fn readFileFull(io: std.Io, path: []const u8, out: []u8) !usize {
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
     return file.readPositionalAll(io, out, 0);
+}
+
+/// Configure socket for ECN (Explicit Congestion Notification).
+/// Sets socket options to mark outgoing packets with ECT(0) and receive ECN bits.
+fn configureEcn(sock: *const net.Socket) !void {
+    // On Linux, use raw syscalls to configure ECN socket options.
+    // std.Io.net.Socket doesn't expose setsockopt directly.
+    const fd = sock.handle;
+
+    // Socket option level and name constants (from Linux headers)
+    const SOL_IP: i32 = 0;      // IPPROTO_IP
+    const SOL_IPV6: i32 = 41;    // IPPROTO_IPV6
+    const IP_TOS: i32 = 1;       // Type of service
+    const IP_RECVTOS: i32 = 13;  // Receive TOS with datagram
+    const IPV6_TCLASS: i32 = 67; // Traffic class
+    const IPV6_RECVTCLASS: i32 = 66; // Receive traffic class
+
+    // Enable ECT(0) marking on outgoing IPv4 packets: IP_TOS with ECT(0)=0x02
+    // ECT(0) = 0b0000 0010 in DSCP/ECN bits (RFC 3168)
+    const tos_value: c_int = 0x02; // ECT(0)
+    var tos_bytes = std.mem.asBytes(&tos_value);
+    const tos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_TOS, tos_bytes.ptr, @sizeOf(c_int));
+    if (tos_result != 0) {
+        std.debug.print("WARNING: Failed to set IP_TOS: {}\n", .{tos_result});
+    }
+
+    // Enable receiving IPv4 ECN bits: IP_RECVTOS
+    const recvtos_value: c_int = 1;
+    var recvtos_bytes = std.mem.asBytes(&recvtos_value);
+    const recvtos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_RECVTOS, recvtos_bytes.ptr, @sizeOf(c_int));
+    if (recvtos_result != 0) {
+        std.debug.print("WARNING: Failed to set IP_RECVTOS: {}\n", .{recvtos_result});
+    }
+
+    // Enable ECT(0) marking on outgoing IPv6 packets: IPV6_TCLASS
+    const tclass_value: c_int = 0x02; // ECT(0)
+    var tclass_bytes = std.mem.asBytes(&tclass_value);
+    const tclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_TCLASS, tclass_bytes.ptr, @sizeOf(c_int));
+    if (tclass_result != 0) {
+        std.debug.print("WARNING: Failed to set IPV6_TCLASS: {}\n", .{tclass_result});
+    }
+
+    // Enable receiving IPv6 ECN bits: IPV6_RECVTCLASS
+    const recvtclass_value: c_int = 1;
+    var recvtclass_bytes = std.mem.asBytes(&recvtclass_value);
+    const recvtclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_RECVTCLASS, recvtclass_bytes.ptr, @sizeOf(c_int));
+    if (recvtclass_result != 0) {
+        std.debug.print("WARNING: Failed to set IPV6_RECVTCLASS: {}\n", .{recvtclass_result});
+    }
+
+    std.debug.print("ECN socket configuration completed\n", .{});
 }
 
 fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, buf: *[MAX_DATAGRAM]u8) void {
