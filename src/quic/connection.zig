@@ -958,10 +958,9 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.initial_version = ver;
                 self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
 
-                // RFC 9368/9369: Echo client's version in Initial/Handshake packets.
-                // This supports both:
-                // - Native V2 mode: client sends V2, server echoes V2 (no TLS negotiation needed)
-                // - Compatible VN: client sends V1, server echoes V1, both negotiate V2 via TLS
+                // RFC 9368/9369: Version negotiation.
+                // Always echo client's version in Initial/Handshake packets.
+                // TLS negotiation via version_information may upgrade to another version.
                 self.quic_version = ver;
                 // NOTE: Do NOT set tls_state.quic_version here. deliverCryptoChunk pushes
                 // conn.quic_version into TLS before processCrypto, allowing TLS to upgrade it
@@ -1982,7 +1981,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        self.quic_version,
+                        self.initial_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
@@ -2227,12 +2226,12 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
-                    // RFC 9369: Send Initial packet with negotiated version in header.
-                    // Keys are derived from client's version for compatibility.
+                    // RFC 9369: Send Initial packet with client's version in header.
+                    // Keys are derived from client's version (initial_version).
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        self.quic_version,
+                        self.initial_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
@@ -2332,7 +2331,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 const hdr_len = packet.encodeLongHeader(
                     &self.enc_scratch,
                     .initial,
-                    self.quic_version,
+                    self.initial_version,
                     self.peer_scid[0..self.peer_scid_len],
                     self.ourScidBytes(),
                     &.{},

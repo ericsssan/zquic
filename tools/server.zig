@@ -149,8 +149,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("receive error: {}\n", .{err});
             };
 
-            // Write initial keylog as soon as we have 1-RTT secrets (app_keys).
-            // This ensures the keylog is available even if the server is killed during handshake.
+            // Write keylog when app_keys are available (after ClientFinished processed).
             if (!keylog_written and conn.app_keys != null) {
                 writeKeyLog(&conn, io);
                 keylog_written = true;
@@ -166,12 +165,12 @@ pub fn main(init: std.process.Init) !void {
             while (conn.pollEvent()) |ev| {
                 switch (ev) {
                     .connected => {
-                        // Ensure keylog is written and synced even if writeKeyLog above was called early
+                        // Write keylog immediately when connection established
                         if (!keylog_written) {
                             writeKeyLog(&conn, io);
+                            keylog_written = true;
                             last_logged_generation = 0;
                         }
-                        keylog_written = true;
                     },
                     .retry_sent => {
                         drainSend(&conn, &sock, io, &msg.from, &send_buf);
@@ -388,10 +387,12 @@ fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
         if (pos >= buf.len - 256) break;
     }
 
-    // Overwrite the keylog file with all generations
+    // Overwrite the keylog file with all generations (directory /logs created by Dockerfile)
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
-    file.writePositionalAll(io, buf[0..pos], 0) catch {};
+    file.writePositionalAll(io, buf[0..pos], 0) catch return;
+    // Sync multiple times to guarantee disk flush before docker cp
+    file.sync(io) catch {};
     file.sync(io) catch {};
 }
 
@@ -420,9 +421,12 @@ fn writeKeyLog(conn: *const Conn, io: std.Io) void {
     line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_0 {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(secrets_0.server, .lower) }) catch return;
     pos += line.len;
 
+    // Write keylog file (directory /logs created by Dockerfile)
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
-    file.writePositionalAll(io, buf[0..pos], 0) catch {};
+    file.writePositionalAll(io, buf[0..pos], 0) catch return;
+    // Sync multiple times to guarantee disk flush before docker cp
+    file.sync(io) catch {};
     file.sync(io) catch {};
 }
 
