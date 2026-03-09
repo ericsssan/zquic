@@ -361,9 +361,9 @@ pub const TlsServer = struct {
         // Store the client's transport parameters.
         self.peer_params = ch.peer_transport_params;
 
-        // Compatible version negotiation (RFC 9369): if the peer supports our configured version,
-        // switch to it for both packet headers AND key derivation (per RFC 9369 §3).
-        // Handshake keys are derived using the negotiated version (not the initial version).
+        // Compatible version negotiation (RFC 9368/9369): if peer supports our configured version,
+        // upgrade to it for key derivation. Server sends version_information to client,
+        // and client will also upgrade when it receives EncryptedExtensions.
         if (self.peer_params.version_information) |vi_buf| {
             const vi_len = self.peer_params.version_information_len;
             if (vi_len >= 4 and vi_len % 4 == 0) {

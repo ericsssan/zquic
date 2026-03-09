@@ -1984,8 +1984,10 @@ pub fn Connection(comptime max_streams: usize) type {
             switch (epoch) {
                 0 => {
                     // Initial packet: Long Header, epoch 0 keys
-                    // RFC 9368: Initial packets always use the client's version (initial_version).
-                    // Version negotiation to V2 happens at TLS layer via version_information.
+                    // RFC 9368: Initial packets MUST use the client's version (initial_version),
+                    // regardless of server configuration. Initial keys are derived from V1,
+                    // so the packet header must also be V1 for decryption to succeed.
+                    // Version upgrade for V2 happens in Handshake epoch after TLS negotiation.
                     const ik = self.initial_keys.server;
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
@@ -2238,17 +2240,13 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
-                    // RFC 9368/9369: Initial packet header version depends on server mode.
-                    // For native V2 (server configured for V2): send V2 in header
-                    // For compatible VN (server configured for V1): send client's version
-                    const initial_hdr_version = if (self.config.initial_quic_version == packet.QUIC_VERSION_2)
-                        packet.QUIC_VERSION_2
-                    else
-                        self.initial_version;
+                    // RFC 9368: Initial packets always use client's version (initial_version).
+                    // Initial keys are derived from V1, so packet header must be V1.
+                    // Version upgrade to V2 happens in Handshake epoch after TLS negotiation.
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        initial_hdr_version,
+                        self.initial_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
