@@ -230,7 +230,7 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
     // PN is at enc_buf[hdr_len-4..hdr_len], sample is at enc_buf[hdr_len..hdr_len+16].
     crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
-    const result = conn.receive(enc_buf[0..total], .{ .v4 = .{ .addr = .{0} ** 4, .port = 1234 } }, 0, io);
+    const result = conn.receive(enc_buf[0..total], .{ .v4 = .{ .addr = .{0} ** 4, .port = 1234 } }, 0, 0, io);
     _ = result catch {};
 
     // Connection must have recorded quic_version = QUIC_VERSION_2 (not dropped as unknown).
