@@ -126,12 +126,14 @@ pub const ConnectionHot = struct {
 
 pub const MAX_PACKET_SIZE = 1500; // Maximum received packet size (standard MTU)
 pub const MAX_SEND_PACKET_SIZE = 1452; // Maximum packet size for sending (UDP datagram limit)
-pub const SEND_QUEUE_DEPTH = 64;
+pub const SEND_QUEUE_DEPTH = 256;
 
 /// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
 const CRYPTO_STAGE_DEPTH = 8;
 /// Maximum bytes in a single staged CRYPTO fragment (conservatively > max QUIC payload).
 pub const CRYPTO_STAGE_FRAG = 1400;
+/// Maximum number of pending stream retransmits when send queue is full.
+const MAX_PENDING_RETX = 32;
 
 /// A single buffered out-of-order CRYPTO fragment.
 const CryptoStagedFrag = struct {
@@ -420,6 +422,14 @@ pub fn Connection(comptime max_streams: usize) type {
         tls_pending_hs_len: usize,
         /// Read offset in tls_pending_hs (bytes already sent from this buffer).
         tls_pending_hs_offset: usize,
+        /// Stream frames that failed to retransmit (send queue full). Drained in tick().
+        stream_pending_retx: [MAX_PENDING_RETX]struct {
+            stream_id: u62,
+            offset: u62,
+            len: u16,
+            fin: bool,
+        },
+        stream_pending_retx_count: u8,
         /// Per-epoch expected CRYPTO receive offset (RFC 9000 §19.6).
         /// Out-of-order/duplicate CRYPTO frames are rejected or trimmed against this.
         crypto_recv_offset: [3]u64,
@@ -550,6 +560,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .tls_pending_hs = std.mem.zeroes([8192]u8),
                 .tls_pending_hs_len = 0,
                 .tls_pending_hs_offset = 0,
+                .stream_pending_retx = undefined,
+                .stream_pending_retx_count = 0,
                 .crypto_recv_offset = .{ 0, 0, 0 },
                 .crypto_staged = @import("std").mem.zeroes([3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag),
                 .crypto_staged_count = .{ 0, 0, 0 },
@@ -696,6 +708,9 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
 
+            // Drain any deferred stream retransmits before generating new traffic
+            self.drainPendingStreamRetx();
+
             // PTO: suppress in closing/draining/closed states.
             if (self.hot.state != .closing and
                 self.hot.state != .draining and
@@ -706,9 +721,11 @@ pub fn Connection(comptime max_streams: usize) type {
                         self.loss.onPtoFired();
                         if (self.app_keys != null) {
                             // Post-handshake: retransmit PATH_CHALLENGE if pending (RFC 9000 §9.2),
-                            // otherwise send a 1-RTT PING probe.
+                            // drain pending stream retransmits, or send a 1-RTT PING probe.
                             if (self.pending_path_challenge) |challenge| {
                                 self.sendPathChallenge(challenge) catch {};
+                            } else if (self.stream_pending_retx_count > 0) {
+                                self.drainPendingStreamRetx();
                             } else {
                                 self.queuePing() catch {};
                             }
@@ -1920,7 +1937,18 @@ pub fn Connection(comptime max_streams: usize) type {
                                         s.offset,
                                         stream_retx_buf[0..n],
                                         s.fin,
-                                    ) catch {};
+                                    ) catch {
+                                        // Send queue full — defer for retry in drainPendingStreamRetx()
+                                        if (self.stream_pending_retx_count < MAX_PENDING_RETX) {
+                                            self.stream_pending_retx[self.stream_pending_retx_count] = .{
+                                                .stream_id = s.stream_id,
+                                                .offset = s.offset,
+                                                .len = @intCast(n),
+                                                .fin = s.fin,
+                                            };
+                                            self.stream_pending_retx_count += 1;
+                                        }
+                                    };
                                 }
                             }
                         },
@@ -1949,6 +1977,25 @@ pub fn Connection(comptime max_streams: usize) type {
                     }
                 }
             }
+        }
+
+        fn drainPendingStreamRetx(self: *Self) void {
+            if (self.stream_pending_retx_count == 0) return;
+            var stream_retx_buf: [MAX_SEND_PACKET_SIZE]u8 = undefined;
+            var remaining: u8 = 0;
+            for (self.stream_pending_retx[0..self.stream_pending_retx_count]) |p| {
+                const st = self.streams.get(p.stream_id) orelse continue;
+                const n = @min(st.getSendData(p.offset, &stream_retx_buf), p.len);
+                if (n > 0 or p.fin) {
+                    self.encryptAndEnqueueStreamFrame(p.stream_id, p.offset, stream_retx_buf[0..n], p.fin) catch {
+                        // Still full — keep in queue
+                        self.stream_pending_retx[remaining] = p;
+                        remaining += 1;
+                        continue;
+                    };
+                }
+            }
+            self.stream_pending_retx_count = remaining;
         }
 
         // -----------------------------------------------------------------------
