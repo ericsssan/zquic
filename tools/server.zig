@@ -330,17 +330,30 @@ fn advanceTransferOne(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
         return true;
     }
 
-    // Combine data + FIN into one packet when this is the last chunk.
-    // A partial read (r < SEND_CHUNK) means we reached EOF, so we can piggyback
-    // the FIN bit on the data frame rather than sending a separate FIN packet.
-    // This halves the packet count for small files and reduces NS-3 queue pressure.
-    const is_last_chunk = r < SEND_CHUNK;
-    conn.streamSend(t.stream_id, data_buf[0..r], is_last_chunk) catch {
+    // Send data without FIN by default; only set FIN if we confirmed EOF.
+    // To avoid premature EOF detection, we verify by attempting a zero-byte read
+    // at the next offset. If that returns 0, we know we're at EOF.
+    conn.streamSend(t.stream_id, data_buf[0..r], false) catch {
         // Send queue, CC window, or flow-control window full — retry next tick.
         return false;
     };
     t.offset += r;
+
+    // Determine if this was the final chunk by checking if we got a partial read.
+    // If r < SEND_CHUNK, either we're at EOF or the read was partial.
+    // To confirm EOF, try reading one more byte at the new offset.
+    const is_last_chunk = if (r < SEND_CHUNK) blk: {
+        var eof_probe: [1]u8 = undefined;
+        const eof_check = file.readPositionalAll(io, &eof_probe, t.offset) catch 0;
+        break :blk eof_check == 0;  // EOF confirmed if zero-byte read
+    } else false;
+
     if (is_last_chunk) {
+        // Now send FIN separately to signal end-of-stream
+        conn.streamSend(t.stream_id, &.{}, true) catch {
+            // If FIN send fails, retry next tick
+            return true;  // Data was sent successfully, so return true
+        };
         file.close(io);
         t.file = null;
         t.active = false;

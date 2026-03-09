@@ -2255,13 +2255,14 @@ pub fn Connection(comptime max_streams: usize) type {
         /// (0 = Initial, 1 = Handshake).  Returns the number of data bytes consumed.
         fn sendCryptoChunk(self: *Self, data: []const u8, epoch: u8) !usize {
             // Per-packet data limit: MAX_SEND_PACKET_SIZE minus overhead.
-            // Header: 1 (first) + 4 (version) + 1 (DCID len) + 8 (DCID) + 1 (SCID len) + 8 (SCID) +
-            //         1 (token len, Initial) + 2 (length varint) + 4 (pn) = ~30-35B typical, 40-45B worst.
-            // CRYPTO frame: 1 (type) + varint(offset, 1-8B) + varint(length, 1-2B) = 3-11B.
-            // AEAD tag: 16B.
-            // Conservative total: 45 + 11 + 16 = 72B, but tests fail with this value.
-            // Empirically, 55B works. Using 55B as the practical limit.
-            const max_chunk = MAX_SEND_PACKET_SIZE - 55;
+            // Header worst case: 1 (first) + 4 (version) + 1 (DCID len) + 20 (DCID max) +
+            //                    1 (SCID len) + 20 (SCID max) + 3 (token len varint) +
+            //                    2 (length varint) + 4 (pn) = ~56-67B
+            // CRYPTO frame: 1 (type) + varint(offset, 1-8B) + varint(length, 1-2B) = 3-11B
+            // AEAD tag: 16B
+            // Worst case total: 67 + 11 + 16 = 94B
+            // Safe margin: 100B to account for all variabilities
+            const max_chunk = MAX_SEND_PACKET_SIZE - 100;
             const chunk_len = @min(data.len, max_chunk);
             const chunk = data[0..chunk_len];
 
