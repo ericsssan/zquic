@@ -102,9 +102,9 @@ pub fn main(init: std.process.Init) !void {
         .initial_max_streams_uni = 100,
     };
 
-    // Bind to all IPv4 interfaces. The NS-3 interop network uses IPv4 for all
-    // standard tests; the dedicated ipv6 test also works via IPv4-mapped addresses.
-    const bind_addr = net.IpAddress{ .ip4 = net.Ip4Address.unspecified(port) };
+    // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6
+    // addresses (::ffff:a.b.c.d); IPv6 clients connect directly.
+    const bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(port) };
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
 
@@ -140,12 +140,22 @@ pub fn main(init: std.process.Init) !void {
                 break :conn_loop;
             };
 
-            peer_addr = msg.from;
+            const new_addr = msg.from;
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
             // Drive timers on every packet, not just on timeout, so the PTO fires
             // even when a stream of client retransmits keeps the receive path busy.
             conn.tick(now_ns);
-            conn.receive(msg.data, ipToSocketAddr(msg.from), now_ns, io) catch |err| {
+            // If address hasn't changed, drain any tick-generated frames before
+            // processing the new packet. This ensures normal operation works correctly.
+            // If address HAS changed, skip drain so PATH_CHALLENGE can be the first
+            // packet on the new path (RFC 9000 §9.3.1).
+            if (peer_addr) |old_addr| {
+                if (ipToSocketAddr(new_addr).eql(ipToSocketAddr(old_addr))) {
+                    drainSend(&conn, &sock, io, &new_addr, &send_buf);
+                }
+            }
+            peer_addr = new_addr;
+            conn.receive(msg.data, ipToSocketAddr(new_addr), now_ns, io) catch |err| {
                 std.debug.print("receive error: {}\n", .{err});
             };
 
