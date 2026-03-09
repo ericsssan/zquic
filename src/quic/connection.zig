@@ -954,11 +954,12 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // On the first Initial, derive initial keys from the client's DCID before HP removal.
             // Keys are required to select the HP key and remove header protection.
+            // Always use the client's version for key derivation to decrypt incoming packets.
             if (raw_pkt_type == .initial and self.hot.state == .idle) {
                 self.initial_version = ver;
                 self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
 
-                // RFC 9368/9369: Version negotiation.
+                // RFC 9368: Version negotiation.
                 // Always echo client's version in Initial/Handshake packets.
                 // TLS negotiation via version_information may upgrade to another version.
                 self.quic_version = ver;
@@ -1983,9 +1984,8 @@ pub fn Connection(comptime max_streams: usize) type {
             switch (epoch) {
                 0 => {
                     // Initial packet: Long Header, epoch 0 keys
-                    // RFC 9369: Keep initial version in header for compatibility with clients that
-                    // don't support compatible version negotiation. Use negotiated version for
-                    // Handshake and 1-RTT packets instead.
+                    // RFC 9368: Initial packets always use the client's version (initial_version).
+                    // Version negotiation to V2 happens at TLS layer via version_information.
                     const ik = self.initial_keys.server;
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
@@ -2238,12 +2238,17 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
-                    // RFC 9369: Send Initial packet with client's version in header.
-                    // Keys are derived from client's version (initial_version).
+                    // RFC 9368/9369: Initial packet header version depends on server mode.
+                    // For native V2 (server configured for V2): send V2 in header
+                    // For compatible VN (server configured for V1): send client's version
+                    const initial_hdr_version = if (self.config.initial_quic_version == packet.QUIC_VERSION_2)
+                        packet.QUIC_VERSION_2
+                    else
+                        self.initial_version;
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        self.initial_version,
+                        initial_hdr_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
