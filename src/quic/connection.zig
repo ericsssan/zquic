@@ -2002,17 +2002,16 @@ pub fn Connection(comptime max_streams: usize) type {
             var ack_ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
             const ack_range_count = buildAckRangesFromBitmap(self.rx_pn_bitmap[epoch], &ack_ranges);
 
-            // Include ACK-ECN frame format to indicate ECN support (RFC 9000 §13.2.1).
-            // Note: actual ECN counting requires IP-level access which sans-I/O library doesn't have.
-            // Application layer would need to track received ECN marks and pass them to the connection.
+            // Include ACK-ECN frame with actual ECN counts received from peer (RFC 9000 §13.2.1).
+            // ecn_ect0_recv and ecn_ce_recv are populated by receive() based on ecn_bits parameter.
             const ack_frame_data: frame.Frame = .{ .ack = .{
                 .largest_acked = @intCast(self.hot.rx_pn[epoch]),
                 .ack_delay = 0,
                 .ranges = ack_ranges,
                 .range_count = ack_range_count,
-                .ect0 = 0,
-                .ect1 = 0,
-                .ecn_ce = self.ecn_ce_seen[epoch],
+                .ect0 = @intCast(@min(self.ecn_ect0_recv[epoch], std.math.maxInt(u62))),
+                .ect1 = 0,  // We don't track ECT(1), only ECT(0)
+                .ecn_ce = @intCast(@min(self.ecn_ce_recv[epoch], std.math.maxInt(u62))),
                 .has_ecn = true,
             } };
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], ack_frame_data);
