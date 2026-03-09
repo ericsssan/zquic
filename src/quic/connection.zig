@@ -959,10 +959,13 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.initial_version = ver;
                 self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
 
-                // RFC 9368: Version negotiation.
-                // Always echo client's version in Initial/Handshake packets.
-                // TLS negotiation via version_information may upgrade to another version.
-                self.quic_version = ver;
+                // RFC 9369: Native V2 mode support.
+                // If configured for V2 and client sent V1, respond with V2.
+                // Otherwise echo client's version (RFC 9368 compatible mode).
+                self.quic_version = if (self.config.initial_quic_version == packet.QUIC_VERSION_2 and ver == packet.QUIC_VERSION_1)
+                    packet.QUIC_VERSION_2
+                else
+                    ver;
                 // NOTE: Do NOT set tls_state.quic_version here. deliverCryptoChunk pushes
                 // conn.quic_version into TLS before processCrypto, allowing TLS to upgrade it
                 // via version_information. conn.quic_version then adopts TLS's result.
@@ -1611,9 +1614,10 @@ pub fn Connection(comptime max_streams: usize) type {
                 // Server always supports V1, optionally V2 if configured
                 if (self.config.initial_quic_version == packet.QUIC_VERSION_2) {
                     // Server supports both V1 and V2: advertise in version_information
+                    // List chosen version (V2) first, then alternatives
                     var vi: [20]u8 = undefined;
-                    std.mem.writeInt(u32, vi[0..4], packet.QUIC_VERSION_1, .big);
-                    std.mem.writeInt(u32, vi[4..8], packet.QUIC_VERSION_2, .big);
+                    std.mem.writeInt(u32, vi[0..4], packet.QUIC_VERSION_2, .big);
+                    std.mem.writeInt(u32, vi[4..8], packet.QUIC_VERSION_1, .big);
                     our_params.version_information = vi;
                     our_params.version_information_len = 8; // 2 versions * 4 bytes each
                 } else {
@@ -1984,18 +1988,20 @@ pub fn Connection(comptime max_streams: usize) type {
             switch (epoch) {
                 0 => {
                     // Initial packet: Long Header, epoch 0 keys
-                    // RFC 9368: Initial packets MUST use the client's version (initial_version),
-                    // regardless of server configuration. Initial keys are derived from V1,
-                    // so the packet header must also be V1 for decryption to succeed.
-                    // Version upgrade for V2 happens in Handshake epoch after TLS negotiation.
-                    const ik = self.initial_keys.server;
+                    // RFC 9369: If configured for V2, respond with V2 Initial and V2 keys.
+                    // Re-derive V2 keys if needed; otherwise use V1 keys derived earlier.
+                    const packet_version = self.quic_version;  // V2 if configured, V1 otherwise
+                    const ik = if (packet_version == packet.QUIC_VERSION_2)
+                        crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
+                    else
+                        self.initial_keys.server;
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        self.initial_version,
+                        packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
@@ -2236,17 +2242,19 @@ pub fn Connection(comptime max_streams: usize) type {
 
             switch (epoch) {
                 0 => {
-                    const ik = self.initial_keys.server;
+                    const packet_version = self.quic_version;  // V2 if configured, V1 otherwise
+                    const ik = if (packet_version == packet.QUIC_VERSION_2)
+                        crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
+                    else
+                        self.initial_keys.server;
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
-                    // RFC 9368: Initial packets always use client's version (initial_version).
-                    // Initial keys are derived from V1, so packet header must be V1.
-                    // Version upgrade to V2 happens in Handshake epoch after TLS negotiation.
+                    // RFC 9369: If configured for V2, respond with V2 Initial and V2 keys.
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
-                        self.initial_version,
+                        packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
                         &.{},
@@ -2339,14 +2347,18 @@ pub fn Connection(comptime max_streams: usize) type {
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
 
             if (epoch == 0) {
-                const ik = self.initial_keys.server;
+                const packet_version = self.quic_version;  // V2 if configured, V1 otherwise
+                const ik = if (packet_version == packet.QUIC_VERSION_2)
+                    crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
+                else
+                    self.initial_keys.server;
                 const pn = self.hot.tx_pn[0];
                 self.hot.tx_pn[0] += 1;
                 const ct_len = fpos + 16;
                 const hdr_len = packet.encodeLongHeader(
                     &self.enc_scratch,
                     .initial,
-                    self.initial_version,
+                    packet_version,
                     self.peer_scid[0..self.peer_scid_len],
                     self.ourScidBytes(),
                     &.{},
