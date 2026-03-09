@@ -929,7 +929,6 @@ pub fn Connection(comptime max_streams: usize) type {
             // Packet type bits 5–4 are NOT header-protected (RFC 9001 §5.4.1).
             const raw_pkt_type = packet.longHeaderType(data[0], ver);
 
-
             // RFC 9000 §9: Discard Initial packets in established state.
             // In established state, all Initial packets (even with matching DCID) must be
             // silently dropped. This handles late/retransmitted Initial packets and new
@@ -1010,17 +1009,14 @@ pub fn Connection(comptime max_streams: usize) type {
             const pn_off = packet.longHeaderPnOffset(data, ver) catch return data.len;
             if (pn_off + 4 + 16 > data.len) return error.PacketTooShort;
 
-
             // Copy packet to a mutable buffer and remove header protection in place.
             // Buffer sized to MAX_PACKET_SIZE; packets larger than this were already rejected above.
             var hp_buf: [MAX_PACKET_SIZE]u8 = undefined;
             @memcpy(hp_buf[0..data.len], data);
             _ = crypto.removeHeaderProtection(hp_key, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
-
             // Parse with header protection removed.
             const result = try packet.parseLongHeader(hp_buf[0..data.len]);
-
 
             const hdr = result.header;
 
@@ -1062,7 +1058,6 @@ pub fn Connection(comptime max_streams: usize) type {
                         @as(u8, hdr.pn_len) * 8,
                     );
 
-
                     // Replay / duplicate protection (RFC 9000 §13.2).
                     if (self.isPnDuplicate(0, pn)) {
                         return result.consumed;
@@ -1078,7 +1073,6 @@ pub fn Connection(comptime max_streams: usize) type {
                     // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
                     defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&plaintext)));
                     if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
-
 
                     crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch |err| {
                         return err;
@@ -1990,7 +1984,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     // Initial packet: Long Header, epoch 0 keys
                     // RFC 9369: If configured for V2, respond with V2 Initial and V2 keys.
                     // Re-derive V2 keys if needed; otherwise use V1 keys derived earlier.
-                    const packet_version = self.quic_version;  // V2 if configured, V1 otherwise
+                    const packet_version = self.quic_version; // V2 if configured, V1 otherwise
                     const ik = if (packet_version == packet.QUIC_VERSION_2)
                         crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
                     else
@@ -2242,7 +2236,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
             switch (epoch) {
                 0 => {
-                    const packet_version = self.quic_version;  // V2 if configured, V1 otherwise
+                    const packet_version = self.quic_version; // V2 if configured, V1 otherwise
                     const ik = if (packet_version == packet.QUIC_VERSION_2)
                         crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
                     else
@@ -2347,7 +2341,7 @@ pub fn Connection(comptime max_streams: usize) type {
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
 
             if (epoch == 0) {
-                const packet_version = self.quic_version;  // V2 if configured, V1 otherwise
+                const packet_version = self.quic_version; // V2 if configured, V1 otherwise
                 const ik = if (packet_version == packet.QUIC_VERSION_2)
                     crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
                 else

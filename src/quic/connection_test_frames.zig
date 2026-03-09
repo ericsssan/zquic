@@ -1548,7 +1548,9 @@ test "flow control: RESET_STREAM uses highest_recv_offset for gap charge" {
     // RESET with final_size=500: gap = 500 - 300 (HWM) = 200, not 500 - 0 (recv_offset) = 500.
     var rst_buf: [64]u8 = undefined;
     const rn = frame.encodeFrame(&rst_buf, .{ .reset_stream = .{
-        .stream_id = 0, .error_code = 0, .final_size = 500,
+        .stream_id = 0,
+        .error_code = 0,
+        .final_size = 500,
     } });
     try conn.processFrames(rst_buf[0..rn], 2, null);
     try testing.expectEqual(@as(u64, 500), conn.conn_flow.recv_total);
