@@ -731,11 +731,11 @@ pub fn Connection(comptime max_streams: usize) type {
                         self.loss.onPtoFired();
                         if (self.app_keys != null) {
                             // Post-handshake: retransmit PATH_CHALLENGE if pending (RFC 9000 §9.2),
-                            // drain pending CRYPTO/stream retransmits, or send a 1-RTT PING probe.
+                            // drain pending stream retransmits, or send a 1-RTT PING probe.
+                            // Note: crypto_pending_retx is cleared on handshake completion, so
+                            // no CRYPTO drain is needed here.
                             if (self.pending_path_challenge) |challenge| {
                                 self.sendPathChallenge(challenge) catch {};
-                            } else if (self.crypto_pending_retx_count > 0) {
-                                self.drainPendingCryptoRetx();
                             } else if (self.stream_pending_retx_count > 0) {
                                 self.drainPendingStreamRetx();
                             } else {
@@ -1722,6 +1722,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.hot.state = .established;
                 // Defense-in-depth: zero initial keys after transition to 1-RTT (no longer needed)
                 std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.InitialKeys)]u8, @ptrCast(&self.initial_keys)));
+                // Discard any queued CRYPTO retransmits — they used handshake-epoch keys that
+                // the peer will discard once 1-RTT keys are established (RFC 9001 §4.9).
+                // Keeping them would cause stale CRYPTO sends on every tick and block the PTO
+                // handler from sending PING probes or stream retransmits post-handshake.
+                self.crypto_pending_retx_count = 0;
                 self.path_validated = true;
                 self.events.push(.connected);
 
@@ -1913,19 +1918,23 @@ pub fn Connection(comptime max_streams: usize) type {
                         .stream => |s| {
                             if (self.streams.get(s.stream_id)) |st| {
                                 st.onAcked(s.offset, s.len);
-                                if (s.fin) {
-                                    st.fin_acked = true;
-                                    if (st.state == .closed) {
-                                        self.streams.close(s.stream_id);
-                                        // Increment local stream limit as slots become available (RFC 9000 §4.6)
-                                        const is_bidi = (s.stream_id & 2) == 0;
-                                        if (is_bidi) {
-                                            self.local_max_streams_bidi +|= 1;
-                                            self.pending_max_streams_bidi = self.local_max_streams_bidi;
-                                        } else {
-                                            self.local_max_streams_uni +|= 1;
-                                            self.pending_max_streams_uni = self.local_max_streams_uni;
-                                        }
+                                if (s.fin) st.fin_acked = true;
+                                // Close the stream slot only when BOTH the FIN and all data
+                                // bytes have been acknowledged. Closing on FIN ACK alone is
+                                // premature when a data packet was lost: the FIN can be ACK'd
+                                // before loss detection fires for the earlier data packet.
+                                // If we free the slot then, streams.get() returns null in
+                                // processLostFrames and the lost data is never retransmitted.
+                                if (st.fin_acked and st.state == .closed and st.send_acked >= st.send_offset) {
+                                    self.streams.close(s.stream_id);
+                                    // Increment local stream limit as slots become available (RFC 9000 §4.6)
+                                    const is_bidi = (s.stream_id & 2) == 0;
+                                    if (is_bidi) {
+                                        self.local_max_streams_bidi +|= 1;
+                                        self.pending_max_streams_bidi = self.local_max_streams_bidi;
+                                    } else {
+                                        self.local_max_streams_uni +|= 1;
+                                        self.pending_max_streams_uni = self.local_max_streams_uni;
                                     }
                                 }
                             }

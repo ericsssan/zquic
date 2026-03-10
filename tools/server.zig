@@ -27,11 +27,23 @@ const MAX_CONNS = 50;
 // Connection type: parameterized for 64 concurrent streams (= MAX_TRANSFERS).
 const Conn = quic.Connection(64);
 
+/// A parsed HTTP/0.9 request waiting for a free transfer slot.
+const PendingTransfer = struct {
+    stream_id: u62 = 0,
+    /// Full path (www_dir + request path), already validated.
+    path: [512]u8 = undefined,
+    path_len: usize = 0,
+};
+
 /// Per-connection state bundled together for heap allocation.
 const ConnSlot = struct {
     conn: Conn,
     peer_addr: ?net.IpAddress = null,
     transfers: [MAX_TRANSFERS]FileTransfer = [_]FileTransfer{.{}} ** MAX_TRANSFERS,
+    /// Parsed requests deferred because all transfer slots were occupied.
+    /// Retried at the start of each flushTransfers() pass.
+    pending: [MAX_TRANSFERS]PendingTransfer = undefined,
+    pending_count: usize = 0,
     last_logged_generation: u32 = 0,
     keylog_written: bool = false,
 };
@@ -138,7 +150,7 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, io
         while (slot.conn.pollEvent()) |ev| {
             switch (ev) {
                 .connection_closed => should_free = true,
-                .stream_data => |st| startTransfer(&slot.conn, st.stream_id, &slot.transfers, www_dir, io),
+                .stream_data => |st| startTransfer(slot, st.stream_id, www_dir, io),
                 else => {},
             }
         }
@@ -149,7 +161,7 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, io
         }
 
         if (slot.peer_addr) |pa| {
-            flushTransfers(&slot.conn, &slot.transfers, www_dir, io);
+            flushTransfers(slot, www_dir, io);
             drainSend(&slot.conn, sock, io, &pa, send_buf);
         }
     }
@@ -255,10 +267,28 @@ pub fn main(init: std.process.Init) !void {
 
         // If no connection found and this is a long header (new Initial), allocate a new slot.
         if (slot == null and msg.data.len > 0 and quic.packet.isLongHeader(msg.data[0])) {
-            slot = allocateSlot(&conn_slots, config, io) catch {
-                // Allocation failed (no free slots); drop packet.
-                continue;
-            };
+            // Before allocating, check if there is already an active connection from this
+            // peer address. This handles PTO retransmits of Initial packets whose DCID
+            // length differs from CID_LEN (e.g. ngtcp2 uses 18-byte DCIDs before the
+            // server has sent its own CID). Without this check, each retransmitted Initial
+            // creates a new slot, producing multiple server SCIDs and failing longrtt.
+            if (dcid == null) {
+                for (conn_slots) |s_opt| {
+                    const s = s_opt orelse continue;
+                    if (s.peer_addr) |pa| {
+                        if (ipToSocketAddr(msg.from).eql(ipToSocketAddr(pa))) {
+                            slot = s;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (slot == null) {
+                slot = allocateSlot(&conn_slots, config, io) catch {
+                    // Allocation failed (no free slots); drop packet.
+                    continue;
+                };
+            }
         }
 
         // If still no slot, drop the packet (unknown CID or allocation failure).
@@ -270,11 +300,13 @@ pub fn main(init: std.process.Init) !void {
         // Drive timers on every packet (so PTO fires even with busy receive path).
         s.conn.tick(now_ns);
 
-        // Handle path migration: only drain send if address hasn't changed.
+        // Always drain queued sends to the current (old) peer address before processing
+        // the incoming packet. For normal packets this is an optimization (flushes ACKs
+        // early). For path migration it is critical: it empties the send queue so that
+        // receive() can queue PATH_CHALLENGE and that frame will be the FIRST packet sent
+        // to the new path — as required by the interop PATH_CHALLENGE check.
         if (s.peer_addr) |old_addr| {
-            if (ipToSocketAddr(msg.from).eql(ipToSocketAddr(old_addr))) {
-                drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
-            }
+            drainSend(&s.conn, &sock, io, &old_addr, &send_buf);
         }
         s.peer_addr = msg.from;
 
@@ -322,7 +354,7 @@ pub fn main(init: std.process.Init) !void {
                     }
                     break; // Exit event loop immediately after freeing
                 },
-                .stream_data => |st| startTransfer(&s.conn, st.stream_id, &s.transfers, www_dir, io),
+                .stream_data => |st| startTransfer(s, st.stream_id, www_dir, io),
                 .connection_closed => {
                     // Connection closed: free the slot.
                     for (0..conn_slots.len) |i| {
@@ -341,7 +373,7 @@ pub fn main(init: std.process.Init) !void {
         // Only access s if slot was not freed inside the event loop.
         if (!slot_freed) {
             // Advance pending file transfers.
-            flushTransfers(&s.conn, &s.transfers, www_dir, io);
+            flushTransfers(s, www_dir, io);
 
             // Drain any queued sends.
             drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
@@ -349,9 +381,27 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+/// Activate a transfer slot from a pre-parsed PendingTransfer entry.
+fn activatePending(transfers: *[MAX_TRANSFERS]FileTransfer, p: *const PendingTransfer, io: std.Io) void {
+    var free_slot: ?*FileTransfer = null;
+    for (transfers) |*t| {
+        if (!t.active) { free_slot = t; break; }
+    }
+    const t = free_slot orelse return; // caller must check before calling
+    t.active = true;
+    t.stream_id = p.stream_id;
+    t.offset = 0;
+    @memcpy(t.path[0..p.path_len], p.path[0..p.path_len]);
+    t.path_len = p.path_len;
+    t.file = std.Io.Dir.openFileAbsolute(io, t.path[0..t.path_len], .{}) catch null;
+}
+
 /// Parse the HTTP/0.9 request from the stream receive buffer and register a FileTransfer.
 /// Does not send any data — flushTransfers() does the actual I/O.
-fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8, io: std.Io) void {
+/// If all transfer slots are occupied, saves the parsed request in slot.pending for retry.
+fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) void {
+    const conn = &slot.conn;
+    const transfers = &slot.transfers;
     const st = conn.streams.get(stream_id) orelse return;
     var req_buf: [256]u8 = undefined;
     const n = st.read(&req_buf);
@@ -364,6 +414,10 @@ fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTra
     // If a transfer is already active for this stream, ignore the duplicate event.
     for (transfers) |*t| {
         if (t.active and t.stream_id == stream_id) return;
+    }
+    // Also check pending queue for duplicates.
+    for (slot.pending[0..slot.pending_count]) |*p| {
+        if (p.stream_id == stream_id) return;
     }
 
     const req = req_buf[0..n];
@@ -384,26 +438,34 @@ fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTra
         return;
     }
 
-    // Find or allocate a transfer slot.
-    var slot: ?*FileTransfer = null;
-    for (transfers) |*t| {
-        if (!t.active) {
-            slot = t;
-            break;
-        }
-    }
-    const t = slot orelse {
-        // No free slot; close the stream empty.
-        conn.streamSend(stream_id, &.{}, true) catch {};
-        return;
-    };
-
     var full_path_buf: [512]u8 = undefined;
     const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ www, path }) catch {
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     };
 
+    // Find or allocate a transfer slot.
+    var free_slot: ?*FileTransfer = null;
+    for (transfers) |*t| {
+        if (!t.active) {
+            free_slot = t;
+            break;
+        }
+    }
+    if (free_slot == null) {
+        // No free slot — save the parsed request for retry when a slot becomes available.
+        if (slot.pending_count < slot.pending.len) {
+            const p = &slot.pending[slot.pending_count];
+            p.stream_id = stream_id;
+            @memcpy(p.path[0..full_path.len], full_path);
+            p.path_len = full_path.len;
+            slot.pending_count += 1;
+        }
+        // If pending queue is also full, the stream is silently dropped (extremely unlikely:
+        // requires >2*MAX_TRANSFERS concurrent streams, which QUIC flow control prevents).
+        return;
+    }
+    const t = free_slot.?;
     t.active = true;
     t.stream_id = stream_id;
     t.offset = 0;
@@ -419,8 +481,20 @@ fn startTransfer(conn: *Conn, stream_id: u62, transfers: *[MAX_TRANSFERS]FileTra
 /// the congestion window is small (e.g. initial cwnd = 10 packets): without
 /// interleaving, stream 0 would fill the window and streams 4/8 would get no
 /// packets at all, stalling their offset-0 delivery.
-fn flushTransfers(conn: *Conn, transfers: *[MAX_TRANSFERS]FileTransfer, www: []const u8, io: std.Io) void {
+fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
+    const conn = &slot.conn;
+    const transfers = &slot.transfers;
     _ = www;
+    // Activate any parsed requests that were deferred because all slots were occupied.
+    while (slot.pending_count > 0) {
+        var has_free = false;
+        for (transfers) |*t| {
+            if (!t.active) { has_free = true; break; }
+        }
+        if (!has_free) break; // Still no room; leave remainder pending.
+        slot.pending_count -= 1;
+        activatePending(transfers, &slot.pending[slot.pending_count], io);
+    }
     // Outer loop: repeat passes until nothing was sent (CC/queue fully blocked).
     while (true) {
         var sent_any = false;

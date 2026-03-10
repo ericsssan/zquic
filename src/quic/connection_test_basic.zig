@@ -432,11 +432,11 @@ test "retransmit: acked FIN on closed stream triggers stream reclamation" {
 }
 
 test "retransmit: lost data retransmitted before FIN ACK frees stream" {
-    // Regression: when a data packet is lost and the FIN is ACKed in the same ACK
-    // processing round, processLostFrames must run BEFORE processAckedFrames so that
-    // the stream slot is still alive during the retransmission attempt. Without this
-    // ordering, processAckedFrames would free the slot (on FIN ACK) and processLostFrames
-    // would silently drop the retransmit, leaving the peer's stream incomplete.
+    // Regression: when a data packet is lost and the FIN is ACKed, the stream slot
+    // must not be freed until the retransmitted data is also acknowledged.
+    // The ordering fix (processLostFrames before processAckedFrames) handles the
+    // same-round case; this test verifies the deferred-close invariant that covers
+    // both the same-round and cross-round (time-threshold) scenarios.
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
@@ -466,8 +466,21 @@ test "retransmit: lost data retransmitted before FIN ACK frees stream" {
     conn.processLostFrames(result);
     try testing.expect(conn.streams.get(4) != null); // stream still alive
 
-    // Step 2: processAckedFrames frees the stream on FIN ACK (state == .closed).
+    // Step 2: processAckedFrames sees the FIN ACK but must NOT free the stream yet:
+    // send_acked (0) < send_offset (2) — the lost data has not been re-ACKed.
     conn.processAckedFrames(result);
+    try testing.expect(conn.streams.get(4) != null); // stream still alive after FIN ACK
+
+    // Step 3: Simulate the retransmitted data being ACKed (a later ACK).
+    var data_ack_result = loss_recovery_mod.AckResult{};
+    var data_acked_fi = loss_recovery_mod.SentFrameInfo{};
+    data_acked_fi.frames[0] = .{ .stream = .{ .stream_id = 4, .offset = 0, .len = 2, .fin = false } };
+    data_acked_fi.count = 1;
+    data_ack_result.acked_frames[0] = data_acked_fi;
+    data_ack_result.acked_frame_count = 1;
+
+    conn.processAckedFrames(data_ack_result);
+    // Now send_acked == send_offset and fin_acked is true: stream should be reclaimed.
     try testing.expectEqual(@as(?*stream_mod.Stream, null), conn.streams.get(4));
 }
 
