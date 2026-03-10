@@ -126,13 +126,30 @@ fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot) std.Io.Timeout {
 }
 
 /// Tick all active connections and drain their sends.
-fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, io: std.Io, send_buf: *[MAX_DATAGRAM]u8) void {
+/// CRITICAL: Must drain pollEvent() to prevent zombie slots from closed connections (Bug 3).
+fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, io: std.Io, send_buf: *[MAX_DATAGRAM]u8, www_dir: []const u8) void {
     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-    for (slots) |slot_opt| {
-        const slot = slot_opt orelse continue;
+    for (slots) |*s_opt| {
+        const slot = s_opt.* orelse continue;
         slot.conn.tick(now_ns);
+
+        // Drain events and free slot if connection closed via timeout.
+        var should_free = false;
+        while (slot.conn.pollEvent()) |ev| {
+            switch (ev) {
+                .connection_closed => should_free = true,
+                .stream_data => |st| startTransfer(&slot.conn, st.stream_id, &slot.transfers, www_dir, io),
+                else => {},
+            }
+        }
+
+        if (should_free) {
+            freeSlot(s_opt, io);
+            continue;
+        }
+
         if (slot.peer_addr) |pa| {
-            flushTransfers(&slot.conn, &slot.transfers, "", io);
+            flushTransfers(&slot.conn, &slot.transfers, www_dir, io);
             drainSend(&slot.conn, sock, io, &pa, send_buf);
         }
     }
@@ -225,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
         const msg = sock.receiveTimeout(io, &recv_buf, timeout) catch |err| {
             if (err == error.Timeout) {
                 // Timeout: tick all active connections
-                tickAllConnections(&conn_slots, &sock, io, &send_buf);
+                tickAllConnections(&conn_slots, &sock, io, &send_buf, www_dir);
                 continue;
             }
             std.debug.print("recv error: {}\n", .{err});
@@ -281,6 +298,9 @@ pub fn main(init: std.process.Init) !void {
         }
 
         // Process connection events.
+        // CRITICAL: If slot is freed inside this loop, s becomes a dangling pointer.
+        // Track this with slot_freed flag to prevent use-after-free after loop exits.
+        var slot_freed = false;
         while (s.conn.pollEvent()) |ev| {
             switch (ev) {
                 .connected => {
@@ -296,9 +316,11 @@ pub fn main(init: std.process.Init) !void {
                     for (0..conn_slots.len) |i| {
                         if (conn_slots[i] == s) {
                             freeSlot(&conn_slots[i], io);
+                            slot_freed = true;
                             break;
                         }
                     }
+                    break; // Exit event loop immediately after freeing
                 },
                 .stream_data => |st| startTransfer(&s.conn, st.stream_id, &s.transfers, www_dir, io),
                 .connection_closed => {
@@ -306,19 +328,24 @@ pub fn main(init: std.process.Init) !void {
                     for (0..conn_slots.len) |i| {
                         if (conn_slots[i] == s) {
                             freeSlot(&conn_slots[i], io);
+                            slot_freed = true;
                             break;
                         }
                     }
+                    break; // Exit event loop immediately after freeing
                 },
                 else => {},
             }
         }
 
-        // Advance pending file transfers.
-        flushTransfers(&s.conn, &s.transfers, www_dir, io);
+        // Only access s if slot was not freed inside the event loop.
+        if (!slot_freed) {
+            // Advance pending file transfers.
+            flushTransfers(&s.conn, &s.transfers, www_dir, io);
 
-        // Drain any queued sends.
-        drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
+            // Drain any queued sends.
+            drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
+        }
     }
 }
 

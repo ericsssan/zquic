@@ -78,7 +78,13 @@ pub const Cubic = struct {
         const MIN_CWND: u64 = 8 * MSS;
         self.w_max = @floatFromInt(self.cwnd);
         self.cwnd = @intFromFloat(@as(f64, @floatFromInt(self.cwnd)) * BETA_CUBIC);
-        if (self.cwnd < MIN_CWND) self.cwnd = MIN_CWND;
+        if (self.cwnd < MIN_CWND) {
+            self.cwnd = MIN_CWND;
+            // RFC 9438 §5.4: when the floor raises cwnd above BETA_CUBIC×w_max,
+            // clip w_max to prevent K from becoming pathologically large (~18s).
+            // This forces K=0 and immediate convex growth instead of prolonged TCP-friendly phase.
+            self.w_max = @floatFromInt(MIN_CWND);
+        }
         self.ssthresh = self.cwnd;
         self.cwnd_remainder = 0;
         self.epoch_start_ns = now_ns; // begin new epoch at loss time
@@ -112,13 +118,19 @@ pub const Cubic = struct {
         const w_cubic = cubicWindow(t_s, self.k, self.w_max);
 
         // TCP-friendly window: RFC 9438 §5.1 running accumulator.
-        // W_est += alpha_aimd * (bytes_acked / cwnd)  per ACK event.
+        // W_est is only incremented during the TCP-friendly phase (W_cubic < W_est).
+        // When W_cubic > W_est (convex growth phase), W_est stalls and CUBIC dominates.
         const alpha_aimd: f64 = 3.0 * BETA_CUBIC / (2.0 - BETA_CUBIC);
         const cwnd_f: f64 = @floatFromInt(self.cwnd);
-        self.w_est += alpha_aimd * @as(f64, @floatFromInt(bytes_acked)) / cwnd_f;
+        if (w_cubic < self.w_est) {
+            self.w_est += alpha_aimd * @as(f64, @floatFromInt(bytes_acked)) / cwnd_f;
+        }
 
         const target = @max(w_cubic, self.w_est);
-        const target_bytes: u64 = @intFromFloat(@max(target, 0));
+        // RFC 9438 Appendix B: Cap target after idle/app-limited periods to 1.5×W_max per RTT.
+        // Prevents burst congestion when t is very large due to idle time.
+        const max_cwnd_target: f64 = 1.5 * self.w_max;
+        const target_bytes: u64 = @intFromFloat(@max(@min(target, max_cwnd_target), 0));
 
         if (target_bytes > self.cwnd) {
             // Accumulate fractional growth to prevent integer division from stalling
@@ -229,6 +241,14 @@ test "cubic: w_est accumulates across ACKs in CUBIC phase" {
     c.onPacketLost(0);
     const w_est_after_loss = c.w_est;
 
+    // Set up a scenario where w_cubic < w_est so TCP-friendly phase is active.
+    // Use a very large w_max relative to cwnd_at_epoch so w_cubic stays below w_est.
+    c.w_max = 1.0e10;  // Very large pre-loss cwnd (simulates old high window)
+    c.k = 100.0;  // Large K so we're far from inflection point
+    c.epoch_start_ns = 0;
+    c.cwnd_at_epoch = @floatFromInt(c.cwnd);
+    c.w_est = @as(f64, @floatFromInt(c.cwnd)) + 1000.0;  // w_est > w_cubic initially
+
     c.onAckReceived(MSS, 50_000_000, 100_000_000);
     try testing.expect(c.w_est > w_est_after_loss);
 }
@@ -308,21 +328,23 @@ test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {
     var c = Cubic.init();
     c.cwnd = 10 * MSS; // 12000 bytes
     c.onPacketLost(0);
-    // Expected: floor(12000 * 0.7) = 8400, but floored to MIN_CWND = 8*MSS = 9600
+    // Expected: floor(12000 * 0.7) = 8400, but floored to MIN_CWND = 8*MSS = 9600.
+    // When floor applies, w_max is clipped to MIN_CWND to prevent K ≈ 18s pathology.
     try testing.expectEqual(@as(u64, 8 * MSS), c.cwnd);
     try testing.expectEqual(c.cwnd, c.ssthresh);
-    try testing.expectEqual(@as(f64, 12000.0), c.w_max);
+    try testing.expectEqual(@as(f64, @floatFromInt(8 * MSS)), c.w_max);
 }
 
 test "cubic: cwnd_remainder uses saturating arithmetic on extreme target" {
     // Regression: (target - cwnd) * MSS can overflow u64 for pathological targets.
-    // Force extreme values: t=400,000s → cubicWindow ≈ 2.56e16, overflow without *|
+    // Force extreme values: t=400,000s → cubicWindow ≈ 2.56e16, would overflow without *|
+    // To test growth in TCP-friendly phase (w_cubic < w_est), set w_est >> w_cubic.
     const testing = std.testing;
     var c = Cubic.init();
     c.ssthresh = MSS;
     c.cwnd = MSS;
-    c.w_max = 1.0;
-    c.w_est = 0.0;
+    c.w_max = 1.0e12;  // Very large w_max
+    c.w_est = 2.0e12;  // w_est >> w_cubic (ensures TCP-friendly phase)
     c.k = 0.0;
     c.epoch_start_ns = 0;
     c.cwnd_at_epoch = @floatFromInt(c.cwnd);

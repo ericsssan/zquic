@@ -733,9 +733,13 @@ pub fn Connection(comptime max_streams: usize) type {
                             // During handshake: flush pending buffered HS data first (covers the case
                             // where amplification limit blocked the initial Handshake send), then
                             // retransmit previously-sent CRYPTO data as probe packets (RFC 9002 §6.2.4).
+                            // If flush() sends data, skip retransmit(1) to avoid double-sending the same HS flight.
+                            const had_pending = self.tls_pending_hs_len > 0;
                             self.flushPendingHsCrypto();
                             self.retransmitCryptoSaved(0);
-                            self.retransmitCryptoSaved(1);
+                            if (!had_pending) {
+                                self.retransmitCryptoSaved(1);
+                            }
                         }
                         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
                     }
@@ -2494,7 +2498,10 @@ pub fn Connection(comptime max_streams: usize) type {
                         @intCast(pn),
                         ct_len,
                     );
-                    if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) break;
+                    if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) {
+                        self.hot.tx_pn[0] -= 1; // Revert pn if packet too large
+                        break;
+                    }
                     crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
                     crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
                     self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch break;
@@ -2517,7 +2524,10 @@ pub fn Connection(comptime max_streams: usize) type {
                         @intCast(pn),
                         ct_len,
                     );
-                    if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) break;
+                    if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) {
+                        self.hot.tx_pn[1] -= 1; // Revert pn if packet too large
+                        break;
+                    }
                     crypto.encryptPayload(hk.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
                     crypto.applyHeaderProtection(hk.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
                     self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch break;
