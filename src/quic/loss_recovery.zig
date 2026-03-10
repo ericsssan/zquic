@@ -137,6 +137,8 @@ pub const AckResult = struct {
     latest_lost_sent_ns: ?i64 = null,
     lost_frames: [MAX_LOSS_EVENTS]SentFrameInfo = undefined,
     lost_frame_count: usize = 0,
+    /// Epoch for each lost packet (parallel to lost_frames)
+    lost_epochs: [MAX_LOSS_EVENTS]u8 = undefined,
     acked_frames: [MAX_LOSS_EVENTS]SentFrameInfo = undefined,
     acked_frame_count: usize = 0,
 };
@@ -264,6 +266,7 @@ pub const SentPacketTable = struct {
                     bif.* -|= slot.size;
                 }
                 result.lost_frames[result.lost_frame_count] = self.frame_info[idx];
+                result.lost_epochs[result.lost_frame_count] = epoch;
                 result.lost_frame_count += 1;
                 // Track earliest/latest sent_ns for persistent congestion detection.
                 if (slot.ack_eliciting) {

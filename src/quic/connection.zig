@@ -430,6 +430,13 @@ pub fn Connection(comptime max_streams: usize) type {
             fin: bool,
         },
         stream_pending_retx_count: u8,
+        /// CRYPTO frames that failed to retransmit (send queue full). Drained in tick().
+        crypto_pending_retx: [MAX_PENDING_RETX]struct {
+            epoch: u8,
+            offset: u62,
+            len: u16,
+        },
+        crypto_pending_retx_count: u8,
         /// Per-epoch expected CRYPTO receive offset (RFC 9000 §19.6).
         /// Out-of-order/duplicate CRYPTO frames are rejected or trimmed against this.
         crypto_recv_offset: [3]u64,
@@ -562,6 +569,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .tls_pending_hs_offset = 0,
                 .stream_pending_retx = undefined,
                 .stream_pending_retx_count = 0,
+                .crypto_pending_retx = undefined,
+                .crypto_pending_retx_count = 0,
                 .crypto_recv_offset = .{ 0, 0, 0 },
                 .crypto_staged = @import("std").mem.zeroes([3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag),
                 .crypto_staged_count = .{ 0, 0, 0 },
@@ -708,7 +717,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
 
-            // Drain any deferred stream retransmits before generating new traffic
+            // Drain any deferred CRYPTO and stream retransmits before generating new traffic
+            self.drainPendingCryptoRetx();
             self.drainPendingStreamRetx();
 
             // PTO: suppress in closing/draining/closed states.
@@ -721,9 +731,11 @@ pub fn Connection(comptime max_streams: usize) type {
                         self.loss.onPtoFired();
                         if (self.app_keys != null) {
                             // Post-handshake: retransmit PATH_CHALLENGE if pending (RFC 9000 §9.2),
-                            // drain pending stream retransmits, or send a 1-RTT PING probe.
+                            // drain pending CRYPTO/stream retransmits, or send a 1-RTT PING probe.
                             if (self.pending_path_challenge) |challenge| {
                                 self.sendPathChallenge(challenge) catch {};
+                            } else if (self.crypto_pending_retx_count > 0) {
+                                self.drainPendingCryptoRetx();
                             } else if (self.stream_pending_retx_count > 0) {
                                 self.drainPendingStreamRetx();
                             } else {
@@ -1928,7 +1940,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Sized to MAX_SEND_PACKET_SIZE so getSendData never returns more bytes than
             // encryptAndEnqueueStreamFrame can encode into pkt_scratch without overflow.
             var stream_retx_buf: [MAX_SEND_PACKET_SIZE]u8 = undefined;
-            for (result.lost_frames[0..result.lost_frame_count]) |fi| {
+            for (result.lost_frames[0..result.lost_frame_count], result.lost_epochs[0..result.lost_frame_count]) |fi, epoch| {
                 for (fi.frames[0..fi.count]) |frame_info| {
                     switch (frame_info) {
                         .stream => |s| {
@@ -1979,7 +1991,18 @@ pub fn Connection(comptime max_streams: usize) type {
                         .connection_close => {
                             self.queueConnectionClose() catch {};
                         },
-                        .crypto_frame, .max_stream_data, .none => {},
+                        .crypto_frame => |cf| {
+                            // Queue lost CRYPTO frame for immediate retransmission.
+                            if (self.crypto_pending_retx_count < MAX_PENDING_RETX) {
+                                self.crypto_pending_retx[self.crypto_pending_retx_count] = .{
+                                    .epoch = epoch,
+                                    .offset = cf.offset,
+                                    .len = cf.len,
+                                };
+                                self.crypto_pending_retx_count += 1;
+                            }
+                        },
+                        .max_stream_data, .none => {},
                     }
                 }
             }
@@ -2015,6 +2038,117 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
             self.stream_pending_retx_count = remaining;
+        }
+
+        fn drainPendingCryptoRetx(self: *Self) void {
+            if (self.crypto_pending_retx_count == 0) return;
+            const max_chunk = MAX_SEND_PACKET_SIZE - 100;
+            var remaining: u8 = 0;
+            for (self.crypto_pending_retx[0..self.crypto_pending_retx_count]) |p| {
+                const epoch = p.epoch;
+                const data_len = self.crypto_send_saved_len[epoch];
+                const offset = p.offset;
+                const len = p.len;
+
+                // Skip if data is no longer available (already acked/sent completely)
+                if (offset >= data_len) continue;
+
+                // Get the chunk from the saved buffer
+                const available = data_len - offset;
+                const chunk_len = @min(len, @min(available, max_chunk));
+                const chunk = self.crypto_send_saved[epoch][offset..][0..chunk_len];
+
+                // Build and send CRYPTO frame for this lost chunk
+                const crypto_frame_val: frame.Frame = .{ .crypto = .{ .offset = @intCast(offset), .data = chunk } };
+                var fpos: usize = 0;
+                fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
+
+                // Send using the appropriate epoch's keys
+                const result = if (epoch == 0)
+                    self.sendCryptoChunkEpoch0(chunk, offset, fpos)
+                else
+                    self.sendCryptoChunkEpoch1(chunk, offset, fpos);
+
+                result catch {
+                    // Send queue full — keep in queue and retry later
+                    self.crypto_pending_retx[remaining] = p;
+                    remaining += 1;
+                    continue;
+                };
+
+                // Successfully sent chunk_len bytes. If more remains, queue the next chunk.
+                if (chunk_len < len) {
+                    if (remaining < MAX_PENDING_RETX) {
+                        self.crypto_pending_retx[remaining] = .{
+                            .epoch = epoch,
+                            .offset = offset + chunk_len,
+                            .len = len - chunk_len,
+                        };
+                        remaining += 1;
+                    }
+                }
+            }
+            self.crypto_pending_retx_count = remaining;
+        }
+
+        fn sendCryptoChunkEpoch0(self: *Self, chunk: []const u8, offset: u62, fpos: usize) !void {
+            const packet_version = self.quic_version;
+            const ik = if (packet_version == packet.QUIC_VERSION_2)
+                crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
+            else
+                self.initial_keys.server;
+            const pn = self.hot.tx_pn[0];
+            self.hot.tx_pn[0] += 1;
+            const ct_len = fpos + 16;
+            const hdr_len = packet.encodeLongHeader(
+                &self.enc_scratch,
+                .initial,
+                packet_version,
+                self.peer_scid[0..self.peer_scid_len],
+                self.ourScidBytes(),
+                &.{},
+                @intCast(pn),
+                ct_len,
+            );
+            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) {
+                self.hot.tx_pn[0] -= 1;
+                return error.PacketTooLarge;
+            }
+            crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+            try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(offset), .len = @intCast(chunk.len) } };
+            fi.count = 1;
+            self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
+        }
+
+        fn sendCryptoChunkEpoch1(self: *Self, chunk: []const u8, offset: u62, fpos: usize) !void {
+            const hk = self.hs_keys orelse return error.NoHandshakeKeys;
+            const pn = self.hot.tx_pn[1];
+            self.hot.tx_pn[1] += 1;
+            const ct_len = fpos + 16;
+            const hdr_len = packet.encodeLongHeader(
+                &self.enc_scratch,
+                .handshake,
+                self.quic_version,
+                self.peer_scid[0..self.peer_scid_len],
+                self.ourScidBytes(),
+                &.{},
+                @intCast(pn),
+                ct_len,
+            );
+            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) {
+                self.hot.tx_pn[1] -= 1;
+                return error.PacketTooLarge;
+            }
+            crypto.encryptPayload(hk.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(hk.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+            try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(offset), .len = @intCast(chunk.len) } };
+            fi.count = 1;
+            self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
         }
 
         // -----------------------------------------------------------------------
