@@ -468,9 +468,11 @@ pub const LossRecovery = struct {
 
     /// PTO deadline: null when nothing is in flight.
     /// Otherwise: last_ack_eliciting_ns + ptoBase × 2^min(pto_count, 12).
-    /// Cap exponent at 12 instead of 20 to prevent handshake timeout under extreme loss/corruption.
+    /// Cap exponent at 12 instead of 20 to prevent handshake timeout under high loss/corruption.
     /// With K_INITIAL_RTT_NS=10ms: ptoBase≈55ms, max backoff=55ms×4096≈225s (fits in 300s test timeout).
-    /// RFC 9002 specifies 2^20, but capping at 2^12 is practical for handshake recovery under 30% corruption.
+    /// RFC 9002 specifies 2^20, but capping at 2^12 is practical for handshake recovery under extreme loss.
+    /// NOTE: handshakecorruption test (30% corruption) still times out - issue is not PTO timing but
+    /// fundamental recovery efficiency under extreme corruption. Requires deeper investigation.
     /// Uses saturating arithmetic to avoid overflow when RTT or pto_count is extreme.
     pub fn ptoDeadline(self: *const LossRecovery, max_ack_delay_ns: u64) ?i64 {
         if (self.bytes_in_flight == 0) return null;
