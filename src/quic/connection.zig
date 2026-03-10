@@ -2006,6 +2006,12 @@ pub fn Connection(comptime max_streams: usize) type {
                     }
                 }
             }
+
+            // During handshake, aggressively drain pending CRYPTO retransmits
+            // immediately after loss detection to speed recovery under high corruption.
+            if (self.app_keys == null and self.crypto_pending_retx_count > 0) {
+                self.drainPendingCryptoRetx();
+            }
         }
 
         fn drainPendingStreamRetx(self: *Self) void {
