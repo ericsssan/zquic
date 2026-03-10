@@ -1984,15 +1984,28 @@ pub fn Connection(comptime max_streams: usize) type {
             var stream_retx_buf: [MAX_SEND_PACKET_SIZE]u8 = undefined;
             var remaining: u8 = 0;
             for (self.stream_pending_retx[0..self.stream_pending_retx_count]) |p| {
-                const st = self.streams.get(p.stream_id) orelse continue;
+                // Try to get the stream; if not found, stream is closed so discard
+                const st = self.streams.get(p.stream_id) orelse {
+                    continue;
+                };
                 const n = @min(st.getSendData(p.offset, &stream_retx_buf), p.len);
+                // Check if data is already acked (offset < send_acked); if so, safe to discard
+                if (p.offset < st.send_acked) {
+                    // Already acked — discard this retransmit
+                    continue;
+                }
+                // Only attempt send if we have data or a FIN bit
                 if (n > 0 or p.fin) {
                     self.encryptAndEnqueueStreamFrame(p.stream_id, p.offset, stream_retx_buf[0..n], p.fin) catch {
-                        // Still full — keep in queue
+                        // Send queue full — keep in queue and retry later
                         self.stream_pending_retx[remaining] = p;
                         remaining += 1;
                         continue;
                     };
+                } else {
+                    // No data available and not already acked — keep retrying
+                    self.stream_pending_retx[remaining] = p;
+                    remaining += 1;
                 }
             }
             self.stream_pending_retx_count = remaining;
