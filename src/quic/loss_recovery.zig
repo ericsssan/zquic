@@ -16,7 +16,7 @@ pub const K_PACKET_THRESHOLD: u64 = 3; // §6.1.1
 pub const K_TIME_THRESHOLD_NUM: u64 = 9; // 9/8 threshold (§6.1.2)
 pub const K_TIME_THRESHOLD_DEN: u64 = 8;
 pub const K_GRANULARITY_NS: u64 = 1_000_000; // 1ms minimum timer granularity
-pub const K_INITIAL_RTT_NS: u64 = 33_000_000; // 33ms — matches 2× 15ms interop link delay
+pub const K_INITIAL_RTT_NS: u64 = 10_000_000; // 10ms — very aggressive for high-loss handshakes (30% loss + 50 concurrent)
 pub const MAX_SENT: usize = 256; // Ring buffer capacity
 pub const MAX_FRAMES_PER_PACKET: usize = 4;
 // Per-ACK capacity for acked/lost frame tracking.
@@ -558,13 +558,13 @@ test "rtt: ack_delay capped at max_ack_delay when computing adjusted_rtt" {
 test "rtt: min_rtt never increases after lower sample" {
     const testing = std.testing;
     var rtt = RttEstimator{};
-    // min_rtt starts at K_INITIAL_RTT_NS = 33_000_000
+    // min_rtt starts at K_INITIAL_RTT_NS = 10_000_000
     rtt.update(150_000_000, 0, 25_000_000); // sample > initial
-    try testing.expectEqual(@as(u64, 33_000_000), rtt.min_rtt); // min(initial, sample)
-    rtt.update(20_000_000, 0, 25_000_000); // lower sample
-    try testing.expectEqual(@as(u64, 20_000_000), rtt.min_rtt);
+    try testing.expectEqual(@as(u64, 10_000_000), rtt.min_rtt); // min(initial, sample)
+    rtt.update(5_000_000, 0, 25_000_000); // lower sample
+    try testing.expectEqual(@as(u64, 5_000_000), rtt.min_rtt);
     rtt.update(500_000_000, 0, 25_000_000); // higher sample — min_rtt must not change
-    try testing.expectEqual(@as(u64, 20_000_000), rtt.min_rtt);
+    try testing.expectEqual(@as(u64, 5_000_000), rtt.min_rtt);
 }
 
 test "sent_table: add and get via modular index" {

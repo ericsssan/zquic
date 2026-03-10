@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-pub const STREAM_BUF_SIZE: usize = 32768;
+pub const STREAM_BUF_SIZE: usize = 32768;  // Revert: buffer size increases cause stack issues in tests
 
 pub const StreamState = enum(u8) {
     open,
