@@ -75,9 +75,10 @@ pub const Cubic = struct {
     /// Called on packet loss (e.g., timeout or three duplicate ACKs).
     /// `now_ns` — current time in nanoseconds.
     pub fn onPacketLost(self: *Cubic, now_ns: i64) void {
+        const MIN_CWND: u64 = 8 * MSS;
         self.w_max = @floatFromInt(self.cwnd);
         self.cwnd = @intFromFloat(@as(f64, @floatFromInt(self.cwnd)) * BETA_CUBIC);
-        if (self.cwnd < MSS) self.cwnd = MSS;
+        if (self.cwnd < MIN_CWND) self.cwnd = MIN_CWND;
         self.ssthresh = self.cwnd;
         self.cwnd_remainder = 0;
         self.epoch_start_ns = now_ns; // begin new epoch at loss time
@@ -257,9 +258,10 @@ test "cubic: single loss event reduces cwnd by exactly BETA_CUBIC" {
     c.cwnd = 100 * MSS; // 120000 bytes
     const before = c.cwnd;
     c.onPacketLost(1_000_000_000);
-    // Expected: floor(120000 * 0.7) = 84000
+    // Expected: floor(120000 * 0.7) = 84000, but minimum is 8*MSS
     const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(before)) * BETA_CUBIC);
-    try testing.expectEqual(@max(expected, MSS), c.cwnd);
+    const MIN_CWND: u64 = 8 * MSS;
+    try testing.expectEqual(@max(expected, MIN_CWND), c.cwnd);
 }
 
 test "cubic: large window growth does not stall" {
@@ -306,8 +308,8 @@ test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {
     var c = Cubic.init();
     c.cwnd = 10 * MSS; // 12000 bytes
     c.onPacketLost(0);
-    // Expected: floor(12000 * 0.7) = 8400
-    try testing.expectEqual(@as(u64, 8400), c.cwnd);
+    // Expected: floor(12000 * 0.7) = 8400, but floored to MIN_CWND = 8*MSS = 9600
+    try testing.expectEqual(@as(u64, 8 * MSS), c.cwnd);
     try testing.expectEqual(c.cwnd, c.ssthresh);
     try testing.expectEqual(@as(f64, 12000.0), c.w_max);
 }

@@ -730,8 +730,10 @@ pub fn Connection(comptime max_streams: usize) type {
                                 self.queuePing() catch {};
                             }
                         } else {
-                            // During handshake: retransmit CRYPTO data (RFC 9002 §6.2.4).
-                            // The client may not have received our Handshake flight; resend it.
+                            // During handshake: flush pending buffered HS data first (covers the case
+                            // where amplification limit blocked the initial Handshake send), then
+                            // retransmit previously-sent CRYPTO data as probe packets (RFC 9002 §6.2.4).
+                            self.flushPendingHsCrypto();
                             self.retransmitCryptoSaved(0);
                             self.retransmitCryptoSaved(1);
                         }
@@ -2452,7 +2454,8 @@ pub fn Connection(comptime max_streams: usize) type {
             return chunk_len;
         }
 
-        /// Retransmit saved CRYPTO data for the given epoch as a new probe packet.
+        /// Retransmit saved CRYPTO data for the given epoch as probe packets.
+        /// Chunks large CRYPTO data (e.g., handshake with certificate chain) across multiple packets.
         /// Called by the PTO handler when the handshake stalls (app_keys == null).
         pub fn retransmitCryptoSaved(self: *Self, comptime epoch: u8) void {
             comptime std.debug.assert(epoch < 2);
@@ -2460,60 +2463,71 @@ pub fn Connection(comptime max_streams: usize) type {
             if (data_len == 0) return;
             const data = self.crypto_send_saved[epoch][0..data_len];
 
-            const crypto_frame_val: frame.Frame = .{ .crypto = .{ .offset = 0, .data = data } };
-            var fpos: usize = 0;
-            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
+            const max_chunk = MAX_SEND_PACKET_SIZE - 100; // Same budget as sendCryptoChunk()
 
-            if (epoch == 0) {
-                const packet_version = self.quic_version; // V2 if configured, V1 otherwise
-                const ik = if (packet_version == packet.QUIC_VERSION_2)
-                    crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
-                else
-                    self.initial_keys.server;
-                const pn = self.hot.tx_pn[0];
-                self.hot.tx_pn[0] += 1;
-                const ct_len = fpos + 16;
-                const hdr_len = packet.encodeLongHeader(
-                    &self.enc_scratch,
-                    .initial,
-                    packet_version,
-                    self.peer_scid[0..self.peer_scid_len],
-                    self.ourScidBytes(),
-                    &.{},
-                    @intCast(pn),
-                    ct_len,
-                );
-                if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return;
-                crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch return;
-                var fi = loss_recovery_mod.SentFrameInfo{};
-                fi.frames[0] = .{ .crypto_frame = .{ .offset = 0, .len = @intCast(data_len) } };
-                fi.count = 1;
-                self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
-            } else {
-                const hk = self.hs_keys orelse return;
-                const pn = self.hot.tx_pn[1];
-                self.hot.tx_pn[1] += 1;
-                const ct_len = fpos + 16;
-                const hdr_len = packet.encodeLongHeader(
-                    &self.enc_scratch,
-                    .handshake,
-                    self.quic_version,
-                    self.peer_scid[0..self.peer_scid_len],
-                    self.ourScidBytes(),
-                    &.{},
-                    @intCast(pn),
-                    ct_len,
-                );
-                if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return;
-                crypto.encryptPayload(hk.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                crypto.applyHeaderProtection(hk.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch return;
-                var fi = loss_recovery_mod.SentFrameInfo{};
-                fi.frames[0] = .{ .crypto_frame = .{ .offset = 0, .len = @intCast(data_len) } };
-                fi.count = 1;
-                self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
+            var sent: usize = 0;
+            while (sent < data.len) {
+                const chunk_end = @min(sent + max_chunk, data.len);
+                const chunk = data[sent..chunk_end];
+
+                // Build CRYPTO frame for this chunk at the correct stream offset
+                const crypto_frame_val: frame.Frame = .{ .crypto = .{ .offset = @intCast(sent), .data = chunk } };
+                var fpos: usize = 0;
+                fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
+
+                if (epoch == 0) {
+                    const packet_version = self.quic_version; // V2 if configured, V1 otherwise
+                    const ik = if (packet_version == packet.QUIC_VERSION_2)
+                        crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
+                    else
+                        self.initial_keys.server;
+                    const pn = self.hot.tx_pn[0];
+                    self.hot.tx_pn[0] += 1;
+                    const ct_len = fpos + 16;
+                    const hdr_len = packet.encodeLongHeader(
+                        &self.enc_scratch,
+                        .initial,
+                        packet_version,
+                        self.peer_scid[0..self.peer_scid_len],
+                        self.ourScidBytes(),
+                        &.{},
+                        @intCast(pn),
+                        ct_len,
+                    );
+                    if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) break;
+                    crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(ik.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+                    self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch break;
+                    var fi = loss_recovery_mod.SentFrameInfo{};
+                    fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(sent), .len = @intCast(chunk.len) } };
+                    fi.count = 1;
+                    self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
+                } else {
+                    const hk = self.hs_keys orelse break;
+                    const pn = self.hot.tx_pn[1];
+                    self.hot.tx_pn[1] += 1;
+                    const ct_len = fpos + 16;
+                    const hdr_len = packet.encodeLongHeader(
+                        &self.enc_scratch,
+                        .handshake,
+                        self.quic_version,
+                        self.peer_scid[0..self.peer_scid_len],
+                        self.ourScidBytes(),
+                        &.{},
+                        @intCast(pn),
+                        ct_len,
+                    );
+                    if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) break;
+                    crypto.encryptPayload(hk.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(hk.server.hp, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+                    self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch break;
+                    var fi = loss_recovery_mod.SentFrameInfo{};
+                    fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(sent), .len = @intCast(chunk.len) } };
+                    fi.count = 1;
+                    self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
+                }
+
+                sent += chunk.len;
             }
             self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
         }

@@ -12,6 +12,7 @@ const pem = @import("pem.zig");
 
 const net = std.Io.net;
 const os = std.os;
+const page_allocator = std.heap.page_allocator;
 const DEFAULT_PORT: u16 = 443;
 const MAX_DATAGRAM = 1452;
 // Chunk size must fit inside a single QUIC packet (MAX_DATAGRAM=1452 minus
@@ -20,10 +21,23 @@ const SEND_CHUNK: usize = 1380;
 // Maximum concurrent file transfers per connection.
 const MAX_TRANSFERS = 64;
 
+// Maximum concurrent connections.
+const MAX_CONNS = 50;
+
 // Connection type: parameterized for 64 concurrent streams (= MAX_TRANSFERS).
 const Conn = quic.Connection(64);
 
+/// Per-connection state bundled together for heap allocation.
+const ConnSlot = struct {
+    conn: Conn,
+    peer_addr: ?net.IpAddress = null,
+    transfers: [MAX_TRANSFERS]FileTransfer = [_]FileTransfer{.{}} ** MAX_TRANSFERS,
+    last_logged_generation: u32 = 0,
+    keylog_written: bool = false,
+};
+
 const ALPN = "hq-interop";
+const CID_LEN = quic.connection_id.len; // 8 bytes
 
 const supported_cases = [_][]const u8{
     "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2", "ecn",
@@ -41,6 +55,88 @@ const FileTransfer = struct {
     /// Cached file handle (open once per transfer, closed on completion or error).
     file: ?std.Io.File = null,
 };
+
+/// Extract the DCID from a QUIC packet's first few bytes.
+/// Returns null if the packet is malformed or too short.
+fn extractDcid(data: []const u8) ?[CID_LEN]u8 {
+    if (data.len < 1) return null;
+    if (quic.packet.isLongHeader(data[0])) {
+        // Long header: version(4) + dcid_len(1) + dcid at byte 6
+        if (data.len < 6) return null;
+        const dcid_len = data[5];
+        if (dcid_len != CID_LEN) return null;
+        if (data.len < 6 + CID_LEN) return null;
+        return data[6..][0..CID_LEN].*;
+    } else {
+        // Short header: dcid at byte 1
+        if (data.len < 1 + CID_LEN) return null;
+        return data[1..][0..CID_LEN].*;
+    }
+}
+
+/// Find a connection slot by its local DCID.
+fn findConnByDcid(slots: *const [MAX_CONNS]?*ConnSlot, dcid: [CID_LEN]u8) ?*ConnSlot {
+    for (slots.*) |slot_opt| {
+        const slot = slot_opt orelse continue;
+        if (std.mem.eql(u8, &slot.conn.local_cid.bytes, &dcid)) return slot;
+        if (std.mem.eql(u8, &slot.conn.alt_local_cid.bytes, &dcid)) return slot;
+    }
+    return null;
+}
+
+/// Allocate and initialize a new connection slot.
+fn allocateSlot(slots: *[MAX_CONNS]?*ConnSlot, config: quic.Config, io: std.Io) !*ConnSlot {
+    for (slots) |*s_opt| {
+        if (s_opt.* == null) {
+            const slot = try page_allocator.create(ConnSlot);
+            slot.* = .{
+                .conn = try Conn.accept(config, io),
+            };
+            s_opt.* = slot;
+            return slot;
+        }
+    }
+    return error.NoSlot;
+}
+
+/// Free a connection slot (close file handles, deallocate memory).
+fn freeSlot(slot_opt_ptr: *?*ConnSlot, io: std.Io) void {
+    const slot = slot_opt_ptr.* orelse return;
+    for (&slot.transfers) |*t| {
+        if (t.file) |file| {
+            file.close(io);
+        }
+    }
+    page_allocator.destroy(slot);
+    slot_opt_ptr.* = null;
+}
+
+/// Compute the minimum timeout across all active connections.
+fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot) std.Io.Timeout {
+    var min_deadline: ?i64 = null;
+    for (slots) |slot_opt| {
+        const slot = slot_opt orelse continue;
+        if (slot.conn.nextTimeout()) |d| {
+            if (min_deadline == null or d < min_deadline.?) {
+                min_deadline = d;
+            }
+        }
+    }
+    return if (min_deadline) |d| .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } } else .none;
+}
+
+/// Tick all active connections and drain their sends.
+fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, io: std.Io, send_buf: *[MAX_DATAGRAM]u8) void {
+    const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+    for (slots) |slot_opt| {
+        const slot = slot_opt orelse continue;
+        slot.conn.tick(now_ns);
+        if (slot.peer_addr) |pa| {
+            flushTransfers(&slot.conn, &slot.transfers, "", io);
+            drainSend(&slot.conn, sock, io, &pa, send_buf);
+        }
+    }
+}
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
@@ -119,109 +215,110 @@ pub fn main(init: std.process.Init) !void {
     var recv_buf: [MAX_DATAGRAM]u8 = undefined;
     var send_buf: [MAX_DATAGRAM]u8 = undefined;
 
-    // Accept and handle connections one at a time.
+    // Connection table: array of nullable pointers (heap-allocated).
+    var conn_slots: [MAX_CONNS]?*ConnSlot = [_]?*ConnSlot{null} ** MAX_CONNS;
+
+    // Multiplexed event loop: handle packets for any active connection.
     while (true) {
-        var conn = try Conn.accept(config, io);
-        var peer_addr: ?net.IpAddress = null;
-        var last_logged_generation: u32 = 0;
-        var keylog_written: bool = false;
+        const timeout = computeGlobalTimeout(&conn_slots);
 
-        // Per-connection file transfer state.
-        var transfers = [_]FileTransfer{.{}} ** MAX_TRANSFERS;
+        const msg = sock.receiveTimeout(io, &recv_buf, timeout) catch |err| {
+            if (err == error.Timeout) {
+                // Timeout: tick all active connections
+                tickAllConnections(&conn_slots, &sock, io, &send_buf);
+                continue;
+            }
+            std.debug.print("recv error: {}\n", .{err});
+            break;
+        };
 
-        conn_loop: while (true) {
-            const timeout = computeTimeout(conn.nextTimeout());
+        // Extract DCID from the packet to find the right connection.
+        const dcid = extractDcid(msg.data);
+        var slot: ?*ConnSlot = if (dcid) |d| findConnByDcid(&conn_slots, d) else null;
 
-            const msg = sock.receiveTimeout(io, &recv_buf, timeout) catch |err| {
-                if (err == error.Timeout) {
-                    const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-                    conn.tick(now_ns);
-                    if (peer_addr) |pa| {
-                        flushTransfers(&conn, &transfers, www_dir, io);
-                        drainSend(&conn, &sock, io, &pa, &send_buf);
+        // If no connection found and this is a long header (new Initial), allocate a new slot.
+        if (slot == null and msg.data.len > 0 and quic.packet.isLongHeader(msg.data[0])) {
+            slot = allocateSlot(&conn_slots, config, io) catch {
+                // Allocation failed (no free slots); drop packet.
+                continue;
+            };
+        }
+
+        // If still no slot, drop the packet (unknown CID or allocation failure).
+        if (slot == null) continue;
+
+        const s = slot.?;
+        const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+
+        // Drive timers on every packet (so PTO fires even with busy receive path).
+        s.conn.tick(now_ns);
+
+        // Handle path migration: only drain send if address hasn't changed.
+        if (s.peer_addr) |old_addr| {
+            if (ipToSocketAddr(msg.from).eql(ipToSocketAddr(old_addr))) {
+                drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
+            }
+        }
+        s.peer_addr = msg.from;
+
+        // TODO: Extract ECN bits from IP header via recvmsg cmsg when ECN is enabled
+        const ecn_bits: u2 = 0; // 0=not-ECT, 1=ECT(1), 2=ECT(0), 3=CE
+        s.conn.receive(msg.data, ipToSocketAddr(msg.from), now_ns, ecn_bits, io) catch |err| {
+            std.debug.print("receive error: {}\n", .{err});
+        };
+
+        // Write keylog when app_keys are available.
+        if (!s.keylog_written and s.conn.app_keys != null) {
+            writeKeyLog(&s.conn, io);
+            s.keylog_written = true;
+            s.last_logged_generation = 0;
+        }
+
+        // If key rotation occurred, update keylog immediately.
+        if (s.conn.current_key_generation > s.last_logged_generation) {
+            updateKeyLog(&s.conn, io, s.last_logged_generation);
+            s.last_logged_generation = s.conn.current_key_generation;
+        }
+
+        // Process connection events.
+        while (s.conn.pollEvent()) |ev| {
+            switch (ev) {
+                .connected => {
+                    if (!s.keylog_written) {
+                        writeKeyLog(&s.conn, io);
+                        s.keylog_written = true;
+                        s.last_logged_generation = 0;
                     }
-                    continue :conn_loop;
-                }
-                std.debug.print("recv error: {}\n", .{err});
-                break :conn_loop;
-            };
-
-            const new_addr = msg.from;
-            const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-            // Drive timers on every packet, not just on timeout, so the PTO fires
-            // even when a stream of client retransmits keeps the receive path busy.
-            conn.tick(now_ns);
-            // If address hasn't changed, drain any tick-generated frames before
-            // processing the new packet. This ensures normal operation works correctly.
-            // If address HAS changed, skip drain so PATH_CHALLENGE can be the first
-            // packet on the new path (RFC 9000 §9.3.1).
-            if (peer_addr) |old_addr| {
-                if (ipToSocketAddr(new_addr).eql(ipToSocketAddr(old_addr))) {
-                    drainSend(&conn, &sock, io, &new_addr, &send_buf);
-                }
-            }
-            peer_addr = new_addr;
-            // TODO: Extract ECN bits from IP header via recvmsg cmsg when ECN is enabled
-            const ecn_bits: u2 = 0;  // 0=not-ECT, 1=ECT(1), 2=ECT(0), 3=CE
-            conn.receive(msg.data, ipToSocketAddr(new_addr), now_ns, ecn_bits, io) catch |err| {
-                std.debug.print("receive error: {}\n", .{err});
-            };
-
-            // Write keylog when app_keys are available (after ClientFinished processed).
-            if (!keylog_written and conn.app_keys != null) {
-                writeKeyLog(&conn, io);
-                keylog_written = true;
-                last_logged_generation = 0;
-            }
-
-            // If key rotation occurred, update keylog immediately (don't wait for connection_closed)
-            if (conn.current_key_generation > last_logged_generation) {
-                updateKeyLog(&conn, io, last_logged_generation);
-                last_logged_generation = conn.current_key_generation;
-            }
-
-            while (conn.pollEvent()) |ev| {
-                switch (ev) {
-                    .connected => {
-                        // Write keylog immediately when connection established
-                        if (!keylog_written) {
-                            writeKeyLog(&conn, io);
-                            keylog_written = true;
-                            last_logged_generation = 0;
+                },
+                .retry_sent => {
+                    // Retry sent: drain send and free this slot.
+                    drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
+                    for (0..conn_slots.len) |i| {
+                        if (conn_slots[i] == s) {
+                            freeSlot(&conn_slots[i], io);
+                            break;
                         }
-                    },
-                    .retry_sent => {
-                        drainSend(&conn, &sock, io, &msg.from, &send_buf);
-                        break :conn_loop;
-                    },
-                    .stream_data => |s| startTransfer(&conn, s.stream_id, &transfers, www_dir, io),
-                    .connection_closed => {
-                        // Note: appendRotatedSecretsToKeyLog is not called here because
-                        // keylog updates now happen incrementally in the main loop above
-                        break :conn_loop;
-                    },
-                    else => {},
-                }
-            }
-
-            // Advance any pending file transfers now that the send window may have grown.
-            flushTransfers(&conn, &transfers, www_dir, io);
-
-            // DO NOT actively close the connection after transfers complete.
-            // The client is responsible for closing the connection when it's done downloading.
-            // For "multiplexing" test with 1999 files but only 64 transfer slots, closing after
-            // the first batch would prematurely terminate the connection. Instead, rely on the
-            // idle timeout (configured by the client) to clean up abandoned connections.
-
-            drainSend(&conn, &sock, io, &msg.from, &send_buf);
-        }
-
-        // Cleanup: close any open file handles before exiting the connection.
-        for (&transfers) |*t| {
-            if (t.file) |file| {
-                file.close(io);
+                    }
+                },
+                .stream_data => |st| startTransfer(&s.conn, st.stream_id, &s.transfers, www_dir, io),
+                .connection_closed => {
+                    // Connection closed: free the slot.
+                    for (0..conn_slots.len) |i| {
+                        if (conn_slots[i] == s) {
+                            freeSlot(&conn_slots[i], io);
+                            break;
+                        }
+                    }
+                },
+                else => {},
             }
         }
+
+        // Advance pending file transfers.
+        flushTransfers(&s.conn, &s.transfers, www_dir, io);
+
+        // Drain any queued sends.
+        drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
     }
 }
 
