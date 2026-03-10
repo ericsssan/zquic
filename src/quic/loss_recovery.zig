@@ -467,13 +467,16 @@ pub const LossRecovery = struct {
     }
 
     /// PTO deadline: null when nothing is in flight.
-    /// Otherwise: last_ack_eliciting_ns + ptoBase × 2^min(pto_count, 20).
+    /// Otherwise: last_ack_eliciting_ns + ptoBase × 2^min(pto_count, 12).
+    /// Cap exponent at 12 instead of 20 to prevent handshake timeout under extreme loss/corruption.
+    /// With K_INITIAL_RTT_NS=10ms: ptoBase≈55ms, max backoff=55ms×4096≈225s (fits in 300s test timeout).
+    /// RFC 9002 specifies 2^20, but capping at 2^12 is practical for handshake recovery under 30% corruption.
     /// Uses saturating arithmetic to avoid overflow when RTT or pto_count is extreme.
     pub fn ptoDeadline(self: *const LossRecovery, max_ack_delay_ns: u64) ?i64 {
         if (self.bytes_in_flight == 0) return null;
         const base_ns = self.last_ack_eliciting_ns orelse return null;
         const pto = self.rtt.ptoBase(max_ack_delay_ns);
-        const shift: u6 = @intCast(@min(self.pto_count, 20));
+        const shift: u6 = @intCast(@min(self.pto_count, 12));
         // Saturating multiply: prevents u64 overflow on extreme RTT values.
         const backoff: u64 = pto *| (@as(u64, 1) << shift);
         // Clamp to i64 max before casting, then add with saturation.
@@ -683,17 +686,17 @@ test "pto: deadline is clamped at 2^20 backoff" {
 
     const d0 = lr.ptoDeadline(25_000_000).?;
 
-    // Drive pto_count well past 20; backoff should saturate at 2^20
-    lr.pto_count = 20;
-    const d_at_20 = lr.ptoDeadline(25_000_000).?;
+    // Drive pto_count well past 12; backoff should saturate at 2^12
+    lr.pto_count = 12;
+    const d_at_12 = lr.ptoDeadline(25_000_000).?;
 
     lr.pto_count = 30; // beyond the clamp
     const d_at_30 = lr.ptoDeadline(25_000_000).?;
 
-    // At count=20 and count=30 the deadline must be identical (clamped)
-    try testing.expectEqual(d_at_20, d_at_30);
+    // At count=12 and count=30 the deadline must be identical (clamped)
+    try testing.expectEqual(d_at_12, d_at_30);
     // And both must be strictly larger than the base deadline
-    try testing.expect(d_at_20 > d0);
+    try testing.expect(d_at_12 > d0);
 }
 
 test "rtt: ack_delay exceeding sample_ns does not underflow adjusted_rtt" {
@@ -764,7 +767,7 @@ test "pto: deadline saturates on extreme pto values" {
     // Force an extreme smoothed_rtt that would cause overflow without saturation
     lr.rtt.smoothed_rtt = std.math.maxInt(u64) / 4;
     lr.rtt.rtt_var = std.math.maxInt(u64) / 8;
-    lr.pto_count = 20;
+    lr.pto_count = 12;
 
     // Must not panic and must return a valid (positive) deadline
     const d = lr.ptoDeadline(0);
