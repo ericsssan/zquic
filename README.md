@@ -91,21 +91,13 @@ tools/
 > **Note:** [`ghcr.io/ericsssan/zquic-interop:latest`](https://github.com/ericsssan/zquic/pkgs/container/zquic-interop) is built solely for use with [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner). It is not a general-purpose or production image.
 
 <!-- INTEROP_START -->
-Tested against **ngtcp2** client (2026-03-09) — goodput 6932 ± 80 kbps:
+Tested against **ngtcp2** client (2026-03-10) — goodput 7037 ± 29 kbps:
 
 | Result | Test cases |
 | :---: | --- |
-| ✅ Pass | handshake, transfer, longrtt, multiplexing, retry, blackhole, keyupdate, v2, ipv6, rebind-port, rebind-addr |
+| ✅ Pass | handshake, transfer, longrtt, multiplexing, retry, blackhole, keyupdate, ecn, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr |
 | ❓ Unsupported | chacha20, resumption, zerortt, http3, connectionmigration |
-| ❌ Fail | ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption |
-
-Tested against **quic-go** client (2026-03-09) — goodput 7285 ± 11 kbps:
-
-| Result | Test cases |
-| :---: | --- |
-| ✅ Pass | handshake, transfer, longrtt, multiplexing, retry, blackhole, keyupdate, ipv6 |
-| ❓ Unsupported | chacha20, resumption, zerortt, http3, ecn, v2, connectionmigration |
-| ❌ Fail | amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, rebind-port, rebind-addr |
+| ❌ Fail | amplificationlimit |
 <!-- INTEROP_END -->
 
 ## Limitations
