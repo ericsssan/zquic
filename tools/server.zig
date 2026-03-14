@@ -39,6 +39,8 @@ const PendingTransfer = struct {
 const ConnSlot = struct {
     conn: Conn,
     peer_addr: ?net.IpAddress = null,
+    /// When true, send responses through the CM socket (after preferred_address migration).
+    use_cm_sock: bool = false,
     transfers: [MAX_TRANSFERS]FileTransfer = [_]FileTransfer{.{}} ** MAX_TRANSFERS,
     /// Parsed requests deferred because all transfer slots were occupied.
     /// Retried at the start of each flushTransfers() pass.
@@ -61,6 +63,9 @@ const supported_cases = [_][]const u8{
 // server6:  fd00:cafe:cafe:0100::100
 const CM_IPV4: [4]u8 = .{ 193, 167, 100, 100 };
 const CM_IPV6: [16]u8 = .{ 0xfd, 0x00, 0xca, 0xfe, 0xca, 0xfe, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00 };
+// Port for preferred_address in connectionmigration (different from initial port 443).
+// Both neqo and lsquic use 4433; the server must bind an additional socket on this port.
+const CM_PORT: u16 = 4433;
 
 /// State for one in-progress file transfer.
 const FileTransfer = struct {
@@ -146,7 +151,7 @@ fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot) std.Io.Timeout {
 
 /// Tick all active connections and drain their sends.
 /// CRITICAL: Must drain pollEvent() to prevent zombie slots from closed connections (Bug 3).
-fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, io: std.Io, send_buf: *[MAX_DATAGRAM]u8, www_dir: []const u8) void {
+fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm_sock_ptr: ?*const net.Socket, io: std.Io, send_buf: *[MAX_DATAGRAM]u8, www_dir: []const u8) void {
     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
     for (slots) |*s_opt| {
         const slot = s_opt.* orelse continue;
@@ -169,9 +174,18 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, io
 
         if (slot.peer_addr) |pa| {
             flushTransfers(slot, www_dir, io);
-            drainSend(&slot.conn, sock, io, &pa, send_buf);
+            const send_sock = slotSendSock(slot, sock, cm_sock_ptr);
+            drainSend(&slot.conn, send_sock, io, &pa, send_buf);
         }
     }
+}
+
+/// Pick the correct socket for sending to a connection: CM socket after migration, main otherwise.
+fn slotSendSock(slot: *const ConnSlot, sock: *const net.Socket, cm_sock_ptr: ?*const net.Socket) *const net.Socket {
+    if (slot.use_cm_sock) {
+        if (cm_sock_ptr) |cs| return cs;
+    }
+    return sock;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -236,9 +250,9 @@ pub fn main(init: std.process.Init) !void {
         .initial_max_streams_uni = 100,
         // RFC 9000 §18.2.3: advertise preferred IPv4+IPv6 addresses for migration.
         .preferred_addr_ipv4 = if (is_cm) CM_IPV4 else null,
-        .preferred_addr_ipv4_port = if (is_cm) port else 0,
+        .preferred_addr_ipv4_port = if (is_cm) CM_PORT else 0,
         .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else [_]u8{0} ** 16,
-        .preferred_addr_ipv6_port = if (is_cm) port else 0,
+        .preferred_addr_ipv6_port = if (is_cm) CM_PORT else 0,
     };
 
     // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6
@@ -246,6 +260,15 @@ pub fn main(init: std.process.Init) !void {
     const bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(port) };
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
+
+    // For connectionmigration: bind a second socket on CM_PORT (4433) so the server
+    // can receive packets after the client migrates to the preferred_address.
+    var cm_sock: ?net.Socket = null;
+    if (is_cm) {
+        const cm_bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(CM_PORT) };
+        cm_sock = try net.IpAddress.bind(&cm_bind_addr, io, .{ .mode = .dgram });
+    }
+    defer if (cm_sock) |s| s.close(io);
 
     // Enable ECN (Explicit Congestion Notification) if testcase is "ecn"
     if (std.mem.eql(u8, testcase, "ecn")) {
@@ -260,137 +283,176 @@ pub fn main(init: std.process.Init) !void {
     // Connection table: array of nullable pointers (heap-allocated).
     var conn_slots: [MAX_CONNS]?*ConnSlot = [_]?*ConnSlot{null} ** MAX_CONNS;
 
+    // Stable pointer to CM socket (if active) for passing to functions.
+    const cm_sock_ptr: ?*const net.Socket = if (cm_sock) |*s| s else null;
+
     // Multiplexed event loop: handle packets for any active connection.
     while (true) {
-        const timeout = computeGlobalTimeout(&conn_slots);
+        var timeout = computeGlobalTimeout(&conn_slots);
 
-        const msg = sock.receiveTimeout(io, &recv_buf, timeout) catch |err| {
-            if (err == error.Timeout) {
-                // Timeout: tick all active connections
-                tickAllConnections(&conn_slots, &sock, io, &send_buf, www_dir);
-                continue;
+        // When CM socket is active, cap the main socket timeout at 5ms so we
+        // check the CM socket frequently for PATH_CHALLENGE/migrated packets.
+        if (cm_sock_ptr != null) timeout = clampTimeout(timeout, 5_000_000, io);
+
+        var got_packet = false;
+
+        // Try main socket.
+        if (sock.receiveTimeout(io, &recv_buf, timeout)) |msg| {
+            processPacket(msg.data, msg.from, false, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+            got_packet = true;
+        } else |err| {
+            if (err != error.Timeout) {
+                std.debug.print("recv error: {}\n", .{err});
+                break;
             }
-            std.debug.print("recv error: {}\n", .{err});
-            break;
-        };
+        }
 
-        // Extract DCID from the packet to find the right connection.
-        const dcid = extractDcid(msg.data);
-        var slot: ?*ConnSlot = if (dcid) |d| findConnByDcid(&conn_slots, d) else null;
+        // Try CM socket (short timeout: 1ms).
+        if (cm_sock_ptr) |cs| {
+            const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+            const cm_timeout: std.Io.Timeout = .{ .deadline = .{ .raw = .{ .nanoseconds = now_ns + 1_000_000 }, .clock = .awake } };
+            if (cs.receiveTimeout(io, &recv_buf, cm_timeout)) |msg| {
+                processPacket(msg.data, msg.from, true, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+                got_packet = true;
+            } else |_| {}
+        }
 
-        // If no connection found and this is a long header (new Initial), allocate a new slot.
-        if (slot == null and msg.data.len > 0 and quic.packet.isLongHeader(msg.data[0])) {
-            // Before allocating, check if there is already an active connection from this
-            // peer address. This handles PTO retransmits of Initial packets whose DCID
-            // length differs from CID_LEN (e.g. ngtcp2 uses 18-byte DCIDs before the
-            // server has sent its own CID). Without this check, each retransmitted Initial
-            // creates a new slot, producing multiple server SCIDs and failing longrtt.
-            if (dcid == null) {
-                for (conn_slots) |s_opt| {
-                    const s = s_opt orelse continue;
-                    if (s.peer_addr) |pa| {
-                        if (ipToSocketAddr(msg.from).eql(ipToSocketAddr(pa))) {
-                            slot = s;
-                            break;
-                        }
+        if (!got_packet) {
+            tickAllConnections(&conn_slots, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+        }
+    }
+}
+
+/// Clamp an Io.Timeout to at most max_ns nanoseconds from now.
+fn clampTimeout(timeout: std.Io.Timeout, max_ns: i64, io: std.Io) std.Io.Timeout {
+    const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+    const max_deadline = now_ns + max_ns;
+    return switch (timeout) {
+        .none => .{ .deadline = .{ .raw = .{ .nanoseconds = max_deadline }, .clock = .awake } },
+        .deadline => |d| .{ .deadline = .{ .raw = .{ .nanoseconds = @min(d.raw.nanoseconds, max_deadline) }, .clock = d.clock } },
+        .duration => .{ .deadline = .{ .raw = .{ .nanoseconds = max_deadline }, .clock = .awake } },
+    };
+}
+
+/// Process a single received packet from either the main or CM socket.
+fn processPacket(
+    data: []u8,
+    from: net.IpAddress,
+    is_cm_socket: bool,
+    conn_slots: *[MAX_CONNS]?*ConnSlot,
+    config: quic.Config,
+    sock: *const net.Socket,
+    cm_sock_ptr: ?*const net.Socket,
+    io: std.Io,
+    send_buf: *[MAX_DATAGRAM]u8,
+    www_dir: []const u8,
+) void {
+    // Extract DCID from the packet to find the right connection.
+    const dcid = extractDcid(data);
+    var slot: ?*ConnSlot = if (dcid) |d| findConnByDcid(conn_slots, d) else null;
+
+    // If no connection found and this is a long header (new Initial), allocate a new slot.
+    if (slot == null and data.len > 0 and quic.packet.isLongHeader(data[0])) {
+        if (dcid == null) {
+            for (conn_slots) |s_opt| {
+                const s = s_opt orelse continue;
+                if (s.peer_addr) |pa| {
+                    if (ipToSocketAddr(from).eql(ipToSocketAddr(pa))) {
+                        slot = s;
+                        break;
                     }
                 }
             }
-            if (slot == null) {
-                slot = allocateSlot(&conn_slots, config, io) catch {
-                    // Allocation failed (no free slots); drop packet.
-                    continue;
-                };
-            }
         }
-
-        // If still no slot, drop the packet (unknown CID or allocation failure).
-        if (slot == null) continue;
-
-        const s = slot.?;
-        const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-
-        // Drive timers on every packet (so PTO fires even with busy receive path).
-        s.conn.tick(now_ns);
-
-        // Always drain queued sends to the current (old) peer address before processing
-        // the incoming packet. For normal packets this is an optimization (flushes ACKs
-        // early). For path migration it is critical: it empties the send queue so that
-        // receive() can queue PATH_CHALLENGE and that frame will be the FIRST packet sent
-        // to the new path — as required by the interop PATH_CHALLENGE check.
-        if (s.peer_addr) |old_addr| {
-            drainSend(&s.conn, &sock, io, &old_addr, &send_buf);
+        if (slot == null) {
+            slot = allocateSlot(conn_slots, config, io) catch return;
         }
-        s.peer_addr = msg.from;
+    }
 
-        // TODO: Extract ECN bits from IP header via recvmsg cmsg when ECN is enabled
-        const ecn_bits: u2 = 0; // 0=not-ECT, 1=ECT(1), 2=ECT(0), 3=CE
-        s.conn.receive(msg.data, ipToSocketAddr(msg.from), now_ns, ecn_bits, io) catch |err| {
-            std.debug.print("receive error: {}\n", .{err});
-        };
+    if (slot == null) return;
 
-        // Write keylog when app_keys are available.
-        if (!s.keylog_written and s.conn.app_keys != null) {
-            writeKeyLog(&s.conn, io);
-            s.keylog_written = true;
-            s.last_logged_generation = 0;
-        }
+    const s = slot.?;
+    const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+    s.conn.tick(now_ns);
 
-        // If key rotation occurred, update keylog immediately.
-        if (s.conn.current_key_generation > s.last_logged_generation) {
-            updateKeyLog(&s.conn, io, s.last_logged_generation);
-            s.last_logged_generation = s.conn.current_key_generation;
-        }
+    // Drain queued sends to the old peer address before processing the incoming packet.
+    if (s.peer_addr) |old_addr| {
+        drainSend(&s.conn, slotSendSock(s, sock, cm_sock_ptr), io, &old_addr, send_buf);
+    }
+    s.peer_addr = from;
 
-        // Process connection events.
-        // CRITICAL: If slot is freed inside this loop, s becomes a dangling pointer.
-        // Track this with slot_freed flag to prevent use-after-free after loop exits.
-        var slot_freed = false;
-        while (s.conn.pollEvent()) |ev| {
-            switch (ev) {
-                .connected => {
-                    if (!s.keylog_written) {
-                        writeKeyLog(&s.conn, io);
-                        s.keylog_written = true;
-                        s.last_logged_generation = 0;
+    // Track which socket this connection should use for sending.
+    // On first CM socket packet: send PATH_CHALLENGE to validate the new path
+    // BEFORE processing the incoming packet, so PATH_CHALLENGE is the first
+    // frame sent from the new address (required by interop test).
+    if (is_cm_socket and !s.use_cm_sock) {
+        s.use_cm_sock = true;
+        var challenge: [8]u8 = undefined;
+        io.random(&challenge);
+        s.conn.sendPathChallenge(challenge) catch {};
+    } else if (is_cm_socket) {
+        // Already on CM socket, no action needed
+    }
+
+    const ecn_bits: u2 = 0;
+    s.conn.receive(data, ipToSocketAddr(from), now_ns, ecn_bits, io) catch |err| {
+        std.debug.print("receive error: {}\n", .{err});
+    };
+
+    // Write keylog when app_keys are available.
+    if (!s.keylog_written and s.conn.app_keys != null) {
+        writeKeyLog(&s.conn, io);
+        s.keylog_written = true;
+        s.last_logged_generation = 0;
+    }
+
+    if (s.conn.current_key_generation > s.last_logged_generation) {
+        updateKeyLog(&s.conn, io, s.last_logged_generation);
+        s.last_logged_generation = s.conn.current_key_generation;
+    }
+
+    const active_sock = slotSendSock(s, sock, cm_sock_ptr);
+
+    // Process connection events.
+    var slot_freed = false;
+    while (s.conn.pollEvent()) |ev| {
+        switch (ev) {
+            .connected => {
+                if (!s.keylog_written) {
+                    writeKeyLog(&s.conn, io);
+                    s.keylog_written = true;
+                    s.last_logged_generation = 0;
+                }
+            },
+            .retry_sent => {
+                drainSend(&s.conn, active_sock, io, &from, send_buf);
+                for (0..conn_slots.len) |i| {
+                    if (conn_slots[i] == s) {
+                        freeSlot(&conn_slots[i], io);
+                        slot_freed = true;
+                        break;
                     }
-                },
-                .retry_sent => {
-                    // Retry sent: drain send and free this slot.
-                    drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
-                    for (0..conn_slots.len) |i| {
-                        if (conn_slots[i] == s) {
-                            freeSlot(&conn_slots[i], io);
-                            slot_freed = true;
-                            break;
-                        }
+                }
+                break;
+            },
+            .stream_data => |st| startTransfer(s, st.stream_id, www_dir, io),
+            .connection_closed => {
+                for (0..conn_slots.len) |i| {
+                    if (conn_slots[i] == s) {
+                        freeSlot(&conn_slots[i], io);
+                        slot_freed = true;
+                        break;
                     }
-                    break; // Exit event loop immediately after freeing
-                },
-                .stream_data => |st| startTransfer(s, st.stream_id, www_dir, io),
-                .connection_closed => {
-                    // Connection closed: free the slot.
-                    for (0..conn_slots.len) |i| {
-                        if (conn_slots[i] == s) {
-                            freeSlot(&conn_slots[i], io);
-                            slot_freed = true;
-                            break;
-                        }
-                    }
-                    break; // Exit event loop immediately after freeing
-                },
-                else => {},
-            }
+                }
+                break;
+            },
+            else => {},
         }
+    }
 
-        // Only access s if slot was not freed inside the event loop.
-        if (!slot_freed) {
-            // Advance pending file transfers.
-            flushTransfers(s, www_dir, io);
-
-            // Drain any queued sends.
-            drainSend(&s.conn, &sock, io, &msg.from, &send_buf);
-        }
+    if (!slot_freed) {
+        flushTransfers(s, www_dir, io);
+        drainSend(&s.conn, active_sock, io, &from, send_buf);
     }
 }
 

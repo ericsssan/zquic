@@ -55,6 +55,7 @@ COPY interop/run_endpoint.sh /run_endpoint.sh
 RUN chmod +x /run_endpoint.sh && mkdir -p /logs /certs
 
 EXPOSE 443/udp
+EXPOSE 4433/udp
 
 ENV PORT=443
 ENV TESTCASE=transfer
