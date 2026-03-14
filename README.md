@@ -95,7 +95,7 @@ Tested against **ngtcp2** client (2026-03-15) — goodput 7001 ± 12 kbps:
 
 | Result | Test cases |
 | :---: | --- |
-| ✅ Pass | handshake, transfer, longrtt, multiplexing, retry, blackhole, keyupdate, ecn, **amplificationlimit**, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration, goodput |
+| ✅ Pass | handshake, transfer, longrtt, multiplexing, retry, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration, goodput |
 | ❓ Unsupported | chacha20, resumption, zerortt, http3 |
 <!-- INTEROP_END -->
 
