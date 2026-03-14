@@ -53,7 +53,14 @@ const CID_LEN = quic.connection_id.len; // 8 bytes
 
 const supported_cases = [_][]const u8{
     "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2", "ecn",
+    "connectionmigration",
 };
+
+// IPv4/IPv6 addresses for preferred_address in connectionmigration test (interop runner addresses).
+// server4:  193.167.100.100  (0xc1, 0xa7, 0x64, 0x64)
+// server6:  fd00:cafe:cafe:0100::100
+const CM_IPV4: [4]u8 = .{ 193, 167, 100, 100 };
+const CM_IPV6: [16]u8 = .{ 0xfd, 0x00, 0xca, 0xfe, 0xca, 0xfe, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00 };
 
 /// State for one in-progress file transfer.
 const FileTransfer = struct {
@@ -214,6 +221,7 @@ pub fn main(init: std.process.Init) !void {
     const key_der_len = try pem.pemToDerBlock(key_pem_buf[0..key_pem_len], "PRIVATE KEY", &key_der_buf);
     const key_material = try pem.parsePrivateKey(key_der_buf[0..key_der_len]);
 
+    const is_cm = std.mem.eql(u8, testcase, "connectionmigration");
     const config: quic.Config = .{
         .alpn = ALPN,
         .validate_addr = std.mem.eql(u8, testcase, "retry"),
@@ -226,6 +234,11 @@ pub fn main(init: std.process.Init) !void {
         .initial_quic_version = if (std.mem.eql(u8, testcase, "v2")) quic.packet.QUIC_VERSION_2 else quic.packet.QUIC_VERSION_1,
         .initial_max_streams_bidi = 64, // Match MAX_TRANSFERS; grows as streams close
         .initial_max_streams_uni = 100,
+        // RFC 9000 §18.2.3: advertise preferred IPv4+IPv6 addresses for migration.
+        .preferred_addr_ipv4 = if (is_cm) CM_IPV4 else null,
+        .preferred_addr_ipv4_port = if (is_cm) port else 0,
+        .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else [_]u8{0} ** 16,
+        .preferred_addr_ipv6_port = if (is_cm) port else 0,
     };
 
     // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6

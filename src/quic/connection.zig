@@ -181,6 +181,14 @@ pub const Config = struct {
     initial_max_streams_bidi: u64 = 100,
     /// Maximum number of client-initiated unidirectional streams to advertise.
     initial_max_streams_uni: u64 = 100,
+    /// IPv4 address for preferred_address transport parameter (RFC 9000 §18.2.3).
+    /// When non-null, the server advertises this as its preferred migration target.
+    /// The alt_local_cid and alt_local_reset_token are used automatically.
+    preferred_addr_ipv4: ?[4]u8 = null,
+    preferred_addr_ipv4_port: u16 = 0,
+    /// IPv6 address for preferred_address transport parameter (RFC 9000 §18.2.3).
+    preferred_addr_ipv6: [16]u8 = [_]u8{0} ** 16,
+    preferred_addr_ipv6_port: u16 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -1708,6 +1716,24 @@ pub fn Connection(comptime max_streams: usize) type {
                     // RFC 9369 requires version_information for servers supporting V2.
                     // V1-only servers can omit it.
                     our_params.version_information = null;
+                }
+
+                // RFC 9000 §18.2.3: advertise preferred_address if configured.
+                // Advertise both IPv4 and IPv6 preferred addresses so that the client
+                // can migrate to whichever address family it is not currently using.
+                if (self.config.preferred_addr_ipv4) |ipv4| {
+                    var pa_cid: [20]u8 = [_]u8{0} ** 20;
+                    const pa_cid_len = self.alt_local_cid.bytes.len;
+                    @memcpy(pa_cid[0..pa_cid_len], &self.alt_local_cid.bytes);
+                    our_params.preferred_address = transport_params.PreferredAddress{
+                        .ipv4_addr = ipv4,
+                        .ipv4_port = self.config.preferred_addr_ipv4_port,
+                        .ipv6_addr = self.config.preferred_addr_ipv6,
+                        .ipv6_port = self.config.preferred_addr_ipv6_port,
+                        .cid = pa_cid,
+                        .cid_len = @intCast(pa_cid_len),
+                        .reset_token = self.alt_local_reset_token,
+                    };
                 }
 
                 self.tls_state.our_transport_params = our_params;
