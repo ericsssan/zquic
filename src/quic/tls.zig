@@ -111,9 +111,13 @@ pub const TlsServer = struct {
     p256_pub: [65]u8,
     // Our signing key (Ed25519 or P-256 ECDSA depending on certificate)
     sign_key: SignKey,
-    // DER-encoded certificate (self-signed or external)
+    // DER-encoded leaf certificate (self-signed or external), used for CertificateVerify.
     cert_buf: [16384]u8,
     cert_len: usize,
+    // Pre-formatted TLS CertificateEntry list for full cert chain.
+    // When chain_len > 0, buildCertificateMessage uses this instead of cert_buf.
+    cert_chain: [32768]u8 = undefined,
+    cert_chain_len: usize = 0,
 
     // Handshake transcript hash state
     transcript: Sha256,
@@ -257,6 +261,14 @@ pub const TlsServer = struct {
         };
         @memcpy(self.cert_buf[0..cert_der.len], cert_der);
         return self;
+    }
+
+    /// Set a pre-formatted TLS CertificateEntry list for multi-cert chains.
+    /// Format: [3-byte len][DER][2-byte ext(0)] repeated for each cert.
+    pub fn setCertChain(self: *TlsServer, chain: []const u8) void {
+        const n = @min(chain.len, self.cert_chain.len);
+        @memcpy(self.cert_chain[0..n], chain[0..n]);
+        self.cert_chain_len = n;
     }
 
     pub fn isComplete(self: *const TlsServer) bool {
@@ -652,19 +664,22 @@ pub const TlsServer = struct {
         pos += 3;
         const list_start = pos;
 
-        // CertificateEntry
-        // cert_data length (u24)
-        const cert_data = self.cert_buf[0..self.cert_len];
-        out[pos] = @intCast((cert_data.len >> 16) & 0xff);
-        out[pos + 1] = @intCast((cert_data.len >> 8) & 0xff);
-        out[pos + 2] = @intCast(cert_data.len & 0xff);
-        pos += 3;
-        @memcpy(out[pos..][0..cert_data.len], cert_data);
-        pos += cert_data.len;
-
-        // Extensions for this CertificateEntry (empty)
-        std.mem.writeInt(u16, out[pos..][0..2], 0, .big);
-        pos += 2;
+        if (self.cert_chain_len > 0) {
+            // Multi-cert chain: pre-formatted CertificateEntry list
+            @memcpy(out[pos..][0..self.cert_chain_len], self.cert_chain[0..self.cert_chain_len]);
+            pos += self.cert_chain_len;
+        } else {
+            // Single certificate
+            const cert_data = self.cert_buf[0..self.cert_len];
+            out[pos] = @intCast((cert_data.len >> 16) & 0xff);
+            out[pos + 1] = @intCast((cert_data.len >> 8) & 0xff);
+            out[pos + 2] = @intCast(cert_data.len & 0xff);
+            pos += 3;
+            @memcpy(out[pos..][0..cert_data.len], cert_data);
+            pos += cert_data.len;
+            std.mem.writeInt(u16, out[pos..][0..2], 0, .big);
+            pos += 2;
+        }
 
         // Fill CertificateList length
         const list_len = pos - list_start;

@@ -42,6 +42,37 @@ pub fn pemToDer(pem_input: []const u8, out: []u8) !usize {
     return pemToDerBlock(pem_input, null, out);
 }
 
+/// Extract ALL CERTIFICATE PEM blocks and format as a TLS CertificateEntry list.
+/// Output format: [3-byte len][DER][2-byte ext(0x0000)] repeated for each cert.
+/// Returns total bytes written.
+pub fn pemToCertChain(pem_input: []const u8, out: []u8) !usize {
+    const begin_marker = "-----BEGIN CERTIFICATE-----";
+    const end_marker = "-----END CERTIFICATE-----";
+    var pos: usize = 0;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, pem_input, search, begin_marker)) |begin| {
+        const body_start = (std.mem.indexOfPos(u8, pem_input, begin, "\n") orelse return error.NoPemMarker) + 1;
+        const end_pos = std.mem.indexOfPos(u8, pem_input, body_start, end_marker) orelse return error.NoPemMarker;
+        const body = std.mem.trim(u8, pem_input[body_start..end_pos], " \t\r\n");
+        // Decode DER into a temp buffer
+        var tmp: [8192]u8 = undefined;
+        const der_len = try pemDecodeBody(body, &tmp);
+        // Write CertificateEntry: [3-byte len][DER][2-byte ext(0)]
+        if (pos + 3 + der_len + 2 > out.len) return error.BufferTooSmall;
+        out[pos] = @intCast((der_len >> 16) & 0xff);
+        out[pos + 1] = @intCast((der_len >> 8) & 0xff);
+        out[pos + 2] = @intCast(der_len & 0xff);
+        pos += 3;
+        @memcpy(out[pos..][0..der_len], tmp[0..der_len]);
+        pos += der_len;
+        std.mem.writeInt(u16, out[pos..][0..2], 0, .big);
+        pos += 2;
+        search = end_pos + end_marker.len;
+    }
+    if (pos == 0) return error.NoPemMarker;
+    return pos;
+}
+
 /// Decode the first PEM block whose header line contains `header_filter` (case-sensitive).
 /// Pass `null` for `header_filter` to accept any block (same as pemToDer).
 /// Returns number of DER bytes written into `out`.

@@ -174,6 +174,10 @@ pub const Config = struct {
     cert_seed: ?[32]u8 = null,
     /// Key algorithm for cert_der (ignored when cert_der is null).
     cert_key_algorithm: tls.KeyAlgorithm = .ed25519,
+    /// Pre-formatted TLS CertificateEntry list for the full cert chain.
+    /// When non-null, buildCertificateMessage sends this instead of just cert_der.
+    /// Format: [3-byte len][DER][2-byte ext(0)] repeated for each cert.
+    cert_chain: ?[]const u8 = null,
     /// Initial QUIC version (0x00000001 = v1, 0x6b3343cf = v2).
     /// Overridden by client's version in first Initial packet.
     initial_quic_version: u32 = packet.QUIC_VERSION_1,
@@ -322,9 +326,6 @@ pub fn Connection(comptime max_streams: usize) type {
         bytes_unvalidated_recv: u64,
         /// Bytes sent to the unvalidated peer (stops counting post-validation).
         bytes_unvalidated_sent: u64,
-        /// When true, the next enqueueSend call bypasses the 3x amplification check
-        /// for one packet (RFC 9000 §8.1.4 anti-amplification probe on PTO).
-        allow_amplification_probe: bool,
 
         // ECN (Explicit Congestion Notification) tracking (RFC 9001 Appendix A).
         /// Count of ECT(0) packets received in each epoch [Initial, Handshake, 1-RTT].
@@ -418,17 +419,19 @@ pub fn Connection(comptime max_streams: usize) type {
 
         // Per-epoch TLS send offset (for FrameInfo tracking)
         crypto_send_offset: [3]u64,
+        /// Rotating retransmit position for CRYPTO PTO retransmissions.
+        /// Each PTO cycle continues from where the last left off, ensuring
+        /// all CRYPTO data is eventually delivered under amplification limits.
+        crypto_retx_pos: [2]usize,
         /// Buffer storing outgoing CRYPTO data (epochs 0 and 1) for PTO retransmission.
         /// Populated by sendCryptoChunk; retransmitted by the PTO handler in tick().
-        /// Sized to match the TLS output buffer (8192 bytes) so overflow is structurally
-        /// impossible: processCrypto writes into an [8192]u8 out_buf, meaning the sum of
-        /// all sendCryptoChunk calls for a single handshake flight cannot exceed 8192 bytes.
-        crypto_send_saved: [2][8192]u8,
+        /// Sized to match the TLS output buffer so overflow is structurally impossible.
+        crypto_send_saved: [2][32768]u8,
         crypto_send_saved_len: [2]u16,
         /// Handshake CRYPTO data (EncryptedExtensions through Finished) buffered during
         /// amplification limit, awaiting budget to send. Allows retry when more client
         /// packets arrive and grow the budget (RFC 9000 §8.1.2).
-        tls_pending_hs: [8192]u8,
+        tls_pending_hs: [32768]u8,
         /// Number of bytes in tls_pending_hs awaiting transmission.
         tls_pending_hs_len: usize,
         /// Read offset in tls_pending_hs (bytes already sent from this buffer).
@@ -475,6 +478,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 try tls.TlsServer.initFromCert(der, config.cert_seed.?, config.cert_key_algorithm, io)
             else
                 try tls.TlsServer.init(io);
+            if (config.cert_chain) |chain| tls_server.setCertChain(chain);
             // NOTE: Do NOT set tls_server.quic_version here. Let it default to V1.
             // The connection layer will set it to the client's Initial version (line 962).
             // TLS will only switch versions if version_information indicates support (RFC 9368).
@@ -556,7 +560,6 @@ pub fn Connection(comptime max_streams: usize) type {
                 .path_validated = false,
                 .bytes_unvalidated_recv = 0,
                 .bytes_unvalidated_sent = 0,
-                .allow_amplification_probe = false,
                 .ecn_ect0_recv = .{ 0, 0, 0 },
                 .ecn_ce_recv = .{ 0, 0, 0 },
                 .pending_path_challenge = null,
@@ -574,9 +577,10 @@ pub fn Connection(comptime max_streams: usize) type {
                 .unknown_version_times = [_]i64{std.math.minInt(i64)} ** 4,
                 .unknown_version_idx = 0,
                 .crypto_send_offset = .{ 0, 0, 0 },
-                .crypto_send_saved = @import("std").mem.zeroes([2][8192]u8),
+                .crypto_retx_pos = .{ 0, 0 },
+                .crypto_send_saved = @import("std").mem.zeroes([2][32768]u8),
                 .crypto_send_saved_len = .{ 0, 0 },
-                .tls_pending_hs = std.mem.zeroes([8192]u8),
+                .tls_pending_hs = std.mem.zeroes([32768]u8),
                 .tls_pending_hs_len = 0,
                 .tls_pending_hs_offset = 0,
                 .stream_pending_retx = undefined,
@@ -648,6 +652,12 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.bytes_unvalidated_recv +|= data.len;
                 // Try to flush any Handshake CRYPTO data buffered during previous amplification limits
                 self.flushPendingHsCrypto();
+                // RFC 9002 §6.2.2.1: restart PTO when anti-amplification budget grows.
+                // The PTO was suppressed (set to null) when the server was fully limited;
+                // now that we have more budget, re-arm it so retransmits can proceed.
+                if (self.pto_deadline_ns == null and self.loss.bytes_in_flight > 0) {
+                    self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                }
             }
 
             // Process all coalesced packets in the datagram
@@ -757,27 +767,30 @@ pub fn Connection(comptime max_streams: usize) type {
                             // During handshake: flush pending buffered HS data first (covers the case
                             // where amplification limit blocked the initial Handshake send), then
                             // retransmit previously-sent CRYPTO data as probe packets (RFC 9002 §6.2.4).
-                            // If flush() sends data, skip retransmit(1) to avoid double-sending the same HS flight.
-                            const had_pending = self.tls_pending_hs_len > 0;
-                            const budget_exhausted = !self.path_validated and
-                                self.bytes_unvalidated_recv > 0 and
-                                self.bytes_unvalidated_sent >= self.bytes_unvalidated_recv *| 3;
+                            // Prioritize Handshake over Initial: once we have HS keys, the client
+                            // must have processed our Initial, so retransmitting Initial wastes budget.
+                            const sent_before = self.bytes_unvalidated_sent;
                             self.flushPendingHsCrypto();
+                            // Retransmit Initial first (small ~149B, critical if dropped
+                            // since client can't derive Handshake keys without ServerHello),
+                            // then Handshake with remaining budget.
                             self.retransmitCryptoSaved(0);
-                            if (!had_pending) {
-                                self.retransmitCryptoSaved(1);
-                            }
-                            // RFC 9000 §8.1.4: if anti-amplification budget was exhausted and
-                            // there is still pending HS data, send one Initial-epoch probe.
-                            // This elicits a 1200-byte padded Initial retransmit from the client
-                            // (RFC 9000 §14.1), growing the budget by 3×1200 = 3600 bytes.
-                            if (had_pending and budget_exhausted) {
-                                self.allow_amplification_probe = true;
-                                self.sendEncryptedAck(0) catch {};
-                                self.allow_amplification_probe = false; // clear if unused
+                            self.retransmitCryptoSaved(1);
+                            const no_progress = self.bytes_unvalidated_sent == sent_before;
+                            if (no_progress and !self.path_validated and self.bytes_unvalidated_recv > 0) {
+                                // Amplification-limited: can't send anything. Schedule PTO
+                                // from current time to prevent the deadline-in-the-past flooding
+                                // bug (last_ack_eliciting_ns doesn't advance when no ack-eliciting
+                                // packets are sent, causing ptoDeadline() to return a past time).
+                                const pto_base = self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns);
+                                const shift: u6 = @intCast(@min(self.loss.pto_count, 5));
+                                const backoff: u64 = pto_base *| (@as(u64, 1) << shift);
+                                const max_i64: u64 = @as(u64, std.math.maxInt(i64));
+                                self.pto_deadline_ns = self.current_time_ns +| @as(i64, @intCast(@min(backoff, max_i64)));
+                            } else {
+                                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
                             }
                         }
-                        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
                     }
                 }
             }
@@ -1746,7 +1759,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.tls_state.quic_version = self.quic_version;
             }
 
-            var out_buf: [8192]u8 = undefined;
+            var out_buf: [32768]u8 = undefined;
             const out_len = try self.tls_state.processCrypto(data, &out_buf, io);
 
             if (self.hs_keys == null and self.tls_state.state != .wait_client_hello) {
@@ -2221,19 +2234,11 @@ pub fn Connection(comptime max_streams: usize) type {
             // (bytes_unvalidated_recv > 0) so that direct enqueueSend calls in tests are
             // unaffected before any receive has happened (RFC 9000 §8.1.2).
             if (!self.path_validated and self.bytes_unvalidated_recv > 0) {
-                if (self.allow_amplification_probe) {
-                    // RFC 9000 §8.1.4: one probe packet per PTO is allowed to exceed
-                    // the 3x limit so the client responds with a padded 1200-byte Initial,
-                    // growing the budget enough to deliver the full handshake flight.
-                    self.bytes_unvalidated_sent +|= data.len;
-                    self.allow_amplification_probe = false; // consumed
-                } else {
-                    const new_sent = self.bytes_unvalidated_sent +| data.len;
-                    if (new_sent > self.bytes_unvalidated_recv *| 3) {
-                        return error.AmplificationLimitExceeded;
-                    }
-                    self.bytes_unvalidated_sent = new_sent;
+                const new_sent = self.bytes_unvalidated_sent +| data.len;
+                if (new_sent > self.bytes_unvalidated_recv *| 3) {
+                    return error.AmplificationLimitExceeded;
                 }
+                self.bytes_unvalidated_sent = new_sent;
             }
             const slot = &self.sq[self.sq_tail & (SEND_QUEUE_DEPTH - 1)];
             const n = @min(data.len, MAX_SEND_PACKET_SIZE);
@@ -2545,7 +2550,24 @@ pub fn Connection(comptime max_streams: usize) type {
             // AEAD tag: 16B
             // Worst case total: 67 + 11 + 16 = 94B
             // Safe margin: 100B to account for all variabilities
-            const max_chunk = MAX_SEND_PACKET_SIZE - 100;
+            const OVERHEAD = 100;
+
+            // When amplification-limited, cap packet size to remaining budget so we
+            // can still send partial chunks instead of failing entirely.  This is
+            // critical for flushPendingHsCrypto: the 9-cert chain in amplificationlimit
+            // generates ~8KB of Handshake CRYPTO, and the remaining budget after the
+            // initial flight may only be ~500 bytes — too small for a full 1352-byte chunk.
+            var effective_max: usize = MAX_SEND_PACKET_SIZE;
+            if (!self.path_validated and self.bytes_unvalidated_recv > 0) {
+                const budget = self.bytes_unvalidated_recv *| 3;
+                if (budget > self.bytes_unvalidated_sent) {
+                    effective_max = @min(effective_max, @as(usize, @intCast(budget - self.bytes_unvalidated_sent)));
+                } else {
+                    return 0; // fully amplification-limited
+                }
+            }
+            if (effective_max <= OVERHEAD) return 0;
+            const max_chunk = effective_max - OVERHEAD;
             const chunk_len = @min(data.len, max_chunk);
             const chunk = data[0..chunk_len];
 
@@ -2662,8 +2684,16 @@ pub fn Connection(comptime max_streams: usize) type {
 
             const max_chunk = MAX_SEND_PACKET_SIZE - 100; // Same budget as sendCryptoChunk()
 
-            var sent: usize = 0;
-            while (sent < data.len) {
+            // Start from the rotating retransmit offset so each PTO cycle sends
+            // the NEXT portion of CRYPTO data instead of re-sending from offset 0.
+            // This is critical under amplification limits: budget is scarce, so
+            // each cycle must advance through the data to eventually deliver it all.
+            var sent: usize = self.crypto_retx_pos[epoch];
+            if (sent >= data.len) sent = 0; // wrap around
+            const start_pos = sent;
+            var wrapped = false;
+            while (true) {
+                if (wrapped and sent >= start_pos) break; // full cycle done
                 const chunk_end = @min(sent + max_chunk, data.len);
                 const chunk = data[sent..chunk_end];
 
@@ -2731,8 +2761,12 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
 
                 sent += chunk.len;
+                if (sent >= data.len) {
+                    sent = 0;
+                    wrapped = true;
+                }
             }
-            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+            self.crypto_retx_pos[epoch] = sent; // save for next PTO
         }
 
         /// Flush pending Handshake CRYPTO data buffered during amplification limit.

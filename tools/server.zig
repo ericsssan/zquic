@@ -235,11 +235,16 @@ pub fn main(init: std.process.Init) !void {
     const key_der_len = try pem.pemToDerBlock(key_pem_buf[0..key_pem_len], "PRIVATE KEY", &key_der_buf);
     const key_material = try pem.parsePrivateKey(key_der_buf[0..key_der_len]);
 
+    // Build TLS CertificateEntry list from all certs in the PEM (supports multi-cert chains).
+    var cert_chain_buf: [32768]u8 = undefined;
+    const cert_chain_len = pem.pemToCertChain(cert_pem_buf[0..cert_pem_len], &cert_chain_buf) catch 0;
+
     const is_cm = std.mem.eql(u8, testcase, "connectionmigration");
     const config: quic.Config = .{
         .alpn = ALPN,
         .validate_addr = std.mem.eql(u8, testcase, "retry"),
         .cert_der = cert_der_buf[0..cert_der_len],
+        .cert_chain = if (cert_chain_len > 0) cert_chain_buf[0..cert_chain_len] else null,
         .cert_seed = key_material.seed,
         .cert_key_algorithm = switch (key_material.algorithm) {
             .ed25519 => .ed25519,
