@@ -793,3 +793,137 @@ test "transport_params: version_information with length > 20 returns error" {
     pos += 24;
     try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
 }
+
+test "transport_params: preferred_address round-trip with 8-byte CID" {
+    const testing = std.testing;
+
+    const original = TransportParams{
+        .max_idle_timeout_ms = 30_000,
+        .preferred_address = PreferredAddress{
+            .ipv4_addr = [_]u8{ 192, 168, 1, 100 },
+            .ipv4_port = 443,
+            .ipv6_addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+            .ipv6_port = 8443,
+            .cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22 } ++ [_]u8{0} ** 12,
+            .cid_len = 8,
+            .reset_token = [_]u8{0x55} ** 16,
+        },
+    };
+
+    var buf: [512]u8 = undefined;
+    const n = encode(original, &buf);
+
+    const decoded = try decode(buf[0..n]);
+
+    try testing.expect(decoded.preferred_address != null);
+    const pa = decoded.preferred_address.?;
+    try testing.expectEqualSlices(u8, &original.preferred_address.?.ipv4_addr, &pa.ipv4_addr);
+    try testing.expectEqual(original.preferred_address.?.ipv4_port, pa.ipv4_port);
+    try testing.expectEqualSlices(u8, &original.preferred_address.?.ipv6_addr, &pa.ipv6_addr);
+    try testing.expectEqual(original.preferred_address.?.ipv6_port, pa.ipv6_port);
+    try testing.expectEqual(original.preferred_address.?.cid_len, pa.cid_len);
+    try testing.expectEqualSlices(u8, original.preferred_address.?.cid[0..pa.cid_len], pa.cid[0..pa.cid_len]);
+    try testing.expectEqualSlices(u8, &original.preferred_address.?.reset_token, &pa.reset_token);
+}
+
+test "transport_params: preferred_address with maximum 20-byte CID" {
+    const testing = std.testing;
+
+    const original = TransportParams{
+        .preferred_address = PreferredAddress{
+            .ipv4_addr = [_]u8{ 10, 0, 0, 1 },
+            .ipv4_port = 1234,
+            .ipv6_addr = [_]u8{0xfe} ++ [_]u8{0x80} ++ [_]u8{0} ** 6 ++ [_]u8{1} ** 8,
+            .ipv6_port = 5678,
+            .cid = [_]u8{0x12} ** 20,
+            .cid_len = 20,
+            .reset_token = [_]u8{0x77} ** 16,
+        },
+    };
+
+    var buf: [512]u8 = undefined;
+    const n = encode(original, &buf);
+
+    const decoded = try decode(buf[0..n]);
+
+    try testing.expect(decoded.preferred_address != null);
+    const pa = decoded.preferred_address.?;
+    try testing.expectEqual(20, pa.cid_len);
+    try testing.expectEqualSlices(u8, original.preferred_address.?.cid[0..20], pa.cid[0..20]);
+}
+
+test "transport_params: preferred_address with zero-length CID" {
+    const testing = std.testing;
+
+    const original = TransportParams{
+        .preferred_address = PreferredAddress{
+            .ipv4_addr = [_]u8{ 127, 0, 0, 1 },
+            .ipv4_port = 9999,
+            .ipv6_addr = [_]u8{0} ** 16,
+            .ipv6_port = 9998,
+            .cid = [_]u8{0} ** 20,
+            .cid_len = 0, // empty CID
+            .reset_token = [_]u8{0xaa} ** 16,
+        },
+    };
+
+    var buf: [512]u8 = undefined;
+    const n = encode(original, &buf);
+
+    const decoded = try decode(buf[0..n]);
+
+    try testing.expect(decoded.preferred_address != null);
+    const pa = decoded.preferred_address.?;
+    try testing.expectEqual(0, pa.cid_len);
+}
+
+test "transport_params: preferred_address with invalid CID length > 20 returns error" {
+    const testing = std.testing;
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+
+    // Manually encode preferred_address with invalid CID length
+    pos += varint.encode(buf[pos..], TP_PREFERRED_ADDRESS);
+    const pa_len = 4 + 2 + 16 + 2 + 1 + 21 + 16; // CID length field says 21 (invalid)
+    pos += varint.encode(buf[pos..], pa_len);
+
+    // IPv4 address
+    @memcpy(buf[pos..][0..4], &[_]u8{ 192, 168, 1, 1 });
+    pos += 4;
+    // IPv4 port
+    buf[pos] = 0x01;
+    buf[pos + 1] = 0xbb;
+    pos += 2;
+    // IPv6 address
+    @memset(buf[pos..][0..16], 0);
+    pos += 16;
+    // IPv6 port
+    buf[pos] = 0x27;
+    buf[pos + 1] = 0x0e;
+    pos += 2;
+    // CID length (invalid: 21)
+    buf[pos] = 21;
+    pos += 1;
+    // CID data (21 bytes)
+    @memset(buf[pos..][0..21], 0xcc);
+    pos += 21;
+    // Reset token
+    @memset(buf[pos..][0..16], 0xdd);
+    pos += 16;
+
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
+
+test "transport_params: preferred_address with invalid length returns error" {
+    const testing = std.testing;
+    var buf: [64]u8 = undefined;
+    var pos: usize = 0;
+
+    // Encode preferred_address with length < 41 (minimum)
+    pos += varint.encode(buf[pos..], TP_PREFERRED_ADDRESS);
+    pos += varint.encode(buf[pos..], 40); // Too short: 40 instead of 41
+    @memset(buf[pos..][0..40], 0xaa);
+    pos += 40;
+
+    try testing.expectError(error.InvalidParams, decode(buf[0..pos]));
+}
