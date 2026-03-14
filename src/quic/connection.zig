@@ -314,6 +314,9 @@ pub fn Connection(comptime max_streams: usize) type {
         bytes_unvalidated_recv: u64,
         /// Bytes sent to the unvalidated peer (stops counting post-validation).
         bytes_unvalidated_sent: u64,
+        /// When true, the next enqueueSend call bypasses the 3x amplification check
+        /// for one packet (RFC 9000 §8.1.4 anti-amplification probe on PTO).
+        allow_amplification_probe: bool,
 
         // ECN (Explicit Congestion Notification) tracking (RFC 9001 Appendix A).
         /// Count of ECT(0) packets received in each epoch [Initial, Handshake, 1-RTT].
@@ -545,6 +548,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .path_validated = false,
                 .bytes_unvalidated_recv = 0,
                 .bytes_unvalidated_sent = 0,
+                .allow_amplification_probe = false,
                 .ecn_ect0_recv = .{ 0, 0, 0 },
                 .ecn_ce_recv = .{ 0, 0, 0 },
                 .pending_path_challenge = null,
@@ -747,10 +751,22 @@ pub fn Connection(comptime max_streams: usize) type {
                             // retransmit previously-sent CRYPTO data as probe packets (RFC 9002 §6.2.4).
                             // If flush() sends data, skip retransmit(1) to avoid double-sending the same HS flight.
                             const had_pending = self.tls_pending_hs_len > 0;
+                            const budget_exhausted = !self.path_validated and
+                                self.bytes_unvalidated_recv > 0 and
+                                self.bytes_unvalidated_sent >= self.bytes_unvalidated_recv *| 3;
                             self.flushPendingHsCrypto();
                             self.retransmitCryptoSaved(0);
                             if (!had_pending) {
                                 self.retransmitCryptoSaved(1);
+                            }
+                            // RFC 9000 §8.1.4: if anti-amplification budget was exhausted and
+                            // there is still pending HS data, send one Initial-epoch probe.
+                            // This elicits a 1200-byte padded Initial retransmit from the client
+                            // (RFC 9000 §14.1), growing the budget by 3×1200 = 3600 bytes.
+                            if (had_pending and budget_exhausted) {
+                                self.allow_amplification_probe = true;
+                                self.sendEncryptedAck(0) catch {};
+                                self.allow_amplification_probe = false; // clear if unused
                             }
                         }
                         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
@@ -2179,11 +2195,19 @@ pub fn Connection(comptime max_streams: usize) type {
             // (bytes_unvalidated_recv > 0) so that direct enqueueSend calls in tests are
             // unaffected before any receive has happened (RFC 9000 §8.1.2).
             if (!self.path_validated and self.bytes_unvalidated_recv > 0) {
-                const new_sent = self.bytes_unvalidated_sent +| data.len;
-                if (new_sent > self.bytes_unvalidated_recv *| 3) {
-                    return error.AmplificationLimitExceeded;
+                if (self.allow_amplification_probe) {
+                    // RFC 9000 §8.1.4: one probe packet per PTO is allowed to exceed
+                    // the 3x limit so the client responds with a padded 1200-byte Initial,
+                    // growing the budget enough to deliver the full handshake flight.
+                    self.bytes_unvalidated_sent +|= data.len;
+                    self.allow_amplification_probe = false; // consumed
+                } else {
+                    const new_sent = self.bytes_unvalidated_sent +| data.len;
+                    if (new_sent > self.bytes_unvalidated_recv *| 3) {
+                        return error.AmplificationLimitExceeded;
+                    }
+                    self.bytes_unvalidated_sent = new_sent;
                 }
-                self.bytes_unvalidated_sent = new_sent;
             }
             const slot = &self.sq[self.sq_tail & (SEND_QUEUE_DEPTH - 1)];
             const n = @min(data.len, MAX_SEND_PACKET_SIZE);
