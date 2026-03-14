@@ -25,6 +25,7 @@ const TP_INITIAL_MAX_STREAMS_UNI: u62 = 0x09;
 const TP_ACK_DELAY_EXPONENT: u62 = 0x0a;
 const TP_MAX_ACK_DELAY: u62 = 0x0b;
 const TP_DISABLE_ACTIVE_MIGRATION: u62 = 0x0c;
+const TP_PREFERRED_ADDRESS: u62 = 0x0d;
 const TP_ACTIVE_CONNECTION_ID_LIMIT: u62 = 0x0e;
 const TP_INITIAL_SOURCE_CONNECTION_ID: u62 = 0x0f;
 const TP_RETRY_SOURCE_CONNECTION_ID: u62 = 0x10;
@@ -61,6 +62,19 @@ pub const TransportParams = struct {
     /// RFC 9369 parameter 0x11. Stored as raw bytes (4 bytes per version).
     version_information: ?[20]u8 = null,
     version_information_len: u8 = 0, // Number of bytes (multiple of 4)
+    /// Preferred address for connection migration (RFC 9000 §18.2 parameter 0x0d).
+    /// Contains IPv4, IPv6, connection ID, and stateless reset token.
+    preferred_address: ?PreferredAddress = null,
+};
+
+pub const PreferredAddress = struct {
+    ipv4_addr: [4]u8,           // IPv4 address
+    ipv4_port: u16,             // IPv4 port
+    ipv6_addr: [16]u8,          // IPv6 address
+    ipv6_port: u16,             // IPv6 port
+    cid: [20]u8,                // Connection ID (max 20 bytes)
+    cid_len: u8,                // Actual length of connection ID
+    reset_token: [16]u8,        // Stateless reset token
 };
 
 // ---------------------------------------------------------------------------
@@ -137,6 +151,36 @@ pub fn encode(params: TransportParams, buf: []u8) usize {
         pos += varint.encode(buf[pos..], @intCast(params.version_information_len));
         @memcpy(buf[pos..][0..params.version_information_len], vi[0..params.version_information_len]);
         pos += params.version_information_len;
+    }
+
+    if (params.preferred_address) |pa| {
+        // RFC 9000 §18.2.3: preferred_address = IPv4 + IPv4 port + IPv6 + IPv6 port + CID len + CID + reset token
+        const pa_len = 4 + 2 + 16 + 2 + 1 + pa.cid_len + 16;
+        pos += varint.encode(buf[pos..], TP_PREFERRED_ADDRESS);
+        pos += varint.encode(buf[pos..], @intCast(pa_len));
+        // IPv4 address
+        @memcpy(buf[pos..][0..4], &pa.ipv4_addr);
+        pos += 4;
+        // IPv4 port (network byte order)
+        buf[pos] = @intCast((pa.ipv4_port >> 8) & 0xff);
+        buf[pos + 1] = @intCast(pa.ipv4_port & 0xff);
+        pos += 2;
+        // IPv6 address
+        @memcpy(buf[pos..][0..16], &pa.ipv6_addr);
+        pos += 16;
+        // IPv6 port (network byte order)
+        buf[pos] = @intCast((pa.ipv6_port >> 8) & 0xff);
+        buf[pos + 1] = @intCast(pa.ipv6_port & 0xff);
+        pos += 2;
+        // Connection ID length
+        buf[pos] = pa.cid_len;
+        pos += 1;
+        // Connection ID
+        @memcpy(buf[pos..][0..pa.cid_len], pa.cid[0..pa.cid_len]);
+        pos += pa.cid_len;
+        // Stateless reset token
+        @memcpy(buf[pos..][0..16], &pa.reset_token);
+        pos += 16;
     }
 
     return pos;
@@ -280,6 +324,49 @@ pub fn decode(buf: []const u8) !TransportParams {
                 @memcpy(vi[0..param_len], param_data);
                 params.version_information = vi;
                 params.version_information_len = @intCast(param_len);
+            },
+            TP_PREFERRED_ADDRESS => {
+                // RFC 9000 §18.2.3: preferred_address structure
+                // IPv4 (4) + IPv4 port (2) + IPv6 (16) + IPv6 port (2) + CID len (1) + CID (0-20) + reset token (16)
+                if (param_len < 41) return error.InvalidParams; // Minimum: 4+2+16+2+1+0+16 = 41
+                if (param_len > 61) return error.InvalidParams; // Maximum: 4+2+16+2+1+20+16 = 61
+
+                var pa: PreferredAddress = undefined;
+                var pa_pos: usize = 0;
+
+                // IPv4 address
+                @memcpy(&pa.ipv4_addr, param_data[pa_pos..][0..4]);
+                pa_pos += 4;
+
+                // IPv4 port (network byte order / big-endian)
+                pa.ipv4_port = (@as(u16, param_data[pa_pos]) << 8) | param_data[pa_pos + 1];
+                pa_pos += 2;
+
+                // IPv6 address
+                @memcpy(&pa.ipv6_addr, param_data[pa_pos..][0..16]);
+                pa_pos += 16;
+
+                // IPv6 port (network byte order / big-endian)
+                pa.ipv6_port = (@as(u16, param_data[pa_pos]) << 8) | param_data[pa_pos + 1];
+                pa_pos += 2;
+
+                // Connection ID length
+                const cid_len = param_data[pa_pos];
+                if (cid_len > 20) return error.InvalidParams;
+                pa_pos += 1;
+
+                // Validate total length matches 41 + cid_len
+                if (param_len != 41 + cid_len) return error.InvalidParams;
+
+                // Connection ID
+                pa.cid_len = cid_len;
+                @memcpy(pa.cid[0..cid_len], param_data[pa_pos..][0..cid_len]);
+                pa_pos += cid_len;
+
+                // Stateless reset token
+                @memcpy(&pa.reset_token, param_data[pa_pos..][0..16]);
+
+                params.preferred_address = pa;
             },
             else => {}, // Unknown parameters are silently skipped (RFC 9000 §18.1).
         }
