@@ -8,7 +8,7 @@ A QUIC protocol library for Zig. Sans-I/O — you own the socket; the library ow
 ## Features
 
 - QUIC v1 (RFC 9000) and v2 (RFC 9369)
-- TLS 1.3 server handshake with AES-128-GCM, key rotation, SSLKEYLOG (RFC 9001)
+- TLS 1.3 server handshake with AES-128-GCM and ChaCha20-Poly1305, key rotation, SSLKEYLOG (RFC 9001)
 - Loss recovery, RTT estimation, PTO (RFC 9002)
 - CUBIC congestion control (RFC 9438)
 - Stream multiplexing, flow control, path migration, PMTUD, retry tokens
@@ -69,7 +69,7 @@ defer pool.release(conn);
 src/quic/
   connection.zig         # connection state machine
   stream.zig             # stream multiplexing
-  crypto.zig             # key derivation, AES-128-GCM, header protection
+  crypto.zig             # key derivation, AES-128-GCM, ChaCha20-Poly1305, header protection
   packet.zig             # packet encoding/decoding
   frame.zig              # frame types
   tls.zig                # TLS 1.3 handshake
@@ -81,8 +81,10 @@ src/quic/
   varint.zig             # variable-length integers (RFC 9000 §16)
   pool.zig               # O(1) fixed-capacity pool
 
+deps/zhttp3/             # HTTP/3 framing (RFC 9114) + QPACK (RFC 9204)
+
 tools/
-  server.zig             # quic-interop-runner HTTP/0.9 server
+  server.zig             # quic-interop-runner HTTP/0.9 + HTTP/3 server
   Dockerfile             # Alpine image for interop runner
 ```
 
@@ -91,18 +93,17 @@ tools/
 > **Note:** [`ghcr.io/ericsssan/zquic-interop:latest`](https://github.com/ericsssan/zquic/pkgs/container/zquic-interop) is built solely for use with [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner). It is not a general-purpose or production image.
 
 <!-- INTEROP_START -->
-Tested against **ngtcp2** client (2026-03-15) — goodput 7001 ± 12 kbps:
+Tested against **ngtcp2** client (2026-03-15) — goodput 7018 ± 20 kbps:
 
 | Result | Test cases |
 | :---: | --- |
-| ✅ Pass | handshake, transfer, longrtt, multiplexing, retry, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration, goodput |
-| ❓ Unsupported | chacha20, resumption, zerortt, http3 |
+| ✅ Pass | handshake, transfer, longrtt, chacha20, multiplexing, retry, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration |
+| ❓ Unsupported | resumption, zerortt |
 <!-- INTEROP_END -->
 
 ## Limitations
 
 - Server-side only (no TLS client)
-- No HTTP/3
 - No 0-RTT / session resumption
 
 ## License

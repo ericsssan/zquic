@@ -1,0 +1,9 @@
+.{
+    .name = .zhttp3,
+    .fingerprint = 0x95735c2f44357a9a,
+    .version = "0.0.1",
+    .dependencies = .{
+        // .zquic = .{ .url = "...", .hash = "..." },
+    },
+    .paths = .{""},
+}

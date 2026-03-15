@@ -46,7 +46,7 @@ fn buildInitialPacket(
         ct_len,
     );
     crypto.encryptPayload(keys.client, pn, buf[0..hdr_len], pt[0..pt_len], buf[hdr_len..][0..ct_len]);
-    crypto.applyHeaderProtection(keys.client.hp, &buf[0], buf[hdr_len - 4 ..][0..4], buf[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(keys.client, &buf[0], buf[hdr_len - 4 ..][0..4], buf[hdr_len..][0..16]);
     return .{ .keys = keys, .pkt_len = hdr_len + ct_len };
 }
 
@@ -85,13 +85,13 @@ test "ecn: CE count non-increase is ignored (monotonic guard)" {
     const io = std.testing.io;
 
     // Run two connections side by side: one with stale CE (non-increasing), one without ECN.
-    var conn_ecn = try Connection(16).accept(.{}, io);
+    var conn_ecn = try Connection(1).accept(.{}, io);
     conn_ecn.current_time_ns = 1_000_000_000;
     conn_ecn.ecn_ce_seen[2] = 5; // already seen 5
     conn_ecn.hot.tx_pn[2] = 2; // pretend pn=0..1 were sent
     conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
 
-    var conn_plain = try Connection(16).accept(.{}, io);
+    var conn_plain = try Connection(1).accept(.{}, io);
     conn_plain.current_time_ns = 1_000_000_000;
     conn_plain.hot.tx_pn[2] = 2;
     conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
@@ -131,12 +131,12 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
     const io = std.testing.io;
 
     // Two connections: one ACK with has_ecn=true but CE=0, one plain ACK without ECN.
-    var conn_ecn = try Connection(16).accept(.{}, io);
+    var conn_ecn = try Connection(1).accept(.{}, io);
     conn_ecn.current_time_ns = 1_000_000_000;
     conn_ecn.hot.tx_pn[2] = 2;
     conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
 
-    var conn_plain = try Connection(16).accept(.{}, io);
+    var conn_plain = try Connection(1).accept(.{}, io);
     conn_plain.current_time_ns = 1_000_000_000;
     conn_plain.hot.tx_pn[2] = 2;
     conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
@@ -228,7 +228,7 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
     crypto.encryptPayload(keys.client, 0, enc_buf[0..hdr_len], &pt, enc_buf[hdr_len..][0..ct_len]);
     const total = hdr_len + ct_len;
     // PN is at enc_buf[hdr_len-4..hdr_len], sample is at enc_buf[hdr_len..hdr_len+16].
-    crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(keys.client, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
     const result = conn.receive(enc_buf[0..total], .{ .v4 = .{ .addr = .{0} ** 4, .port = 1234 } }, 0, 0, io);
     _ = result catch {};
@@ -269,12 +269,12 @@ test "connection: RFC 9369 v2 initial key derivation" {
     try testing.expect(!std.mem.eql(u8, &keys_v2.client.hp, &keys_v1.client.hp));
 
     // Verify that both client and server keys are derived (not null)
-    try testing.expect(keys_v2.client.key.len == 16);
+    try testing.expect(keys_v2.client.key.len == 32);
     try testing.expect(keys_v2.client.iv.len == 12);
-    try testing.expect(keys_v2.client.hp.len == 16);
-    try testing.expect(keys_v2.server.key.len == 16);
+    try testing.expect(keys_v2.client.hp.len == 32);
+    try testing.expect(keys_v2.server.key.len == 32);
     try testing.expect(keys_v2.server.iv.len == 12);
-    try testing.expect(keys_v2.server.hp.len == 16);
+    try testing.expect(keys_v2.server.hp.len == 32);
 }
 
 test "connection: queueTlsOutput splits ServerHello into Initial epoch and rest into Handshake epoch" {
@@ -644,7 +644,7 @@ test "connection: sendEncryptedAck encodes gaps from received bitmap" {
     const pn_off = try packet.longHeaderPnOffset(slot.buf[0..slot.len], packet.QUIC_VERSION_1);
     var hp_buf: [1500]u8 = undefined;
     @memcpy(hp_buf[0..slot.len], slot.buf[0..slot.len]);
-    _ = crypto.removeHeaderProtection(ik.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+    _ = crypto.removeHeaderProtection(ik, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
     const parse_result = try packet.parseLongHeader(hp_buf[0..slot.len]);
     const pn: u64 = packet.decodePacketNumber(0, parse_result.header.packet_number, @as(u8, parse_result.header.pn_len) * 8);
     const payload_start = parse_result.consumed - parse_result.header.payload.len;
@@ -722,13 +722,13 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
     conn.hot.state = .established; // skip handshake
 
-    // Derive app keys (simplified; just use a fixed 16-byte key for both directions).
-    const app_key = [_]u8{0xAA} ** 16;
+    // Derive app keys (simplified; just use a fixed 32-byte key for both directions).
+    const app_key = [_]u8{0xAA} ** 32;
     const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 16;
+    const app_hp = [_]u8{0xCC} ** 32;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
-        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
+        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
+        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
     };
     conn.peer_cid = conn.local_cid;
 
@@ -739,7 +739,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     const pt5_len = frame.encodeFrame(&pt5, .ping);
     const ct5_len = pt5_len + 16;
     crypto.encryptPayload(conn.app_keys.?.client, 5, pkt5[0..pkt5_len], pt5[0..pt5_len], pkt5[pkt5_len..][0..ct5_len]);
-    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt5[0], pkt5[pkt5_len - 4 ..][0..4], pkt5[pkt5_len..][0..16]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt5[0], pkt5[pkt5_len - 4 ..][0..4], pkt5[pkt5_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
     try conn.receive(pkt5[0 .. pkt5_len + ct5_len], src, 1_000_000_000, 0, io);
@@ -755,7 +755,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     const pt3_len = frame.encodeFrame(&pt3, .ping);
     const ct3_len = pt3_len + 16;
     crypto.encryptPayload(conn.app_keys.?.client, 3, pkt3[0..pkt3_len], pt3[0..pt3_len], pkt3[pkt3_len..][0..ct3_len]);
-    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt3[0], pkt3[pkt3_len - 4 ..][0..4], pkt3[pkt3_len..][0..16]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt3[0], pkt3[pkt3_len - 4 ..][0..4], pkt3[pkt3_len..][0..16]);
 
     // This should NOT be dropped (before the fix, it would have been).
     try conn.receive(pkt3[0 .. pkt3_len + ct3_len], src, 1_000_000_001, 0, io);
@@ -770,7 +770,7 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     const pt4_len = frame.encodeFrame(&pt4, .ping);
     const ct4_len = pt4_len + 16;
     crypto.encryptPayload(conn.app_keys.?.client, 4, pkt4[0..pkt4_len], pt4[0..pt4_len], pkt4[pkt4_len..][0..ct4_len]);
-    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt4[0], pkt4[pkt4_len - 4 ..][0..4], pkt4[pkt4_len..][0..16]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt4[0], pkt4[pkt4_len - 4 ..][0..4], pkt4[pkt4_len..][0..16]);
 
     _ = try conn.receive(pkt4[0 .. pkt4_len + ct4_len], src, 1_000_000_002, 0, io);
     // Now all three packets are marked as received.
@@ -863,7 +863,7 @@ test "connection: sendEncryptedAck sends valid ACK after receiving packet" {
     const pn_off = try packet.longHeaderPnOffset(slot.buf[0..slot.len], packet.QUIC_VERSION_1);
     var hp_buf: [1500]u8 = undefined;
     @memcpy(hp_buf[0..slot.len], slot.buf[0..slot.len]);
-    _ = crypto.removeHeaderProtection(ik.hp, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+    _ = crypto.removeHeaderProtection(ik, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
     const parse_result = try packet.parseLongHeader(hp_buf[0..slot.len]);
     const pn: u64 = packet.decodePacketNumber(0, parse_result.header.packet_number, @as(u8, parse_result.header.pn_len) * 8);
     const payload_start = parse_result.consumed - parse_result.header.payload.len;
@@ -984,12 +984,12 @@ test "connection: accept() initializes quic_version to V1 for client version ech
     // TLS layer may negotiate to another version via version_information.
 
     // Test with default V1 config
-    var conn_v1 = try Connection(16).accept(.{}, io);
+    var conn_v1 = try Connection(1).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.quic_version);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
 
     // Test with V2 config - still starts with V1, configured version stored separately
-    var conn_v2 = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    var conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v2.quic_version);
     try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
 }
@@ -1004,8 +1004,8 @@ test "connection: rotateKeys toggles current_key_phase" {
 
     // Mock app_keys to allow rotation
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
-        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = [_]u8{0} ** 32;
@@ -1023,8 +1023,8 @@ test "connection: multiple key rotations toggle key_phase correctly" {
     const initial_phase = conn.current_key_phase;
 
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
-        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = [_]u8{0} ** 32;
@@ -1048,8 +1048,8 @@ test "connection: key generation counter increments on rotation" {
 
     // Setup for key rotation
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
-        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = [_]u8{0} ** 32;
@@ -1108,8 +1108,8 @@ test "connection: multiple sequential key rotations with generation tracking" {
 
     // Setup for multiple rotations
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
-        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = [_]u8{1} ** 32;
@@ -1142,8 +1142,8 @@ test "connection: key_phase bit and key_generation independent" {
 
     // Setup for rotation
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
-        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = [_]u8{0} ** 32;
@@ -1173,8 +1173,8 @@ test "connection: full key rotation flow - secret derivation for interop" {
 
     // Setup application keys (simulating post-handshake state)
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0xaa} ** 16, .iv = [_]u8{0xbb} ** 12, .hp = [_]u8{0xcc} ** 16 },
-        .server = .{ .key = [_]u8{0xdd} ** 16, .iv = [_]u8{0xee} ** 12, .hp = [_]u8{0xff} ** 16 },
+        .client = .{ .key = [_]u8{0xaa} ** 32, .iv = [_]u8{0xbb} ** 12, .hp = [_]u8{0xcc} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0xdd} ** 32, .iv = [_]u8{0xee} ** 12, .hp = [_]u8{0xff} ** 32, .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = crypto.deriveNextAppSecret(conn.tls_state.client_app_secret, packet.QUIC_VERSION_1);
@@ -1243,13 +1243,13 @@ test "connection: packet encryption/decryption works with key rotation" {
     client.tls_state.server_app_secret = [_]u8{0xee} ** 32;
 
     // Setup symmetric keys for encryption/decryption
-    const test_key = [_]u8{0x42} ** 16;
+    const test_key = [_]u8{0x42} ** 32;
     const test_iv = [_]u8{0x43} ** 12;
-    const test_hp = [_]u8{0x44} ** 16;
+    const test_hp = [_]u8{0x44} ** 32;
 
     client.app_keys = .{
-        .client = .{ .key = test_key, .iv = test_iv, .hp = test_hp },
-        .server = .{ .key = test_key, .iv = test_iv, .hp = test_hp },
+        .client = .{ .key = test_key, .iv = test_iv, .hp = test_hp, .suite = .aes_128_gcm },
+        .server = .{ .key = test_key, .iv = test_iv, .hp = test_hp, .suite = .aes_128_gcm },
     };
 
     // Setup for rotation
@@ -1262,9 +1262,9 @@ test "connection: packet encryption/decryption works with key rotation" {
     const keys_gen0 = crypto.derivePacketKeys(secrets_gen0.server, packet.QUIC_VERSION_1);
 
     // Simulate encryption (verify keys are usable)
-    try testing.expect(keys_gen0.key.len == 16);
+    try testing.expect(keys_gen0.key.len == 32);
     try testing.expect(keys_gen0.iv.len == 12);
-    try testing.expect(keys_gen0.hp.len == 16);
+    try testing.expect(keys_gen0.hp.len == 32);
 
     // SCENARIO 2: Rotate keys
     client.rotateKeys();
@@ -1319,7 +1319,7 @@ test "connection: processFrames marks STREAM frame as ack-eliciting" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm }, .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm } };
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
     // Build a STREAM frame
@@ -1345,7 +1345,7 @@ test "connection: processFrames does NOT mark PADDING as ack-eliciting" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm }, .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm } };
 
     // PADDING is all zeros
     const buf = [_]u8{ 0x00, 0x00, 0x00 };
@@ -1363,7 +1363,7 @@ test "connection: processFrames does NOT mark ACK as ack-eliciting" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 }, .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 } };
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm }, .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm } };
 
     conn.hot.tx_pn[2] = 1; // pretend pn=0 was sent in epoch 2
 
@@ -1609,11 +1609,11 @@ test "connection: version negotiation - server_configured_version set from confi
     const io = std.testing.io;
 
     // Test with default v1
-    var conn_v1 = try Connection(16).accept(.{}, io);
+    var conn_v1 = try Connection(1).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
 
     // Test with configured v2
-    var conn_v2 = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    var conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
 }
 
@@ -1689,7 +1689,7 @@ test "DCID check: variable-length DCID accepted on Initial retransmission at sta
         ct_len,
     );
     crypto.encryptPayload(keys.client, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
-    crypto.applyHeaderProtection(keys.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(keys.client, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
     try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, 0, io);
@@ -1730,7 +1730,7 @@ test "DCID check: Initial with wrong DCID silently dropped at state=handshake" {
         ct_len,
     );
     crypto.encryptPayload(keys_b.client, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
-    crypto.applyHeaderProtection(keys_b.client.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(keys_b.client, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
     try conn.receive(enc_buf[0 .. hdr_len + ct_len], src, 0, 0, io);
@@ -2054,7 +2054,7 @@ test "crypto: RFC 9369 Appendix A v2 deterministic key derivation" {
     try testing.expect(!std.mem.eql(u8, &keys_v2_1.server.hp, &keys_v1.server.hp));
 
     // Verify key lengths are correct
-    try testing.expectEqual(@as(usize, 16), keys_v2_1.client.key.len);
+    try testing.expectEqual(@as(usize, 32), keys_v2_1.client.key.len);
     try testing.expectEqual(@as(usize, 12), keys_v2_1.client.iv.len);
-    try testing.expectEqual(@as(usize, 16), keys_v2_1.client.hp.len);
+    try testing.expectEqual(@as(usize, 32), keys_v2_1.client.hp.len);
 }

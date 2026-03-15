@@ -1213,8 +1213,8 @@ test "connection: deinit zeroes all key material" {
 
     // Populate key fields with non-zero values.
     const dummy_keys = tls.AppKeys{
-        .client = .{ .key = [_]u8{0xAB} ** 16, .iv = [_]u8{0xCD} ** 12, .hp = [_]u8{0xEF} ** 16 },
-        .server = .{ .key = [_]u8{0xAB} ** 16, .iv = [_]u8{0xCD} ** 12, .hp = [_]u8{0xEF} ** 16 },
+        .client = .{ .key = [_]u8{0xAB} ** 32, .iv = [_]u8{0xCD} ** 12, .hp = [_]u8{0xEF} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0xAB} ** 32, .iv = [_]u8{0xCD} ** 12, .hp = [_]u8{0xEF} ** 32, .suite = .aes_128_gcm },
     };
     conn.app_keys = dummy_keys;
     conn.next_app_keys = dummy_keys;

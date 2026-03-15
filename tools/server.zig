@@ -9,6 +9,8 @@
 const std = @import("std");
 const quic = @import("zquic");
 const pem = @import("pem.zig");
+const http3 = @import("http3");
+const qpack = @import("qpack");
 
 const net = std.Io.net;
 const os = std.os;
@@ -48,6 +50,8 @@ const ConnSlot = struct {
     pending_count: usize = 0,
     last_logged_generation: u32 = 0,
     keylog_written: bool = false,
+    /// H3: server control streams sent.
+    h3_control_sent: bool = false,
 };
 
 const ALPN = "hq-interop";
@@ -55,8 +59,11 @@ const CID_LEN = quic.connection_id.len; // 8 bytes
 
 const supported_cases = [_][]const u8{
     "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2", "ecn",
-    "connectionmigration",
+    "connectionmigration", "chacha20", "http3",
 };
+
+/// True when TESTCASE=http3 — uses H3 framing instead of HTTP/0.9.
+var g_is_h3: bool = false;
 
 // IPv4/IPv6 addresses for preferred_address in connectionmigration test (interop runner addresses).
 // server4:  193.167.100.100  (0xc1, 0xa7, 0x64, 0x64)
@@ -78,6 +85,8 @@ const FileTransfer = struct {
     offset: u64 = 0,
     /// Cached file handle (open once per transfer, closed on completion or error).
     file: ?std.Io.File = null,
+    /// H3: response HEADERS frame already sent on this stream.
+    h3_headers_sent: bool = false,
 };
 
 /// Extract the DCID from a QUIC packet's first few bytes.
@@ -239,9 +248,10 @@ pub fn main(init: std.process.Init) !void {
     var cert_chain_buf: [32768]u8 = undefined;
     const cert_chain_len = pem.pemToCertChain(cert_pem_buf[0..cert_pem_len], &cert_chain_buf) catch 0;
 
+    g_is_h3 = std.mem.eql(u8, testcase, "http3");
     const is_cm = std.mem.eql(u8, testcase, "connectionmigration");
     const config: quic.Config = .{
-        .alpn = ALPN,
+        .alpn = if (g_is_h3) "h3" else ALPN,
         .validate_addr = std.mem.eql(u8, testcase, "retry"),
         .cert_der = cert_der_buf[0..cert_der_len],
         .cert_chain = if (cert_chain_len > 0) cert_chain_buf[0..cert_chain_len] else null,
@@ -251,6 +261,7 @@ pub fn main(init: std.process.Init) !void {
             .p256 => .p256,
         },
         .initial_quic_version = if (std.mem.eql(u8, testcase, "v2")) quic.packet.QUIC_VERSION_2 else quic.packet.QUIC_VERSION_1,
+        .preferred_cipher = if (std.mem.eql(u8, testcase, "chacha20")) .chacha20_poly1305 else .aes_128_gcm,
         .initial_max_streams_bidi = 64, // Match MAX_TRANSFERS; grows as streams close
         .initial_max_streams_uni = 100,
         // RFC 9000 §18.2.3: advertise preferred IPv4+IPv6 addresses for migration.
@@ -428,6 +439,9 @@ fn processPacket(
                     s.keylog_written = true;
                     s.last_logged_generation = 0;
                 }
+                if (g_is_h3 and !s.h3_control_sent) {
+                    sendH3ControlStreams(s);
+                }
             },
             .retry_sent => {
                 drainSend(&s.conn, active_sock, io, &from, send_buf);
@@ -440,7 +454,12 @@ fn processPacket(
                 }
                 break;
             },
-            .stream_data => |st| startTransfer(s, st.stream_id, www_dir, io),
+            .stream_data => |st| {
+                if (g_is_h3)
+                    startTransferH3(s, st.stream_id, www_dir, io)
+                else
+                    startTransfer(s, st.stream_id, www_dir, io);
+            },
             .connection_closed => {
                 for (0..conn_slots.len) |i| {
                     if (conn_slots[i] == s) {
@@ -580,7 +599,11 @@ fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
         var sent_any = false;
         for (transfers) |*t| {
             if (!t.active) continue;
-            if (advanceTransferOne(conn, t, io)) sent_any = true;
+            if (g_is_h3) {
+                if (advanceTransferOneH3(conn, t, io)) sent_any = true;
+            } else {
+                if (advanceTransferOne(conn, t, io)) sent_any = true;
+            }
         }
         if (!sent_any) break;
     }
@@ -640,6 +663,206 @@ fn advanceTransferOne(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
             // If FIN send fails, retry next tick
             return true;  // Data was sent successfully, so return true
         };
+        file.close(io);
+        t.file = null;
+        t.active = false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP/3 support
+// ---------------------------------------------------------------------------
+
+/// Open the three server-initiated unidirectional streams required by RFC 9114.
+fn sendH3ControlStreams(s: *ConnSlot) void {
+    const conn = &s.conn;
+    // Stream IDs: server-initiated unidirectional = 4*n + 3 → 3, 7, 11
+
+    // 1. Control stream (type 0x00) + SETTINGS frame
+    var ctrl_buf: [64]u8 = undefined;
+    var pos: usize = 0;
+    // Stream type 0x00 (control)
+    pos += http3.varint.encode(ctrl_buf[pos..], http3.StreamType.control) catch return;
+    // SETTINGS frame (empty — all defaults)
+    pos += http3.frame.writeHeader(ctrl_buf[pos..], http3.FrameType.settings, 0) catch return;
+    conn.streamSend(3, ctrl_buf[0..pos], false) catch return;
+
+    // 2. QPACK encoder stream (type 0x02)
+    var enc_buf: [4]u8 = undefined;
+    const enc_len = http3.varint.encode(&enc_buf, http3.StreamType.qpack_encoder) catch return;
+    conn.streamSend(7, enc_buf[0..enc_len], false) catch return;
+
+    // 3. QPACK decoder stream (type 0x03)
+    var dec_buf: [4]u8 = undefined;
+    const dec_len = http3.varint.encode(&dec_buf, http3.StreamType.qpack_decoder) catch return;
+    conn.streamSend(11, dec_buf[0..dec_len], false) catch return;
+
+    s.h3_control_sent = true;
+}
+
+/// Parse an H3 request from a bidirectional stream and register a FileTransfer.
+fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) void {
+    const conn = &slot.conn;
+    const transfers = &slot.transfers;
+
+    // Client-initiated unidirectional streams (bit pattern xx10): control/QPACK streams.
+    // Just consume and ignore (static-only QPACK, no dynamic table).
+    if (stream_id & 0x3 == 2) {
+        if (conn.streams.get(stream_id)) |st| {
+            var sink: [256]u8 = undefined;
+            _ = st.read(&sink);
+        }
+        return;
+    }
+
+    const st = conn.streams.get(stream_id) orelse return;
+    var req_buf: [4096]u8 = undefined;
+    const n = st.read(&req_buf);
+    if (n == 0) return;
+
+    // Deduplicate
+    for (transfers) |*t| {
+        if (t.active and t.stream_id == stream_id) return;
+    }
+    for (slot.pending[0..slot.pending_count]) |*p| {
+        if (p.stream_id == stream_id) return;
+    }
+
+    // Parse H3 HEADERS frame
+    const hdr = http3.frame.parseHeader(req_buf[0..n]) catch return;
+    if (hdr.frame_type != http3.FrameType.headers) return;
+    const block_end = hdr.header_len + @as(usize, @intCast(hdr.payload_len));
+    if (block_end > n) return; // incomplete
+
+    // QPACK decode (static-only)
+    var fields: [64]qpack.Field = undefined;
+    var strings: [4096]u8 = undefined;
+    const fc = qpack.decoder.decode(
+        req_buf[hdr.header_len..block_end],
+        &fields,
+        &strings,
+        null,
+        0,
+    ) catch return;
+
+    // Extract :path
+    var path: ?[]const u8 = null;
+    for (fields[0..fc]) |f| {
+        if (std.mem.eql(u8, f.name, ":path")) {
+            path = f.value;
+            break;
+        }
+    }
+    const req_path = path orelse return;
+    if (std.mem.indexOf(u8, req_path, "..") != null) return;
+
+    // Build filesystem path
+    var full_path_buf: [512]u8 = undefined;
+    const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ www, req_path }) catch return;
+
+    // Allocate transfer slot
+    var free_slot: ?*FileTransfer = null;
+    for (transfers) |*t| {
+        if (!t.active) { free_slot = t; break; }
+    }
+    const t = free_slot orelse {
+        // Defer to pending queue
+        if (slot.pending_count < MAX_TRANSFERS) {
+            var p = &slot.pending[slot.pending_count];
+            p.stream_id = stream_id;
+            @memcpy(p.path[0..full_path.len], full_path);
+            p.path_len = full_path.len;
+            slot.pending_count += 1;
+        }
+        return;
+    };
+    t.active = true;
+    t.stream_id = stream_id;
+    t.offset = 0;
+    @memcpy(t.path[0..full_path.len], full_path);
+    t.path_len = full_path.len;
+    t.file = std.Io.Dir.openFileAbsolute(io, t.path[0..t.path_len], .{}) catch null;
+    t.h3_headers_sent = false;
+}
+
+/// Build an H3 HEADERS frame with a QPACK-encoded :status response.
+fn buildH3Headers(buf: []u8, status: u16) usize {
+    var status_buf: [3]u8 = undefined;
+    const status_str = std.fmt.bufPrint(&status_buf, "{d}", .{status}) catch return 0;
+
+    const field = qpack.Field{ .name = ":status", .value = status_str };
+    var qpack_buf: [128]u8 = undefined;
+    const qpack_len = qpack.encoder.encode(&[_]qpack.Field{field}, &qpack_buf, null) catch return 0;
+
+    var pos: usize = 0;
+    pos += http3.frame.writeHeader(buf[pos..], http3.FrameType.headers, qpack_len) catch return 0;
+    @memcpy(buf[pos..][0..qpack_len], qpack_buf[0..qpack_len]);
+    pos += qpack_len;
+    return pos;
+}
+
+/// Send one chunk of an H3 transfer. Returns true if progress was made.
+fn advanceTransferOneH3(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
+    const file = t.file orelse {
+        // No file — send H3 404 HEADERS + FIN
+        if (!t.h3_headers_sent) {
+            var hdr_buf: [128]u8 = undefined;
+            const hdr_len = buildH3Headers(&hdr_buf, 404);
+            if (hdr_len == 0) { t.active = false; return false; }
+            conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], true) catch return false;
+            t.h3_headers_sent = true;
+        }
+        t.active = false;
+        return true;
+    };
+
+    // First: send H3 HEADERS frame (:status 200)
+    if (!t.h3_headers_sent) {
+        var hdr_buf: [128]u8 = undefined;
+        const hdr_len = buildH3Headers(&hdr_buf, 200);
+        if (hdr_len == 0) { t.active = false; return false; }
+        conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], false) catch return false;
+        t.h3_headers_sent = true;
+        return true;
+    }
+
+    // Read file data (leave room for DATA frame header: type varint + length varint ≤ 8 bytes)
+    const DATA_HDR_MAX = 8;
+    var data_buf: [SEND_CHUNK - DATA_HDR_MAX]u8 = undefined;
+    const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
+        file.close(io);
+        t.file = null;
+        t.active = false;
+        return false;
+    };
+
+    if (r == 0) {
+        // EOF — send FIN
+        conn.streamSend(t.stream_id, &.{}, true) catch return false;
+        file.close(io);
+        t.file = null;
+        t.active = false;
+        return true;
+    }
+
+    // Wrap in H3 DATA frame
+    var frame_buf: [SEND_CHUNK]u8 = undefined;
+    var pos: usize = 0;
+    pos += http3.frame.writeHeader(frame_buf[pos..], http3.FrameType.data, r) catch return false;
+    @memcpy(frame_buf[pos..][0..r], data_buf[0..r]);
+    pos += r;
+
+    // Check EOF
+    const is_eof = if (r < data_buf.len) blk: {
+        var eof_probe: [1]u8 = undefined;
+        break :blk (file.readPositionalAll(io, &eof_probe, t.offset + r) catch 0) == 0;
+    } else false;
+
+    conn.streamSend(t.stream_id, frame_buf[0..pos], is_eof) catch return false;
+    t.offset += r;
+
+    if (is_eof) {
         file.close(io);
         t.file = null;
         t.active = false;

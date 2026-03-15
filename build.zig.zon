@@ -3,7 +3,9 @@
     .fingerprint = 0x947d823de6e9d35b,
     .version = "0.0.1",
     .minimum_zig_version = "0.13.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zhttp3 = .{ .path = "deps/zhttp3" },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -55,7 +55,7 @@ test "PMTUD: queuePmtudProbe succeeds when conditions are met" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
     // Setup 1-RTT keys (required for probing)
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Attempt to queue a probe at valid size (within MAX_PACKET_SIZE=1200)
@@ -76,7 +76,7 @@ test "PMTUD: queuePmtudProbe rejects invalid sizes" {
     conn.hot.state = .established;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Reject too-small size (< 1200)
@@ -111,7 +111,7 @@ test "PMTUD: queuePmtudProbe initiates and stores probe info" {
     conn.path_mtu = 1200;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate a probe at valid size
@@ -133,7 +133,7 @@ test "PMTUD: probe timeout detected at 3×PTO without ACK" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.cached_max_ack_delay_ns = 25_000_000; // 25ms
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate probe at maximum valid size (1200)
@@ -159,7 +159,7 @@ test "PMTUD: ACK detection marks probe as successful" {
     conn.path_mtu = 1200;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate probe at valid size
@@ -199,7 +199,7 @@ test "PMTUD: does not backoff on ACK with gap containing probe" {
     conn.pmtud_next_probe_ns = 0;
     conn.cached_max_ack_delay_ns = 25_000_000;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate probe at valid size
@@ -243,7 +243,7 @@ test "PMTUD: does not backoff on ACK with unreachable packet" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Queue a small probe manually
@@ -305,7 +305,7 @@ test "PMTUD: state machine: probe can only be initiated when none in flight" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate probe manually
@@ -332,7 +332,7 @@ test "PMTUD: respects 1-second retry interval after failure" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.cached_max_ack_delay_ns = 25_000_000;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate and timeout probe manually
@@ -367,7 +367,7 @@ test "PMTUD: 3×PTO timeout check uses saturating multiply (no overflow panic)" 
     conn.loss.rtt.smoothed_rtt = std.math.maxInt(u64) / 3 + 1;
     conn.loss.rtt.rtt_var = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     try conn.queuePmtudProbe(1200);
@@ -390,7 +390,7 @@ test "PMTUD: probe packet is marked ack-eliciting" {
     conn.path_mtu = 1200;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Queue probe at realistic size (< MAX_PACKET_SIZE)
@@ -416,7 +416,7 @@ test "PMTUD: doesn't probe if already at maximum" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     conn.tick(conn.current_time_ns);
@@ -435,7 +435,7 @@ test "PMTUD: backoff on PacketTooLarge error" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     conn.tick(conn.current_time_ns);
@@ -454,7 +454,7 @@ test "PMTUD: converges when probe size exceeds MAX_PACKET_SIZE" {
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     for (0..5) |i| {
@@ -472,7 +472,7 @@ test "PMTUD: short header padding calculation is correct" {
     conn.path_mtu = 1200;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     try conn.queuePmtudProbe(1200);
@@ -486,7 +486,7 @@ test "PMTUD: rejects probe size above MAX_PACKET_SIZE" {
     conn.hot.state = .established;
     conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     try conn.queuePmtudProbe(1452);
@@ -732,7 +732,7 @@ fn buildInitialPacket(
     crypto.encryptPayload(keys.client, pn, buf[0..hdr_len], pt[0..pt_len], buf[hdr_len..][0..ct_len]);
     // Apply header protection so processLongHeaderPacket can remove it.
     // PN is at buf[hdr_len-4..hdr_len], sample is at buf[hdr_len..hdr_len+16].
-    crypto.applyHeaderProtection(keys.client.hp, &buf[0], buf[hdr_len - 4 ..][0..4], buf[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(keys.client, &buf[0], buf[hdr_len - 4 ..][0..4], buf[hdr_len..][0..16]);
     return .{ .keys = keys, .pkt_len = hdr_len + ct_len };
 }
 

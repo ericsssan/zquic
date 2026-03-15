@@ -22,6 +22,20 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
+    // zhttp3 dependency (HTTP/3 + QPACK)
+    const zhttp3_dep = b.dependency("zhttp3", .{ .target = target, .optimize = optimize });
+    const qpack_mod = b.createModule(.{
+        .root_source_file = zhttp3_dep.path("src/qpack/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const http3_mod = b.createModule(.{
+        .root_source_file = zhttp3_dep.path("src/http3/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    http3_mod.addImport("qpack", qpack_mod);
+
     // Interop server
     const server_mod = b.createModule(.{
         .root_source_file = b.path("tools/server.zig"),
@@ -29,6 +43,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_mod.addImport("zquic", zquic_mod);
+    server_mod.addImport("http3", http3_mod);
+    server_mod.addImport("qpack", qpack_mod);
     const server = b.addExecutable(.{
         .name = "server",
         .root_module = server_mod,
@@ -97,6 +113,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     server_test_mod.addImport("zquic", zquic_mod);
+    server_test_mod.addImport("http3", http3_mod);
+    server_test_mod.addImport("qpack", qpack_mod);
     const server_test = b.addTest(.{ .root_module = server_test_mod });
     test_step.dependOn(&b.addRunArtifact(server_test).step);
 }

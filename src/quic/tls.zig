@@ -42,6 +42,7 @@ const SignKey = union(KeyAlgorithm) {
 const TLS_VERSION_1_3: u16 = 0x0304;
 const TLS_VERSION_LEGACY: u16 = 0x0303;
 const CIPHER_TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+const CIPHER_TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 const GROUP_X25519: u16 = 0x001d;
 const GROUP_SECP256R1: u16 = 0x0017; // P-256
 
@@ -99,6 +100,8 @@ const ClientHelloData = struct {
     alpn_names: [4][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 4,
     alpn_lens: [4]u8 = [_]u8{0} ** 4,
     alpn_count: u8 = 0,
+    has_aes_128_gcm: bool = false,
+    has_chacha20_poly1305: bool = false,
 };
 
 pub const TlsServer = struct {
@@ -164,6 +167,11 @@ pub const TlsServer = struct {
     required_alpn_len: u8 = 0,
     negotiated_alpn: [32]u8 = [_]u8{0} ** 32,
     negotiated_alpn_len: u8 = 0,
+
+    // Cipher suite negotiation. Server prefers AES by default.
+    // Set preferred_cipher to .chacha20_poly1305 to prefer ChaCha20 when client offers it.
+    preferred_cipher: crypto.CipherSuite = .aes_128_gcm,
+    negotiated_cipher: crypto.CipherSuite = .aes_128_gcm,
 
     // CRYPTO data accumulation buffers
     read_buf: [8192]u8,
@@ -355,6 +363,13 @@ pub const TlsServer = struct {
         if (!ch.has_x25519 and !ch.has_p256) return error.NoSupportedKeyShare;
         const use_p256 = !ch.has_x25519 and ch.has_p256;
 
+        // Cipher suite negotiation: client must offer at least one supported suite.
+        if (!ch.has_aes_128_gcm and !ch.has_chacha20_poly1305) return error.NoSupportedCipher;
+        self.negotiated_cipher = switch (self.preferred_cipher) {
+            .chacha20_poly1305 => if (ch.has_chacha20_poly1305) .chacha20_poly1305 else .aes_128_gcm,
+            .aes_128_gcm => if (ch.has_aes_128_gcm) .aes_128_gcm else .chacha20_poly1305,
+        };
+
         // ALPN negotiation: if we require a protocol, the client must offer it.
         if (self.required_alpn_len > 0) {
             const req = self.required_alpn[0..self.required_alpn_len];
@@ -515,10 +530,10 @@ pub const TlsServer = struct {
         deriveSecret(&self.client_hs_secret, self.handshake_secret, "c hs traffic", &th_hello);
         deriveSecret(&self.server_hs_secret, self.handshake_secret, "s hs traffic", &th_hello);
 
-        // Derive handshake-epoch QUIC packet keys
+        // Derive handshake-epoch QUIC packet keys (uses negotiated cipher suite)
         self.handshake_keys = .{
-            .client = crypto.derivePacketKeys(self.client_hs_secret, self.quic_version),
-            .server = crypto.derivePacketKeys(self.server_hs_secret, self.quic_version),
+            .client = crypto.derivePacketKeysWithSuite(self.client_hs_secret, self.quic_version, self.negotiated_cipher),
+            .server = crypto.derivePacketKeysWithSuite(self.server_hs_secret, self.quic_version, self.negotiated_cipher),
         };
 
         // Master Secret
@@ -533,8 +548,8 @@ pub const TlsServer = struct {
         deriveSecret(&self.server_app_secret, self.master_secret, "s ap traffic", transcript_hash);
 
         self.app_keys = .{
-            .client = crypto.derivePacketKeys(self.client_app_secret, self.quic_version),
-            .server = crypto.derivePacketKeys(self.server_app_secret, self.quic_version),
+            .client = crypto.derivePacketKeysWithSuite(self.client_app_secret, self.quic_version, self.negotiated_cipher),
+            .server = crypto.derivePacketKeysWithSuite(self.server_app_secret, self.quic_version, self.negotiated_cipher),
         };
     }
 
@@ -595,8 +610,8 @@ pub const TlsServer = struct {
         @memcpy(out[pos..][0..session_id.len], session_id);
         pos += session_id.len;
 
-        // Cipher suite: TLS_AES_128_GCM_SHA256
-        std.mem.writeInt(u16, out[pos..][0..2], CIPHER_TLS_AES_128_GCM_SHA256, .big);
+        // Cipher suite: negotiated
+        std.mem.writeInt(u16, out[pos..][0..2], @intFromEnum(self.negotiated_cipher), .big);
         pos += 2;
 
         // Legacy compression method: null
@@ -792,10 +807,20 @@ fn parseClientHello(data: []const u8) !ClientHelloData {
     @memcpy(ch.legacy_session_id[0..ch.session_id_len], data[pos..][0..ch.session_id_len]);
     pos += sid_len;
 
-    // Cipher suites (skip)
+    // Cipher suites
     if (pos + 2 > data.len) return error.TooShort;
     const cs_len = std.mem.readInt(u16, data[pos..][0..2], .big);
-    pos += 2 + cs_len;
+    pos += 2;
+    if (pos + cs_len > data.len) return error.TooShort;
+    {
+        var cs_off: usize = 0;
+        while (cs_off + 2 <= cs_len) : (cs_off += 2) {
+            const cs = std.mem.readInt(u16, data[pos + cs_off ..][0..2], .big);
+            if (cs == CIPHER_TLS_AES_128_GCM_SHA256) ch.has_aes_128_gcm = true;
+            if (cs == CIPHER_TLS_CHACHA20_POLY1305_SHA256) ch.has_chacha20_poly1305 = true;
+        }
+    }
+    pos += cs_len;
 
     // Compression methods (skip)
     if (pos >= data.len) return error.TooShort;
@@ -1402,6 +1427,7 @@ test "tls: ALPN: matching protocol selected" {
         .client_p256_pub = [_]u8{0} ** 65,
         .has_p256 = false,
         .peer_transport_params = .{},
+        .has_aes_128_gcm = true,
     };
     @memcpy(ch.alpn_names[0][0..name_len], alpn_name);
     ch.alpn_lens[0] = name_len;
@@ -1451,6 +1477,7 @@ test "tls: ALPN: mismatch returns AlpnMismatch" {
         .client_p256_pub = [_]u8{0} ** 65,
         .has_p256 = false,
         .peer_transport_params = .{},
+        .has_aes_128_gcm = true,
     };
     @memcpy(ch.alpn_names[0][0..2], "h3");
     ch.alpn_lens[0] = 2;
@@ -1530,6 +1557,7 @@ test "tls: full handshake roundtrip: client Finished verifies correctly" {
         .client_p256_pub = [_]u8{0} ** 65,
         .has_p256 = false,
         .peer_transport_params = .{},
+        .has_aes_128_gcm = true,
     };
     @memcpy(ch.alpn_names[0][0..10], "hq-interop");
     ch.alpn_lens[0] = 10;
@@ -1634,6 +1662,7 @@ test "tls: P-256 ECDH: server accepts P-256-only client and produces handshake k
         .client_p256_pub = client_pub,
         .has_p256 = true,
         .peer_transport_params = .{},
+        .has_aes_128_gcm = true,
     };
 
     var out: [4096]u8 = undefined;
@@ -1743,6 +1772,7 @@ test "tls: no key share returns NoSupportedKeyShare" {
         .client_p256_pub = [_]u8{0} ** 65,
         .has_p256 = false,
         .peer_transport_params = .{},
+        .has_aes_128_gcm = true,
     };
     var out: [4096]u8 = undefined;
     try std.testing.expectError(error.NoSupportedKeyShare, server.handleClientHello(ch, &out, io));

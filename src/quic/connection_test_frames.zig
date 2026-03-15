@@ -40,8 +40,8 @@ test "connection: tick clears shouldSendMaxStreamData after stream read" {
     // for decryption here; we only check that the watermark is cleared and a packet queued).
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
-        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
     };
     const sq_before = conn.sq_tail;
     conn.tick(1_000_000);
@@ -482,7 +482,7 @@ test "connection: initiateKeyUpdate errors when not established" {
 test "connection: initiateKeyUpdate errors when key_update_pending" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.next_client_secret = [_]u8{0x33} ** 32;
     conn.next_server_secret = [_]u8{0x44} ** 32;
@@ -495,7 +495,7 @@ test "connection: initiateKeyUpdate flips key_phase and sets pending" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.next_client_secret = [_]u8{0x55} ** 32;
     conn.next_server_secret = [_]u8{0x66} ** 32;
@@ -511,7 +511,7 @@ test "connection: rotateKeys advances next-generation secrets" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     const secret = [_]u8{0x77} ** 32;
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.next_client_secret = secret;
@@ -533,7 +533,7 @@ test "connection: ACK generation after key update" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Setup: establish connection with initial keys
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.next_client_secret = [_]u8{0x55} ** 32;
     conn.next_server_secret = [_]u8{0x66} ** 32;
@@ -707,7 +707,7 @@ test "connection: sendEncryptedAck for 1-RTT epoch produces short header" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.markPnReceived(2, 3);
 
@@ -810,7 +810,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     );
     crypto.encryptPayload(client_keys, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
     // Apply header protection so receive() can remove it correctly.
-    crypto.applyHeaderProtection(client_keys.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(client_keys, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
     const pkt = enc_buf[0 .. hdr_len + ct_len];
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
@@ -853,7 +853,7 @@ test "connection: receive() suppresses epoch-0 ACK when hs_keys is null" {
         ct_len,
     );
     crypto.encryptPayload(client_keys, pn, enc_buf[0..hdr_len], pt[0..pt_len], enc_buf[hdr_len..][0..ct_len]);
-    crypto.applyHeaderProtection(client_keys.hp, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(client_keys, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
     const pkt = enc_buf[0 .. hdr_len + ct_len];
 
     const src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 1234 } };
@@ -987,7 +987,7 @@ test "connection: tick batches MAX_DATA and MAX_STREAM_DATA in one packet" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Set up pending MAX_DATA.
@@ -1012,7 +1012,7 @@ test "connection: flushControlFrames is no-op when nothing pending" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     const sq_before = conn.sq_tail;
@@ -1025,7 +1025,7 @@ test "connection: coalesced packet tracked by loss recovery" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.pending_max_data = true;
 
@@ -1192,7 +1192,7 @@ test "connection: enqueueSend refreshes idle deadline" {
     conn.idle_timeout_i64 = 30_000_000_000; // 30s
     conn.idle_deadline_ns = 1; // stale deadline from before
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 };
+    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.queuePing() catch {};
 
@@ -1392,13 +1392,13 @@ test "connection: 1-RTT malformed frame closes connection with FRAME_ENCODING_ER
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
-    const app_key = [_]u8{0xAA} ** 16;
+    const app_key = [_]u8{0xAA} ** 32;
     const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 16;
+    const app_hp = [_]u8{0xCC} ** 32;
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
-        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
+        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
+        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
     };
     conn.peer_cid = conn.local_cid;
 
@@ -1410,7 +1410,7 @@ test "connection: 1-RTT malformed frame closes connection with FRAME_ENCODING_ER
     var pkt: [256]u8 = undefined;
     const hdr_len = packet.encodeShortHeader(&pkt, &conn.local_cid.bytes, 1, false);
     crypto.encryptPayload(conn.app_keys.?.client, 1, pkt[0..hdr_len], &pt_garbled, pkt[hdr_len..][0..ct_len]);
-    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5001 } };
     try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, 0, io);
@@ -1435,13 +1435,13 @@ test "connection: 1-RTT protocol violation closes connection, not silently ignor
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     // Establish state with 1-RTT keys.
-    const app_key = [_]u8{0xAA} ** 16;
+    const app_key = [_]u8{0xAA} ** 32;
     const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 16;
+    const app_hp = [_]u8{0xCC} ** 32;
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
-        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
+        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
+        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
     };
     conn.peer_cid = conn.local_cid;
 
@@ -1454,7 +1454,7 @@ test "connection: 1-RTT protocol violation closes connection, not silently ignor
     var pkt: [256]u8 = undefined;
     const hdr_len = packet.encodeShortHeader(&pkt, &conn.local_cid.bytes, 1, false);
     crypto.encryptPayload(conn.app_keys.?.client, 1, pkt[0..hdr_len], pt_buf[0..pt_len], pkt[hdr_len..][0..ct_len]);
-    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
     try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, 0, io);
@@ -1565,8 +1565,8 @@ test "flow control: pending_max_streams_bidi preserved when packet full" {
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
-        .server = .{ .key = [_]u8{0} ** 16, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 16 },
+        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
     };
     // Fill pkt_scratch to the budget limit by setting pending_max_data at max value
     // so MAX_DATA alone exhausts the frame budget, leaving no room for MAX_STREAMS.
@@ -1597,13 +1597,13 @@ test "connection: server-initiated stream ID in STREAM frame closes with STREAM_
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
-    const app_key = [_]u8{0xAA} ** 16;
+    const app_key = [_]u8{0xAA} ** 32;
     const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 16;
+    const app_hp = [_]u8{0xCC} ** 32;
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
-        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp },
+        .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
+        .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
     };
     conn.peer_cid = conn.local_cid;
 
@@ -1614,7 +1614,7 @@ test "connection: server-initiated stream ID in STREAM frame closes with STREAM_
     var pkt: [256]u8 = undefined;
     const hdr_len = packet.encodeShortHeader(&pkt, &conn.local_cid.bytes, 1, false);
     crypto.encryptPayload(conn.app_keys.?.client, 1, pkt[0..hdr_len], pt[0..pt_len], pkt[hdr_len..][0..ct_len]);
-    crypto.applyHeaderProtection(conn.app_keys.?.client.hp, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
     try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, 0, io);

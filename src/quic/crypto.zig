@@ -3,8 +3,8 @@
 //! Implements:
 //!   - Initial secret derivation (§5.2)
 //!   - HKDF-Expand-Label (RFC 8446 §7.1 with "tls13 " prefix)
-//!   - AES-128-GCM payload encryption/decryption (§5.3)
-//!   - AES-128-ECB header protection (§5.4)
+//!   - AES-128-GCM and ChaCha20-Poly1305 payload encryption/decryption (§5.3)
+//!   - AES-128-ECB and ChaCha20 header protection (§5.4)
 
 const std = @import("std");
 const packet = @import("packet.zig");
@@ -12,12 +12,21 @@ const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Aes128 = std.crypto.core.aes.Aes128;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const ChaCha20Poly1305 = std.crypto.aead.chacha_poly.ChaCha20Poly1305;
+const ChaCha20IETF = std.crypto.stream.chacha.ChaCha20IETF;
+
+pub const CipherSuite = enum(u16) {
+    aes_128_gcm = 0x1301,
+    chacha20_poly1305 = 0x1303,
+};
 
 /// Keys for one direction of a QUIC epoch.
+/// key/hp are 32 bytes (max size); AES-128-GCM uses first 16, ChaCha20 uses all 32.
 pub const PacketKeys = struct {
-    key: [16]u8,
+    key: [32]u8,
     iv: [12]u8,
-    hp: [16]u8,
+    hp: [32]u8,
+    suite: CipherSuite,
 };
 
 /// Keys for both directions of the Initial epoch.
@@ -105,11 +114,33 @@ pub fn deriveInitialKeys(dcid: []const u8, version: u32) InitialKeys {
 
 /// Derive key/iv/hp from a traffic secret (RFC 9001 §5.1, RFC 9369 §3.2).
 pub fn derivePacketKeys(secret: [32]u8, version: u32) PacketKeys {
-    var keys: PacketKeys = undefined;
+    return derivePacketKeysWithSuite(secret, version, .aes_128_gcm);
+}
+
+/// Derive key/iv/hp for a specific cipher suite.
+pub fn derivePacketKeysWithSuite(secret: [32]u8, version: u32, suite: CipherSuite) PacketKeys {
+    var keys: PacketKeys = .{
+        .key = [_]u8{0} ** 32,
+        .iv = undefined,
+        .hp = [_]u8{0} ** 32,
+        .suite = suite,
+    };
     const is_v2 = version == packet.QUIC_VERSION_2;
-    hkdfExpandLabel(&keys.key, secret, if (is_v2) "quicv2 key" else "quic key", "");
-    hkdfExpandLabel(&keys.iv, secret, if (is_v2) "quicv2 iv" else "quic iv", "");
-    hkdfExpandLabel(&keys.hp, secret, if (is_v2) "quicv2 hp" else "quic hp", "");
+    const key_label = if (is_v2) "quicv2 key" else "quic key";
+    const iv_label = if (is_v2) "quicv2 iv" else "quic iv";
+    const hp_label = if (is_v2) "quicv2 hp" else "quic hp";
+    switch (suite) {
+        .aes_128_gcm => {
+            hkdfExpandLabel(keys.key[0..16], secret, key_label, "");
+            hkdfExpandLabel(&keys.iv, secret, iv_label, "");
+            hkdfExpandLabel(keys.hp[0..16], secret, hp_label, "");
+        },
+        .chacha20_poly1305 => {
+            hkdfExpandLabel(&keys.key, secret, key_label, "");
+            hkdfExpandLabel(&keys.iv, secret, iv_label, "");
+            hkdfExpandLabel(&keys.hp, secret, hp_label, "");
+        },
+    }
     return keys;
 }
 
@@ -133,18 +164,32 @@ pub fn encryptPayload(
     plaintext: []const u8,
     ciphertext_tag_out: []u8,
 ) void {
-    std.debug.assert(ciphertext_tag_out.len == plaintext.len + Aes128Gcm.tag_length);
+    std.debug.assert(ciphertext_tag_out.len == plaintext.len + 16);
 
     const nonce = buildNonce(keys.iv, pn);
-    var tag: [Aes128Gcm.tag_length]u8 = undefined;
-    Aes128Gcm.encrypt(
-        ciphertext_tag_out[0..plaintext.len],
-        &tag,
-        plaintext,
-        header,
-        nonce,
-        keys.key,
-    );
+    var tag: [16]u8 = undefined;
+    switch (keys.suite) {
+        .aes_128_gcm => {
+            Aes128Gcm.encrypt(
+                ciphertext_tag_out[0..plaintext.len],
+                &tag,
+                plaintext,
+                header,
+                nonce,
+                keys.key[0..16].*,
+            );
+        },
+        .chacha20_poly1305 => {
+            ChaCha20Poly1305.encrypt(
+                ciphertext_tag_out[0..plaintext.len],
+                &tag,
+                plaintext,
+                header,
+                nonce,
+                keys.key,
+            );
+        },
+    }
     @memcpy(ciphertext_tag_out[plaintext.len..], &tag);
 }
 
@@ -159,50 +204,52 @@ pub fn decryptPayload(
     ciphertext_tag: []const u8,
     plaintext_out: []u8,
 ) !void {
-    if (ciphertext_tag.len < Aes128Gcm.tag_length) return error.TooShort;
-    const ct_len = ciphertext_tag.len - Aes128Gcm.tag_length;
+    if (ciphertext_tag.len < 16) return error.TooShort;
+    const ct_len = ciphertext_tag.len - 16;
     std.debug.assert(plaintext_out.len == ct_len);
 
     const nonce = buildNonce(keys.iv, pn);
-    var tag: [Aes128Gcm.tag_length]u8 = undefined;
+    var tag: [16]u8 = undefined;
     @memcpy(&tag, ciphertext_tag[ct_len..]);
-    try Aes128Gcm.decrypt(
-        plaintext_out,
-        ciphertext_tag[0..ct_len],
-        tag,
-        header,
-        nonce,
-        keys.key,
-    );
+    switch (keys.suite) {
+        .aes_128_gcm => {
+            try Aes128Gcm.decrypt(
+                plaintext_out,
+                ciphertext_tag[0..ct_len],
+                tag,
+                header,
+                nonce,
+                keys.key[0..16].*,
+            );
+        },
+        .chacha20_poly1305 => {
+            try ChaCha20Poly1305.decrypt(
+                plaintext_out,
+                ciphertext_tag[0..ct_len],
+                tag,
+                header,
+                nonce,
+                keys.key,
+            );
+        },
+    }
 }
 
 /// Apply or remove header protection (RFC 9001 §5.4).
 ///
+/// `keys`              — packet keys (suite determines AES vs ChaCha20 HP).
 /// `header_first_byte` — pointer to the first byte of the packet (mutated).
 /// `pn_bytes`          — the packet-number bytes in the header (mutated).
 /// `sample`            — 16 bytes from the ciphertext starting at
 ///                       offset 4 past the packet-number field.
 pub fn applyHeaderProtection(
-    hp_key: [16]u8,
+    keys: PacketKeys,
     header_first_byte: *u8,
     pn_bytes: []u8,
     sample: *const [16]u8,
 ) void {
-    var mask: [16]u8 = undefined;
-    const aes = Aes128.initEnc(hp_key);
-    aes.encrypt(&mask, sample);
-
-    // Long header: mask bits 0..3 of first byte; short header: bits 0..4
-    // We detect by checking whether bit 7 is set (long header flag = 1).
-    if (header_first_byte.* & 0x80 != 0) {
-        header_first_byte.* ^= mask[0] & 0x0f;
-    } else {
-        header_first_byte.* ^= mask[0] & 0x1f;
-    }
-
-    for (pn_bytes, 1..) |*b, i| {
-        b.* ^= mask[i];
-    }
+    const mask = hpMask(keys, sample);
+    applyMask(header_first_byte, pn_bytes, mask);
 }
 
 /// Remove header protection from a received QUIC packet (RFC 9001 §5.4).
@@ -214,14 +261,12 @@ pub fn applyHeaderProtection(
 /// `pn_field` must point to at least 4 bytes starting at the PN offset.
 /// Returns the actual packet-number length (1..4) decoded from `first_byte`.
 pub fn removeHeaderProtection(
-    hp_key: [16]u8,
+    keys: PacketKeys,
     first_byte: *u8,
     pn_field: *[4]u8,
     sample: *const [16]u8,
 ) u8 {
-    var mask: [16]u8 = undefined;
-    const aes = Aes128.initEnc(hp_key);
-    aes.encrypt(&mask, sample);
+    const mask = hpMask(keys, sample);
 
     // Long header: mask bits 0..3; short header: mask bits 0..4.
     if (first_byte.* & 0x80 != 0) {
@@ -256,6 +301,39 @@ pub fn removeHeaderProtection(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Compute 5-byte header protection mask (RFC 9001 §5.4.3 / §5.4.4).
+fn hpMask(keys: PacketKeys, sample: *const [16]u8) [5]u8 {
+    switch (keys.suite) {
+        .aes_128_gcm => {
+            var mask_full: [16]u8 = undefined;
+            const aes = Aes128.initEnc(keys.hp[0..16].*);
+            aes.encrypt(&mask_full, sample);
+            return mask_full[0..5].*;
+        },
+        .chacha20_poly1305 => {
+            // RFC 9001 §5.4.4: counter = sample[0..4] (LE), nonce = sample[4..16]
+            const counter = std.mem.readInt(u32, sample[0..4], .little);
+            const nonce = sample[4..16].*;
+            var mask: [5]u8 = undefined;
+            const zeros = [_]u8{0} ** 5;
+            ChaCha20IETF.xor(&mask, &zeros, counter, keys.hp, nonce);
+            return mask;
+        },
+    }
+}
+
+/// Apply a 5-byte HP mask to the first byte and PN bytes.
+fn applyMask(header_first_byte: *u8, pn_bytes: []u8, mask: [5]u8) void {
+    if (header_first_byte.* & 0x80 != 0) {
+        header_first_byte.* ^= mask[0] & 0x0f;
+    } else {
+        header_first_byte.* ^= mask[0] & 0x1f;
+    }
+    for (pn_bytes, 1..) |*b, i| {
+        b.* ^= mask[i];
+    }
+}
 
 fn buildNonce(iv: [12]u8, pn: u64) [12]u8 {
     var nonce = iv;
@@ -310,9 +388,9 @@ test "crypto: RFC 9001 A — client key/iv/hp" {
         0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2,
     };
 
-    try testing.expectEqualSlices(u8, &expected_key, &keys.client.key);
+    try testing.expectEqualSlices(u8, &expected_key, keys.client.key[0..16]);
     try testing.expectEqualSlices(u8, &expected_iv, &keys.client.iv);
-    try testing.expectEqualSlices(u8, &expected_hp, &keys.client.hp);
+    try testing.expectEqualSlices(u8, &expected_hp, keys.client.hp[0..16]);
 }
 
 test "crypto: RFC 9001 A — server key/iv/hp" {
@@ -332,9 +410,9 @@ test "crypto: RFC 9001 A — server key/iv/hp" {
         0x44, 0x43, 0x0b, 0x49, 0x0e, 0xea, 0xa3, 0x14,
     };
 
-    try testing.expectEqualSlices(u8, &expected_key, &keys.server.key);
+    try testing.expectEqualSlices(u8, &expected_key, keys.server.key[0..16]);
     try testing.expectEqualSlices(u8, &expected_iv, &keys.server.iv);
-    try testing.expectEqualSlices(u8, &expected_hp, &keys.server.hp);
+    try testing.expectEqualSlices(u8, &expected_hp, keys.server.hp[0..16]);
 }
 
 test "crypto: encrypt-decrypt round-trip" {
@@ -379,7 +457,9 @@ test "crypto: decryptPayload with corrupted authentication tag returns error" {
 }
 
 test "crypto: applyHeaderProtection is self-inverse (XOR involution)" {
-    const hp_key = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
+    var hp32: [32]u8 = [_]u8{0} ** 32;
+    @memcpy(hp32[0..16], &[_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 });
+    const keys = PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = hp32, .suite = .aes_128_gcm };
     // Use a non-zero sample to get a non-trivial mask
     const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
     var first_byte: u8 = 0xC3; // long header (bit 7 = 1)
@@ -389,9 +469,9 @@ test "crypto: applyHeaderProtection is self-inverse (XOR involution)" {
     const orig_pn = pn_bytes;
 
     // Apply once (protect)
-    applyHeaderProtection(hp_key, &first_byte, &pn_bytes, &sample);
+    applyHeaderProtection(keys, &first_byte, &pn_bytes, &sample);
     // Apply again (remove — same XOR operation)
-    applyHeaderProtection(hp_key, &first_byte, &pn_bytes, &sample);
+    applyHeaderProtection(keys, &first_byte, &pn_bytes, &sample);
 
     try std.testing.expectEqual(orig_first, first_byte);
     try std.testing.expectEqualSlices(u8, &orig_pn, &pn_bytes);
@@ -399,13 +479,16 @@ test "crypto: applyHeaderProtection is self-inverse (XOR involution)" {
 
 test "crypto: removeHeaderProtection handles all pn_len values (1-4)" {
     const testing = std.testing;
-    const hp_key = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
+    var hp32: [32]u8 = [_]u8{0} ** 32;
+    const hp16 = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
+    @memcpy(hp32[0..16], &hp16);
+    const keys = PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = hp32, .suite = .aes_128_gcm };
     const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
 
     // Compute actual mask using AES
     var mask: [5]u8 = undefined;
     {
-        var cipher = std.crypto.core.aes.Aes128.initEnc(hp_key);
+        var cipher = std.crypto.core.aes.Aes128.initEnc(hp16);
         var mask_full: [16]u8 = undefined;
         cipher.encrypt(&mask_full, &sample);
         for (0..5) |i| {
@@ -423,7 +506,7 @@ test "crypto: removeHeaderProtection handles all pn_len values (1-4)" {
         var pn_field = unmasked_pn;
         pn_field[0] ^= mask[1]; // Only first byte masked since pn_len = 1
 
-        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        const pn_len = removeHeaderProtection(keys, &first_byte, &pn_field, &sample);
         try testing.expectEqual(@as(u8, 1), pn_len);
         try testing.expectEqual(unmasked_first, first_byte);
         try testing.expectEqual(unmasked_pn[0], pn_field[0]);
@@ -439,7 +522,7 @@ test "crypto: removeHeaderProtection handles all pn_len values (1-4)" {
         pn_field[0] ^= mask[1];
         pn_field[1] ^= mask[2];
 
-        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        const pn_len = removeHeaderProtection(keys, &first_byte, &pn_field, &sample);
         try testing.expectEqual(@as(u8, 2), pn_len);
         try testing.expectEqual(unmasked_first, first_byte);
         try testing.expectEqual(unmasked_pn[0], pn_field[0]);
@@ -457,7 +540,7 @@ test "crypto: removeHeaderProtection handles all pn_len values (1-4)" {
         pn_field[1] ^= mask[2];
         pn_field[2] ^= mask[3];
 
-        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        const pn_len = removeHeaderProtection(keys, &first_byte, &pn_field, &sample);
         try testing.expectEqual(@as(u8, 3), pn_len);
         try testing.expectEqual(unmasked_first, first_byte);
         try testing.expectEqual(unmasked_pn[0], pn_field[0]);
@@ -477,7 +560,7 @@ test "crypto: removeHeaderProtection handles all pn_len values (1-4)" {
         pn_field[2] ^= mask[3];
         pn_field[3] ^= mask[4];
 
-        const pn_len = removeHeaderProtection(hp_key, &first_byte, &pn_field, &sample);
+        const pn_len = removeHeaderProtection(keys, &first_byte, &pn_field, &sample);
         try testing.expectEqual(@as(u8, 4), pn_len);
         try testing.expectEqual(unmasked_first, first_byte);
         try testing.expectEqual(unmasked_pn[0], pn_field[0]);
@@ -560,9 +643,9 @@ test "crypto: v2 initial keys differ from v1 for same DCID" {
     const keys_v1 = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1);
     const keys_v2 = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_2);
     // v2 uses a different salt and labels, so keys must differ.
-    try testing.expect(!std.mem.eql(u8, &keys_v1.client.key, &keys_v2.client.key));
+    try testing.expect(!std.mem.eql(u8, keys_v1.client.key[0..16], keys_v2.client.key[0..16]));
     try testing.expect(!std.mem.eql(u8, &keys_v1.client.iv, &keys_v2.client.iv));
-    try testing.expect(!std.mem.eql(u8, &keys_v1.server.key, &keys_v2.server.key));
+    try testing.expect(!std.mem.eql(u8, keys_v1.server.key[0..16], keys_v2.server.key[0..16]));
 }
 
 test "crypto: v2 derivePacketKeys uses quicv2 labels" {
@@ -573,9 +656,9 @@ test "crypto: v2 derivePacketKeys uses quicv2 labels" {
     hkdfExpandLabel(&secret, prk, "client in", "");
     const k_v1 = derivePacketKeys(secret, packet.QUIC_VERSION_1);
     const k_v2 = derivePacketKeys(secret, packet.QUIC_VERSION_2);
-    try testing.expect(!std.mem.eql(u8, &k_v1.key, &k_v2.key));
+    try testing.expect(!std.mem.eql(u8, k_v1.key[0..16], k_v2.key[0..16]));
     try testing.expect(!std.mem.eql(u8, &k_v1.iv, &k_v2.iv));
-    try testing.expect(!std.mem.eql(u8, &k_v1.hp, &k_v2.hp));
+    try testing.expect(!std.mem.eql(u8, k_v1.hp[0..16], k_v2.hp[0..16]));
 }
 
 test "crypto: RFC 9369 — v2 client key/iv/hp derived correctly" {
@@ -585,14 +668,69 @@ test "crypto: RFC 9369 — v2 client key/iv/hp derived correctly" {
     const test_dcid_v2 = [_]u8{ 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
     const keys = deriveInitialKeys(&test_dcid_v2, packet.QUIC_VERSION_2);
 
-    // The key/iv/hp must be 16/12/16 bytes respectively.
-    try testing.expectEqual(16, keys.client.key.len);
+    // Initial keys always use AES-128-GCM.
+    try testing.expectEqual(CipherSuite.aes_128_gcm, keys.client.suite);
+    try testing.expectEqual(32, keys.client.key.len);
     try testing.expectEqual(12, keys.client.iv.len);
-    try testing.expectEqual(16, keys.client.hp.len);
+    try testing.expectEqual(32, keys.client.hp.len);
 
     // v2 keys must differ from v1 keys for the same DCID.
     const keys_v1 = deriveInitialKeys(&test_dcid_v2, packet.QUIC_VERSION_1);
-    try testing.expect(!std.mem.eql(u8, &keys.client.key, &keys_v1.client.key));
+    try testing.expect(!std.mem.eql(u8, keys.client.key[0..16], keys_v1.client.key[0..16]));
     try testing.expect(!std.mem.eql(u8, &keys.client.iv, &keys_v1.client.iv));
-    try testing.expect(!std.mem.eql(u8, &keys.client.hp, &keys_v1.client.hp));
+    try testing.expect(!std.mem.eql(u8, keys.client.hp[0..16], keys_v1.client.hp[0..16]));
+}
+
+test "crypto: ChaCha20-Poly1305 encrypt-decrypt round-trip" {
+    const testing = std.testing;
+    const secret = [_]u8{0x42} ** 32;
+    const keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .chacha20_poly1305);
+    try testing.expectEqual(CipherSuite.chacha20_poly1305, keys.suite);
+
+    const pn: u64 = 5;
+    const header = [_]u8{ 0x40, 0x01 };
+    const plaintext = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE };
+
+    var ct: [plaintext.len + 16]u8 = undefined;
+    encryptPayload(keys, pn, &header, &plaintext, &ct);
+
+    var recovered: [plaintext.len]u8 = undefined;
+    try decryptPayload(keys, pn, &header, &ct, &recovered);
+    try testing.expectEqualSlices(u8, &plaintext, &recovered);
+}
+
+test "crypto: ChaCha20-Poly1305 header protection round-trip" {
+    const testing = std.testing;
+    const secret = [_]u8{0x42} ** 32;
+    const keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .chacha20_poly1305);
+
+    const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+    var first_byte: u8 = 0x40; // short header
+    var pn_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x05 };
+
+    const orig_first = first_byte;
+    const orig_pn = pn_bytes;
+
+    applyHeaderProtection(keys, &first_byte, &pn_bytes, &sample);
+    // Must have changed
+    try testing.expect(first_byte != orig_first or !std.mem.eql(u8, &pn_bytes, &orig_pn));
+    // Apply again to remove (self-inverse)
+    applyHeaderProtection(keys, &first_byte, &pn_bytes, &sample);
+    try testing.expectEqual(orig_first, first_byte);
+    try testing.expectEqualSlices(u8, &orig_pn, &pn_bytes);
+}
+
+test "crypto: ChaCha20 keys differ from AES keys for same secret" {
+    const testing = std.testing;
+    const secret = [_]u8{0x42} ** 32;
+    const aes_keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .aes_128_gcm);
+    const cc_keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .chacha20_poly1305);
+    // Suite must be recorded correctly.
+    try testing.expectEqual(CipherSuite.aes_128_gcm, aes_keys.suite);
+    try testing.expectEqual(CipherSuite.chacha20_poly1305, cc_keys.suite);
+    // HKDF-Expand-Label output depends on the requested output length, so AES (16-byte key)
+    // and ChaCha20 (32-byte key) produce entirely different key material.
+    try testing.expect(!std.mem.eql(u8, &aes_keys.key, &cc_keys.key));
+    // HP keys also differ: AES derives 16 bytes (zero-padded to 32), ChaCha20 derives 32 bytes.
+    try testing.expect(!std.mem.eql(u8, &aes_keys.hp, &cc_keys.hp));
 }
