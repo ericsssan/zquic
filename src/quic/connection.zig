@@ -195,6 +195,9 @@ pub const Config = struct {
     preferred_addr_ipv6_port: u16 = 0,
     /// Preferred AEAD cipher suite. The server negotiates this when the client offers it.
     preferred_cipher: crypto.CipherSuite = .aes_128_gcm,
+    /// 32-byte key for session ticket encryption (enables resumption/0-RTT).
+    /// When null, session tickets are not issued.
+    ticket_key: ?*const [32]u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -297,6 +300,12 @@ pub fn Connection(comptime max_streams: usize) type {
         // Sized to MAX_SEND_PACKET_SIZE to allow large data chunks + frame headers.
         pkt_scratch: [MAX_SEND_PACKET_SIZE]u8,
         enc_scratch: [MAX_SEND_PACKET_SIZE]u8,
+
+        // Receive-path scratch buffers (reused per packet, avoids 3KB stack per receive).
+        // rx_hp_buf: mutable copy for header-protection removal.
+        // rx_plaintext: decrypted payload output.
+        rx_hp_buf: [MAX_PACKET_SIZE]u8,
+        rx_plaintext: [MAX_PACKET_SIZE]u8,
 
         // Peer stream limits (updated by MAX_STREAMS frames and transport params)
         peer_max_streams_bidi: u62,
@@ -473,6 +482,14 @@ pub fn Connection(comptime max_streams: usize) type {
         /// the @intCast/@min per packet. Zero when idle timeout is disabled.
         idle_timeout_i64: i64,
 
+        // Session resumption / 0-RTT state
+        /// Set after handshake completes when ticket_key is configured; triggers NST send.
+        pending_new_session_ticket: bool = false,
+        /// 0-RTT decryption keys derived from client_early_traffic_secret.
+        zero_rtt_keys: ?crypto.PacketKeys = null,
+        /// True when we are accepting 0-RTT data (STREAM frames allowed before established).
+        accepting_early_data: bool = false,
+
         /// Create a server-side connection.  Call `receive()` with the first
         /// datagram to start the handshake.
         pub fn accept(config: Config, io: std.Io) !Self {
@@ -486,6 +503,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // TLS will only switch versions if version_information indicates support (RFC 9368).
             tls_server.server_configured_version = config.initial_quic_version;
             tls_server.preferred_cipher = config.preferred_cipher;
+            tls_server.ticket_key = config.ticket_key;
             if (config.alpn.len > 0) {
                 const n = @min(config.alpn.len, 32);
                 @memcpy(tls_server.required_alpn[0..n], config.alpn[0..n]);
@@ -551,6 +569,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .closing_frame_len = 0,
                 .pkt_scratch = undefined,
                 .enc_scratch = undefined,
+                .rx_hp_buf = undefined,
+                .rx_plaintext = undefined,
                 .peer_max_streams_bidi = 0,
                 .peer_max_streams_uni = 0,
                 .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
@@ -866,6 +886,13 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
 
+            // Send NewSessionTicket if pending (post-handshake, 1-RTT CRYPTO).
+            if (self.pending_new_session_ticket and self.app_keys != null) {
+                if (self.sendNewSessionTicket()) {
+                    self.pending_new_session_ticket = false;
+                } else |_| {}
+            }
+
             // Flush pending retransmits.
             if (self.pending_handshake_done) {
                 self.pending_handshake_done = false;
@@ -910,16 +937,15 @@ pub fn Connection(comptime max_streams: usize) type {
             }
             // Check buffer capacity before any mutation so the operation is all-or-nothing.
             if (st.sendBufferFree() < data.len) return error.BufferFull;
-            if (self.hot.state == .established) {
-                // Congestion window gate for new sends only (RFC 9002 §7).
-                // Retransmissions (processLostFrames) bypass this check so loss recovery
-                // is never blocked by a temporarily-reduced cwnd after a loss event.
-                // Estimate packet size as data.len + 64 bytes of header/AEAD overhead.
-                if (self.loss.bytes_in_flight + data.len + 64 > self.congestion.cwnd) {
-                    return error.CongestionWindowFull;
-                }
-                try self.queueStreamData(stream_id, data, fin);
+            if (self.hot.state != .established) return error.StreamNotWritable;
+            // Congestion window gate for new sends only (RFC 9002 §7).
+            // Retransmissions (processLostFrames) bypass this check so loss recovery
+            // is never blocked by a temporarily-reduced cwnd after a loss event.
+            // Estimate packet size as data.len + 64 bytes of header/AEAD overhead.
+            if (self.loss.bytes_in_flight + data.len + 64 > self.congestion.cwnd) {
+                return error.CongestionWindowFull;
             }
+            try self.queueStreamData(stream_id, data, fin);
         }
 
         /// Initiate a connection close.  Transitions to closing, queues a CONNECTION_CLOSE,
@@ -971,6 +997,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 std.crypto.secureZero(u8, @as(*volatile [@sizeOf(tls.AppKeys)]u8, @ptrCast(ks)));
                 self.next_app_keys = null;
             }
+            if (self.zero_rtt_keys) |*ks| {
+                std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.PacketKeys)]u8, @ptrCast(ks)));
+                self.zero_rtt_keys = null;
+            }
+            self.accepting_early_data = false;
         }
 
         /// Reset a stream and queue a RESET_STREAM frame.
@@ -1109,7 +1140,8 @@ pub fn Connection(comptime max_streams: usize) type {
             const hp_keys: crypto.PacketKeys = switch (raw_pkt_type) {
                 .initial => self.initial_keys.client,
                 .handshake => if (self.hs_keys) |hk| hk.client else return data.len,
-                else => return data.len, // 0-RTT/Retry: can't process
+                .zero_rtt => if (self.zero_rtt_keys) |zk| zk else return data.len,
+                else => return data.len, // Retry: can't process
             };
 
             // Compute offset of the packet-number field; validate buffer has space for HP sample.
@@ -1118,8 +1150,8 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Copy packet to a mutable buffer and remove header protection in place.
             // Buffer sized to MAX_PACKET_SIZE; packets larger than this were already rejected above.
-            var hp_buf: [MAX_PACKET_SIZE]u8 = undefined;
-            @memcpy(hp_buf[0..data.len], data);
+            @memcpy(self.rx_hp_buf[0..data.len], data);
+            const hp_buf = &self.rx_hp_buf;
             _ = crypto.removeHeaderProtection(hp_keys, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
 
             // Parse with header protection removed.
@@ -1176,12 +1208,11 @@ pub fn Connection(comptime max_streams: usize) type {
 
                     if (hdr.payload.len < 16) return error.PacketTooShort;
                     const pt_len = hdr.payload.len - 16;
-                    var plaintext: [MAX_PACKET_SIZE]u8 = undefined;
                     // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
-                    defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&plaintext)));
+                    defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&self.rx_plaintext)));
                     if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
 
-                    crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch |err| {
+                    crypto.decryptPayload(keys, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch |err| {
                         return err;
                     };
 
@@ -1215,7 +1246,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.pkts_recv += 1;
 
                     // Process frames in plaintext.
-                    try self.processFrames(plaintext[0..pt_len], 0, io);
+                    try self.processFrames(self.rx_plaintext[0..pt_len], 0, io);
 
                     return result.consumed;
                 },
@@ -1235,19 +1266,45 @@ pub fn Connection(comptime max_streams: usize) type {
                     const aad = hp_buf[0..payload_start];
                     if (hdr.payload.len < 16) return error.PacketTooShort;
                     const pt_len = hdr.payload.len - 16;
-                    var plaintext: [MAX_PACKET_SIZE]u8 = undefined;
                     // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
-                    defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&plaintext)));
+                    defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&self.rx_plaintext)));
                     if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
 
-                    crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch |err| {
+                    crypto.decryptPayload(keys, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch |err| {
                         return err;
                     };
                     self.markPnReceived(1, pn);
-                    try self.processFrames(plaintext[0..pt_len], 1, io);
+                    try self.processFrames(self.rx_plaintext[0..pt_len], 1, io);
                     return result.consumed;
                 },
-                else => return result.consumed, // ignore retry, 0-rtt
+                .zero_rtt => {
+                    // 0-RTT packet: use 0-RTT keys, epoch 2 PN space (RFC 9001 §4.1.4).
+                    const zk = self.zero_rtt_keys orelse return result.consumed;
+                    const pn = packet.decodePacketNumber(
+                        self.hot.rx_pn[2],
+                        hdr.packet_number,
+                        @as(u8, hdr.pn_len) * 8,
+                    );
+                    if (self.isPnDuplicate(2, pn)) return result.consumed;
+                    const payload_start = result.consumed - hdr.payload.len;
+                    const aad = hp_buf[0..payload_start];
+                    if (hdr.payload.len < 16) return error.PacketTooShort;
+                    const pt_len = hdr.payload.len - 16;
+                    // No secureZero for 0-RTT: plaintext contains stream data, not key material.
+                    if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+
+                    crypto.decryptPayload(zk, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch {
+                        return result.consumed; // silent drop on decrypt failure
+                    };
+                    self.markPnReceived(2, pn);
+                    self.bytes_recv += result.consumed;
+                    self.pkts_recv += 1;
+                    // Process frames with 0-RTT restrictions (RFC 9000 Table 3).
+                    // Uses epoch 2 PN space (shares with 1-RTT per RFC 9001 §4.1.4).
+                    try self.processFramesZeroRtt(self.rx_plaintext[0..pt_len], io);
+                    return result.consumed;
+                },
+                else => return result.consumed, // ignore retry
             }
         }
 
@@ -1381,11 +1438,10 @@ pub fn Connection(comptime max_streams: usize) type {
             if (pn_off + 4 + 16 > data.len) {
                 return 0;
             }
-            var hp_buf: [MAX_PACKET_SIZE]u8 = undefined;
-            @memcpy(hp_buf[0..data.len], data);
-            _ = crypto.removeHeaderProtection(self.app_keys.?.client, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+            @memcpy(self.rx_hp_buf[0..data.len], data);
+            _ = crypto.removeHeaderProtection(self.app_keys.?.client, &self.rx_hp_buf[0], self.rx_hp_buf[pn_off..][0..4], self.rx_hp_buf[pn_off + 4 ..][0..16]);
 
-            const result = try packet.parseShortHeader(hp_buf[0..data.len], our_scid_len);
+            const result = try packet.parseShortHeader(self.rx_hp_buf[0..data.len], our_scid_len);
             const hdr = result.header;
             const pn = packet.decodePacketNumber(
                 self.hot.rx_pn[2],
@@ -1396,12 +1452,10 @@ pub fn Connection(comptime max_streams: usize) type {
             if (self.isPnDuplicate(2, pn)) return result.consumed;
             const payload_start = result.consumed - hdr.payload.len;
             // AAD = HP-removed header bytes (per RFC 9001 §5.3).
-            const aad = hp_buf[0..payload_start];
+            const aad = self.rx_hp_buf[0..payload_start];
             if (hdr.payload.len < 16) return result.consumed;
             const pt_len = hdr.payload.len - 16;
-            var plaintext: [MAX_PACKET_SIZE]u8 = undefined;
-            // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
-            defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&plaintext)));
+            // No secureZero for 1-RTT: plaintext contains stream data, not key material.
             if (pt_len > MAX_PACKET_SIZE) return result.consumed;
 
             // Key phase handling (RFC 9001 §6): different phase bit indicates key update.
@@ -1409,7 +1463,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 // Peer has initiated a key update. Try next-generation keys first.
                 var decrypted_with_next = false;
                 if (self.next_app_keys) |nk| {
-                    if (crypto.decryptPayload(nk.client, pn, aad, hdr.payload, plaintext[0..pt_len])) |_| {
+                    if (crypto.decryptPayload(nk.client, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len])) |_| {
                         decrypted_with_next = true;
                     } else |_| {
                         // next keys decrypt failed
@@ -1422,7 +1476,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.key_update_pending = false; // peer has successfully updated keys
                 } else {
                     // Fallback: current keys (handles reordering during transition).
-                    crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
+                    crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch {
                         // RFC 9000 §10.3: decryption failure → check for stateless reset.
                         if (self.checkStatelessReset(data)) {
                             self.hot.state = .closed;
@@ -1433,7 +1487,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             } else {
                 // Same phase: use current keys; clear pending flag (peer ACKed our update).
-                crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, plaintext[0..pt_len]) catch {
+                crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch {
                     // RFC 9000 §10.3: decryption failure → check for stateless reset.
                     if (self.checkStatelessReset(data)) {
                         self.hot.state = .closed;
@@ -1451,7 +1505,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Process frames with consistent key state.
             // On protocol errors, close the connection with the appropriate QUIC
             // transport error code rather than silently ignoring the violation.
-            self.processFrames(plaintext[0..pt_len], 2, null) catch |err| {
+            self.processFrames(self.rx_plaintext[0..pt_len], 2, null) catch |err| {
                 const code: u62 = switch (err) {
                     error.FlowControlViolation => 0x03,
                     error.StreamLimitError => 0x04,
@@ -1484,11 +1538,28 @@ pub fn Connection(comptime max_streams: usize) type {
         ///   epoch 0 (Initial) and epoch 1 (Handshake) allow only:
         ///     PADDING, PING, ACK, CRYPTO, CONNECTION_CLOSE (transport, 0x1c).
         ///   epoch 2 (1-RTT) allows all frame types.
+        ///   0-RTT (is_zero_rtt=true): PADDING, PING, STREAM, CONNECTION_CLOSE (0x1c),
+        ///     RESET_STREAM, STOP_SENDING, MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS,
+        ///     DATA_BLOCKED, STREAM_DATA_BLOCKED, STREAMS_BLOCKED, NEW_CONNECTION_ID.
+        ///     Prohibited: ACK, CRYPTO, HANDSHAKE_DONE, NEW_TOKEN (RFC 9000 Table 3).
         ///
         /// RFC 9000 Table 3 column notation: I=Initial H=Handshake 0=0-RTT 1=1-RTT
         ///   CONNECTION_CLOSE (0x1c): IH01 — all epochs
         ///   CONNECTION_CLOSE (0x1d) / APPLICATION_CLOSE: __01 — 1-RTT only
-        fn isFrameAllowedInEpoch(f: frame.Frame, epoch: u8) bool {
+        pub fn isFrameAllowedInEpoch(f: frame.Frame, epoch: u8, is_zero_rtt: bool) bool {
+            if (is_zero_rtt) {
+                // RFC 9000 Table 3: 0-RTT prohibits ACK, CRYPTO, HANDSHAKE_DONE, NEW_TOKEN.
+                return switch (f) {
+                    .ack, .crypto, .handshake_done, .new_token => false,
+                    .connection_close => |cc| !cc.is_app, // only transport close (0x1c)
+                    .padding, .ping, .stream, .reset_stream, .stop_sending,
+                    .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni,
+                    .data_blocked, .stream_data_blocked, .streams_blocked_bidi,
+                    .streams_blocked_uni, .new_connection_id, .retire_connection_id,
+                    .path_challenge, .path_response,
+                    => true,
+                };
+            }
             return switch (f) {
                 .padding, .ping, .ack, .crypto => true,
                 // RFC 9000 Table 3: transport close (0x1c) is IH01; app close (0x1d) is __01.
@@ -1498,6 +1569,14 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         pub fn processFrames(self: *Self, plaintext: []const u8, epoch: u8, io: ?std.Io) !void {
+            return self.processFramesInner(plaintext, epoch, io, false);
+        }
+
+        fn processFramesZeroRtt(self: *Self, plaintext: []const u8, io: ?std.Io) !void {
+            return self.processFramesInner(plaintext, 2, io, true);
+        }
+
+        fn processFramesInner(self: *Self, plaintext: []const u8, epoch: u8, io: ?std.Io, is_zero_rtt: bool) !void {
             var pos: usize = 0;
             while (pos < plaintext.len) {
                 // RFC 9000 §12.4: a malformed frame MUST trigger FRAME_ENCODING_ERROR.
@@ -1507,7 +1586,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 pos += fr.consumed;
 
                 // RFC 9000 §12.4: reject frames not permitted in this epoch.
-                if (!isFrameAllowedInEpoch(fr.frame, epoch)) return error.ProtocolViolation;
+                if (!isFrameAllowedInEpoch(fr.frame, epoch, is_zero_rtt)) return error.ProtocolViolation;
 
                 // RFC 9000 §19.19: all frames except PADDING and ACK are ack-eliciting.
                 const is_ack_eliciting = switch (fr.frame) {
@@ -1779,6 +1858,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Guard ensures this only fires on ClientHello call, not again on ClientFinished.
             if (self.tls_state.state == .wait_client_hello) {
                 self.tls_state.quic_version = self.quic_version;
+                self.tls_state.current_time_ns = self.current_time_ns;
             }
 
             var out_buf: [32768]u8 = undefined;
@@ -1788,6 +1868,16 @@ pub fn Connection(comptime max_streams: usize) type {
                 // Adopt whatever version TLS negotiated (V1 unchanged, or V2 if version_info matched).
                 self.quic_version = self.tls_state.quic_version;
                 self.hs_keys = self.tls_state.handshake_keys;
+
+                // If TLS accepted 0-RTT, derive 0-RTT decryption keys from client_early_traffic_secret.
+                if (self.tls_state.accept_early_data) {
+                    self.zero_rtt_keys = crypto.derivePacketKeysWithSuite(
+                        self.tls_state.client_early_traffic_secret,
+                        self.quic_version,
+                        self.tls_state.negotiated_cipher,
+                    );
+                    self.accepting_early_data = true;
+                }
             }
 
             if (out_len > 0) {
@@ -1833,13 +1923,22 @@ pub fn Connection(comptime max_streams: usize) type {
 
                 self.peer_disable_migration = params.disable_active_migration;
 
+                // 0-RTT acceptance phase is over once handshake completes.
+                self.accepting_early_data = false;
+
+                // Schedule NewSessionTicket if ticket_key is configured.
+                if (self.config.ticket_key != null) {
+                    self.pending_new_session_ticket = true;
+                }
+
                 try self.queueHandshakeDone();
             }
         }
 
         pub fn processStreamFrame(self: *Self, f: frame.StreamFrame) !void {
             // RFC 9000 §12.4: STREAM frames are only valid in 1-RTT (established) state.
-            if (self.hot.state != .established) return error.ProtocolViolation;
+            // Exception: allow STREAM in handshake state when accepting 0-RTT data.
+            if (self.hot.state != .established and !self.accepting_early_data) return error.ProtocolViolation;
             // Server must only receive client-initiated streams (bit 0 = 0).
             if (f.stream_id & 1 != 0) return error.StreamStateError;
             // RFC 9000 §4.6: reject streams that exceed the advertised stream limit.
@@ -2176,12 +2275,15 @@ pub fn Connection(comptime max_streams: usize) type {
             return false;
         }
 
-        fn drainPendingCryptoRetx(self: *Self) void {
+        pub fn drainPendingCryptoRetx(self: *Self) void {
             if (self.crypto_pending_retx_count == 0) return;
             const max_chunk = MAX_SEND_PACKET_SIZE - 100;
             var remaining: u8 = 0;
             for (self.crypto_pending_retx[0..self.crypto_pending_retx_count]) |p| {
                 const epoch = p.epoch;
+                // Only retransmit Initial (0) and Handshake (1) CRYPTO.
+                // Epoch 2 CRYPTO (e.g. NewSessionTicket) is not saved for retransmission.
+                if (epoch >= 2) continue;
                 const data_len = self.crypto_send_saved_len[epoch];
                 const offset = p.offset;
                 const len = p.len;
@@ -2410,43 +2512,63 @@ pub fn Connection(comptime max_streams: usize) type {
                 },
                 2 => {
                     // 1-RTT packet: Short Header, app keys
-                    if (self.app_keys == null) return;
-                    const ak = self.app_keys.?.server;
-                    const pn = self.hot.tx_pn[2];
-                    self.hot.tx_pn[2] += 1;
-                    const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-                    const ct_len = fpos + 16;
-                    if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-                    crypto.encryptPayload(ak, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                    crypto.applyHeaderProtection(ak, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                    try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.count = 0;
-                    self.loss.onPacketSent(pn, 2, hdr_len + ct_len, false, self.current_time_ns, fi);
+                    _ = self.sendShortHeaderPacket(fpos, fi, false) catch return;
                 },
                 else => return,
             }
         }
 
-        pub fn queuePing(self: *Self) !void {
-            if (self.app_keys) |ak| {
-                // Post-handshake: send an encrypted PING in a 1-RTT packet.
-                const n = frame.encodeFrame(&self.pkt_scratch, .ping);
-                const pn = self.hot.tx_pn[2];
-                self.hot.tx_pn[2] += 1;
-                const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-                const ct_len = n + 16;
-                if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-                crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..n], self.enc_scratch[hdr_len..][0..ct_len]);
-                crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                const out_len = hdr_len + ct_len;
-                try self.enqueueSend(self.enc_scratch[0..out_len]);
-                var fi = loss_recovery_mod.SentFrameInfo{};
-                fi.frames[0] = .ping;
-                fi.count = 1;
-                self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
-                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+        // -----------------------------------------------------------------------
+        // 1-RTT packet send helper
+        // -----------------------------------------------------------------------
+
+        /// Encrypt the frame payload in pkt_scratch[0..plaintext_len], wrap in a
+        /// 1-RTT Short Header packet, and enqueue for sending.
+        /// Optionally tracks the packet for loss recovery and updates PTO.
+        ///
+        /// `plaintext_len`:  bytes of frame data already serialized in pkt_scratch.
+        /// `fi`:             frame info for loss tracking; null = don't track (e.g. PATH_RESPONSE).
+        /// `ack_eliciting`:  whether this packet is ack-eliciting (for loss recovery).
+        ///
+        /// Returns the packet number used, or error on failure.
+        /// On PacketTooLarge, reverts tx_pn so no PN is wasted.
+        pub fn sendShortHeaderPacket(self: *Self, plaintext_len: usize, fi: ?loss_recovery_mod.SentFrameInfo, ack_eliciting: bool) !u64 {
+            const ak = self.app_keys orelse return error.NoAppKeys;
+
+            const pn = self.hot.tx_pn[2];
+            self.hot.tx_pn[2] += 1;
+
+            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
+            const ct_len = plaintext_len + 16;
+            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) {
+                self.hot.tx_pn[2] -= 1;
+                return error.PacketTooLarge;
             }
+            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..plaintext_len], self.enc_scratch[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
+            const out_len = hdr_len + ct_len;
+            self.enqueueSend(self.enc_scratch[0..out_len]) catch |err| {
+                self.hot.tx_pn[2] -= 1;
+                return err;
+            };
+
+            if (fi) |frame_info| {
+                self.loss.onPacketSent(pn, 2, out_len, ack_eliciting, self.current_time_ns, frame_info);
+                if (ack_eliciting) {
+                    self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                }
+            }
+            return pn;
+        }
+
+        pub fn queuePing(self: *Self) !void {
+            const n = frame.encodeFrame(&self.pkt_scratch, .ping);
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .ping;
+            fi.count = 1;
+            _ = try self.sendShortHeaderPacket(n, fi, true);
         }
 
         /// Queue a PMTUD probe: a PING frame padded to target_size.
@@ -2463,69 +2585,60 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         pub fn queuePmtudProbe(self: *Self, target_size: u16) !void {
-            if (self.app_keys == null) return error.InvalidState; // probes only in 1-RTT
-            if (target_size < 1200 or target_size > 65535) return error.InvalidSize; // invalid size, skip probe
-            if (target_size > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge; // probe can't fit in send buffer
+            if (self.app_keys == null) return error.InvalidState;
+            if (target_size < 1200 or target_size > 65535) return error.InvalidSize;
+            if (target_size > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
 
             var pos: usize = 0;
             pos += frame.encodeFrame(self.pkt_scratch[pos..], .ping);
 
-            // Short Header: 1 byte flag + 8 byte CID + 4 byte PN = 13 bytes
-            // Plaintext + 16 (AEAD tag) + 13 (hdr) must equal target_size
+            // Pad to exact target_size: header(1+scid_len+4) + plaintext + AEAD(16) = target_size
             const short_hdr_len: usize = 1 + self.peer_scid_len + 4;
             const max_plaintext = if (target_size > short_hdr_len + 16)
                 target_size - short_hdr_len - 16
             else
                 @as(usize, 1);
-
-            const padding_needed = if (max_plaintext > pos)
-                max_plaintext - pos
-            else
-                @as(usize, 0);
-
-            if (padding_needed > 0) {
-                pos += frame.encodeFrame(self.pkt_scratch[pos..], .{ .padding = padding_needed });
+            if (max_plaintext > pos) {
+                pos += frame.encodeFrame(self.pkt_scratch[pos..], .{ .padding = max_plaintext - pos });
             }
 
-            // Encrypt and send
-            const ak = self.app_keys orelse return error.InvalidState;
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = pos + 16;
-
-            // Verify target size is exactly achievable
-            if (hdr_len + ct_len != target_size) {
-                return error.SizeMismatch; // Probe must be exact size to be meaningful
-            }
-
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
-
-            // Track the probe
-            self.pmtud_probing = .{
-                .target_size = target_size,
-                .packet_number = pn,
-                .epoch = 2, // 1-RTT
-                .sent_ns = self.current_time_ns,
-            };
-
-            // Mark as ack-eliciting and track for loss recovery
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .ping;
             fi.count = 1;
-            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
+            const pn = try self.sendShortHeaderPacket(pos, fi, true);
+
+            self.pmtud_probing = .{
+                .target_size = target_size,
+                .packet_number = pn,
+                .epoch = 2,
+                .sent_ns = self.current_time_ns,
+            };
+        }
+
+        /// Build and send a NewSessionTicket in a 1-RTT CRYPTO frame (post-handshake).
+        fn sendNewSessionTicket(self: *Self) !void {
+            var nst_buf: [512]u8 = undefined;
+            self.tls_state.current_time_ns = self.current_time_ns;
+            const nst_len = self.tls_state.buildNewSessionTicket(&nst_buf);
+            if (nst_len == 0) return;
+
+            const tls_offset = self.crypto_send_offset[2];
+            var fpos: usize = 0;
+            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .crypto = .{
+                .offset = @intCast(tls_offset),
+                .data = nst_buf[0..nst_len],
+            } });
+
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(tls_offset), .len = @intCast(@min(nst_len, 0xffff)) } };
+            fi.count = 1;
+            _ = try self.sendShortHeaderPacket(fpos, fi, true);
+            self.crypto_send_offset[2] += nst_len;
         }
 
         fn queueHandshakeDone(self: *Self) !void {
             var pos: usize = 0;
             pos += frame.encodeFrame(self.pkt_scratch[pos..], .handshake_done);
-            // RFC 9000 §5.1.1: advertise an alternative CID so the peer can use it
-            // for subsequent packets. This lets tshark correctly track the 1-RTT
-            // session when the client's long-header DCID appears before the server's
-            // Initial SCID in the left pcap.
             var ncid_frame = frame.NewConnectionIdFrame{
                 .sequence_number = 1,
                 .retire_prior_to = 0,
@@ -2535,23 +2648,11 @@ pub fn Connection(comptime max_streams: usize) type {
             };
             @memcpy(ncid_frame.cid[0..self.alt_local_cid.bytes.len], &self.alt_local_cid.bytes);
             pos += frame.encodeFrame(self.pkt_scratch[pos..], .{ .new_connection_id = ncid_frame });
-            // Encrypt with 1-RTT keys and send
-            if (self.app_keys) |ak| {
-                const pn = self.hot.tx_pn[2];
-                self.hot.tx_pn[2] += 1;
-                const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-                const ct_len = pos + 16;
-                if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-                crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..pos], self.enc_scratch[hdr_len..][0..ct_len]);
-                crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                const out_len = hdr_len + ct_len;
-                try self.enqueueSend(self.enc_scratch[0..out_len]);
-                var fi = loss_recovery_mod.SentFrameInfo{};
-                fi.frames[0] = .handshake_done;
-                fi.count = 1;
-                self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
-                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
-            }
+
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .handshake_done;
+            fi.count = 1;
+            _ = try self.sendShortHeaderPacket(pos, fi, true);
         }
 
         pub fn queueTlsOutput(self: *Self, tls_data: []const u8) !void {
@@ -2929,46 +3030,18 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Low-level: encrypt and enqueue a STREAM frame at an explicit offset.
         /// Does NOT advance stream.send_offset (caller is responsible for that).
-        fn encryptAndEnqueueStreamFrame(
-            self: *Self,
-            id: u62,
-            offset: u62,
-            data: []const u8,
-            fin: bool,
-        ) !void {
-            if (self.app_keys == null) return;
-            const ak = self.app_keys.?;
-
+        fn encryptAndEnqueueStreamFrame(self: *Self, id: u62, offset: u62, data: []const u8, fin: bool) !void {
             var fpos: usize = 0;
-            const sf: frame.Frame = .{ .stream = .{
-                .stream_id = id,
-                .offset = offset,
-                .fin = fin,
-                .data = data,
-            } };
-            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], sf);
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = fpos + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
-
+            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream = .{
+                .stream_id = id, .offset = offset, .fin = fin, .data = data,
+            } });
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .stream = .{
-                .stream_id = id,
-                .offset = offset,
-                .len = @intCast(@min(data.len, 0xffff)),
-                .fin = fin,
+                .stream_id = id, .offset = offset,
+                .len = @intCast(@min(data.len, 0xffff)), .fin = fin,
             } };
             fi.count = 1;
-            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
-            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+            _ = try self.sendShortHeaderPacket(fpos, fi, true);
         }
 
         fn queueStreamData(self: *Self, id: u62, data: []const u8, fin: bool) !void {
@@ -2994,61 +3067,24 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Encrypt and enqueue the pre-serialized CONNECTION_CLOSE frame.
         fn queueConnectionClose(self: *Self) !void {
-            if (self.app_keys == null) return;
             if (self.closing_frame_len == 0) return;
-            const ak = self.app_keys.?;
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = self.closing_frame_len + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(
-                ak.server,
-                pn,
-                self.enc_scratch[0..hdr_len],
-                self.closing_frame_buf[0..self.closing_frame_len],
-                self.enc_scratch[hdr_len..][0..ct_len],
-            );
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
+            @memcpy(self.pkt_scratch[0..self.closing_frame_len], self.closing_frame_buf[0..self.closing_frame_len]);
             // Not tracked for retransmission — closing state re-sends on every receive().
+            _ = self.sendShortHeaderPacket(self.closing_frame_len, null, false) catch return;
         }
 
         /// Queue a RESET_STREAM frame for `stream_id`.
         fn queueResetStream(self: *Self, stream_id: u62, error_code: u62, final_size: u62) !void {
-            if (self.app_keys == null) return;
-            const ak = self.app_keys.?;
-
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .reset_stream = .{
-                .stream_id = stream_id,
-                .error_code = error_code,
-                .final_size = final_size,
+                .stream_id = stream_id, .error_code = error_code, .final_size = final_size,
             } });
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = fpos + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
-
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .reset_stream = .{
-                .stream_id = stream_id,
-                .error_code = error_code,
-                .final_size = final_size,
+                .stream_id = stream_id, .error_code = error_code, .final_size = final_size,
             } };
             fi.count = 1;
-            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
-            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+            _ = try self.sendShortHeaderPacket(fpos, fi, true);
         }
 
         /// Scan all streams for pending_reset and queue a RESET_STREAM frame for each.
@@ -3067,45 +3103,18 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Echo a PATH_RESPONSE with the same 8-byte data from a PATH_CHALLENGE.
         /// PATH_RESPONSE is not tracked for retransmission (RFC 9000 §8.2.2).
         fn queuePathResponse(self: *Self, data: [8]u8) !void {
-            if (self.app_keys == null) return;
-            const ak = self.app_keys.?;
-
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .path_response = .{ .data = data } });
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = fpos + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
-            // Not tracked via loss recovery — PATH_RESPONSE is not retransmittable.
+            _ = self.sendShortHeaderPacket(fpos, null, false) catch return;
         }
 
         /// Queue a PATH_CHALLENGE with `data` and record it so the peer's
         /// PATH_RESPONSE can be validated (RFC 9000 §9.2).
         pub fn sendPathChallenge(self: *Self, data: [8]u8) !void {
-            if (self.app_keys == null) return;
-            const ak = self.app_keys.?;
-
+            self.pending_path_challenge = data;
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .path_challenge = .{ .data = data } });
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = fpos + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
-            // Store challenge so incoming PATH_RESPONSE can be validated.
-            self.pending_path_challenge = data;
+            _ = self.sendShortHeaderPacket(fpos, null, false) catch return;
         }
 
         /// Process a NEW_CONNECTION_ID frame: store the CID and retire entries below retire_prior_to.
@@ -3154,56 +3163,25 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Queue a MAX_STREAM_DATA frame advertising `new_max` bytes for `stream_id`.
         fn queueMaxStreamData(self: *Self, stream_id: u62, new_max: u62) !void {
-            if (self.app_keys == null) return;
-            const ak = self.app_keys.?;
-
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .max_stream_data = .{
-                .stream_id = stream_id,
-                .max_data = new_max,
+                .stream_id = stream_id, .max_data = new_max,
             } });
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = fpos + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
-
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .max_stream_data = .{ .stream_id = stream_id, .max_data = new_max } };
             fi.count = 1;
-            self.loss.onPacketSent(pn, 2, out_len, true, self.current_time_ns, fi);
-            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+            _ = try self.sendShortHeaderPacket(fpos, fi, true);
         }
 
         /// Queue a STREAM_DATA_BLOCKED frame (RFC 9000 §19.13) for the given stream.
         /// Sent when the sender is blocked by flow control at `max` bytes.
         fn queueStreamDataBlocked(self: *Self, stream_id: u62, max: u62) !void {
-            if (self.app_keys == null) return;
-            const ak = self.app_keys.?;
-
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream_data_blocked = .{
-                .stream_id = stream_id,
-                .max = max,
+                .stream_id = stream_id, .max = max,
             } });
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = fpos + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
-            // STREAM_DATA_BLOCKED is informational; not tracked for loss recovery.
+            // Informational; not tracked for loss recovery.
+            _ = try self.sendShortHeaderPacket(fpos, null, false);
         }
 
         /// Scan all streams and send MAX_STREAM_DATA frames for any whose recv window grew.
@@ -3227,7 +3205,6 @@ pub fn Connection(comptime max_streams: usize) type {
         /// MAX_STREAM_DATA: not tracked (shouldSendMaxStreamData re-triggers on next tick).
         pub fn flushControlFrames(self: *Self) !void {
             if (self.app_keys == null) return;
-            const ak = self.app_keys.?;
 
             // Leave room for Short Header (~13 bytes) + AEAD tag (16 bytes).
             // Use MAX_SEND_PACKET_SIZE (not MAX_PACKET_SIZE) since pkt_scratch is
@@ -3299,19 +3276,7 @@ pub fn Connection(comptime max_streams: usize) type {
             }
 
             if (fpos == 0) return; // nothing to send
-
-            const pn = self.hot.tx_pn[2];
-            self.hot.tx_pn[2] += 1;
-
-            const hdr_len = packet.encodeShortHeader(&self.enc_scratch, self.peer_scid[0..self.peer_scid_len], @intCast(pn), self.current_key_phase);
-            const ct_len = fpos + 16;
-            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-            crypto.encryptPayload(ak.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-            const out_len = hdr_len + ct_len;
-            try self.enqueueSend(self.enc_scratch[0..out_len]);
-            self.loss.onPacketSent(pn, 2, out_len, has_ack_eliciting, self.current_time_ns, fi);
-            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+            _ = try self.sendShortHeaderPacket(fpos, fi, has_ack_eliciting);
         }
 
         // -----------------------------------------------------------------------

@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
         "src/quic/connection_test_crypto.zig",
         "src/quic/connection_test_corruption.zig",
         "src/quic/fuzz.zig",
+        "src/quic/connection_test_resumption.zig",
         "tools/pem.zig",
     };
 

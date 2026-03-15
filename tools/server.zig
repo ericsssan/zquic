@@ -1,6 +1,6 @@
 //! zquic interop server — quic-interop-runner compatible UDP server.
 //!
-//! Supported TESTCASE values: handshake, transfer, multiconnect, retry, keyupdate, v2, ecn.
+//! Supported TESTCASE values: handshake, transfer, multiconnect, retry, keyupdate, v2, ecn, resumption, zerortt.
 //! All other values cause exit(127) as required by the interop runner.
 //! HTTP/0.9: accepts "GET /path\r\n" and serves files from ${WWW} directory.
 //! File serving is event-driven: data is pushed in chunks each event loop tick
@@ -59,7 +59,7 @@ const CID_LEN = quic.connection_id.len; // 8 bytes
 
 const supported_cases = [_][]const u8{
     "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2", "ecn",
-    "connectionmigration", "chacha20", "http3",
+    "connectionmigration", "chacha20", "http3", "resumption", "zerortt",
 };
 
 /// True when TESTCASE=http3 — uses H3 framing instead of HTTP/0.9.
@@ -250,6 +250,11 @@ pub fn main(init: std.process.Init) !void {
 
     g_is_h3 = std.mem.eql(u8, testcase, "http3");
     const is_cm = std.mem.eql(u8, testcase, "connectionmigration");
+
+    // Generate a random ticket encryption key for session resumption / 0-RTT.
+    var ticket_key: [32]u8 = undefined;
+    io.random(&ticket_key);
+
     const config: quic.Config = .{
         .alpn = if (g_is_h3) "h3" else ALPN,
         .validate_addr = std.mem.eql(u8, testcase, "retry"),
@@ -269,6 +274,7 @@ pub fn main(init: std.process.Init) !void {
         .preferred_addr_ipv4_port = if (is_cm) CM_PORT else 0,
         .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else [_]u8{0} ** 16,
         .preferred_addr_ipv6_port = if (is_cm) CM_PORT else 0,
+        .ticket_key = &ticket_key,
     };
 
     // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6
@@ -302,7 +308,10 @@ pub fn main(init: std.process.Init) !void {
     // Stable pointer to CM socket (if active) for passing to functions.
     const cm_sock_ptr: ?*const net.Socket = if (cm_sock) |*s| s else null;
 
-    // Multiplexed event loop: handle packets for any active connection.
+    // Non-blocking receive timeout: returns immediately if no packet ready.
+    const nonblocking: std.Io.Timeout = .{ .duration = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake } };
+
+    // Multiplexed event loop: drain all pending packets, then tick/send.
     while (true) {
         var timeout = computeGlobalTimeout(&conn_slots);
 
@@ -310,9 +319,8 @@ pub fn main(init: std.process.Init) !void {
         // check the CM socket frequently for PATH_CHALLENGE/migrated packets.
         if (cm_sock_ptr != null) timeout = clampTimeout(timeout, 5_000_000, io);
 
+        // Phase 1: Block for first packet (or timeout).
         var got_packet = false;
-
-        // Try main socket.
         if (sock.receiveTimeout(io, &recv_buf, timeout)) |msg| {
             processPacket(msg.data, msg.from, false, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
             got_packet = true;
@@ -323,19 +331,31 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // Try CM socket (short timeout: 1ms).
-        if (cm_sock_ptr) |cs| {
-            const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-            const cm_timeout: std.Io.Timeout = .{ .deadline = .{ .raw = .{ .nanoseconds = now_ns + 1_000_000 }, .clock = .awake } };
-            if (cs.receiveTimeout(io, &recv_buf, cm_timeout)) |msg| {
-                processPacket(msg.data, msg.from, true, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
-                got_packet = true;
-            } else |_| {}
+        // Phase 2: Drain all remaining packets without blocking.
+        // This batches N datagrams per event loop iteration instead of 1,
+        // reducing recv syscall overhead under load.
+        if (got_packet) {
+            while (true) {
+                if (sock.receiveTimeout(io, &recv_buf, nonblocking)) |msg| {
+                    processPacket(msg.data, msg.from, false, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+                } else |_| break;
+            }
         }
 
-        if (!got_packet) {
-            tickAllConnections(&conn_slots, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+        // Phase 3: Check CM socket (non-blocking).
+        if (cm_sock_ptr) |cs| {
+            while (true) {
+                if (cs.receiveTimeout(io, &recv_buf, nonblocking)) |msg| {
+                    processPacket(msg.data, msg.from, true, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+                    got_packet = true;
+                } else |_| break;
+            }
         }
+
+        // Phase 4: Tick timers and flush transfers.
+        // Always tick — even after processing packets, timers may have fired
+        // and connections need PTO/idle handling.
+        tickAllConnections(&conn_slots, &sock, cm_sock_ptr, io, &send_buf, www_dir);
     }
 }
 
@@ -502,7 +522,7 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
     const conn = &slot.conn;
     const transfers = &slot.transfers;
     const st = conn.streams.get(stream_id) orelse return;
-    var req_buf: [256]u8 = undefined;
+    var req_buf: [512]u8 = undefined;
     const n = st.read(&req_buf);
 
     // No new data: FIN-only frame arrived after data was already consumed (e.g.
@@ -609,17 +629,47 @@ fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
     }
 }
 
-/// Send exactly one SEND_CHUNK from the transfer. Returns true if a chunk was sent.
+/// Send exactly one chunk from the transfer. Returns true if progress was made.
+/// Handles both hq-interop (raw bytes) and H3 (DATA frame wrapping).
 fn advanceTransferOne(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
-    // Use cached file handle; if not open (null), transfer is already closed.
+    return advanceTransferGeneric(conn, t, io, false);
+}
+
+/// Core transfer logic shared by hq-interop and H3 paths.
+fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool) bool {
     const file = t.file orelse {
+        if (is_h3) {
+            // No file → send H3 404 HEADERS + FIN
+            if (!t.h3_headers_sent) {
+                var hdr_buf: [128]u8 = undefined;
+                const hdr_len = buildH3Headers(&hdr_buf, 404);
+                if (hdr_len == 0) { t.active = false; return false; }
+                conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], true) catch return false;
+                t.h3_headers_sent = true;
+            }
+            t.active = false;
+            return true;
+        }
+        // hq-interop: no file → already closed
         t.active = false;
         return false;
     };
 
+    // H3: send HEADERS frame first (:status 200)
+    if (is_h3 and !t.h3_headers_sent) {
+        var hdr_buf: [128]u8 = undefined;
+        const hdr_len = buildH3Headers(&hdr_buf, 200);
+        if (hdr_len == 0) { t.active = false; return false; }
+        conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], false) catch return false;
+        t.h3_headers_sent = true;
+        return true;
+    }
+
+    // Read file data. H3 needs room for DATA frame header (≤8 bytes).
+    const DATA_HDR_MAX: usize = if (is_h3) 8 else 0;
     var data_buf: [SEND_CHUNK]u8 = undefined;
-    const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
-        // Read error; close file and send FIN to signal error to client.
+    const read_limit = SEND_CHUNK - DATA_HDR_MAX;
+    const r = file.readPositionalAll(io, data_buf[0..read_limit], t.offset) catch {
         file.close(io);
         t.file = null;
         conn.streamSend(t.stream_id, &.{}, true) catch {};
@@ -628,41 +678,34 @@ fn advanceTransferOne(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
     };
 
     if (r == 0) {
-        // EOF — send FIN and close file handle. If the send queue is full, retry next tick.
-        conn.streamSend(t.stream_id, &.{}, true) catch {
-            // Send queue, CC window, or flow-control window full — retry next tick.
-            return false;
-        };
+        // EOF — send FIN
+        conn.streamSend(t.stream_id, &.{}, true) catch return false;
         file.close(io);
         t.file = null;
         t.active = false;
         return true;
     }
 
-    // Send data without FIN by default; only set FIN if we confirmed EOF.
-    // To avoid premature EOF detection, we verify by attempting a zero-byte read
-    // at the next offset. If that returns 0, we know we're at EOF.
-    conn.streamSend(t.stream_id, data_buf[0..r], false) catch {
-        // Send queue, CC window, or flow-control window full — retry next tick.
-        return false;
-    };
-    t.offset += r;
-
-    // Determine if this was the final chunk by checking if we got a partial read.
-    // If r < SEND_CHUNK, either we're at EOF or the read was partial.
-    // To confirm EOF, try reading one more byte at the new offset.
-    const is_last_chunk = if (r < SEND_CHUNK) blk: {
+    // Probe for EOF: if partial read, check if next byte exists.
+    const is_eof = if (r < read_limit) blk: {
         var eof_probe: [1]u8 = undefined;
-        const eof_check = file.readPositionalAll(io, &eof_probe, t.offset) catch 0;
-        break :blk eof_check == 0;  // EOF confirmed if zero-byte read
+        break :blk (file.readPositionalAll(io, &eof_probe, t.offset + r) catch 0) == 0;
     } else false;
 
-    if (is_last_chunk) {
-        // Now send FIN separately to signal end-of-stream
-        conn.streamSend(t.stream_id, &.{}, true) catch {
-            // If FIN send fails, retry next tick
-            return true;  // Data was sent successfully, so return true
-        };
+    // Send data (optionally wrapped in H3 DATA frame).
+    if (is_h3) {
+        var frame_buf: [SEND_CHUNK]u8 = undefined;
+        var pos: usize = 0;
+        pos += http3.frame.writeHeader(frame_buf[pos..], http3.FrameType.data, r) catch return false;
+        @memcpy(frame_buf[pos..][0..r], data_buf[0..r]);
+        pos += r;
+        conn.streamSend(t.stream_id, frame_buf[0..pos], is_eof) catch return false;
+    } else {
+        conn.streamSend(t.stream_id, data_buf[0..r], is_eof) catch return false;
+    }
+    t.offset += r;
+
+    if (is_eof) {
         file.close(io);
         t.file = null;
         t.active = false;
@@ -804,70 +847,7 @@ fn buildH3Headers(buf: []u8, status: u16) usize {
 
 /// Send one chunk of an H3 transfer. Returns true if progress was made.
 fn advanceTransferOneH3(conn: *Conn, t: *FileTransfer, io: std.Io) bool {
-    const file = t.file orelse {
-        // No file — send H3 404 HEADERS + FIN
-        if (!t.h3_headers_sent) {
-            var hdr_buf: [128]u8 = undefined;
-            const hdr_len = buildH3Headers(&hdr_buf, 404);
-            if (hdr_len == 0) { t.active = false; return false; }
-            conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], true) catch return false;
-            t.h3_headers_sent = true;
-        }
-        t.active = false;
-        return true;
-    };
-
-    // First: send H3 HEADERS frame (:status 200)
-    if (!t.h3_headers_sent) {
-        var hdr_buf: [128]u8 = undefined;
-        const hdr_len = buildH3Headers(&hdr_buf, 200);
-        if (hdr_len == 0) { t.active = false; return false; }
-        conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], false) catch return false;
-        t.h3_headers_sent = true;
-        return true;
-    }
-
-    // Read file data (leave room for DATA frame header: type varint + length varint ≤ 8 bytes)
-    const DATA_HDR_MAX = 8;
-    var data_buf: [SEND_CHUNK - DATA_HDR_MAX]u8 = undefined;
-    const r = file.readPositionalAll(io, &data_buf, t.offset) catch {
-        file.close(io);
-        t.file = null;
-        t.active = false;
-        return false;
-    };
-
-    if (r == 0) {
-        // EOF — send FIN
-        conn.streamSend(t.stream_id, &.{}, true) catch return false;
-        file.close(io);
-        t.file = null;
-        t.active = false;
-        return true;
-    }
-
-    // Wrap in H3 DATA frame
-    var frame_buf: [SEND_CHUNK]u8 = undefined;
-    var pos: usize = 0;
-    pos += http3.frame.writeHeader(frame_buf[pos..], http3.FrameType.data, r) catch return false;
-    @memcpy(frame_buf[pos..][0..r], data_buf[0..r]);
-    pos += r;
-
-    // Check EOF
-    const is_eof = if (r < data_buf.len) blk: {
-        var eof_probe: [1]u8 = undefined;
-        break :blk (file.readPositionalAll(io, &eof_probe, t.offset + r) catch 0) == 0;
-    } else false;
-
-    conn.streamSend(t.stream_id, frame_buf[0..pos], is_eof) catch return false;
-    t.offset += r;
-
-    if (is_eof) {
-        file.close(io);
-        t.file = null;
-        t.active = false;
-    }
-    return true;
+    return advanceTransferGeneric(conn, t, io, true);
 }
 
 /// Read an entire file into `out`. Returns number of bytes read.

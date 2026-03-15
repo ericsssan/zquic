@@ -9,6 +9,7 @@ A QUIC protocol library for Zig. Sans-I/O — you own the socket; the library ow
 
 - QUIC v1 (RFC 9000) and v2 (RFC 9369)
 - TLS 1.3 server handshake with AES-128-GCM and ChaCha20-Poly1305, key rotation, SSLKEYLOG (RFC 9001)
+- Session resumption and 0-RTT (RFC 8446 §2.2, §2.3)
 - Loss recovery, RTT estimation, PTO (RFC 9002)
 - CUBIC congestion control (RFC 9438)
 - Stream multiplexing, flow control, path migration, PMTUD, retry tokens
@@ -93,18 +94,17 @@ tools/
 > **Note:** [`ghcr.io/ericsssan/zquic-interop:latest`](https://github.com/ericsssan/zquic/pkgs/container/zquic-interop) is built solely for use with [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner). It is not a general-purpose or production image.
 
 <!-- INTEROP_START -->
-Tested against **ngtcp2** client (2026-03-15) — goodput 7018 ± 20 kbps:
+Tested against ngtcp2 client (2026-03-15) — goodput 7025 ± 6 kbps:
 
 | Result | Test cases |
 | :---: | --- |
-| ✅ Pass | handshake, transfer, longrtt, chacha20, multiplexing, retry, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration |
-| ❓ Unsupported | resumption, zerortt |
+| ✅ Pass (21) | handshake, transfer, longrtt, chacha20, multiplexing, retry, resumption, zerortt, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration |
+| ❌ Fail (1) | handshakecorruption |
 <!-- INTEROP_END -->
 
 ## Limitations
 
 - Server-side only (no TLS client)
-- No 0-RTT / session resumption
 
 ## License
 
