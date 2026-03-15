@@ -906,31 +906,25 @@ test "connection: ACK generation with interleaved out-of-order packets" {
     const testing = std.testing;
     var conn = try Connection(16).accept(.{}, testing.io);
 
-    std.debug.print("\n=== ACK DIAGNOSTIC TEST: Interleaved packets ===\n", .{});
+    // (diagnostic prints removed — they break zig build test IPC pipe)
 
     // Simulate: recv 5
     conn.markPnReceived(2, 5);
-    std.debug.print("After pkt 5: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
 
     // Simulate: recv 7 (gap of 1)
     conn.markPnReceived(2, 7);
-    std.debug.print("After pkt 7: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
 
     // Simulate: recv 6 (fill in gap)
     conn.markPnReceived(2, 6);
-    std.debug.print("After pkt 6: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
 
     // Simulate: recv 9 (another gap)
     conn.markPnReceived(2, 9);
-    std.debug.print("After pkt 9: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
 
     // Simulate: recv 8 (fill gap)
     conn.markPnReceived(2, 8);
-    std.debug.print("After pkt 8: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
 
     // Simulate: recv 10 (extend forward)
     conn.markPnReceived(2, 10);
-    std.debug.print("After pkt 10: rx_pn={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
 
     // Final state: packets [5,6,7,8,9,10] all received
     // Bitmap should be all 1s in positions 0-5
@@ -939,7 +933,6 @@ test "connection: ACK generation with interleaved out-of-order packets" {
 
     // Verify final bitmap state
     // All 6 packets received: bitmap should have bits 0-5 set (largest is 10, so 10, 9, 8, 7, 6, 5)
-    std.debug.print("Final verification: expected contiguous packets [5..10]\n", .{});
 }
 
 test "connection: ACK generation with sequential packet arrival" {
@@ -954,7 +947,6 @@ test "connection: ACK generation with sequential packet arrival" {
         conn.markPnReceived(2, pn);
     }
 
-    std.debug.print("\nSEQUENTIAL 1..100: largest_acked={} bitmap={b:0>64}\n", .{ conn.hot.rx_pn[2], conn.rx_pn_bitmap[2] });
 
     // Verify state
     try testing.expectEqual(@as(u64, 100), conn.hot.rx_pn[2]);

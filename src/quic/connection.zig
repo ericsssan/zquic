@@ -734,6 +734,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 if (now_ns >= d) {
                     self.hot.state = .closed;
                     self.drain_deadline_ns = null;
+                    self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
                 }
             }
 
@@ -742,6 +743,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 if (now_ns >= d) {
                     self.hot.state = .closed;
                     self.idle_deadline_ns = null;
+                    self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
                 }
             }
 
@@ -1074,7 +1076,14 @@ pub fn Connection(comptime max_streams: usize) type {
             // On the first Initial, derive initial keys from the client's DCID before HP removal.
             // Keys are required to select the HP key and remove header protection.
             // Always use the client's version for key derivation to decrypt incoming packets.
+            //
+            // IMPORTANT: We derive keys here (needed for HP removal and decryption) but
+            // defer the state transition to .handshake until AFTER decryption succeeds.
+            // This prevents corrupted Initial packets from creating zombie connections
+            // that block all subsequent valid Initials from the same client address.
+            var transitioning_from_idle = false;
             if (raw_pkt_type == .initial and self.hot.state == .idle) {
+                transitioning_from_idle = true;
                 self.initial_version = ver;
                 self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
 
@@ -1088,28 +1097,6 @@ pub fn Connection(comptime max_streams: usize) type {
                 // NOTE: Do NOT set tls_state.quic_version here. deliverCryptoChunk pushes
                 // conn.quic_version into TLS before processCrypto, allowing TLS to upgrade it
                 // via version_information. conn.quic_version then adopts TLS's result.
-                self.hot.state = .handshake;
-                // Record the client's address now so the first post-handshake 1-RTT
-                // packet does not trigger a false path migration (RFC 9000 §9).
-                self.peer_addr = src;
-                // Store the DCID for original_destination_connection_id (RFC 9000 §7.3).
-                // The server MUST always include this transport parameter.
-                @memcpy(self.first_initial_dcid[0..raw_dcid_len], raw_dcid);
-                self.first_initial_dcid_len = @intCast(raw_dcid_len);
-                // Set peer_cid and peer_scid from the SCID field (not HP-protected).
-                if (data.len >= 6 + raw_dcid_len + 1) {
-                    const raw_scid_len = data[6 + raw_dcid_len];
-                    if (raw_scid_len <= 20 and data.len >= 6 + raw_dcid_len + 1 + raw_scid_len) {
-                        // Store full wire SCID for use as DCID in server long-header packets.
-                        // RFC 9000 §7.2: server's DCID must exactly match client's SCID.
-                        if (raw_scid_len > 0) @memcpy(self.peer_scid[0..raw_scid_len], data[6 + raw_dcid_len + 1 ..][0..raw_scid_len]);
-                        self.peer_scid_len = @intCast(raw_scid_len);
-                        const copy_len = @min(raw_scid_len, cid_mod.len);
-                        var pc: ConnectionId = .{};
-                        if (copy_len > 0) @memcpy(pc.bytes[0..copy_len], data[6 + raw_dcid_len + 1 ..][0..copy_len]);
-                        self.peer_cid = pc;
-                    }
-                }
             } else if (raw_pkt_type == .initial and self.hot.state != .idle and ver != self.initial_version) {
                 // RFC 9369: Compatible version negotiation with Retry.
                 // Client may retry with a different version (e.g., after Retry response).
@@ -1197,6 +1184,31 @@ pub fn Connection(comptime max_streams: usize) type {
                     crypto.decryptPayload(keys, pn, aad, hdr.payload, plaintext[0..pt_len]) catch |err| {
                         return err;
                     };
+
+                    // Decryption succeeded — now commit the idle→handshake transition.
+                    // This is deferred from the pre-HP block to prevent corrupted Initials
+                    // from creating zombie connections with wrong first_initial_dcid.
+                    if (transitioning_from_idle) {
+                        self.hot.state = .handshake;
+                        // Record the client's address now so the first post-handshake 1-RTT
+                        // packet does not trigger a false path migration (RFC 9000 §9).
+                        self.peer_addr = src;
+                        // Store the DCID for original_destination_connection_id (RFC 9000 §7.3).
+                        @memcpy(self.first_initial_dcid[0..raw_dcid_len], raw_dcid);
+                        self.first_initial_dcid_len = @intCast(raw_dcid_len);
+                        // Set peer_cid and peer_scid from the SCID field (not HP-protected).
+                        if (data.len >= 6 + raw_dcid_len + 1) {
+                            const raw_scid_len = data[6 + raw_dcid_len];
+                            if (raw_scid_len <= 20 and data.len >= 6 + raw_dcid_len + 1 + raw_scid_len) {
+                                if (raw_scid_len > 0) @memcpy(self.peer_scid[0..raw_scid_len], data[6 + raw_dcid_len + 1 ..][0..raw_scid_len]);
+                                self.peer_scid_len = @intCast(raw_scid_len);
+                                const copy_len = @min(raw_scid_len, cid_mod.len);
+                                var pc: ConnectionId = .{};
+                                if (copy_len > 0) @memcpy(pc.bytes[0..copy_len], data[6 + raw_dcid_len + 1 ..][0..copy_len]);
+                                self.peer_cid = pc;
+                            }
+                        }
+                    }
 
                     self.markPnReceived(0, pn);
                     self.bytes_recv += result.consumed;
