@@ -160,7 +160,7 @@ fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot) std.Io.Timeout {
 
 /// Tick all active connections and drain their sends.
 /// CRITICAL: Must drain pollEvent() to prevent zombie slots from closed connections (Bug 3).
-fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm_sock_ptr: ?*const net.Socket, io: std.Io, send_buf: *[MAX_DATAGRAM]u8, www_dir: []const u8) void {
+fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm_sock_ptr: ?*const net.Socket, io: std.Io, send_bufs: *SendBufs, www_dir: []const u8) void {
     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
     for (slots) |*s_opt| {
         const slot = s_opt.* orelse continue;
@@ -184,7 +184,7 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
         if (slot.peer_addr) |pa| {
             flushTransfers(slot, www_dir, io);
             const send_sock = slotSendSock(slot, sock, cm_sock_ptr);
-            drainSend(&slot.conn, send_sock, io, &pa, send_buf);
+            drainSend(&slot.conn, send_sock, io, &pa, send_bufs);
         }
     }
 }
@@ -299,7 +299,10 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("zquic interop server: testcase={s} port={d}\n", .{ testcase, port });
 
-    var send_buf: [MAX_DATAGRAM]u8 = undefined;
+    // Heap-allocated send buffer pool: 32 × 1452 = ~46KB.
+    // Separate buffer per outgoing packet enables sendmmsg batch send.
+    var send_bufs_storage: SendBufs = undefined;
+    const send_bufs: *SendBufs = &send_bufs_storage;
 
     // Connection table: array of nullable pointers (heap-allocated).
     var conn_slots: [MAX_CONNS]?*ConnSlot = [_]?*ConnSlot{null} ** MAX_CONNS;
@@ -380,13 +383,13 @@ pub fn main(init: std.process.Init) !void {
                 &sock,
                 cm_sock_ptr,
                 io,
-                &send_buf,
+                send_bufs,
                 www_dir,
             );
         }
 
         // Phase 5: Tick timers and flush transfers.
-        tickAllConnections(&conn_slots, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+        tickAllConnections(&conn_slots, &sock, cm_sock_ptr, io, send_bufs, www_dir);
     }
 }
 
@@ -411,7 +414,7 @@ fn processPacket(
     sock: *const net.Socket,
     cm_sock_ptr: ?*const net.Socket,
     io: std.Io,
-    send_buf: *[MAX_DATAGRAM]u8,
+    send_bufs: *SendBufs,
     www_dir: []const u8,
 ) void {
     // Extract DCID from the packet to find the right connection.
@@ -444,7 +447,7 @@ fn processPacket(
 
     // Drain queued sends to the old peer address before processing the incoming packet.
     if (s.peer_addr) |old_addr| {
-        drainSend(&s.conn, slotSendSock(s, sock, cm_sock_ptr), io, &old_addr, send_buf);
+        drainSend(&s.conn, slotSendSock(s, sock, cm_sock_ptr), io, &old_addr, send_bufs);
     }
     s.peer_addr = from;
 
@@ -495,7 +498,7 @@ fn processPacket(
                 }
             },
             .retry_sent => {
-                drainSend(&s.conn, active_sock, io, &from, send_buf);
+                drainSend(&s.conn, active_sock, io, &from, send_bufs);
                 for (0..conn_slots.len) |i| {
                     if (conn_slots[i] == s) {
                         freeSlot(&conn_slots[i], io);
@@ -527,7 +530,7 @@ fn processPacket(
 
     if (!slot_freed) {
         flushTransfers(s, www_dir, io);
-        drainSend(&s.conn, active_sock, io, &from, send_buf);
+        drainSend(&s.conn, active_sock, io, &from, send_bufs);
     }
 }
 
@@ -984,13 +987,38 @@ fn configureEcn(sock: *const net.Socket) !void {
     std.debug.print("ECN socket configuration completed\n", .{});
 }
 
-fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, buf: *[MAX_DATAGRAM]u8) void {
-    while (true) {
-        const n = conn.send(buf);
+/// Batch send: collect all outgoing packets, then send via sendMany().
+/// On Linux, sendMany uses sendmmsg (1 syscall for N packets).
+/// On macOS, sendMany loops sendto (N syscalls — no batch syscall available).
+fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs) void {
+    var messages: [SEND_BATCH]net.OutgoingMessage = undefined;
+    var count: usize = 0;
+
+    // Phase 1: collect all outgoing packets into separate buffers.
+    while (count < SEND_BATCH) {
+        const n = conn.send(&bufs.bufs[count]);
         if (n == 0) break;
-        sock.send(io, dest, buf[0..n]) catch {};
+        messages[count] = .{
+            .address = dest,
+            .data_ptr = &bufs.bufs[count],
+            .data_len = n,
+        };
+        count += 1;
     }
+
+    if (count == 0) return;
+
+    // Phase 2: batch send (sendmmsg on Linux, loop on macOS).
+    sock.sendMany(io, messages[0..count], .{}) catch {};
 }
+
+const SEND_BATCH = 32;
+
+/// Per-connection send buffer pool: separate buffer per outgoing packet
+/// so sendMany can reference them all simultaneously.
+const SendBufs = struct {
+    bufs: [SEND_BATCH][MAX_DATAGRAM]u8,
+};
 
 fn computeTimeout(deadline: ?i64) std.Io.Timeout {
     const d = deadline orelse return .none;
