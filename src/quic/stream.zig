@@ -5,8 +5,19 @@
 //!   bit 1: 0 = bidirectional,   1 = unidirectional
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const STREAM_BUF_SIZE: usize = 32768;  // Revert: buffer size increases cause stack issues in tests
+
+/// High-performance ring buffer type: MirroredRingBuf on POSIX (wrap-free
+/// peekAll via mmap double-mapping), RingBuf on Windows (peekContiguous
+/// returns non-wrapped portion only).  Same API — callers use peekContiguous().
+pub fn HighPerfBuf(comptime cap: usize) type {
+    return if (builtin.os.tag == .windows)
+        RingBuf(cap)
+    else
+        @import("mirrored_buf.zig").MirroredRingBuf(cap);
+}
 
 pub const StreamState = enum(u8) {
     open,
@@ -297,6 +308,14 @@ pub const Stream = struct {
     /// high-water marks, not raw bytes per frame. Updated by processStreamFrame.
     highest_recv_offset: u64,
 
+    /// Inline borrow: slice into the caller's recv buffer for in-order data.
+    /// Avoids the ring buffer copy entirely for single-packet requests.
+    /// Valid only until the next receive() call overwrites the recv buffer.
+    /// If non-null, peekInline() returns this instead of reading from recv_buf.
+    inline_recv: ?[]const u8 = null,
+    /// Length of inline-borrowed data (for flow control on consume).
+    inline_recv_len: u16 = 0,
+
     pub fn init(id: u62) Stream {
         return .{
             .id = id,
@@ -318,11 +337,40 @@ pub const Stream = struct {
             .last_sent_max_stream_data = STREAM_BUF_SIZE,
             .gap_list = GapList.init(0, STREAM_BUF_SIZE),
             .highest_recv_offset = 0,
+            .inline_recv = null,
+            .inline_recv_len = 0,
         };
     }
 
     pub fn isReadable(self: *const Stream) bool {
-        return self.recv_buf.readable() > 0;
+        return self.inline_recv != null or self.recv_buf.readable() > 0;
+    }
+
+    /// Zero-copy read: returns inline-borrowed slice (direct pointer into recv
+    /// buffer) if available, otherwise falls back to ring buffer peekContiguous.
+    /// Inline path: 0 copies.  Ring buffer path: 0 copies (slice into ring buf).
+    pub fn peekInline(self: *const Stream) ?[]const u8 {
+        return self.inline_recv;
+    }
+
+    /// Consume inline-borrowed data and update flow control.
+    pub fn consumeInline(self: *Stream) void {
+        if (self.inline_recv) |_| {
+            self.recv_max = self.recv_buf.rp + self.inline_recv_len + STREAM_BUF_SIZE;
+            self.inline_recv = null;
+            self.inline_recv_len = 0;
+        }
+    }
+
+    /// Flush inline borrow to ring buffer (safety net: called at start of
+    /// next receive() before the recv buffer is overwritten).
+    pub fn flushInline(self: *Stream) void {
+        if (self.inline_recv) |data| {
+            _ = self.recv_buf.write(data);
+            self.recv_buf.wp = self.recv_buf.rp + self.recv_buf.readable(); // ensure wp consistent
+            self.inline_recv = null;
+            self.inline_recv_len = 0;
+        }
     }
 
     pub fn canSend(self: *const Stream, bytes: u64) bool {

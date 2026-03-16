@@ -654,6 +654,11 @@ pub fn Connection(comptime max_streams: usize) type {
         pub fn receive(self: *Self, data: []u8, src: SocketAddr, now_ns: i64, ecn_bits: u2, io: std.Io) !void {
             self.current_time_ns = now_ns;
 
+            // Flush any unconsumed inline borrows before the recv buffer is overwritten.
+            // Sans-IO guarantee: receive() is the only entry that overwrites the buffer,
+            // so inline slices are valid from processStreamFrame until here.
+            self.flushAllInlineBorrows();
+
             // Track ECN bits if present (RFC 9001 Appendix A)
             // ecn_bits: 0=not-ECT, 1=ECT(1), 2=ECT(0), 3=CE
             if (ecn_bits != 0) {
@@ -2015,18 +2020,32 @@ pub fn Connection(comptime max_streams: usize) type {
             if (is_new and (f.stream_id >> 1) & 1 == 0) {
                 st.send_max = self.peer_max_stream_data_bidi_local;
             }
-            // Charge the connection window only after the stream successfully buffers the data.
-            // Charging before receiveData would permanently shrink recv_total on failure
-            // (e.g., FinalSizeError, BufferFull, stream-level FlowControlViolation).
-            try st.receiveData(f.offset, f.data, f.fin);
-            self.conn_flow.onReceived(fc_delta);
-            if (new_end > old_hwm) st.highest_recv_offset = new_end;
+            // Inline borrow: if data is in-order (offset == recv_offset) and there's
+            // no existing inline borrow, skip the ring buffer entirely.  The app gets
+            // a direct slice into the recv buffer — zero copies.
+            // Falls back to ring buffer for out-of-order or when inline is already active.
+            const is_in_order = f.offset == st.recv_offset and st.inline_recv == null;
+            if (is_in_order and f.data.len > 0 and !f.fin) {
+                // Fast path: borrow the slice, skip receiveData entirely.
+                // The data lives in the caller's recv buffer until next receive().
+                self.conn_flow.onReceived(fc_delta);
+                if (new_end > old_hwm) st.highest_recv_offset = new_end;
+                st.recv_offset += f.data.len;
+                st.inline_recv = f.data;
+                st.inline_recv_len = @intCast(f.data.len);
+                // Update gap list to reflect the received range.
+                st.gap_list.fill(f.offset, f.data.len);
+            } else {
+                // Slow path: out-of-order, FIN, or inline already active → ring buffer.
+                try st.receiveData(f.offset, f.data, f.fin);
+                self.conn_flow.onReceived(fc_delta);
+                if (new_end > old_hwm) st.highest_recv_offset = new_end;
+            }
             // Grow connection receive window when 75% consumed (RFC 9000 §4.2).
             if (self.conn_flow.shouldSendMaxData()) {
                 self.conn_flow.recv_max = self.conn_flow.nextMaxData();
                 self.pending_max_data = true;
             }
-            // Notify the application; the echo behaviour from Phase 1 is removed.
             self.events.push(.{ .stream_data = .{ .stream_id = f.stream_id } });
         }
 
@@ -3022,6 +3041,16 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Flush pending Handshake CRYPTO data buffered during amplification limit.
         /// Called by receive() after each client packet to allow retry when the budget grows.
         /// Returns without action if tls_pending_hs_len == 0.
+        /// Flush all inline borrows across all streams. Called at the start
+        /// of receive() before the recv buffer is overwritten.
+        fn flushAllInlineBorrows(self: *Self) void {
+            for (0..self.streams.streams.len) |i| {
+                if (self.streams.occupied(i)) {
+                    self.streams.streams[i].flushInline();
+                }
+            }
+        }
+
         fn flushPendingHsCrypto(self: *Self) void {
             if (self.tls_pending_hs_len == 0) return;
             const pending = self.tls_pending_hs[self.tls_pending_hs_offset..self.tls_pending_hs_len];

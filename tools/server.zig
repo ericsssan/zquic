@@ -554,8 +554,10 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
     const transfers = &slot.transfers;
     const st = conn.streams.get(stream_id) orelse return;
 
-    // Zero-copy read: peek directly into ring buffer, no memcpy.
-    const req = st.recv_buf.peekContiguous();
+    // Zero-copy read: try inline borrow first (direct slice into recv buffer,
+    // 0 copies), then fall back to ring buffer peek (1 copy to ring buf).
+    const is_inline = st.peekInline() != null;
+    const req = st.peekInline() orelse st.recv_buf.peekContiguous();
     if (req.len == 0) return;
 
     // If a transfer is already active for this stream, ignore the duplicate event.
@@ -567,13 +569,20 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
         if (p.stream_id == stream_id) return;
     }
 
+    // Helper to release the borrow/consume after parsing.
+    const consumeFn = struct {
+        fn consume(s: *quic.stream.Stream, inline_: bool, len: usize) void {
+            if (inline_) s.consumeInline() else s.consumeRecv(len);
+        }
+    }.consume;
+
     if (!std.mem.startsWith(u8, req, "GET ")) {
-        st.consumeRecv(req.len);
+        consumeFn(st, is_inline, req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     }
     const eol = std.mem.indexOf(u8, req, "\r\n") orelse {
-        st.consumeRecv(req.len);
+        consumeFn(st, is_inline, req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     };
@@ -581,19 +590,19 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
 
     // Reject path traversal: any component containing ".." is forbidden.
     if (std.mem.indexOf(u8, path, "..") != null) {
-        st.consumeRecv(req.len);
+        consumeFn(st, is_inline, req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     }
 
-    // Build full path, then consume ring buffer data (no longer needed).
+    // Build full path, then release borrow (path copied to full_path_buf).
     var full_path_buf: [512]u8 = undefined;
     const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ www, path }) catch {
-        st.consumeRecv(req.len);
+        consumeFn(st, is_inline, req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     };
-    st.consumeRecv(req.len);
+    consumeFn(st, is_inline, req.len);
 
     // Find or allocate a transfer slot.
     var free_slot: ?*FileTransfer = null;
@@ -785,16 +794,20 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
     // Just consume and ignore (static-only QPACK, no dynamic table).
     if (stream_id & 0x3 == 2) {
         if (conn.streams.get(stream_id)) |st| {
-            // Discard control/QPACK stream data without copying.
-            st.consumeRecv(st.recv_buf.readable());
+            if (st.peekInline()) |_| {
+                st.consumeInline();
+            } else {
+                st.consumeRecv(st.recv_buf.readable());
+            }
         }
         return;
     }
 
     const st = conn.streams.get(stream_id) orelse return;
 
-    // Zero-copy read: peek directly into ring buffer, no memcpy.
-    const req_data = st.recv_buf.peekContiguous();
+    // Zero-copy read: try inline borrow first (0 copies), fall back to ring buffer.
+    const is_inline = st.peekInline() != null;
+    const req_data = st.peekInline() orelse st.recv_buf.peekContiguous();
     if (req_data.len == 0) return;
 
     // Deduplicate
@@ -805,13 +818,20 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
         if (p.stream_id == stream_id) return;
     }
 
+    // Helper to release inline borrow or ring buffer data.
+    const release = struct {
+        fn do(s: *quic.stream.Stream, inl: bool, len: usize) void {
+            if (inl) s.consumeInline() else s.consumeRecv(len);
+        }
+    }.do;
+
     // Parse H3 HEADERS frame directly from ring buffer (zero copy).
     const hdr = http3.frame.parseHeader(req_data) catch {
-        st.consumeRecv(req_data.len);
+        release(st, is_inline, req_data.len);
         return;
     };
     if (hdr.frame_type != http3.FrameType.headers) {
-        st.consumeRecv(req_data.len);
+        release(st, is_inline, req_data.len);
         return;
     }
     const block_end = hdr.header_len + @as(usize, @intCast(hdr.payload_len));
@@ -827,7 +847,7 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
         null,
         0,
     ) catch {
-        st.consumeRecv(req_data.len);
+        release(st, is_inline, req_data.len);
         return;
     };
 
@@ -840,21 +860,21 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
         }
     }
     const req_path = path orelse {
-        st.consumeRecv(req_data.len);
+        release(st, is_inline, req_data.len);
         return;
     };
     if (std.mem.indexOf(u8, req_path, "..") != null) {
-        st.consumeRecv(req_data.len);
+        release(st, is_inline, req_data.len);
         return;
     }
 
     // Build filesystem path, then release ring buffer.
     var full_path_buf: [512]u8 = undefined;
     const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ www, req_path }) catch {
-        st.consumeRecv(req_data.len);
+        release(st, is_inline, req_data.len);
         return;
     };
-    st.consumeRecv(req_data.len);
+    release(st, is_inline, req_data.len);
 
     // Allocate transfer slot
     var free_slot: ?*FileTransfer = null;
