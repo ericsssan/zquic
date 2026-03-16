@@ -17,9 +17,10 @@ const os = std.os;
 const page_allocator = std.heap.page_allocator;
 const DEFAULT_PORT: u16 = 443;
 const MAX_DATAGRAM = 1452;
-// Chunk size must fit inside a single QUIC packet (MAX_DATAGRAM=1452 minus
-// short header ~13 + AEAD 16 + STREAM frame header ~17 = ~46 bytes overhead).
-const SEND_CHUNK: usize = 1380;
+// Chunk size must fit inside a single QUIC packet. MAX_DATAGRAM=1452 minus
+// short header(13) + STREAM frame header(up to 17 for large offsets) + AEAD(16)
+// = 46 bytes worst case. Use 1390 for safety with large offset varints.
+const SEND_CHUNK: usize = 1390;
 // Maximum concurrent file transfers per connection.
 const MAX_TRANSFERS = 64;
 
@@ -145,14 +146,29 @@ fn freeSlot(slot_opt_ptr: *?*ConnSlot, io: std.Io) void {
 }
 
 /// Compute the minimum timeout across all active connections.
-fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot) std.Io.Timeout {
+fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot, io: std.Io) std.Io.Timeout {
     var min_deadline: ?i64 = null;
+    var has_active_transfer = false;
     for (slots) |slot_opt| {
         const slot = slot_opt orelse continue;
         if (slot.conn.nextTimeout()) |d| {
             if (min_deadline == null or d < min_deadline.?) {
                 min_deadline = d;
             }
+        }
+        // Check if any connection has active transfers needing pacing.
+        for (slot.transfers) |t| {
+            if (t.active) { has_active_transfer = true; break; }
+        }
+    }
+    // If any transfer is active, cap timeout to 1ms for pacing granularity.
+    // This wakes the event loop frequently enough to pace packets smoothly
+    // instead of bursting all cwnd bytes in one 15ms tick.
+    if (has_active_transfer) {
+        const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+        const pacing_deadline = now_ns + 1_000_000; // 1ms
+        if (min_deadline == null or pacing_deadline < min_deadline.?) {
+            min_deadline = pacing_deadline;
         }
     }
     return if (min_deadline) |d| .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } } else .none;
@@ -325,7 +341,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Multiplexed event loop: collect batch → process → tick/send.
     while (true) {
-        var timeout = computeGlobalTimeout(&conn_slots);
+        var timeout = computeGlobalTimeout(&conn_slots, io);
 
         // When CM socket is active, cap the main socket timeout at 5ms so we
         // check the CM socket frequently for PATH_CHALLENGE/migrated packets.

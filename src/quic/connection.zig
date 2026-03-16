@@ -3137,6 +3137,15 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Low-level: encrypt and enqueue a STREAM frame at an explicit offset.
         /// Does NOT advance stream.send_offset (caller is responsible for that).
         fn encryptAndEnqueueStreamFrame(self: *Self, id: u62, offset: u62, data: []const u8, fin: bool) !void {
+            // Pacing gate: refill tokens based on elapsed time, then check budget.
+            // ACKs and control frames bypass pacing (only stream data is paced).
+            const tokens = self.congestion.pacingRefill(self.current_time_ns);
+            const pkt_size = data.len + 50; // approximate: data + header + AEAD
+            if (tokens < pkt_size and !fin) {
+                // No pacing budget — caller should retry next tick.
+                return error.SendQueueFull;
+            }
+
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream = .{
                 .stream_id = id, .offset = offset, .fin = fin, .data = data,
@@ -3148,6 +3157,7 @@ pub fn Connection(comptime max_streams: usize) type {
             } };
             fi.count = 1;
             _ = try self.sendShortHeaderPacket(fpos, fi, true);
+            self.congestion.pacingConsume(pkt_size);
         }
 
         fn queueStreamData(self: *Self, id: u62, data: []const u8, fin: bool) !void {

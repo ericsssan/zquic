@@ -88,8 +88,8 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     conn.current_time_ns = 3_200_000_000;
     try conn.processAck(ack, 0);
 
-    // Persistent congestion → cwnd = 2 * MSS = 2400
-    try testing.expectEqual(@as(u64, 2 * 1200), conn.congestion.cwnd);
+    // Persistent congestion → cwnd = 2 * MSS = 2904 (MSS=1452)
+    try testing.expectEqual(@as(u64, 2 * 1452), conn.congestion.cwnd);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,9 +605,10 @@ test "connection: migration resets congestion" {
     // Inflate the congestion window to a large value.
     conn.congestion.cwnd = 999_999;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 5000 } };
-    try conn.receive(&[_]u8{}, new_src, 0, 0, io);
-    // RFC 9000 §9.4: congestion controller reset on migration.
-    try testing.expectEqual(@as(u64, 10 * 1200), conn.congestion.cwnd);
+    var empty = [_]u8{};
+    try conn.receive(&empty, new_src, 0, 0, io);
+    // RFC 9002 §7.2: initial_window = min(10*1452, max(14720, 2*1452)) = 14520.
+    try testing.expectEqual(@as(u64, 14520), conn.congestion.cwnd);
 }
 
 test "connection: migration sets path_validated false" {

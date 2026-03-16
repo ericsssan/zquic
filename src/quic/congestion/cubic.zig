@@ -9,8 +9,12 @@ const std = @import("std");
 
 const C: f64 = 0.4;
 const BETA_CUBIC: f64 = 0.7;
-const INITIAL_CWND_PACKETS: u64 = 10;
-const MSS: u64 = 1200; // Max segment size in bytes
+/// RFC 9002 §7.2: max_datagram_size for congestion control.
+/// Matches MAX_SEND_PACKET_SIZE (1452) — the actual UDP payload we send.
+const MSS: u64 = 1452;
+/// RFC 9002 §7.2: initial_window = min(10 * mds, max(14720, 2 * mds))
+/// = min(14520, max(14720, 2904)) = 14520.
+const INITIAL_CWND: u64 = @min(10 * MSS, @max(14720, 2 * MSS));
 
 pub const Cubic = struct {
     /// Congestion window in bytes.
@@ -32,9 +36,20 @@ pub const Cubic = struct {
     /// growth when (target - cwnd) * MSS < cwnd.
     cwnd_remainder: u64,
 
+    // Pacing state: spread packets evenly across the RTT instead of bursting.
+    // Without pacing, all cwnd bytes are sent instantly on ACK, overflowing
+    // shallow queues and causing loss.  Pacing targets ~95% link utilization.
+    /// Pacing rate in bytes per second.  Updated on every ACK.
+    pacing_rate: u64,
+    /// Pacing token bucket: bytes allowed to send now.  Refilled each tick
+    /// based on elapsed time × pacing_rate.
+    pacing_tokens: u64,
+    /// Timestamp of last token refill (ns).
+    pacing_last_refill_ns: i64,
+
     pub fn init() Cubic {
         return .{
-            .cwnd = INITIAL_CWND_PACKETS * MSS,
+            .cwnd = INITIAL_CWND,
             .ssthresh = std.math.maxInt(u64),
             .w_max = 0,
             .epoch_start_ns = null,
@@ -42,6 +57,9 @@ pub const Cubic = struct {
             .cwnd_at_epoch = 0,
             .w_est = 0,
             .cwnd_remainder = 0,
+            .pacing_rate = 0,
+            .pacing_tokens = INITIAL_CWND, // allow initial burst
+            .pacing_last_refill_ns = 0,
         };
     }
 
@@ -56,10 +74,20 @@ pub const Cubic = struct {
     /// `now_ns`      — current time in nanoseconds.
     pub fn onAckReceived(self: *Cubic, bytes_acked: u64, rtt_ns: u64, now_ns: i64) void {
         if (self.cwnd < self.ssthresh) {
-            // Slow start
+            // Slow start: double cwnd per RTT (exponential growth).
             self.cwnd += bytes_acked;
         } else {
             self.updateCwndCubic(bytes_acked, rtt_ns, now_ns);
+        }
+        // Update pacing rate: cwnd / srtt (bytes per second).
+        // During slow start, pace at 2× to allow exponential growth.
+        // In congestion avoidance, pace at 1.25× cwnd/srtt for headroom.
+        if (rtt_ns > 0) {
+            const base_rate = self.cwnd *| 1_000_000_000 / rtt_ns;
+            self.pacing_rate = if (self.cwnd < self.ssthresh)
+                base_rate *| 2 // slow start: 2× pacing for fast ramp
+            else
+                base_rate + base_rate / 4; // CA: 1.25× for headroom
         }
     }
 
@@ -91,6 +119,32 @@ pub const Cubic = struct {
         self.cwnd_at_epoch = @floatFromInt(self.cwnd);
         self.w_est = self.cwnd_at_epoch; // reset TCP-friendly estimate to post-loss cwnd
         self.k = computeK(self.w_max, self.cwnd_at_epoch);
+    }
+
+    /// Refill pacing tokens based on elapsed time.  Call at the start of each
+    /// send opportunity (tick or post-ACK).  Returns the number of bytes
+    /// allowed to send.  Tokens are capped at 2×cwnd to allow modest bursts
+    /// (e.g., after ACK batching) without unlimited accumulation.
+    pub fn pacingRefill(self: *Cubic, now_ns: i64) u64 {
+        if (self.pacing_rate == 0) {
+            // No pacing rate yet (before first ACK) — allow full cwnd.
+            return self.cwnd;
+        }
+        if (self.pacing_last_refill_ns == 0) {
+            self.pacing_last_refill_ns = now_ns;
+            return self.pacing_tokens;
+        }
+        const elapsed_ns: u64 = @intCast(@max(now_ns - self.pacing_last_refill_ns, 0));
+        self.pacing_last_refill_ns = now_ns;
+        // tokens += pacing_rate × elapsed_seconds
+        const new_tokens = self.pacing_rate *| elapsed_ns / 1_000_000_000;
+        self.pacing_tokens = @min(self.pacing_tokens +| new_tokens, self.cwnd *| 2);
+        return self.pacing_tokens;
+    }
+
+    /// Consume pacing tokens after sending a packet.
+    pub fn pacingConsume(self: *Cubic, bytes: u64) void {
+        self.pacing_tokens -|= bytes;
     }
 
     fn updateCwndCubic(self: *Cubic, bytes_acked: u64, rtt_ns: u64, now_ns: i64) void {
