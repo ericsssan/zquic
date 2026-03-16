@@ -45,6 +45,21 @@ pub const SocketAddr = union(enum(u1)) {
             },
         };
     }
+
+    /// Returns true if only the port differs (same address family + IP).
+    /// RFC 9000 §9.3.1: port-only changes indicate NAT rebinding, not path migration.
+    pub fn isPortOnlyChange(a: SocketAddr, b: SocketAddr) bool {
+        return switch (a) {
+            .v4 => |av4| switch (b) {
+                .v4 => |bv4| std.mem.eql(u8, &av4.addr, &bv4.addr) and av4.port != bv4.port,
+                .v6 => false,
+            },
+            .v6 => |av6| switch (b) {
+                .v6 => |bv6| std.mem.eql(u8, &av6.addr, &bv6.addr) and av6.port != bv6.port,
+                .v4 => false,
+            },
+        };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -129,7 +144,7 @@ pub const MAX_SEND_PACKET_SIZE = 1452; // Maximum packet size for sending (UDP d
 pub const SEND_QUEUE_DEPTH = 256;
 
 /// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
-const CRYPTO_STAGE_DEPTH = 8;
+const CRYPTO_STAGE_DEPTH = 16;
 /// Maximum bytes in a single staged CRYPTO fragment (conservatively > max QUIC payload).
 pub const CRYPTO_STAGE_FRAG = 1400;
 /// Maximum number of pending stream retransmits when send queue is full.
@@ -655,7 +670,13 @@ pub fn Connection(comptime max_streams: usize) type {
             // and only when the peer has not disabled active migration.
             if (self.hot.state == .established and !self.peer_addr.eql(src)) {
                 if (!self.peer_disable_migration) {
-                    self.onPathMigration(src, io) catch {};
+                    if (SocketAddr.isPortOnlyChange(self.peer_addr, src)) {
+                        // RFC 9000 §9.3.1: port-only change is likely NAT rebinding.
+                        // Skip congestion reset and path validation to preserve throughput.
+                        self.onNatRebind(src, io) catch {};
+                    } else {
+                        self.onPathMigration(src, io) catch {};
+                    }
                 }
             }
 
@@ -771,6 +792,13 @@ pub fn Connection(comptime max_streams: usize) type {
             self.drainPendingCryptoRetx();
             self.drainPendingStreamRetx();
 
+            // Re-arm PTO if drain sent packets but PTO was null (e.g., processAck set
+            // pto_deadline_ns to null when bytes_in_flight dropped to 0, then loss
+            // detection queued CRYPTO retransmits that drainPendingCryptoRetx just sent).
+            if (self.pto_deadline_ns == null and self.loss.bytes_in_flight > 0) {
+                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+            }
+
             // PTO: suppress in closing/draining/closed states.
             if (self.hot.state != .closing and
                 self.hot.state != .draining and
@@ -803,10 +831,21 @@ pub fn Connection(comptime max_streams: usize) type {
                             // must have processed our Initial, so retransmitting Initial wastes budget.
                             const sent_before = self.bytes_unvalidated_sent;
                             self.flushPendingHsCrypto();
-                            // Retransmit Initial first (small ~149B, critical if dropped
-                            // since client can't derive Handshake keys without ServerHello),
-                            // then Handshake with remaining budget.
-                            self.retransmitCryptoSaved(0);
+                            // Retransmit CRYPTO data as PTO probes (RFC 9002 §6.2.4).
+                            // Once we have Handshake keys, the client has already processed
+                            // our ServerHello — skip Initial retransmit to preserve scarce
+                            // amplification budget for the Handshake CRYPTO (cert chain)
+                            // that the client actually needs. Under 30% corruption with
+                            // the 3× amplification limit, each wasted 149-byte Initial
+                            // starves the 753-byte Handshake, causing permanent deadlock.
+                            // Skip Initial retransmit if the client has already proven it
+                            // has our ServerHello (by sending a Handshake-epoch packet).
+                            // Each wasted 149-byte Initial starves the Handshake CRYPTO
+                            // retransmit under the 3× amplification limit.
+                            const client_has_sh = self.hot.rx_pn_valid[1];
+                            if (!client_has_sh) {
+                                self.retransmitCryptoSaved(0);
+                            }
                             self.retransmitCryptoSaved(1);
                             const no_progress = self.bytes_unvalidated_sent == sent_before;
                             if (no_progress and !self.path_validated and self.bytes_unvalidated_recv > 0) {
@@ -2080,6 +2119,20 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Refresh PTO timer and time-loss alarm after any ACK.
             self.pto_deadline_ns = self.loss.ptoDeadline(max_ack_delay_ns);
+            // RFC 9002 §6.2.2.1: server MUST keep PTO armed during handshake even
+            // when bytes_in_flight == 0.  The peer may have ACKed our Handshake CRYPTO
+            // at the QUIC level but not yet processed it at the TLS level (e.g. gaps in
+            // the CRYPTO stream).  Without PTO the server stops retransmitting and the
+            // handshake deadlocks.
+            if (self.pto_deadline_ns == null and self.app_keys == null and
+                self.hot.state != .idle and self.hot.state != .closed)
+            {
+                const pto = self.loss.rtt.ptoBase(max_ack_delay_ns);
+                const shift: u6 = @intCast(@min(self.loss.pto_count, 5));
+                const backoff: u64 = pto *| (@as(u64, 1) << shift);
+                const max_i64: u64 = @as(u64, std.math.maxInt(i64));
+                self.pto_deadline_ns = self.current_time_ns +| @as(i64, @intCast(@min(backoff, max_i64)));
+            }
             self.time_loss_alarm_ns = self.loss.timeLossAlarmNs(max_ack_delay_ns);
         }
 
@@ -2855,7 +2908,22 @@ pub fn Connection(comptime max_streams: usize) type {
             if (data_len == 0) return;
             const data = self.crypto_send_saved[epoch][0..data_len];
 
-            const max_chunk = MAX_SEND_PACKET_SIZE - 100; // Same budget as sendCryptoChunk()
+            const OVERHEAD = 100;
+            // Budget-aware chunk sizing: cap to remaining amplification budget
+            // so partial CRYPTO can be sent even when budget is tight.
+            // Without this, a 754-byte cert chain retransmit silently fails when
+            // only ~100 bytes of budget remain, causing handshake deadlock.
+            var effective_max: usize = MAX_SEND_PACKET_SIZE;
+            if (!self.path_validated and self.bytes_unvalidated_recv > 0) {
+                const budget = self.bytes_unvalidated_recv *| 3;
+                if (budget > self.bytes_unvalidated_sent) {
+                    effective_max = @min(effective_max, @as(usize, @intCast(budget - self.bytes_unvalidated_sent)));
+                } else {
+                    return; // fully amplification-limited
+                }
+            }
+            if (effective_max <= OVERHEAD) return;
+            const max_chunk = effective_max - OVERHEAD;
 
             // Start from the rotating retransmit offset so each PTO cycle sends
             // the NEXT portion of CRYPTO data instead of re-sending from offset 0.
@@ -3357,6 +3425,19 @@ pub fn Connection(comptime max_streams: usize) type {
             // RFC 9000 §9.3: reset path validation on migration — must re-validate new path.
             self.path_validated = false;
             // Send PATH_CHALLENGE to validate the new path.
+            var challenge: [8]u8 = undefined;
+            io.random(&challenge);
+            try self.sendPathChallenge(challenge);
+            self.events.push(.path_migrated);
+        }
+
+        /// Handle a port-only source address change (NAT rebinding).
+        /// RFC 9000 §9.3.1: an endpoint MAY skip path validation if only the
+        /// source port changed.  Preserves congestion state for throughput.
+        fn onNatRebind(self: *Self, new_addr: SocketAddr, io: std.Io) !void {
+            // Adopt new address without resetting congestion or path validation.
+            self.peer_addr = new_addr;
+            // Still send PATH_CHALLENGE to confirm reachability on the new port.
             var challenge: [8]u8 = undefined;
             io.random(&challenge);
             try self.sendPathChallenge(challenge);

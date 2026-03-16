@@ -167,10 +167,24 @@ pub const SentPacketTable = struct {
         return t;
     }
 
-    /// O(1) add. Modular index = pn & (MAX_SENT-1). Evicts any previous occupant.
+    /// Compute the table index for a (pn, epoch) pair.
+    /// Partitions the table into 3 regions (one per epoch) to prevent
+    /// cross-epoch collisions: Handshake pkn N and 1-RTT pkn N must never
+    /// share an index, otherwise one evicts the other and loss recovery breaks.
+    /// Each epoch gets MAX_SENT/4 = 64 slots (epoch 2 gets 128 for 1-RTT bulk).
+    pub const EPOCH_REGION_SIZE: usize = MAX_SENT / 4; // 64 slots per epoch
+    pub const EPOCH_OFFSETS = [3]usize{ 0, EPOCH_REGION_SIZE, EPOCH_REGION_SIZE * 2 };
+    pub const EPOCH_SIZES = [3]usize{ EPOCH_REGION_SIZE, EPOCH_REGION_SIZE, EPOCH_REGION_SIZE * 2 };
+
+    pub fn slotIndex(pn: u64, epoch: u8) usize {
+        const e: usize = @min(epoch, 2);
+        return EPOCH_OFFSETS[e] + (pn % EPOCH_SIZES[e]);
+    }
+
+    /// O(1) add. Modular index from (pn, epoch). Evicts any previous occupant.
     /// Returns the evicted packet (if any) so the caller can adjust bytes_in_flight.
     pub fn add(self: *SentPacketTable, pkt: SentPacket, fi: SentFrameInfo) ?SentPacket {
-        const idx = pkt.pn & (MAX_SENT - 1);
+        const idx = slotIndex(pkt.pn, pkt.epoch);
         const evicted: ?SentPacket = if (self.slots[idx].valid) self.slots[idx] else null;
         // Decrement evicted slot's epoch count before overwriting.
         if (evicted) |ev| {
@@ -186,7 +200,7 @@ pub const SentPacketTable = struct {
 
     /// O(1) lookup. Returns null if slot is empty or belongs to a different pn/epoch.
     pub fn get(self: *const SentPacketTable, pn: u64, epoch: u8) ?SentPacket {
-        const idx = pn & (MAX_SENT - 1);
+        const idx = slotIndex(pn, epoch);
         const slot = self.slots[idx];
         if (slot.valid and slot.pn == pn and slot.epoch == epoch) return slot;
         return null;
@@ -194,7 +208,7 @@ pub const SentPacketTable = struct {
 
     /// O(1) remove. Returns the removed packet and its frame info, or null if not found.
     pub fn remove(self: *SentPacketTable, pn: u64, epoch: u8) ?RemovedPacket {
-        const idx = pn & (MAX_SENT - 1);
+        const idx = slotIndex(pn, epoch);
         const slot = self.slots[idx];
         if (slot.valid and slot.pn == pn and slot.epoch == epoch) {
             self.slots[idx].valid = false;
@@ -728,18 +742,19 @@ test "sent_table: eviction decrements bytes_in_flight to avoid double-counting" 
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    // Send 64 packets (fills the ring buffer exactly)
+    // Use epoch 2 (1-RTT) which has 128 slots. Fill them all.
+    const region = SentPacketTable.EPOCH_SIZES[2]; // 128
     var pn: u64 = 0;
-    while (pn < MAX_SENT) : (pn += 1) {
-        lr.onPacketSent(pn, 0, 1200, true, 0, .{});
+    while (pn < region) : (pn += 1) {
+        lr.onPacketSent(pn, 2, 1200, true, 0, .{});
     }
-    const bif_after_64 = lr.bytes_in_flight;
-    try testing.expectEqual(@as(u64, MAX_SENT * 1200), bif_after_64);
+    const bif_after = lr.bytes_in_flight;
+    try testing.expectEqual(@as(u64, region * 1200), bif_after);
 
-    // Send packet pn=64: maps to slot 64 % 64 = 0, evicting pn=0 (still in flight).
+    // Send pn=128: maps to same slot as pn=0, evicting it.
     // bytes_in_flight should stay the same (evict 1200, add 1200).
-    lr.onPacketSent(MAX_SENT, 0, 1200, true, 0, .{});
-    try testing.expectEqual(bif_after_64, lr.bytes_in_flight);
+    lr.onPacketSent(region, 2, 1200, true, 0, .{});
+    try testing.expectEqual(bif_after, lr.bytes_in_flight);
 }
 
 test "loss_detection: last_ack_eliciting_ns updated after packets declared lost" {
@@ -886,24 +901,19 @@ test "frame_info: MAX_LOSS_EVENTS caps lost_frames output" {
     var lr = LossRecovery.init();
 
     // Send enough packets so that MAX_LOSS_EVENTS+1 are lost by pkt threshold.
-    // Need: top_pn - 3 - 0 + 1 > MAX_LOSS_EVENTS  →  top_pn > MAX_LOSS_EVENTS + 2
-    // Use N = MAX_LOSS_EVENTS + 4 packets (pn 0..N-1), ACK pn=N-1.
-    // Lost: pn+3 <= N-1  →  pn <= N-4. Count = N-3 = MAX_LOSS_EVENTS+1.
-    const N: u64 = MAX_LOSS_EVENTS + 4;
+    // Use epoch 2 (1-RTT, 128 slots) to have enough capacity for N=68 packets.
+    const N: u64 = MAX_LOSS_EVENTS + 4; // 68
     var pn: u64 = 0;
     while (pn < N) : (pn += 1) {
-        lr.onPacketSent(pn, 0, 100, true, 0, .{});
+        lr.onPacketSent(pn, 2, 100, true, 0, .{});
     }
     const top_pn = N - 1;
     const ranges = [_]AckedRange{.{ .low = top_pn, .high = top_pn }};
-    const result = lr.onAckReceived(top_pn, 0, &ranges, 0, 0, 25_000_000);
+    const result = lr.onAckReceived(top_pn, 0, &ranges, 2, 0, 25_000_000);
 
-    // lost_frame_count and newly_lost are both capped at MAX_LOSS_EVENTS.
-    // The one packet that doesn't fit is deferred (kept valid) for the next alarm round.
     try testing.expectEqual(@as(usize, MAX_LOSS_EVENTS), result.lost_frame_count);
     try testing.expectEqual(@as(u32, MAX_LOSS_EVENTS), result.newly_lost);
-    // Packets beyond the buffer are kept valid (deferred), so valid_per_epoch > 0.
-    try testing.expect(lr.sent.valid_per_epoch[0] > 0);
+    try testing.expect(lr.sent.valid_per_epoch[2] > 0);
 }
 
 test "sent_table: power-of-two slot collision evicts correctly" {
@@ -920,15 +930,13 @@ test "sent_table: power-of-two slot collision evicts correctly" {
     try testing.expect(lr.sent.get(MAX_SENT, 0) != null); // pn=256 present
 }
 
-test "sent_table: epoch mismatch in same slot returns null" {
-    // Two packets with different epochs that land in the same slot.
+test "sent_table: different epochs use different slots (no cross-epoch eviction)" {
     const testing = std.testing;
     var table = SentPacketTable.init();
-    _ = table.add(.{ .pn = 1, .sent_ns = 0, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
-    // pn=257 & 255 == 1, same slot, different epoch
-    _ = table.add(.{ .pn = 257, .sent_ns = 0, .size = 100, .epoch = 2, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
-    try testing.expectEqual(@as(?SentPacket, null), table.get(1, 0)); // evicted
-    try testing.expect(table.get(257, 2) != null); // present
+    _ = table.add(.{ .pn = 5, .sent_ns = 0, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    _ = table.add(.{ .pn = 5, .sent_ns = 0, .size = 100, .epoch = 2, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expect(table.get(5, 0) != null); // NOT evicted
+    try testing.expect(table.get(5, 2) != null); // also present
 }
 
 test "frame_info: ring buffer eviction preserves new packet frame info" {
@@ -957,21 +965,22 @@ test "frame_info: ring buffer eviction preserves new packet frame info" {
 }
 
 test "sent_table: 128 concurrent unacked packets coexist without eviction" {
-    // Verify that 128 packets (half of MAX_SENT=256) can be tracked simultaneously
-    // without any eviction occurring due to slot collision.
+    // Verify that 128 packets (the 1-RTT epoch region size) can be tracked
+    // simultaneously without any eviction occurring due to slot collision.
+    // Use epoch 2 (1-RTT) which has 128 slots.
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    // Send 128 packets with distinct packet numbers 0..127
+    // Send 128 packets with distinct packet numbers 0..127 in epoch 2
     var pn: u64 = 0;
     while (pn < 128) : (pn += 1) {
-        lr.onPacketSent(pn, 0, 1200, true, @as(i64, @intCast(pn)) * 1000, .{});
+        lr.onPacketSent(pn, 2, 1200, true, @as(i64, @intCast(pn)) * 1000, .{});
     }
 
-    // All 128 must still be present (no eviction for pn < MAX_SENT/2)
+    // All 128 must still be present (no eviction for pn < region size)
     pn = 0;
     while (pn < 128) : (pn += 1) {
-        try testing.expect(lr.sent.get(pn, 0) != null);
+        try testing.expect(lr.sent.get(pn, 2) != null);
     }
 }
 
@@ -994,18 +1003,22 @@ test "valid_per_epoch: add increments, remove decrements" {
     try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]);
 }
 
-test "valid_per_epoch: eviction decrements old epoch, add increments new epoch" {
+test "valid_per_epoch: same-epoch eviction decrements and increments correctly" {
     const testing = std.testing;
     var table = SentPacketTable.init();
 
-    // Add pn=0 in epoch 0 (slot 0)
+    // Add pn=0 in epoch 0
     _ = table.add(.{ .pn = 0, .sent_ns = 0, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
     try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[0]);
 
-    // Add pn=256 in epoch 1 (same slot 0, evicts epoch 0 packet)
-    _ = table.add(.{ .pn = MAX_SENT, .sent_ns = 0, .size = 100, .epoch = 1, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
-    try testing.expectEqual(@as(u16, 0), table.valid_per_epoch[0]); // evicted
-    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]); // new packet
+    // Add pn=256 in epoch 0 (same slot, same epoch → evicts)
+    _ = table.add(.{ .pn = MAX_SENT, .sent_ns = 0, .size = 100, .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[0]); // evicted + added = 1
+
+    // Cross-epoch: pn=0 epoch 1 uses different slot, no eviction
+    _ = table.add(.{ .pn = 0, .sent_ns = 0, .size = 100, .epoch = 1, .ack_eliciting = true, .in_flight = true, .valid = true }, .{});
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[0]); // unchanged
+    try testing.expectEqual(@as(u16, 1), table.valid_per_epoch[1]); // new
 }
 
 test "valid_per_epoch: detectLoss decrements on loss" {

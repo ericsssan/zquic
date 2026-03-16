@@ -94,12 +94,11 @@ tools/
 > **Note:** [`ghcr.io/ericsssan/zquic-interop:latest`](https://github.com/ericsssan/zquic/pkgs/container/zquic-interop) is built solely for use with [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner). It is not a general-purpose or production image.
 
 <!-- INTEROP_START -->
-Tested against ngtcp2 client (2026-03-15) — goodput 7025 ± 6 kbps:
+Tested against ngtcp2 client (2026-03-16) — goodput 7028 ± 21 kbps:
 
 | Result | Test cases |
 | :---: | --- |
-| ✅ Pass (21) | handshake, transfer, longrtt, chacha20, multiplexing, retry, resumption, zerortt, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration |
-| ❌ Fail (1) | handshakecorruption |
+| ✅ Pass (22) | handshake, transfer, longrtt, chacha20, multiplexing, retry, resumption, zerortt, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration |
 <!-- INTEROP_END -->
 
 ## Limitations
