@@ -7,7 +7,10 @@
 
 const std = @import("std");
 
-const C: f64 = 0.4;
+/// RFC 9438 §5.1: C = 0.4 (in segments). Since our cwnd is in bytes,
+/// scale by MSS to get the correct growth rate: C_bytes = 0.4 × MSS.
+/// Without this scaling, K is MSS× too large and CUBIC degenerates to AIMD.
+const C: f64 = 0.4 * @as(f64, @floatFromInt(MSS));
 const BETA_CUBIC: f64 = 0.7;
 /// RFC 9002 §7.2: max_datagram_size for congestion control.
 /// Matches MAX_SEND_PACKET_SIZE (1452) — the actual UDP payload we send.
@@ -84,10 +87,10 @@ pub const Cubic = struct {
         // In congestion avoidance, pace at 1.25× cwnd/srtt for headroom.
         if (rtt_ns > 0) {
             const base_rate = self.cwnd *| 1_000_000_000 / rtt_ns;
-            self.pacing_rate = if (self.cwnd < self.ssthresh)
-                base_rate *| 2 // slow start: 2× pacing for fast ramp
-            else
-                base_rate + base_rate / 4; // CA: 1.25× for headroom
+            // Pace at 2× cwnd/RTT: allows CUBIC to probe above current cwnd
+            // without being throttled by the pacing rate. The congestion window
+            // is the real limit; pacing just smooths burst timing.
+            self.pacing_rate = base_rate *| 2;
         }
     }
 

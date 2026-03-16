@@ -7,7 +7,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const STREAM_BUF_SIZE: usize = 32768;  // Revert: buffer size increases cause stack issues in tests
+pub const STREAM_BUF_SIZE: usize = 32768;
+/// Send buffer is larger to exceed BDP on high-bandwidth links.
+/// Recv buffer stays at 32KB (app consumes promptly via peekContiguous/inline borrow).
+pub const SEND_BUF_SIZE: usize = 65536;
 
 /// High-performance ring buffer type: MirroredRingBuf on POSIX (wrap-free
 /// peekAll via mmap double-mapping), RingBuf on Windows (peekContiguous
@@ -279,7 +282,8 @@ pub const Stream = struct {
     send_max: u64,
 
     // Send-side buffer: holds data until acknowledged (for retransmission).
-    send_buf: RingBuf(STREAM_BUF_SIZE),
+    // Larger than recv_buf to exceed BDP on high-bandwidth links.
+    send_buf: RingBuf(SEND_BUF_SIZE),
     /// Cumulative bytes acknowledged on the send side.
     send_acked: u64,
     /// Out-of-order (SACK) acknowledged ranges waiting for the gap to be filled.
@@ -940,7 +944,7 @@ test "stream_send: out-of-order onAcked (SACK) frees ring buffer when gap filled
     try testing.expectEqual(@as(u64, 2400), s.send_acked);
     try testing.expectEqual(@as(usize, 0), s.sack_count); // SACK buffer drained
     // Ring buffer should be fully freed (2400 bytes written, 2400 discarded)
-    try testing.expectEqual(@as(usize, STREAM_BUF_SIZE), s.send_buf.writable());
+    try testing.expectEqual(@as(usize, SEND_BUF_SIZE), s.send_buf.writable());
 }
 
 test "stream_send: multiple out-of-order SACK ranges resolved in one flush" {
@@ -960,7 +964,7 @@ test "stream_send: multiple out-of-order SACK ranges resolved in one flush" {
     try testing.expectEqual(@as(u64, 3600), s.send_acked);
     try testing.expectEqual(@as(usize, 0), s.sack_count);
     // Ring buffer fully freed (3600 bytes written, 3600 discarded)
-    try testing.expectEqual(@as(usize, STREAM_BUF_SIZE), s.send_buf.writable());
+    try testing.expectEqual(@as(usize, SEND_BUF_SIZE), s.send_buf.writable());
 }
 
 test "stream_send: stale SACK ranges (before send_acked) are discarded" {

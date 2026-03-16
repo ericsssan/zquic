@@ -156,17 +156,14 @@ fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot, io: std.Io) std.Io.
                 min_deadline = d;
             }
         }
-        // Check if any connection has active transfers needing pacing.
         for (slot.transfers) |t| {
             if (t.active) { has_active_transfer = true; break; }
         }
     }
-    // If any transfer is active, cap timeout to 1ms for pacing granularity.
-    // This wakes the event loop frequently enough to pace packets smoothly
-    // instead of bursting all cwnd bytes in one 15ms tick.
+    // Wake every 1ms during active transfers for smooth pacing.
     if (has_active_transfer) {
         const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-        const pacing_deadline = now_ns + 1_000_000; // 1ms
+        const pacing_deadline = now_ns + 1_000_000;
         if (min_deadline == null or pacing_deadline < min_deadline.?) {
             min_deadline = pacing_deadline;
         }
