@@ -291,6 +291,8 @@ pub fn main(init: std.process.Init) !void {
         .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else [_]u8{0} ** 16,
         .preferred_addr_ipv6_port = if (is_cm) CM_PORT else 0,
         .ticket_key = &ticket_key,
+        // BBR available but needs tuning for the interop sim; CUBIC is battle-tested.
+        .cc_algorithm = .cubic,
     };
 
     // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6

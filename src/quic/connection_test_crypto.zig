@@ -60,7 +60,7 @@ test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
     conn.hot.tx_pn[2] = 2; // pretend pn=0..1 were sent in epoch 2
     conn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
 
-    const initial_cwnd = conn.congestion.cwnd;
+    const initial_cwnd = conn.congestion.cubic.cwnd;
 
     const ack = frame.AckFrame{
         .largest_acked = 1,
@@ -77,7 +77,7 @@ test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
     // CE count recorded
     try testing.expectEqual(@as(u62, 1), conn.ecn_ce_seen[2]);
     // cwnd must have been reduced (congestion event)
-    try testing.expect(conn.congestion.cwnd < initial_cwnd);
+    try testing.expect(conn.congestion.cubic.cwnd < initial_cwnd);
 }
 
 test "ecn: CE count non-increase is ignored (monotonic guard)" {
@@ -123,7 +123,7 @@ test "ecn: CE count non-increase is ignored (monotonic guard)" {
     // CE count must still be 5 (not updated)
     try testing.expectEqual(@as(u62, 5), conn_ecn.ecn_ce_seen[2]);
     // cwnd must match the plain case (no congestion triggered)
-    try testing.expectEqual(conn_plain.congestion.cwnd, conn_ecn.congestion.cwnd);
+    try testing.expectEqual(conn_plain.congestion.cubic.cwnd, conn_ecn.congestion.cubic.cwnd);
 }
 
 test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
@@ -168,7 +168,7 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
     // ecn_ce_seen stays 0 — CE count was 0 and did not increase
     try testing.expectEqual(@as(u62, 0), conn_ecn.ecn_ce_seen[2]);
     // cwnd matches plain (no congestion event from CE=0)
-    try testing.expectEqual(conn_plain.congestion.cwnd, conn_ecn.congestion.cwnd);
+    try testing.expectEqual(conn_plain.congestion.cubic.cwnd, conn_ecn.congestion.cubic.cwnd);
 }
 
 test "ecn: has_ecn=false ACK does not touch ecn_ce_seen" {
