@@ -141,6 +141,8 @@ fn freeSlot(slot_opt_ptr: *?*ConnSlot, io: std.Io) void {
             file.close(io);
         }
     }
+    // Zero all crypto key material before freeing heap memory.
+    slot.conn.deinit();
     page_allocator.destroy(slot);
     slot_opt_ptr.* = null;
 }
@@ -195,6 +197,10 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
         }
 
         if (slot.peer_addr) |pa| {
+            // Retry H3 control streams if initial send failed (queue was full).
+            if (g_is_h3 and !slot.h3_control_sent and slot.conn.app_keys != null) {
+                sendH3ControlStreams(slot);
+            }
             flushTransfers(slot, www_dir, io);
             const send_sock = slotSendSock(slot, sock, cm_sock_ptr);
             drainSend(&slot.conn, send_sock, io, &pa, send_bufs);
