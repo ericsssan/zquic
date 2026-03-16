@@ -80,7 +80,6 @@ pub const Bbr = struct {
 
     // PROBE_RTT
     probe_rtt_done_stamp_ns: ?i64,
-    probe_rtt_round_done: bool,
     prior_cwnd: u64, // saved cwnd before PROBE_RTT
 
     // Tracking
@@ -110,7 +109,6 @@ pub const Bbr = struct {
             .bw_filter = [_]u64{0} ** BTLBW_FILTER_LEN,
             .bw_filter_idx = 0,
             .probe_rtt_done_stamp_ns = null,
-            .probe_rtt_round_done = false,
             .prior_cwnd = 0,
             .bytes_in_flight = 0,
         };
@@ -272,7 +270,6 @@ pub const Bbr = struct {
         self.pacing_gain = 1.0;
         self.cwnd = MIN_CWND;
         self.probe_rtt_done_stamp_ns = null;
-        self.probe_rtt_round_done = false;
         _ = now_ns;
     }
 

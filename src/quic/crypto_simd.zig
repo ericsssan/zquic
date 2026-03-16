@@ -68,13 +68,7 @@ pub const CachedKeyCtx = union(quic_crypto.CipherSuite) {
 
     pub fn init(keys: quic_crypto.PacketKeys) CachedKeyCtx {
         return switch (keys.suite) {
-            .aes_128_gcm => {
-                const enc = Aes128.initEnc(keys.key[0..16].*);
-                var h: [16]u8 = undefined;
-                const zeros = [_]u8{0} ** 16;
-                enc.encrypt(&h, &zeros);
-                return .{ .aes_128_gcm = .{ .enc = enc, .hash_key = h } };
-            },
+            .aes_128_gcm => .{ .aes_128_gcm = AesCached.initFromKey(keys.key[0..16].*) },
             .chacha20_poly1305 => .{ .chacha20_poly1305 = .{ .key = keys.key } },
         };
     }
@@ -327,19 +321,6 @@ pub fn decryptCached(
     }
 }
 
-/// AES-only convenience for batch HP mask computation.
-pub fn decryptGcmCached(
-    ctx: CachedAesCtx,
-    nonce: [12]u8,
-    aad: []const u8,
-    payload: []u8,
-) !usize {
-    if (payload.len < 16) return error.TooShort;
-    var results: [1]DecryptStatus = .{.pending};
-    multiDecryptGcm(1, ctx, .{nonce}, .{aad}, .{payload}, &results);
-    if (results[0] != .ok) return error.AuthenticationFailed;
-    return payload.len - 16;
-}
 
 // ---------------------------------------------------------------------------
 // Tests

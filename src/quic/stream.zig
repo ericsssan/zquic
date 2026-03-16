@@ -5,22 +5,12 @@
 //!   bit 1: 0 = bidirectional,   1 = unidirectional
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 pub const STREAM_BUF_SIZE: usize = 32768;
 /// Send buffer is larger to exceed BDP on high-bandwidth links.
 /// Recv buffer stays at 32KB (app consumes promptly via peekContiguous/inline borrow).
 pub const SEND_BUF_SIZE: usize = 65536;
 
-/// High-performance ring buffer type: MirroredRingBuf on POSIX (wrap-free
-/// peekAll via mmap double-mapping), RingBuf on Windows (peekContiguous
-/// returns non-wrapped portion only).  Same API — callers use peekContiguous().
-pub fn HighPerfBuf(comptime cap: usize) type {
-    return if (builtin.os.tag == .windows)
-        RingBuf(cap)
-    else
-        @import("mirrored_buf.zig").MirroredRingBuf(cap);
-}
 
 pub const StreamState = enum(u8) {
     open,
@@ -317,8 +307,6 @@ pub const Stream = struct {
     /// Valid only until the next receive() call overwrites the recv buffer.
     /// If non-null, peekInline() returns this instead of reading from recv_buf.
     inline_recv: ?[]const u8 = null,
-    /// Length of inline-borrowed data (for flow control on consume).
-    inline_recv_len: u16 = 0,
 
     pub fn init(id: u62) Stream {
         return .{
@@ -342,7 +330,6 @@ pub const Stream = struct {
             .gap_list = GapList.init(0, STREAM_BUF_SIZE),
             .highest_recv_offset = 0,
             .inline_recv = null,
-            .inline_recv_len = 0,
         };
     }
 
@@ -360,9 +347,8 @@ pub const Stream = struct {
     /// Consume inline-borrowed data and update flow control.
     pub fn consumeInline(self: *Stream) void {
         if (self.inline_recv) |_| {
-            self.recv_max = self.recv_buf.rp + self.inline_recv_len + STREAM_BUF_SIZE;
+            self.recv_max = self.recv_buf.rp + self.inline_recv.?.len + STREAM_BUF_SIZE;
             self.inline_recv = null;
-            self.inline_recv_len = 0;
         }
     }
 
@@ -371,9 +357,7 @@ pub const Stream = struct {
     pub fn flushInline(self: *Stream) void {
         if (self.inline_recv) |data| {
             _ = self.recv_buf.write(data);
-            self.recv_buf.wp = self.recv_buf.rp + self.recv_buf.readable(); // ensure wp consistent
             self.inline_recv = null;
-            self.inline_recv_len = 0;
         }
     }
 

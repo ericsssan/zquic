@@ -382,6 +382,10 @@ pub fn Connection(comptime max_streams: usize) type {
         // Receive-path: in-place decrypt on caller's mutable buffer (zero copy).
         // rx_hp_buf and rx_plaintext eliminated — saves 3000 bytes per connection.
 
+        /// Stream ID with an active inline borrow (at most one at a time).
+        /// Avoids scanning all streams in flushAllInlineBorrows.
+        inline_borrow_stream: ?u62 = null,
+
         // Peer stream limits (updated by MAX_STREAMS frames and transport params)
         peer_max_streams_bidi: u62,
         peer_max_streams_uni: u62,
@@ -651,6 +655,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .pkt_scratch = undefined,
                 .enc_scratch = undefined,
                 // rx_hp_buf and rx_plaintext removed (in-place decrypt)
+                .inline_borrow_stream = null,
                 .peer_max_streams_bidi = 0,
                 .peer_max_streams_uni = 0,
                 .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
@@ -2094,7 +2099,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 if (new_end > old_hwm) st.highest_recv_offset = new_end;
                 st.recv_offset += f.data.len;
                 st.inline_recv = f.data;
-                st.inline_recv_len = @intCast(f.data.len);
+                self.inline_borrow_stream = f.stream_id;
                 // Update gap list to reflect the received range.
                 st.gap_list.fill(f.offset, f.data.len);
             } else {
@@ -3103,13 +3108,14 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Flush pending Handshake CRYPTO data buffered during amplification limit.
         /// Called by receive() after each client packet to allow retry when the budget grows.
         /// Returns without action if tls_pending_hs_len == 0.
-        /// Flush all inline borrows across all streams. Called at the start
-        /// of receive() before the recv buffer is overwritten.
+        /// Flush the single active inline borrow (if any). Called at the start
+        /// of receive() before the recv buffer is overwritten.  O(1) — no scan.
         fn flushAllInlineBorrows(self: *Self) void {
-            for (0..self.streams.streams.len) |i| {
-                if (self.streams.occupied(i)) {
-                    self.streams.streams[i].flushInline();
+            if (self.inline_borrow_stream) |sid| {
+                if (self.streams.get(sid)) |st| {
+                    st.flushInline();
                 }
+                self.inline_borrow_stream = null;
             }
         }
 
@@ -3469,7 +3475,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 std.crypto.secureZero(u8, @as(*volatile [@sizeOf(tls.AppKeys)]u8, @ptrCast(old)));
             }
             self.app_keys = self.next_app_keys;
-            self.cached_app_keys = self.cached_next_keys; // promote cached key schedule
+            // Zero old cached key schedule (defense-in-depth: AES round keys are key material).
+            if (self.cached_app_keys) |*old_cached| {
+                std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto_simd.CachedKeyCtx)]u8, @ptrCast(old_cached)));
+            }
+            self.cached_app_keys = self.cached_next_keys;
             self.current_key_phase = !self.current_key_phase;
             self.current_key_generation += 1;
             self.key_update_pending = false;
