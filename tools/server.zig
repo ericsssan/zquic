@@ -745,11 +745,8 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
         return true;
     }
 
-    // Probe for EOF: if partial read, check if next byte exists.
-    const is_eof = if (r < read_limit) blk: {
-        var eof_probe: [1]u8 = undefined;
-        break :blk (file.readPositionalAll(io, &eof_probe, t.offset + r) catch 0) == 0;
-    } else false;
+    // Short read from positional read on a regular file means EOF.
+    const is_eof = r < read_limit;
 
     // Send data (optionally wrapped in H3 DATA frame).
     if (is_h3) {

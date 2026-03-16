@@ -2585,7 +2585,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // precisely identify which packets we have (and have not) received.  This
             // is required by RFC 9000 §13.2: an endpoint MUST send ACK frames that
             // cover all ack-eliciting packets it has received.
-            var ack_ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+            var ack_ranges: [32]frame.AckRange = undefined;
             const ack_range_count = buildAckRangesFromBitmap(self.rx_pn_bitmap[epoch], &ack_ranges);
 
             // Include ACK-ECN frame with actual ECN counts received from peer (RFC 9000 §13.2.1).

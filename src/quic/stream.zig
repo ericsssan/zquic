@@ -346,8 +346,8 @@ pub const Stream = struct {
 
     /// Consume inline-borrowed data and update flow control.
     pub fn consumeInline(self: *Stream) void {
-        if (self.inline_recv) |_| {
-            self.recv_max = self.recv_buf.rp + self.inline_recv.?.len + STREAM_BUF_SIZE;
+        if (self.inline_recv) |data| {
+            self.recv_max = self.recv_buf.rp + data.len + STREAM_BUF_SIZE;
             self.inline_recv = null;
         }
     }
