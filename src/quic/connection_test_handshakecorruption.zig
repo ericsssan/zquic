@@ -267,7 +267,7 @@ test "zombie connection: pkts_recv == 0 after failed receive" {
     try testing.expect(conn.hot.state == .idle);
 
     const dummy_addr = conn_mod.SocketAddr{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 443 } };
-    const bad_data = [_]u8{0xC0} ++ [_]u8{0} ** 99;
+    var bad_data = [_]u8{0xC0} ++ [_]u8{0} ** 99;
     conn.receive(&bad_data, dummy_addr, 1_000_000_000, 0, io) catch {};
 
     try testing.expectEqual(@as(u64, 0), conn.pkts_recv);

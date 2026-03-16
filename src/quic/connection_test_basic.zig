@@ -611,7 +611,7 @@ test "close: closing state discards incoming packets (returns early)" {
     conn.current_time_ns = 0;
 
     // Feed a dummy packet — should not panic and connection stays closing.
-    const dummy = [_]u8{0x00} ** 10;
+    var dummy = [_]u8{0x00} ** 10;
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
     conn.receive(&dummy, src, 0, 0, io) catch {};
     try testing.expectEqual(ConnState.closing, conn.hot.state);
@@ -625,7 +625,7 @@ test "close: receive refreshes idle_deadline on active connection" {
     conn.idle_deadline_ns = 500;
 
     // Feed a (malformed but non-empty) packet at time 1000.
-    const dummy = [_]u8{0x00} ** 5;
+    var dummy = [_]u8{0x00} ** 5;
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
     conn.receive(&dummy, src, 1_000_000_000, 0, io) catch {};
 

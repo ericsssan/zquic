@@ -299,7 +299,6 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("zquic interop server: testcase={s} port={d}\n", .{ testcase, port });
 
-    var recv_buf: [MAX_DATAGRAM]u8 = undefined;
     var send_buf: [MAX_DATAGRAM]u8 = undefined;
 
     // Connection table: array of nullable pointers (heap-allocated).
@@ -311,7 +310,17 @@ pub fn main(init: std.process.Init) !void {
     // Non-blocking receive timeout: returns immediately if no packet ready.
     const nonblocking: std.Io.Timeout = .{ .duration = .{ .raw = .{ .nanoseconds = 0 }, .clock = .awake } };
 
-    // Multiplexed event loop: drain all pending packets, then tick/send.
+    // Batch receive buffers: collect up to BATCH_SIZE packets before processing.
+    // Separate buffers per packet are required because in-place decrypt modifies
+    // the buffer. With SIMD multi-buffer decrypt, same-connection packets in the
+    // batch share the pre-expanded AES key schedule (CachedKeyCtx).
+    const BATCH_SIZE = 16;
+    var batch_bufs: [BATCH_SIZE][MAX_DATAGRAM]u8 = undefined;
+    var batch_lens: [BATCH_SIZE]u16 = undefined;
+    var batch_froms: [BATCH_SIZE]net.IpAddress = undefined;
+    var batch_is_cm: [BATCH_SIZE]bool = undefined;
+
+    // Multiplexed event loop: collect batch → process → tick/send.
     while (true) {
         var timeout = computeGlobalTimeout(&conn_slots);
 
@@ -319,11 +328,14 @@ pub fn main(init: std.process.Init) !void {
         // check the CM socket frequently for PATH_CHALLENGE/migrated packets.
         if (cm_sock_ptr != null) timeout = clampTimeout(timeout, 5_000_000, io);
 
+        var batch_count: usize = 0;
+
         // Phase 1: Block for first packet (or timeout).
-        var got_packet = false;
-        if (sock.receiveTimeout(io, &recv_buf, timeout)) |msg| {
-            processPacket(msg.data, msg.from, false, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
-            got_packet = true;
+        if (sock.receiveTimeout(io, &batch_bufs[0], timeout)) |msg| {
+            batch_lens[0] = @intCast(msg.data.len);
+            batch_froms[0] = msg.from;
+            batch_is_cm[0] = false;
+            batch_count = 1;
         } else |err| {
             if (err != error.Timeout) {
                 std.debug.print("recv error: {}\n", .{err});
@@ -331,30 +343,49 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // Phase 2: Drain all remaining packets without blocking.
-        // This batches N datagrams per event loop iteration instead of 1,
-        // reducing recv syscall overhead under load.
-        if (got_packet) {
-            while (true) {
-                if (sock.receiveTimeout(io, &recv_buf, nonblocking)) |msg| {
-                    processPacket(msg.data, msg.from, false, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
+        // Phase 2: Drain remaining packets into batch (non-blocking).
+        if (batch_count > 0) {
+            while (batch_count < BATCH_SIZE) {
+                if (sock.receiveTimeout(io, &batch_bufs[batch_count], nonblocking)) |msg| {
+                    batch_lens[batch_count] = @intCast(msg.data.len);
+                    batch_froms[batch_count] = msg.from;
+                    batch_is_cm[batch_count] = false;
+                    batch_count += 1;
                 } else |_| break;
             }
         }
 
-        // Phase 3: Check CM socket (non-blocking).
+        // Phase 3: Check CM socket (non-blocking), add to batch.
         if (cm_sock_ptr) |cs| {
-            while (true) {
-                if (cs.receiveTimeout(io, &recv_buf, nonblocking)) |msg| {
-                    processPacket(msg.data, msg.from, true, &conn_slots, config, &sock, cm_sock_ptr, io, &send_buf, www_dir);
-                    got_packet = true;
+            while (batch_count < BATCH_SIZE) {
+                if (cs.receiveTimeout(io, &batch_bufs[batch_count], nonblocking)) |msg| {
+                    batch_lens[batch_count] = @intCast(msg.data.len);
+                    batch_froms[batch_count] = msg.from;
+                    batch_is_cm[batch_count] = true;
+                    batch_count += 1;
                 } else |_| break;
             }
         }
 
-        // Phase 4: Tick timers and flush transfers.
-        // Always tick — even after processing packets, timers may have fired
-        // and connections need PTO/idle handling.
+        // Phase 4: Process all collected packets.
+        // Each packet has its own buffer — in-place decrypt is safe.
+        // TODO: group by connection, use multiDecryptGcm(N) for same-key batches.
+        for (0..batch_count) |i| {
+            processPacket(
+                batch_bufs[i][0..batch_lens[i]],
+                batch_froms[i],
+                batch_is_cm[i],
+                &conn_slots,
+                config,
+                &sock,
+                cm_sock_ptr,
+                io,
+                &send_buf,
+                www_dir,
+            );
+        }
+
+        // Phase 5: Tick timers and flush transfers.
         tickAllConnections(&conn_slots, &sock, cm_sock_ptr, io, &send_buf, www_dir);
     }
 }
@@ -522,13 +553,10 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
     const conn = &slot.conn;
     const transfers = &slot.transfers;
     const st = conn.streams.get(stream_id) orelse return;
-    var req_buf: [512]u8 = undefined;
-    const n = st.read(&req_buf);
 
-    // No new data: FIN-only frame arrived after data was already consumed (e.g.
-    // ngtcp2 sends FIN as a separate empty STREAM frame). Ignore — the transfer
-    // for this stream is either already registered or not needed.
-    if (n == 0) return;
+    // Zero-copy read: peek directly into ring buffer, no memcpy.
+    const req = st.recv_buf.peekContiguous();
+    if (req.len == 0) return;
 
     // If a transfer is already active for this stream, ignore the duplicate event.
     for (transfers) |*t| {
@@ -539,13 +567,13 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
         if (p.stream_id == stream_id) return;
     }
 
-    const req = req_buf[0..n];
-
     if (!std.mem.startsWith(u8, req, "GET ")) {
+        st.consumeRecv(req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     }
     const eol = std.mem.indexOf(u8, req, "\r\n") orelse {
+        st.consumeRecv(req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     };
@@ -553,15 +581,19 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
 
     // Reject path traversal: any component containing ".." is forbidden.
     if (std.mem.indexOf(u8, path, "..") != null) {
+        st.consumeRecv(req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     }
 
+    // Build full path, then consume ring buffer data (no longer needed).
     var full_path_buf: [512]u8 = undefined;
     const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ www, path }) catch {
+        st.consumeRecv(req.len);
         conn.streamSend(stream_id, &.{}, true) catch {};
         return;
     };
+    st.consumeRecv(req.len);
 
     // Find or allocate a transfer slot.
     var free_slot: ?*FileTransfer = null;
@@ -753,16 +785,17 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
     // Just consume and ignore (static-only QPACK, no dynamic table).
     if (stream_id & 0x3 == 2) {
         if (conn.streams.get(stream_id)) |st| {
-            var sink: [256]u8 = undefined;
-            _ = st.read(&sink);
+            // Discard control/QPACK stream data without copying.
+            st.consumeRecv(st.recv_buf.readable());
         }
         return;
     }
 
     const st = conn.streams.get(stream_id) orelse return;
-    var req_buf: [4096]u8 = undefined;
-    const n = st.read(&req_buf);
-    if (n == 0) return;
+
+    // Zero-copy read: peek directly into ring buffer, no memcpy.
+    const req_data = st.recv_buf.peekContiguous();
+    if (req_data.len == 0) return;
 
     // Deduplicate
     for (transfers) |*t| {
@@ -772,22 +805,31 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
         if (p.stream_id == stream_id) return;
     }
 
-    // Parse H3 HEADERS frame
-    const hdr = http3.frame.parseHeader(req_buf[0..n]) catch return;
-    if (hdr.frame_type != http3.FrameType.headers) return;
+    // Parse H3 HEADERS frame directly from ring buffer (zero copy).
+    const hdr = http3.frame.parseHeader(req_data) catch {
+        st.consumeRecv(req_data.len);
+        return;
+    };
+    if (hdr.frame_type != http3.FrameType.headers) {
+        st.consumeRecv(req_data.len);
+        return;
+    }
     const block_end = hdr.header_len + @as(usize, @intCast(hdr.payload_len));
-    if (block_end > n) return; // incomplete
+    if (block_end > req_data.len) return; // incomplete, wait for more data
 
-    // QPACK decode (static-only)
+    // QPACK decode (static-only) directly from ring buffer.
     var fields: [64]qpack.Field = undefined;
     var strings: [4096]u8 = undefined;
     const fc = qpack.decoder.decode(
-        req_buf[hdr.header_len..block_end],
+        req_data[hdr.header_len..block_end],
         &fields,
         &strings,
         null,
         0,
-    ) catch return;
+    ) catch {
+        st.consumeRecv(req_data.len);
+        return;
+    };
 
     // Extract :path
     var path: ?[]const u8 = null;
@@ -797,12 +839,22 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
             break;
         }
     }
-    const req_path = path orelse return;
-    if (std.mem.indexOf(u8, req_path, "..") != null) return;
+    const req_path = path orelse {
+        st.consumeRecv(req_data.len);
+        return;
+    };
+    if (std.mem.indexOf(u8, req_path, "..") != null) {
+        st.consumeRecv(req_data.len);
+        return;
+    }
 
-    // Build filesystem path
+    // Build filesystem path, then release ring buffer.
     var full_path_buf: [512]u8 = undefined;
-    const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ www, req_path }) catch return;
+    const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ www, req_path }) catch {
+        st.consumeRecv(req_data.len);
+        return;
+    };
+    st.consumeRecv(req_data.len);
 
     // Allocate transfer slot
     var free_slot: ?*FileTransfer = null;

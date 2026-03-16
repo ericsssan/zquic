@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
+const crypto_simd = @import("crypto_simd.zig");
 const packet = @import("packet.zig");
 const frame = @import("frame.zig");
 const tls = @import("tls.zig");
@@ -316,11 +317,8 @@ pub fn Connection(comptime max_streams: usize) type {
         pkt_scratch: [MAX_SEND_PACKET_SIZE]u8,
         enc_scratch: [MAX_SEND_PACKET_SIZE]u8,
 
-        // Receive-path scratch buffers (reused per packet, avoids 3KB stack per receive).
-        // rx_hp_buf: mutable copy for header-protection removal.
-        // rx_plaintext: decrypted payload output.
-        rx_hp_buf: [MAX_PACKET_SIZE]u8,
-        rx_plaintext: [MAX_PACKET_SIZE]u8,
+        // Receive-path: in-place decrypt on caller's mutable buffer (zero copy).
+        // rx_hp_buf and rx_plaintext eliminated — saves 3000 bytes per connection.
 
         // Peer stream limits (updated by MAX_STREAMS frames and transport params)
         peer_max_streams_bidi: u62,
@@ -371,6 +369,12 @@ pub fn Connection(comptime max_streams: usize) type {
         current_key_phase: bool,
         /// Pre-computed next-generation app keys (ready to use on peer-initiated update).
         next_app_keys: ?tls.AppKeys,
+
+        // Cached AES contexts — pre-expanded key schedule for multi-buffer SIMD.
+        // Avoids ~200ns key expansion per packet on the 1-RTT hot path.
+        cached_app_keys: ?crypto_simd.CachedKeyCtx,
+        cached_next_keys: ?crypto_simd.CachedKeyCtx,
+
         /// Next-generation client traffic secret (source for key derivation).
         next_client_secret: [32]u8,
         /// Next-generation server traffic secret.
@@ -584,8 +588,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .closing_frame_len = 0,
                 .pkt_scratch = undefined,
                 .enc_scratch = undefined,
-                .rx_hp_buf = undefined,
-                .rx_plaintext = undefined,
+                // rx_hp_buf and rx_plaintext removed (in-place decrypt)
                 .peer_max_streams_bidi = 0,
                 .peer_max_streams_uni = 0,
                 .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
@@ -607,6 +610,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .key_update_pending = false,
                 .current_key_phase = false,
                 .next_app_keys = null,
+                .cached_app_keys = null,
+                .cached_next_keys = null,
                 .next_client_secret = [_]u8{0} ** 32,
                 .next_server_secret = [_]u8{0} ** 32,
                 .current_key_generation = 0,
@@ -646,7 +651,7 @@ pub fn Connection(comptime max_streams: usize) type {
         /// `src`     — sender address (used for migration detection).
         /// `now_ns`  — current monotonic time in nanoseconds.
         /// `io`      — I/O handle (needed for TLS key generation).
-        pub fn receive(self: *Self, data: []const u8, src: SocketAddr, now_ns: i64, ecn_bits: u2, io: std.Io) !void {
+        pub fn receive(self: *Self, data: []u8, src: SocketAddr, now_ns: i64, ecn_bits: u2, io: std.Io) !void {
             self.current_time_ns = now_ns;
 
             // Track ECN bits if present (RFC 9001 Appendix A)
@@ -1055,7 +1060,7 @@ pub fn Connection(comptime max_streams: usize) type {
         // Internal packet processing
         // -----------------------------------------------------------------------
 
-        pub fn processOnePacket(self: *Self, data: []const u8, src: SocketAddr, io: std.Io) !usize {
+        pub fn processOnePacket(self: *Self, data: []u8, src: SocketAddr, io: std.Io) !usize {
             if (data.len == 0) return 0;
 
             if (packet.isLongHeader(data[0])) {
@@ -1065,7 +1070,7 @@ pub fn Connection(comptime max_streams: usize) type {
             }
         }
 
-        pub fn processLongHeaderPacket(self: *Self, data: []const u8, src: SocketAddr, io: std.Io) !usize {
+        pub fn processLongHeaderPacket(self: *Self, data: []u8, src: SocketAddr, io: std.Io) !usize {
             // RFC 9000 §6 + RFC 9368: Version negotiation with compatible version support.
             // Check the version field before full parsing — VN packets (version 0) have
             // a different wire format that parseLongHeader cannot handle.
@@ -1187,14 +1192,11 @@ pub fn Connection(comptime max_streams: usize) type {
             const pn_off = packet.longHeaderPnOffset(data, ver) catch return data.len;
             if (pn_off + 4 + 16 > data.len) return error.PacketTooShort;
 
-            // Copy packet to a mutable buffer and remove header protection in place.
-            // Buffer sized to MAX_PACKET_SIZE; packets larger than this were already rejected above.
-            @memcpy(self.rx_hp_buf[0..data.len], data);
-            const hp_buf = &self.rx_hp_buf;
-            _ = crypto.removeHeaderProtection(hp_keys, &hp_buf[0], hp_buf[pn_off..][0..4], hp_buf[pn_off + 4 ..][0..16]);
+            // Remove header protection in-place on the caller's mutable buffer (zero copy).
+            _ = crypto.removeHeaderProtection(hp_keys, &data[0], data[pn_off..][0..4], data[pn_off + 4 ..][0..16]);
 
             // Parse with header protection removed.
-            const result = try packet.parseLongHeader(hp_buf[0..data.len]);
+            const result = try packet.parseLongHeader(data);
 
             const hdr = result.header;
 
@@ -1243,17 +1245,17 @@ pub fn Connection(comptime max_streams: usize) type {
 
                     // AAD = HP-removed header bytes (before payload, per RFC 9001 §5.3).
                     const payload_start = result.consumed - hdr.payload.len;
-                    const aad = hp_buf[0..payload_start];
+                    const aad: []const u8 = data[0..payload_start];
 
                     if (hdr.payload.len < 16) return error.PacketTooShort;
-                    const pt_len = hdr.payload.len - 16;
-                    // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
-                    defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&self.rx_plaintext)));
-                    if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                    if (hdr.payload.len - 16 > MAX_PACKET_SIZE) return error.PacketTooLarge;
 
-                    crypto.decryptPayload(keys, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch |err| {
+                    // In-place decrypt: plaintext overwrites ciphertext in caller's buffer.
+                    const pt_len = crypto.decryptPayloadInPlace(keys, pn, aad, data[payload_start..][0..hdr.payload.len]) catch |err| {
                         return err;
                     };
+                    // Defense-in-depth: zero plaintext after frame processing (key material in Initial).
+                    defer std.crypto.secureZero(u8, data[payload_start..][0..pt_len]);
 
                     // Decryption succeeded — now commit the idle→handshake transition.
                     // This is deferred from the pre-HP block to prevent corrupted Initials
@@ -1284,8 +1286,8 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.bytes_recv += result.consumed;
                     self.pkts_recv += 1;
 
-                    // Process frames in plaintext.
-                    try self.processFrames(self.rx_plaintext[0..pt_len], 0, io);
+                    // Process frames from in-place decrypted plaintext (zero copy).
+                    try self.processFrames(data[payload_start..][0..pt_len], 0, io);
 
                     return result.consumed;
                 },
@@ -1302,18 +1304,16 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (self.isPnDuplicate(1, pn)) return result.consumed;
                     // AAD = HP-removed header bytes.
                     const payload_start = result.consumed - hdr.payload.len;
-                    const aad = hp_buf[0..payload_start];
+                    const aad: []const u8 = data[0..payload_start];
                     if (hdr.payload.len < 16) return error.PacketTooShort;
-                    const pt_len = hdr.payload.len - 16;
-                    // Defense-in-depth: zeroize plaintext after frame processing to prevent leakage
-                    defer std.crypto.secureZero(u8, @as(*volatile [MAX_PACKET_SIZE]u8, @ptrCast(&self.rx_plaintext)));
-                    if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                    if (hdr.payload.len - 16 > MAX_PACKET_SIZE) return error.PacketTooLarge;
 
-                    crypto.decryptPayload(keys, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch |err| {
+                    const pt_len = crypto.decryptPayloadInPlace(keys, pn, aad, data[payload_start..][0..hdr.payload.len]) catch |err| {
                         return err;
                     };
+                    defer std.crypto.secureZero(u8, data[payload_start..][0..pt_len]);
                     self.markPnReceived(1, pn);
-                    try self.processFrames(self.rx_plaintext[0..pt_len], 1, io);
+                    try self.processFrames(data[payload_start..][0..pt_len], 1, io);
                     return result.consumed;
                 },
                 .zero_rtt => {
@@ -1326,21 +1326,17 @@ pub fn Connection(comptime max_streams: usize) type {
                     );
                     if (self.isPnDuplicate(2, pn)) return result.consumed;
                     const payload_start = result.consumed - hdr.payload.len;
-                    const aad = hp_buf[0..payload_start];
+                    const aad: []const u8 = data[0..payload_start];
                     if (hdr.payload.len < 16) return error.PacketTooShort;
-                    const pt_len = hdr.payload.len - 16;
-                    // No secureZero for 0-RTT: plaintext contains stream data, not key material.
-                    if (pt_len > MAX_PACKET_SIZE) return error.PacketTooLarge;
+                    if (hdr.payload.len - 16 > MAX_PACKET_SIZE) return error.PacketTooLarge;
 
-                    crypto.decryptPayload(zk, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch {
+                    const pt_len = crypto.decryptPayloadInPlace(zk, pn, aad, data[payload_start..][0..hdr.payload.len]) catch {
                         return result.consumed; // silent drop on decrypt failure
                     };
                     self.markPnReceived(2, pn);
                     self.bytes_recv += result.consumed;
                     self.pkts_recv += 1;
-                    // Process frames with 0-RTT restrictions (RFC 9000 Table 3).
-                    // Uses epoch 2 PN space (shares with 1-RTT per RFC 9001 §4.1.4).
-                    try self.processFramesZeroRtt(self.rx_plaintext[0..pt_len], io);
+                    try self.processFramesZeroRtt(data[payload_start..][0..pt_len], io);
                     return result.consumed;
                 },
                 else => return result.consumed, // ignore retry
@@ -1461,26 +1457,23 @@ pub fn Connection(comptime max_streams: usize) type {
             return count;
         }
 
-        pub fn processShortHeaderPacket(self: *Self, data: []const u8) !usize {
+        pub fn processShortHeaderPacket(self: *Self, data: []u8) !usize {
             if (self.app_keys == null) return 0;
 
             // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
             if (data.len > MAX_PACKET_SIZE) return 0;
 
             // DCID in short headers = server's SCID = local_cid (always cid_mod.len bytes).
-            // The client uses the SCID we sent in our Initial packet as its DCID.
-            // This is always cid_mod.len (8 bytes) regardless of what the peer sent as SCID.
             const our_scid_len: usize = cid_mod.len;
 
-            // Remove header protection before parsing.
+            // Remove header protection in-place on the caller's buffer (zero copy).
             const pn_off = packet.shortHeaderPnOffset(our_scid_len);
             if (pn_off + 4 + 16 > data.len) {
                 return 0;
             }
-            @memcpy(self.rx_hp_buf[0..data.len], data);
-            _ = crypto.removeHeaderProtection(self.app_keys.?.client, &self.rx_hp_buf[0], self.rx_hp_buf[pn_off..][0..4], self.rx_hp_buf[pn_off + 4 ..][0..16]);
+            _ = crypto.removeHeaderProtection(self.app_keys.?.client, &data[0], data[pn_off..][0..4], data[pn_off + 4 ..][0..16]);
 
-            const result = try packet.parseShortHeader(self.rx_hp_buf[0..data.len], our_scid_len);
+            const result = try packet.parseShortHeader(data, our_scid_len);
             const hdr = result.header;
             const pn = packet.decodePacketNumber(
                 self.hot.rx_pn[2],
@@ -1490,34 +1483,41 @@ pub fn Connection(comptime max_streams: usize) type {
             // Replay / duplicate protection (RFC 9000 §13.2).
             if (self.isPnDuplicate(2, pn)) return result.consumed;
             const payload_start = result.consumed - hdr.payload.len;
+            const payload_len = hdr.payload.len;
             // AAD = HP-removed header bytes (per RFC 9001 §5.3).
-            const aad = self.rx_hp_buf[0..payload_start];
-            if (hdr.payload.len < 16) return result.consumed;
-            const pt_len = hdr.payload.len - 16;
-            // No secureZero for 1-RTT: plaintext contains stream data, not key material.
+            const aad: []const u8 = data[0..payload_start];
+            if (payload_len < 16) return result.consumed;
+            const pt_len = payload_len - 16;
             if (pt_len > MAX_PACKET_SIZE) return result.consumed;
+
+            // Save potential stateless reset token BEFORE in-place decrypt
+            // (decrypt overwrites the buffer even on auth failure).
+            var saved_tail: [16]u8 = undefined;
+            if (data.len >= 21) @memcpy(&saved_tail, data[data.len - 16 ..][0..16]);
+
+            // Mutable payload region for in-place decrypt.
+            const payload = data[payload_start..][0..payload_len];
 
             // Key phase handling (RFC 9001 §6): different phase bit indicates key update.
             if (hdr.key_phase != self.current_key_phase) {
-                // Peer has initiated a key update. Try next-generation keys first.
+                // Peer initiated key update. Try next-generation keys first.
                 var decrypted_with_next = false;
                 if (self.next_app_keys) |nk| {
-                    if (crypto.decryptPayload(nk.client, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len])) |_| {
+                    const ctx = self.cached_next_keys orelse crypto_simd.CachedKeyCtx.init(nk.client);
+                    const nonce = crypto.buildNonce(nk.client.iv, pn);
+                    if (crypto_simd.decryptCached(ctx, nonce, aad, payload)) |_| {
                         decrypted_with_next = true;
-                    } else |_| {
-                        // next keys decrypt failed
-                    }
+                    } else |_| {}
                 }
                 if (decrypted_with_next) {
-                    self.rotateKeys(); // promote next → current, derive new next
-                    // RFC 9001 §6.4: After accepting peer-initiated key update,
-                    // immediately acknowledge packets to synchronize key state
-                    self.key_update_pending = false; // peer has successfully updated keys
+                    self.rotateKeys();
+                    self.key_update_pending = false;
                 } else {
-                    // Fallback: current keys (handles reordering during transition).
-                    crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch {
-                        // RFC 9000 §10.3: decryption failure → check for stateless reset.
-                        if (self.checkStatelessReset(data)) {
+                    // Fallback: current keys (handles reordering during key transition).
+                    const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(self.app_keys.?.client);
+                    const nonce = crypto.buildNonce(self.app_keys.?.client.iv, pn);
+                    _ = crypto_simd.decryptCached(ctx, nonce, aad, payload) catch {
+                        if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                             self.hot.state = .closed;
                             self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
                         }
@@ -1525,10 +1525,11 @@ pub fn Connection(comptime max_streams: usize) type {
                     };
                 }
             } else {
-                // Same phase: use current keys; clear pending flag (peer ACKed our update).
-                crypto.decryptPayload(self.app_keys.?.client, pn, aad, hdr.payload, self.rx_plaintext[0..pt_len]) catch {
-                    // RFC 9000 §10.3: decryption failure → check for stateless reset.
-                    if (self.checkStatelessReset(data)) {
+                // Same phase — HOT PATH. Cached key schedule, no branch on cipher suite.
+                const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(self.app_keys.?.client);
+                const nonce = crypto.buildNonce(self.app_keys.?.client.iv, pn);
+                _ = crypto_simd.decryptCached(ctx, nonce, aad, payload) catch {
+                    if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                         self.hot.state = .closed;
                         self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
                     }
@@ -1541,16 +1542,14 @@ pub fn Connection(comptime max_streams: usize) type {
             self.markPnReceived(2, pn);
             self.bytes_recv += data.len;
             self.pkts_recv += 1;
-            // Process frames with consistent key state.
-            // On protocol errors, close the connection with the appropriate QUIC
-            // transport error code rather than silently ignoring the violation.
-            self.processFrames(self.rx_plaintext[0..pt_len], 2, null) catch |err| {
+            // Process frames from in-place decrypted plaintext (zero copy).
+            self.processFrames(data[payload_start..][0..pt_len], 2, null) catch |err| {
                 const code: u62 = switch (err) {
                     error.FlowControlViolation => 0x03,
                     error.StreamLimitError => 0x04,
-                    error.StreamStateError => 0x05, // RFC 9000 §20.1 STREAM_STATE_ERROR
+                    error.StreamStateError => 0x05,
                     error.FrameEncodingError => 0x07,
-                    else => 0x0a, // PROTOCOL_VIOLATION
+                    else => 0x0a,
                 };
                 self.close(code, false, "") catch {};
             };
@@ -1564,7 +1563,13 @@ pub fn Connection(comptime max_streams: usize) type {
             // RFC 9000 §10.3: a stateless reset is at least 21 bytes
             // (1 fixed-bit header + 4 bytes min body + 16-byte token).
             if (raw_packet.len < 21) return false;
-            const token = raw_packet[raw_packet.len - 16 ..][0..16];
+            return self.checkStatelessResetToken(raw_packet[raw_packet.len - 16 ..][0..16]);
+        }
+
+        /// Check a pre-saved 16-byte token against known peer stateless reset tokens.
+        /// Used by in-place decrypt path where the original packet tail may be
+        /// overwritten by AEAD — caller saves the token before decryption.
+        fn checkStatelessResetToken(self: *Self, token: *const [16]u8) bool {
             for (&self.peer_cid_table) |*entry| {
                 if (!entry.valid) continue;
                 if (std.crypto.timing_safe.eql([16]u8, entry.reset_token, token.*)) return true;
@@ -1925,6 +1930,8 @@ pub fn Connection(comptime max_streams: usize) type {
 
             if (self.tls_state.isComplete()) {
                 self.app_keys = self.tls_state.app_keys;
+                // Cache key schedule for the hot path (both AES and ChaCha20).
+                self.cached_app_keys = crypto_simd.CachedKeyCtx.init(self.tls_state.app_keys.client);
                 self.hot.state = .established;
                 // Defense-in-depth: zero initial keys after transition to 1-RTT (no longer needed)
                 std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.InitialKeys)]u8, @ptrCast(&self.initial_keys)));
@@ -1948,6 +1955,8 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.next_app_keys.?.client.hp = cur.client.hp;
                     self.next_app_keys.?.server.hp = cur.server.hp;
                 }
+                // Cache next-gen key schedule for fast key-update decrypt.
+                self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.next_app_keys.?.client);
 
                 const params = self.tls_state.peerTransportParams();
                 self.conn_flow.updateSendMax(params.initial_max_data);
@@ -3361,6 +3370,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 std.crypto.secureZero(u8, @as(*volatile [@sizeOf(tls.AppKeys)]u8, @ptrCast(old)));
             }
             self.app_keys = self.next_app_keys;
+            self.cached_app_keys = self.cached_next_keys; // promote cached key schedule
             self.current_key_phase = !self.current_key_phase;
             self.current_key_generation += 1;
             self.key_update_pending = false;
@@ -3384,6 +3394,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.next_app_keys.?.client.hp = cur.client.hp;
                 self.next_app_keys.?.server.hp = cur.server.hp;
             }
+            // Cache rotated key schedule.
+            self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.next_app_keys.?.client);
         }
 
         /// Initiate a locally-triggered key update (RFC 9001 §6).

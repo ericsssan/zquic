@@ -235,6 +235,61 @@ pub fn decryptPayload(
     }
 }
 
+/// Decrypt a QUIC packet payload in-place: plaintext overwrites ciphertext
+/// in the same buffer.  Eliminates the separate plaintext output buffer,
+/// reducing one full-packet memcpy on the receive hot path.
+///
+/// `payload` must contain ciphertext followed by the 16-byte AEAD auth tag.
+/// On success, `payload[0..payload.len-16]` holds the decrypted plaintext.
+/// On failure (auth tag mismatch), the buffer contents are **undefined** —
+/// the caller must not read from it.  Save any data needed for fallback
+/// (e.g., stateless reset token) BEFORE calling this function.
+///
+/// Returns the plaintext length (payload.len - 16).
+pub fn decryptPayloadInPlace(
+    keys: PacketKeys,
+    pn: u64,
+    header: []const u8,
+    payload: []u8,
+) !usize {
+    if (payload.len < 16) return error.TooShort;
+    const ct_len = payload.len - 16;
+
+    const nonce = buildNonce(keys.iv, pn);
+    // Extract tag before decrypt — AES-GCM processes blocks in-place and
+    // the tag region may be read during GHASH before we need it for verify.
+    var tag: [16]u8 = undefined;
+    @memcpy(&tag, payload[ct_len..][0..16]);
+
+    // Both AES-128-GCM and ChaCha20-Poly1305 support aliased m==c:
+    //   AES-GCM:    GHASH each block before CTR-decrypt overwrites it.
+    //   ChaCha20:   Poly1305 authenticates all ciphertext before any XOR.
+    const ct: []const u8 = payload[0..ct_len];
+    switch (keys.suite) {
+        .aes_128_gcm => {
+            try Aes128Gcm.decrypt(
+                payload[0..ct_len],
+                ct,
+                tag,
+                header,
+                nonce,
+                keys.key[0..16].*,
+            );
+        },
+        .chacha20_poly1305 => {
+            try ChaCha20Poly1305.decrypt(
+                payload[0..ct_len],
+                ct,
+                tag,
+                header,
+                nonce,
+                keys.key,
+            );
+        },
+    }
+    return ct_len;
+}
+
 /// Apply or remove header protection (RFC 9001 §5.4).
 ///
 /// `keys`              — packet keys (suite determines AES vs ChaCha20 HP).
@@ -335,7 +390,7 @@ fn applyMask(header_first_byte: *u8, pn_bytes: []u8, mask: [5]u8) void {
     }
 }
 
-fn buildNonce(iv: [12]u8, pn: u64) [12]u8 {
+pub fn buildNonce(iv: [12]u8, pn: u64) [12]u8 {
     var nonce = iv;
     // XOR packet number into the low-order bytes (big-endian, left-padded).
     const pn_bytes = std.mem.toBytes(std.mem.nativeToBig(u64, pn));

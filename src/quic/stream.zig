@@ -118,6 +118,28 @@ pub fn RingBuf(comptime cap: usize) type {
             self.rp += actual;
             return actual;
         }
+
+        /// Zero-copy read: return a slice into the internal buffer for the
+        /// contiguous region starting at the read pointer.  If data wraps
+        /// around the ring boundary, only the first (non-wrapped) portion
+        /// is returned — call again after consume() to get the rest.
+        ///
+        /// The returned slice is valid until the next write/writeAt or
+        /// until consume() advances past it.  Callers in the sans-IO model
+        /// must finish reading before the next receive() call.
+        pub fn peekContiguous(self: *const Self) []const u8 {
+            const n = self.readable();
+            if (n == 0) return &.{};
+            const start = self.rp & (cap - 1);
+            const first = @min(n, cap - start);
+            return self.buf[start..][0..first];
+        }
+
+        /// Advance the read pointer by `n` bytes without copying.
+        /// Paired with peekContiguous() for zero-copy reads.
+        pub fn consume(self: *Self, n: usize) void {
+            self.rp += @min(n, self.readable());
+        }
     };
 }
 
@@ -412,6 +434,16 @@ pub const Stream = struct {
             self.recv_max = self.recv_buf.rp + STREAM_BUF_SIZE;
         }
         return n;
+    }
+
+    /// Zero-copy consume: advance read pointer by `n` bytes without copying.
+    /// Paired with recv_buf.peekContiguous() for zero-copy reads.
+    /// Updates recv_max (flow control) so the remote can send more data.
+    pub fn consumeRecv(self: *Stream, n: usize) void {
+        self.recv_buf.consume(n);
+        if (n > 0) {
+            self.recv_max = self.recv_buf.rp + STREAM_BUF_SIZE;
+        }
     }
 
     /// True when recv_max has grown beyond what we last advertised to the peer.
