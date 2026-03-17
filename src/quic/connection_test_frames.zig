@@ -63,8 +63,8 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    conn.congestion.cubic.cwnd = 100 * 1200;
-    conn.congestion.cubic.ssthresh = 0; // always in CUBIC phase
+    conn.congestion.cwnd = 100 * 1200;
+    conn.congestion.ssthresh = 0; // always in CUBIC phase
 
     conn.current_time_ns = 0;
     conn.hot.tx_pn[0] = 9; // pretend pn=0..8 were sent
@@ -89,7 +89,7 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     try conn.processAck(ack, 0);
 
     // Persistent congestion → cwnd = 2 * MSS = 2904 (MSS=1452)
-    try testing.expectEqual(@as(u64, 2 * 1452), conn.congestion.cubic.cwnd);
+    try testing.expectEqual(@as(u64, 2 * 1452), conn.congestion.cwnd);
 }
 
 // ---------------------------------------------------------------------------
@@ -603,12 +603,12 @@ test "connection: migration resets congestion" {
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // Inflate the congestion window to a large value.
-    conn.congestion.cubic.cwnd = 999_999;
+    conn.congestion.cwnd = 999_999;
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 5000 } };
     var empty = [_]u8{};
     try conn.receive(&empty, new_src, 0, 0, io);
     // RFC 9002 §7.2: initial_window = min(10*1452, max(14720, 2*1452)) = 14520.
-    try testing.expectEqual(@as(u64, 14520), conn.congestion.cubic.cwnd);
+    try testing.expectEqual(@as(u64, 14520), conn.congestion.cwnd);
 }
 
 test "connection: migration sets path_validated false" {

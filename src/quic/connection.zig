@@ -22,7 +22,6 @@ const cid_mod = @import("connection_id.zig");
 const stream_mod = @import("stream.zig");
 const flow_control = @import("flow_control.zig");
 const cubic_mod = @import("congestion/cubic.zig");
-const bbr_mod = @import("congestion/bbr.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 
 const ConnectionId = cid_mod.ConnectionId;
@@ -215,67 +214,6 @@ pub const Config = struct {
     /// 32-byte key for session ticket encryption (enables resumption/0-RTT).
     /// When null, session tickets are not issued.
     ticket_key: ?*const [32]u8 = null,
-    /// Congestion control algorithm.
-    cc_algorithm: CcAlgorithm = .cubic,
-};
-
-pub const CcAlgorithm = enum { cubic, bbr };
-
-/// Unified congestion controller: dispatches to CUBIC or BBR.
-/// Both share the same API surface, selected at connection init.
-pub const CongestionController = union(CcAlgorithm) {
-    cubic: cubic_mod.Cubic,
-    bbr: bbr_mod.Bbr,
-
-    pub fn init(algo: CcAlgorithm) CongestionController {
-        return switch (algo) {
-            .cubic => .{ .cubic = cubic_mod.Cubic.init() },
-            .bbr => .{ .bbr = bbr_mod.Bbr.init() },
-        };
-    }
-
-    pub inline fn onAckReceived(self: *CongestionController, bytes_acked: u64, rtt_ns: u64, now_ns: i64) void {
-        switch (self.*) {
-            inline else => |*cc| cc.onAckReceived(bytes_acked, rtt_ns, now_ns),
-        }
-    }
-
-    pub inline fn onPacketLost(self: *CongestionController, now_ns: i64) void {
-        switch (self.*) {
-            inline else => |*cc| cc.onPacketLost(now_ns),
-        }
-    }
-
-    pub inline fn onPersistentCongestion(self: *CongestionController) void {
-        switch (self.*) {
-            inline else => |*cc| cc.onPersistentCongestion(),
-        }
-    }
-
-    pub inline fn pacingRefill(self: *CongestionController, now_ns: i64) u64 {
-        return switch (self.*) {
-            inline else => |*cc| cc.pacingRefill(now_ns),
-        };
-    }
-
-    pub inline fn pacingConsume(self: *CongestionController, bytes: u64) void {
-        switch (self.*) {
-            inline else => |*cc| cc.pacingConsume(bytes),
-        }
-    }
-
-    pub inline fn cwnd(self: *const CongestionController) u64 {
-        return switch (self.*) {
-            .cubic => |c| c.cwnd,
-            .bbr => |b| b.cwnd,
-        };
-    }
-
-    pub inline fn canSend(self: *const CongestionController) bool {
-        return switch (self.*) {
-            inline else => |*cc| cc.canSend(),
-        };
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -331,7 +269,7 @@ pub fn Connection(comptime max_streams: usize) type {
         conn_flow: flow_control.FlowController,
 
         // Congestion control
-        congestion: CongestionController,
+        congestion: cubic_mod.Cubic,
 
         // Loss recovery (RTT estimation, sent-packet tracking, PTO)
         loss: loss_recovery_mod.LossRecovery,
@@ -634,7 +572,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     config.initial_max_data,
                     config.initial_max_data,
                 ),
-                .congestion = CongestionController.init(config.cc_algorithm),
+                .congestion = cubic_mod.Cubic.init(),
                 .loss = loss_recovery_mod.LossRecovery.init(),
                 .current_time_ns = 0,
                 .cached_max_ack_delay_ns = 25_000_000,
@@ -1070,7 +1008,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Retransmissions (processLostFrames) bypass this check so loss recovery
             // is never blocked by a temporarily-reduced cwnd after a loss event.
             // Estimate packet size as data.len + 64 bytes of header/AEAD overhead.
-            if (self.loss.bytes_in_flight + data.len + 64 > self.congestion.cwnd()) {
+            if (self.loss.bytes_in_flight + data.len + 64 > self.congestion.cwnd) {
                 return error.CongestionWindowFull;
             }
             try self.queueStreamData(stream_id, data, fin);
@@ -3541,7 +3479,7 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Handle a source address change: reset congestion, request path validation.
         fn onPathMigration(self: *Self, new_addr: SocketAddr, io: std.Io) !void {
             // RFC 9000 §9.4: reset congestion controller on path change.
-            self.congestion = CongestionController.init(self.config.cc_algorithm);
+            self.congestion = cubic_mod.Cubic.init();
             // RFC 9000 §9.4: reset amplification limit for the new path (separate from old path tracking).
             // Each path must independently satisfy the 3x amplification limit until validated.
             self.bytes_unvalidated_recv = 0;

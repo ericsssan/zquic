@@ -965,9 +965,9 @@ test "loss: multi-packet loss triggers single congestion event" {
     conn.current_time_ns = 1_000_000_000;
 
     // Force CUBIC into congestion avoidance with a known large window.
-    conn.congestion.cubic.ssthresh = 0; // cwnd always > ssthresh=0 → CUBIC always used
-    conn.congestion.cubic.cwnd = 100 * 1200; // 120000 bytes (100 × MSS)
-    const initial_cwnd = conn.congestion.cubic.cwnd;
+    conn.congestion.ssthresh = 0; // cwnd always > ssthresh=0 → CUBIC always used
+    conn.congestion.cwnd = 100 * 1200; // 120000 bytes (100 × MSS)
+    const initial_cwnd = conn.congestion.cwnd;
 
     // Register 10 packets in epoch 0, all sent at t=0.
     conn.hot.tx_pn[0] = 11; // pretend pn=0..10 were sent
@@ -990,7 +990,7 @@ test "loss: multi-packet loss triggers single congestion event" {
     try conn.processAck(ack, 0);
 
     const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(initial_cwnd)) * 0.7);
-    try testing.expectEqual(expected, conn.congestion.cubic.cwnd);
+    try testing.expectEqual(expected, conn.congestion.cwnd);
 }
 
 // ---------------------------------------------------------------------------
