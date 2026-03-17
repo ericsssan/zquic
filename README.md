@@ -7,7 +7,12 @@ A QUIC protocol library for Zig. Sans-I/O — you own the socket; the library ow
 - QUIC v1 (RFC 9000) and v2 (RFC 9369)
 - TLS 1.3 server handshake with AES-128-GCM and ChaCha20-Poly1305 (RFC 9001)
 - Session resumption and 0-RTT
+- Loss recovery, RTT estimation, PTO (RFC 9002)
 - CUBIC congestion control (RFC 9438)
+- Stream multiplexing and flow control
+- Path migration and NAT rebinding
+- PMTUD, retry tokens, key rotation, ECN
+- Ed25519 and P-256 certificates
 - Zero external dependencies
 
 ## Build
