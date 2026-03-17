@@ -8,7 +8,7 @@ A QUIC protocol library for Zig. Sans-I/O — you own the socket; the library ow
 - TLS 1.3 with AES-128-GCM and ChaCha20-Poly1305 (RFC 9001)
 - Session resumption and 0-RTT
 - HTTP/3 (RFC 9114) and QPACK (RFC 9204)
-- CUBIC and BBR congestion control
+- CUBIC congestion control (RFC 9438)
 - Zero external dependencies
 
 ## Build
