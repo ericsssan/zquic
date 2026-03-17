@@ -157,16 +157,20 @@ fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot, io: std.Io) std.Io.
                 min_deadline = d;
             }
         }
-        for (slot.transfers) |t| {
-            if (t.active) { has_active_transfer = true; break; }
+        if (!has_active_transfer) {
+            for (slot.transfers) |t| {
+                if (t.active) { has_active_transfer = true; break; }
+            }
         }
     }
-    // Wake every 1ms during active transfers for smooth pacing.
+    // Wake frequently during active transfers to push data after ACKs
+    // open the congestion window. Without this, the server sleeps until
+    // the next recv, missing opportunities to fill the pipe.
     if (has_active_transfer) {
         const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-        const pacing_deadline = now_ns + 1_000_000;
-        if (min_deadline == null or pacing_deadline < min_deadline.?) {
-            min_deadline = pacing_deadline;
+        const flush_deadline = now_ns + 1_000_000; // 1ms
+        if (min_deadline == null or flush_deadline < min_deadline.?) {
+            min_deadline = flush_deadline;
         }
     }
     return if (min_deadline) |d| .{ .deadline = .{ .raw = .{ .nanoseconds = d }, .clock = .awake } } else .none;

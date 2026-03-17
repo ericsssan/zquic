@@ -3218,13 +3218,6 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Does NOT advance stream.send_offset (caller is responsible for that).
         fn encryptAndEnqueueStreamFrame(self: *Self, id: u62, offset: u62, data: []const u8, fin: bool) !void {
             self.idle_ping_count = 0; // real data → reset idle PING counter
-            // Pacing: spread packets to avoid queue overflow.
-            // Token bucket refilled each call based on elapsed time.
-            const tokens = self.congestion.pacingRefill(self.current_time_ns);
-            const pkt_size = data.len + 50;
-            if (tokens < pkt_size and !fin) {
-                return error.SendQueueFull;
-            }
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream = .{
                 .stream_id = id, .offset = offset, .fin = fin, .data = data,
@@ -3236,7 +3229,6 @@ pub fn Connection(comptime max_streams: usize) type {
             } };
             fi.count = 1;
             _ = try self.sendShortHeaderPacket(fpos, fi, true);
-            self.congestion.pacingConsume(pkt_size);
         }
 
         fn queueStreamData(self: *Self, id: u62, data: []const u8, fin: bool) !void {
