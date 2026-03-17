@@ -17,10 +17,9 @@ const os = std.os;
 const page_allocator = std.heap.page_allocator;
 const DEFAULT_PORT: u16 = 443;
 const MAX_DATAGRAM = 1452;
-// Chunk size must fit inside a single QUIC packet. MAX_DATAGRAM=1452 minus
-// short header(13) + STREAM frame header(up to 17 for large offsets) + AEAD(16)
-// = 46 bytes worst case. Use 1390 for safety with large offset varints.
-const SEND_CHUNK: usize = 1390;
+// Chunk size must fit inside a single QUIC packet (MAX_DATAGRAM=1452 minus
+// short header ~13 + AEAD 16 + STREAM frame header ~17 = ~46 bytes overhead).
+const SEND_CHUNK: usize = 1380;
 // Maximum concurrent file transfers per connection.
 const MAX_TRANSFERS = 64;
 
@@ -751,8 +750,11 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
         return true;
     }
 
-    // Short read from positional read on a regular file means EOF.
-    const is_eof = r < read_limit;
+    // Probe for EOF: if partial read, check if next byte exists.
+    const is_eof = if (r < read_limit) true else blk: {
+        var eof_probe: [1]u8 = undefined;
+        break :blk (file.readPositionalAll(io, &eof_probe, t.offset + r) catch 0) == 0;
+    };
 
     // Send data (optionally wrapped in H3 DATA frame).
     if (is_h3) {
