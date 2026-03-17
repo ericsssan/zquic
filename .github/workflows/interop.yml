@@ -96,17 +96,65 @@ jobs:
         if: always()
         run: |
           cd runner
-          echo "=== Interop Results ==="
+          echo "## Interop Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           for f in results_handshake.json results_trk.json results_v2.json; do
             [ -f "$f" ] || continue
+
+            # Print to log
             echo "--- $f ---"
             jq -r '.results | flatten | .[] | "\(.name): \(.result)"' "$f" 2>/dev/null || true
-            bad=$(jq -c '.results | flatten | .[] | select(.result == "failed") | .name' "$f" 2>/dev/null || true)
-            if [ -n "$bad" ]; then
-              echo "::warning::Some tests failed in $f (expected for certain client/server combos)"
-            fi
+
+            # Build summary table from JSON
+            python3 - "$f" >> "$GITHUB_STEP_SUMMARY" << 'PYEOF'
+          import json, sys
+
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
+
+          servers = data.get("servers", [])
+          clients = data.get("clients", [])
+          results = data.get("results", [])
+          if not servers or not clients or not results:
+              sys.exit(0)
+
+          zquic_idx = servers.index("zquic") if "zquic" in servers else None
+          if zquic_idx is None:
+              sys.exit(0)
+
+          # Collect tests
+          tests = set()
+          for s in results:
+              if isinstance(s, list):
+                  for c in s:
+                      if isinstance(c, list):
+                          for r in c:
+                              if isinstance(r, dict) and "name" in r:
+                                  tests.add(r["name"])
+          tests = sorted(tests)
+          if not tests:
+              sys.exit(0)
+
+          symbols = {"succeeded": "pass", "failed": "FAIL", "unsupported": "n/a"}
+
+          print(f"| Test | {' | '.join(clients)} |")
+          print(f"| --- |{' :---: |' * len(clients)}")
+          for test in tests:
+              row = f"| {test} |"
+              for c_idx in range(len(clients)):
+                  sym = "—"
+                  try:
+                      for tr in results[zquic_idx][c_idx]:
+                          if isinstance(tr, dict) and tr.get("name") == test:
+                              sym = symbols.get(tr["result"], tr["result"])
+                              break
+                  except (IndexError, KeyError, TypeError):
+                      pass
+                  row += f" {sym} |"
+              print(row)
+          print()
+          PYEOF
           done
-          echo "=== Done ==="
 
       - name: Update README with results table
         if: always() && hashFiles('runner/results.json') != ''
@@ -213,3 +261,14 @@ jobs:
           name: interop-logs
           path: runner/logs/
           retention-days: 7
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-results
+          path: |
+            runner/results_handshake.json
+            runner/results_trk.json
+            runner/results_v2.json
+          retention-days: 30
