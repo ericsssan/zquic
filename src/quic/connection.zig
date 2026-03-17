@@ -383,8 +383,11 @@ pub fn Connection(comptime max_streams: usize) type {
         // rx_hp_buf and rx_plaintext eliminated — saves 3000 bytes per connection.
 
         /// Stream ID with an active inline borrow (at most one at a time).
-        /// Avoids scanning all streams in flushAllInlineBorrows.
         inline_borrow_stream: ?u62 = null,
+        /// Consecutive idle PTO PINGs sent (no real data to probe).
+        /// Capped at 2 to prevent infinite PING flood after transfers complete.
+        /// Reset to 0 when real stream data is sent.
+        idle_ping_count: u8 = 0,
 
         // Peer stream limits (updated by MAX_STREAMS frames and transport params)
         peer_max_streams_bidi: u62,
@@ -656,6 +659,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .enc_scratch = undefined,
                 // rx_hp_buf and rx_plaintext removed (in-place decrypt)
                 .inline_borrow_stream = null,
+                .idle_ping_count = 0,
                 .peer_max_streams_bidi = 0,
                 .peer_max_streams_uni = 0,
                 .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
@@ -898,7 +902,15 @@ pub fn Connection(comptime max_streams: usize) type {
                                 // Sent unacked stream data as PTO probe (RFC 9002 §6.2:
                                 // "a sender SHOULD include new data in probe datagrams").
                             } else {
-                                self.queuePing() catch {};
+                                // Only PING probe if there's meaningful data in flight
+                                // (not just our own previous PINGs). Without this guard,
+                                // PTO sends infinite PINGs after all transfers complete:
+                                // each PING creates in-flight state → PTO fires → PING → loop.
+                                // Limit to 2 consecutive idle PINGs, then let idle timeout close.
+                                if (self.idle_ping_count < 6) {
+                                    self.queuePing() catch {};
+                                    self.idle_ping_count += 1;
+                                }
                             }
                         } else {
                             // During handshake: flush pending buffered HS data first (covers the case
@@ -3205,6 +3217,7 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Low-level: encrypt and enqueue a STREAM frame at an explicit offset.
         /// Does NOT advance stream.send_offset (caller is responsible for that).
         fn encryptAndEnqueueStreamFrame(self: *Self, id: u62, offset: u62, data: []const u8, fin: bool) !void {
+            self.idle_ping_count = 0; // real data → reset idle PING counter
             // Pacing: spread packets to avoid queue overflow.
             // Token bucket refilled each call based on elapsed time.
             const tokens = self.congestion.pacingRefill(self.current_time_ns);
