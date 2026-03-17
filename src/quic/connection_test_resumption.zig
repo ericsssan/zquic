@@ -217,9 +217,14 @@ fn checkFrameAllowed(comptime Conn: type, f: frame.Frame, epoch: u8, is_zero_rtt
 test "0-RTT rejects ACK frames (RFC 9000 Table 3)" {
     const Conn = Connection(16);
     const ack_frame: frame.Frame = .{ .ack = .{
-        .largest_acked = 0, .ack_delay = 0,
-        .ranges = undefined, .range_count = 0,
-        .ect0 = 0, .ect1 = 0, .ecn_ce = 0, .has_ecn = false,
+        .largest_acked = 0,
+        .ack_delay = 0,
+        .ranges = undefined,
+        .range_count = 0,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
+        .has_ecn = false,
     } };
     // ACK allowed in epoch 0 (Initial) and epoch 2 (1-RTT)
     try testing.expect(checkFrameAllowed(Conn, ack_frame, 0, false));
@@ -247,7 +252,10 @@ test "0-RTT rejects HANDSHAKE_DONE (RFC 9000 Table 3)" {
 test "0-RTT allows STREAM frames" {
     const Conn = Connection(16);
     const stream_frame: frame.Frame = .{ .stream = .{
-        .stream_id = 0, .offset = 0, .fin = false, .data = &.{},
+        .stream_id = 0,
+        .offset = 0,
+        .fin = false,
+        .data = &.{},
     } };
     try testing.expect(checkFrameAllowed(Conn, stream_frame, 2, true));
     try testing.expect(checkFrameAllowed(Conn, stream_frame, 2, false));
@@ -262,10 +270,16 @@ test "0-RTT allows PING and PADDING" {
 test "0-RTT rejects application CONNECTION_CLOSE (0x1d)" {
     const Conn = Connection(16);
     const app_close: frame.Frame = .{ .connection_close = .{
-        .error_code = 0, .frame_type = 0, .reason = "", .is_app = true,
+        .error_code = 0,
+        .frame_type = 0,
+        .reason = "",
+        .is_app = true,
     } };
     const transport_close: frame.Frame = .{ .connection_close = .{
-        .error_code = 0, .frame_type = 0, .reason = "", .is_app = false,
+        .error_code = 0,
+        .frame_type = 0,
+        .reason = "",
+        .is_app = false,
     } };
     // Transport close allowed in 0-RTT, app close not
     try testing.expect(checkFrameAllowed(Conn, transport_close, 2, true));
@@ -416,39 +430,59 @@ test "parseClientHello parses PSK extension fields" {
 
     // Extension: key_share (x25519)
     // ext_data = list_len(2) + group(2) + key_len(2) + key(32) = 38 bytes
-    std.mem.writeInt(u16, buf[w..][0..2], 0x0033, .big); w += 2;
-    std.mem.writeInt(u16, buf[w..][0..2], 38, .big); w += 2;
-    std.mem.writeInt(u16, buf[w..][0..2], 36, .big); w += 2;
-    std.mem.writeInt(u16, buf[w..][0..2], 0x001d, .big); w += 2;
-    std.mem.writeInt(u16, buf[w..][0..2], 32, .big); w += 2;
-    @memset(buf[w..][0..32], 0x55); w += 32;
+    std.mem.writeInt(u16, buf[w..][0..2], 0x0033, .big);
+    w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 38, .big);
+    w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 36, .big);
+    w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 0x001d, .big);
+    w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 32, .big);
+    w += 2;
+    @memset(buf[w..][0..32], 0x55);
+    w += 32;
 
     // Extension: psk_key_exchange_modes (ext_len=2)
-    std.mem.writeInt(u16, buf[w..][0..2], 0x002d, .big); w += 2;
-    std.mem.writeInt(u16, buf[w..][0..2], 2, .big); w += 2;
-    buf[w] = 1; w += 1; // modes_len=1
-    buf[w] = 1; w += 1; // psk_dhe_ke
+    std.mem.writeInt(u16, buf[w..][0..2], 0x002d, .big);
+    w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 2, .big);
+    w += 2;
+    buf[w] = 1;
+    w += 1; // modes_len=1
+    buf[w] = 1;
+    w += 1; // psk_dhe_ke
 
     // Extension: early_data (ext_len=0)
-    std.mem.writeInt(u16, buf[w..][0..2], 0x002a, .big); w += 2;
-    std.mem.writeInt(u16, buf[w..][0..2], 0, .big); w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 0x002a, .big);
+    w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 0, .big);
+    w += 2;
 
     // Extension: pre_shared_key (must be last)
-    std.mem.writeInt(u16, buf[w..][0..2], 0x0029, .big); w += 2;
+    std.mem.writeInt(u16, buf[w..][0..2], 0x0029, .big);
+    w += 2;
     const psk_data_pos = w;
     w += 2; // ext data len placeholder
 
     // PSK identities: list_len(2) + [ id_len(2) + id(8) + age(4) ] = 2+14 = 16
-    std.mem.writeInt(u16, buf[w..][0..2], 14, .big); w += 2; // identities list len
-    std.mem.writeInt(u16, buf[w..][0..2], 8, .big); w += 2; // id len
-    @memset(buf[w..][0..8], 0xBB); w += 8; // id data
-    std.mem.writeInt(u32, buf[w..][0..4], 12345, .big); w += 4; // obfuscated_age
+    std.mem.writeInt(u16, buf[w..][0..2], 14, .big);
+    w += 2; // identities list len
+    std.mem.writeInt(u16, buf[w..][0..2], 8, .big);
+    w += 2; // id len
+    @memset(buf[w..][0..8], 0xBB);
+    w += 8; // id data
+    std.mem.writeInt(u32, buf[w..][0..4], 12345, .big);
+    w += 4; // obfuscated_age
 
     // PSK binders: list_len(2) + [ binder_len(1) + binder(32) ] = 2+33 = 35
     const binders_list_pos = w;
-    std.mem.writeInt(u16, buf[w..][0..2], 33, .big); w += 2; // binders list len
-    buf[w] = 32; w += 1; // binder len
-    @memset(buf[w..][0..32], 0xDD); w += 32; // binder data
+    std.mem.writeInt(u16, buf[w..][0..2], 33, .big);
+    w += 2; // binders list len
+    buf[w] = 32;
+    w += 1; // binder len
+    @memset(buf[w..][0..32], 0xDD);
+    w += 32; // binder data
 
     // Fill PSK ext data length
     std.mem.writeInt(u16, buf[psk_data_pos..][0..2], @intCast(w - psk_data_pos - 2), .big);

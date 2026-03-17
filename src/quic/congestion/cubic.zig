@@ -300,11 +300,11 @@ test "cubic: w_est accumulates across ACKs in CUBIC phase" {
 
     // Set up a scenario where w_cubic < w_est so TCP-friendly phase is active.
     // Use a very large w_max relative to cwnd_at_epoch so w_cubic stays below w_est.
-    c.w_max = 1.0e10;  // Very large pre-loss cwnd (simulates old high window)
-    c.k = 100.0;  // Large K so we're far from inflection point
+    c.w_max = 1.0e10; // Very large pre-loss cwnd (simulates old high window)
+    c.k = 100.0; // Large K so we're far from inflection point
     c.epoch_start_ns = 0;
     c.cwnd_at_epoch = @floatFromInt(c.cwnd);
-    c.w_est = @as(f64, @floatFromInt(c.cwnd)) + 1000.0;  // w_est > w_cubic initially
+    c.w_est = @as(f64, @floatFromInt(c.cwnd)) + 1000.0; // w_est > w_cubic initially
 
     c.onAckReceived(MSS, 50_000_000, 100_000_000);
     try testing.expect(c.w_est > w_est_after_loss);
@@ -400,8 +400,8 @@ test "cubic: cwnd_remainder uses saturating arithmetic on extreme target" {
     var c = Cubic.init();
     c.ssthresh = MSS;
     c.cwnd = MSS;
-    c.w_max = 1.0e12;  // Very large w_max
-    c.w_est = 2.0e12;  // w_est >> w_cubic (ensures TCP-friendly phase)
+    c.w_max = 1.0e12; // Very large w_max
+    c.w_est = 2.0e12; // w_est >> w_cubic (ensures TCP-friendly phase)
     c.k = 0.0;
     c.epoch_start_ns = 0;
     c.cwnd_at_epoch = @floatFromInt(c.cwnd);

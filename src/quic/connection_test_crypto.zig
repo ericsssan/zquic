@@ -947,7 +947,6 @@ test "connection: ACK generation with sequential packet arrival" {
         conn.markPnReceived(2, pn);
     }
 
-
     // Verify state
     try testing.expectEqual(@as(u64, 100), conn.hot.rx_pn[2]);
     try testing.expect(conn.hot.rx_pn_valid[2]);

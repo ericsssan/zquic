@@ -130,20 +130,16 @@ fn mmapMirror(size: usize) ![*]align(std.heap.page_size_min) u8 {
     // Reserve 2× contiguous virtual address space.
     const base_raw = c.mmap(null, size * 2, c.PROT_NONE, c.MAP_PRIVATE | c.MAP_ANON, -1, 0);
     if (base_raw == c.MAP_FAILED) return error.MmapFailed;
-    const base: [*]align(std.heap.page_size_min) u8 = @alignCast(@ptrCast(base_raw));
+    const base: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(base_raw));
 
     // Map first half: physical pages at [base, base+size).
-    if (c.mmap(@ptrCast(base), size, c.PROT_READ | c.PROT_WRITE,
-        c.MAP_SHARED | c.MAP_FIXED, fd, 0) == c.MAP_FAILED)
-    {
+    if (c.mmap(@ptrCast(base), size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED | c.MAP_FIXED, fd, 0) == c.MAP_FAILED) {
         _ = c.munmap(@ptrCast(base), size * 2);
         return error.MmapFailed;
     }
 
     // Map second half: SAME physical pages at [base+size, base+2×size).
-    if (c.mmap(@ptrCast(base + size), size, c.PROT_READ | c.PROT_WRITE,
-        c.MAP_SHARED | c.MAP_FIXED, fd, 0) == c.MAP_FAILED)
-    {
+    if (c.mmap(@ptrCast(base + size), size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED | c.MAP_FIXED, fd, 0) == c.MAP_FAILED) {
         _ = c.munmap(@ptrCast(base), size * 2);
         return error.MmapFailed;
     }

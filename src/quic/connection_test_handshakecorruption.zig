@@ -34,9 +34,14 @@ fn setupEstablished(conn: *Conn) void {
 
 fn makeAck(largest: u62, range_count: usize, ranges: [32]frame.AckRange) frame.AckFrame {
     return .{
-        .largest_acked = largest, .ack_delay = 0,
-        .range_count = range_count, .has_ecn = false,
-        .ranges = ranges, .ect0 = 0, .ect1 = 0, .ecn_ce = 0,
+        .largest_acked = largest,
+        .ack_delay = 0,
+        .range_count = range_count,
+        .has_ecn = false,
+        .ranges = ranges,
+        .ect0 = 0,
+        .ect1 = 0,
+        .ecn_ce = 0,
     };
 }
 
@@ -49,18 +54,31 @@ test "sent table: different epochs use different indices — no cross-epoch evic
 
     var stream_fi = loss_recovery_mod.SentFrameInfo{};
     stream_fi.frames[0] = .{ .stream = .{
-        .stream_id = 0, .offset = 0, .len = 1024, .fin = true,
+        .stream_id = 0,
+        .offset = 0,
+        .len = 1024,
+        .fin = true,
     } };
     stream_fi.count = 1;
     _ = table.add(.{
-        .pn = 5, .sent_ns = 100, .size = 1066, .epoch = 2,
-        .ack_eliciting = true, .in_flight = true, .valid = true,
+        .pn = 5,
+        .sent_ns = 100,
+        .size = 1066,
+        .epoch = 2,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .valid = true,
     }, stream_fi);
 
     // Handshake pkn 5 must NOT evict 1-RTT pkn 5
     const evicted = table.add(.{
-        .pn = 5, .sent_ns = 200, .size = 95, .epoch = 1,
-        .ack_eliciting = true, .in_flight = true, .valid = true,
+        .pn = 5,
+        .sent_ns = 200,
+        .size = 95,
+        .epoch = 1,
+        .ack_eliciting = true,
+        .in_flight = true,
+        .valid = true,
     }, .{});
 
     try testing.expect(evicted == null);
@@ -95,15 +113,25 @@ test "sent table: Initial and Handshake coexist, ACK one without affecting other
 
     for (0..6) |pn| {
         _ = table.add(.{
-            .pn = @intCast(pn), .sent_ns = 0, .size = 149,
-            .epoch = 0, .ack_eliciting = true, .in_flight = true, .valid = true,
+            .pn = @intCast(pn),
+            .sent_ns = 0,
+            .size = 149,
+            .epoch = 0,
+            .ack_eliciting = true,
+            .in_flight = true,
+            .valid = true,
         }, .{});
         bif += 149;
     }
     for (0..6) |pn| {
         const evicted = table.add(.{
-            .pn = @intCast(pn), .sent_ns = 0, .size = 752,
-            .epoch = 1, .ack_eliciting = true, .in_flight = true, .valid = true,
+            .pn = @intCast(pn),
+            .sent_ns = 0,
+            .size = 752,
+            .epoch = 1,
+            .ack_eliciting = true,
+            .in_flight = true,
+            .valid = true,
         }, .{});
         try testing.expect(evicted == null);
         bif += 752;
@@ -214,7 +242,9 @@ test "full retransmission lifecycle: loss → retransmit → PTO → re-probe" {
     conn.tick(pto1 + 1);
 
     var probe_sent = false;
-    while (conn.send(&buf) > 0) { probe_sent = true; }
+    while (conn.send(&buf) > 0) {
+        probe_sent = true;
+    }
     try testing.expect(probe_sent);
     try testing.expect(conn.pto_deadline_ns != null);
     try testing.expect(!conn.isClosed());
@@ -314,7 +344,10 @@ test "processLostFrames retransmits STREAM directly when send queue has space" {
     result.lost_frame_count = 1;
     result.lost_frames[0] = loss_recovery_mod.SentFrameInfo{};
     result.lost_frames[0].frames[0] = .{ .stream = .{
-        .stream_id = 0, .offset = 0, .len = 100, .fin = true,
+        .stream_id = 0,
+        .offset = 0,
+        .len = 100,
+        .fin = true,
     } };
     result.lost_frames[0].count = 1;
     result.lost_epochs[0] = 2;
@@ -336,7 +369,10 @@ test "pending stream retransmit arms PTO when drained via tick" {
     conn.current_time_ns = t0;
 
     conn.stream_pending_retx[0] = .{
-        .stream_id = 0, .offset = 0, .len = 50, .fin = true,
+        .stream_id = 0,
+        .offset = 0,
+        .len = 50,
+        .fin = true,
     };
     conn.stream_pending_retx_count = 1;
     const st = conn.streams.getOrCreate(0) orelse return error.TestUnexpectedResult;

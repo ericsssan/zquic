@@ -462,7 +462,6 @@ pub const TlsServer = struct {
                 const age_ns = self.current_time_ns - ticket_data.timestamp;
                 const age_ok = age_ns >= 0 and age_ns < 7 * 24 * 3600 * std.time.ns_per_s;
 
-
                 if (cipher_ok and alpn_ok and age_ok) {
                     // Compute early_secret from PSK for binder validation
                     const zero32 = [_]u8{0} ** 32;
@@ -1101,10 +1100,16 @@ pub fn parseClientHello(data: []const u8) !ClientHelloData {
         if (ext_type == EXT_PRE_SHARED_KEY) {
             var ep: usize = 0;
             // Identities list
-            if (ep + 2 > ext_data.len) { pos += ext_len; continue; }
+            if (ep + 2 > ext_data.len) {
+                pos += ext_len;
+                continue;
+            }
             const identities_len = std.mem.readInt(u16, ext_data[ep..][0..2], .big);
             ep += 2;
-            if (ep + identities_len > ext_data.len) { pos += ext_len; continue; }
+            if (ep + identities_len > ext_data.len) {
+                pos += ext_len;
+                continue;
+            }
             // Parse first identity only
             if (identities_len >= 6) { // min: 2 (id_len) + 0 (id) + 4 (obfuscated_age)
                 const id_len = std.mem.readInt(u16, ext_data[ep..][0..2], .big);
@@ -1120,7 +1125,10 @@ pub fn parseClientHello(data: []const u8) !ClientHelloData {
             // Skip remaining identities
             ep = 2 + identities_len;
             // Binders list
-            if (ep + 2 > ext_data.len) { pos += ext_len; continue; }
+            if (ep + 2 > ext_data.len) {
+                pos += ext_len;
+                continue;
+            }
             const binders_len = std.mem.readInt(u16, ext_data[ep..][0..2], .big);
             // ch_truncated_len: total CH bytes up to but NOT including the binders list.
             // The binders list starts at: ext_data_start + ep

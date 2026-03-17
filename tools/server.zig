@@ -58,8 +58,8 @@ const ALPN = "hq-interop";
 const CID_LEN = quic.connection_id.len; // 8 bytes
 
 const supported_cases = [_][]const u8{
-    "handshake", "transfer", "multiconnect", "multiplexing", "retry", "keyupdate", "v2", "ecn",
-    "connectionmigration", "chacha20", "http3", "resumption", "zerortt",
+    "handshake",           "transfer", "multiconnect", "multiplexing", "retry",   "keyupdate", "v2", "ecn",
+    "connectionmigration", "chacha20", "http3",        "resumption",   "zerortt",
 };
 
 /// True when TESTCASE=http3 — uses H3 framing instead of HTTP/0.9.
@@ -159,7 +159,10 @@ fn computeGlobalTimeout(slots: *const [MAX_CONNS]?*ConnSlot, io: std.Io) std.Io.
         }
         if (!has_active_transfer) {
             for (slot.transfers) |t| {
-                if (t.active) { has_active_transfer = true; break; }
+                if (t.active) {
+                    has_active_transfer = true;
+                    break;
+                }
             }
         }
     }
@@ -560,7 +563,10 @@ fn processPacket(
 fn activatePending(transfers: *[MAX_TRANSFERS]FileTransfer, p: *const PendingTransfer, io: std.Io) void {
     var free_slot: ?*FileTransfer = null;
     for (transfers) |*t| {
-        if (!t.active) { free_slot = t; break; }
+        if (!t.active) {
+            free_slot = t;
+            break;
+        }
     }
     const t = free_slot orelse return; // caller must check before calling
     t.active = true;
@@ -674,7 +680,10 @@ fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
     while (slot.pending_count > 0) {
         var has_free = false;
         for (transfers) |*t| {
-            if (!t.active) { has_free = true; break; }
+            if (!t.active) {
+                has_free = true;
+                break;
+            }
         }
         if (!has_free) break; // Still no room; leave remainder pending.
         slot.pending_count -= 1;
@@ -709,7 +718,10 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
             if (!t.h3_headers_sent) {
                 var hdr_buf: [128]u8 = undefined;
                 const hdr_len = buildH3Headers(&hdr_buf, 404);
-                if (hdr_len == 0) { t.active = false; return false; }
+                if (hdr_len == 0) {
+                    t.active = false;
+                    return false;
+                }
                 conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], true) catch return false;
                 t.h3_headers_sent = true;
             }
@@ -725,7 +737,10 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
     if (is_h3 and !t.h3_headers_sent) {
         var hdr_buf: [128]u8 = undefined;
         const hdr_len = buildH3Headers(&hdr_buf, 200);
-        if (hdr_len == 0) { t.active = false; return false; }
+        if (hdr_len == 0) {
+            t.active = false;
+            return false;
+        }
         conn.streamSend(t.stream_id, hdr_buf[0..hdr_len], false) catch return false;
         t.h3_headers_sent = true;
         return true;
@@ -904,7 +919,10 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
     // Allocate transfer slot
     var free_slot: ?*FileTransfer = null;
     for (transfers) |*t| {
-        if (!t.active) { free_slot = t; break; }
+        if (!t.active) {
+            free_slot = t;
+            break;
+        }
     }
     const t = free_slot orelse {
         // Defer to pending queue
@@ -962,10 +980,10 @@ fn configureEcn(sock: *const net.Socket) !void {
     const fd = sock.handle;
 
     // Socket option level and name constants (from Linux headers)
-    const SOL_IP: i32 = 0;      // IPPROTO_IP
-    const SOL_IPV6: i32 = 41;    // IPPROTO_IPV6
-    const IP_TOS: i32 = 1;       // Type of service
-    const IP_RECVTOS: i32 = 13;  // Receive TOS with datagram
+    const SOL_IP: i32 = 0; // IPPROTO_IP
+    const SOL_IPV6: i32 = 41; // IPPROTO_IPV6
+    const IP_TOS: i32 = 1; // Type of service
+    const IP_RECVTOS: i32 = 13; // Receive TOS with datagram
     const IPV6_TCLASS: i32 = 67; // Traffic class
     const IPV6_RECVTCLASS: i32 = 66; // Receive traffic class
 

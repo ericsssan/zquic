@@ -68,13 +68,13 @@ pub const TransportParams = struct {
 };
 
 pub const PreferredAddress = struct {
-    ipv4_addr: [4]u8,           // IPv4 address
-    ipv4_port: u16,             // IPv4 port
-    ipv6_addr: [16]u8,          // IPv6 address
-    ipv6_port: u16,             // IPv6 port
-    cid: [20]u8,                // Connection ID (max 20 bytes)
-    cid_len: u8,                // Actual length of connection ID
-    reset_token: [16]u8,        // Stateless reset token
+    ipv4_addr: [4]u8, // IPv4 address
+    ipv4_port: u16, // IPv4 port
+    ipv6_addr: [16]u8, // IPv6 address
+    ipv6_port: u16, // IPv6 port
+    cid: [20]u8, // Connection ID (max 20 bytes)
+    cid_len: u8, // Actual length of connection ID
+    reset_token: [16]u8, // Stateless reset token
 };
 
 // ---------------------------------------------------------------------------

@@ -1618,11 +1618,23 @@ pub fn Connection(comptime max_streams: usize) type {
                 return switch (f) {
                     .ack, .crypto, .handshake_done, .new_token => false,
                     .connection_close => |cc| !cc.is_app, // only transport close (0x1c)
-                    .padding, .ping, .stream, .reset_stream, .stop_sending,
-                    .max_data, .max_stream_data, .max_streams_bidi, .max_streams_uni,
-                    .data_blocked, .stream_data_blocked, .streams_blocked_bidi,
-                    .streams_blocked_uni, .new_connection_id, .retire_connection_id,
-                    .path_challenge, .path_response,
+                    .padding,
+                    .ping,
+                    .stream,
+                    .reset_stream,
+                    .stop_sending,
+                    .max_data,
+                    .max_stream_data,
+                    .max_streams_bidi,
+                    .max_streams_uni,
+                    .data_blocked,
+                    .stream_data_blocked,
+                    .streams_blocked_bidi,
+                    .streams_blocked_uni,
+                    .new_connection_id,
+                    .retire_connection_id,
+                    .path_challenge,
+                    .path_response,
                     => true,
                 };
             }
@@ -2540,16 +2552,18 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Include ACK-ECN frame with actual ECN counts received from peer (RFC 9000 §13.2.1).
             // ecn_ect0_recv and ecn_ce_recv are populated by receive() based on ecn_bits parameter.
-            const ack_frame_data: frame.Frame = .{ .ack = .{
-                .largest_acked = @intCast(self.hot.rx_pn[epoch]),
-                .ack_delay = 0,
-                .ranges = ack_ranges,
-                .range_count = ack_range_count,
-                .ect0 = @intCast(@min(self.ecn_ect0_recv[epoch], std.math.maxInt(u62))),
-                .ect1 = 0,  // We don't track ECT(1), only ECT(0)
-                .ecn_ce = @intCast(@min(self.ecn_ce_recv[epoch], std.math.maxInt(u62))),
-                .has_ecn = true,
-            } };
+            const ack_frame_data: frame.Frame = .{
+                .ack = .{
+                    .largest_acked = @intCast(self.hot.rx_pn[epoch]),
+                    .ack_delay = 0,
+                    .ranges = ack_ranges,
+                    .range_count = ack_range_count,
+                    .ect0 = @intCast(@min(self.ecn_ect0_recv[epoch], std.math.maxInt(u62))),
+                    .ect1 = 0, // We don't track ECT(1), only ECT(0)
+                    .ecn_ce = @intCast(@min(self.ecn_ce_recv[epoch], std.math.maxInt(u62))),
+                    .has_ecn = true,
+                },
+            };
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], ack_frame_data);
 
             switch (epoch) {
@@ -3158,12 +3172,17 @@ pub fn Connection(comptime max_streams: usize) type {
             self.idle_ping_count = 0; // real data → reset idle PING counter
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream = .{
-                .stream_id = id, .offset = offset, .fin = fin, .data = data,
+                .stream_id = id,
+                .offset = offset,
+                .fin = fin,
+                .data = data,
             } });
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .stream = .{
-                .stream_id = id, .offset = offset,
-                .len = @intCast(@min(data.len, 0xffff)), .fin = fin,
+                .stream_id = id,
+                .offset = offset,
+                .len = @intCast(@min(data.len, 0xffff)),
+                .fin = fin,
             } };
             fi.count = 1;
             _ = try self.sendShortHeaderPacket(fpos, fi, true);
@@ -3202,11 +3221,15 @@ pub fn Connection(comptime max_streams: usize) type {
         fn queueResetStream(self: *Self, stream_id: u62, error_code: u62, final_size: u62) !void {
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .reset_stream = .{
-                .stream_id = stream_id, .error_code = error_code, .final_size = final_size,
+                .stream_id = stream_id,
+                .error_code = error_code,
+                .final_size = final_size,
             } });
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .reset_stream = .{
-                .stream_id = stream_id, .error_code = error_code, .final_size = final_size,
+                .stream_id = stream_id,
+                .error_code = error_code,
+                .final_size = final_size,
             } };
             fi.count = 1;
             _ = try self.sendShortHeaderPacket(fpos, fi, true);
@@ -3290,7 +3313,8 @@ pub fn Connection(comptime max_streams: usize) type {
         fn queueMaxStreamData(self: *Self, stream_id: u62, new_max: u62) !void {
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .max_stream_data = .{
-                .stream_id = stream_id, .max_data = new_max,
+                .stream_id = stream_id,
+                .max_data = new_max,
             } });
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .max_stream_data = .{ .stream_id = stream_id, .max_data = new_max } };
@@ -3303,7 +3327,8 @@ pub fn Connection(comptime max_streams: usize) type {
         fn queueStreamDataBlocked(self: *Self, stream_id: u62, max: u62) !void {
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream_data_blocked = .{
-                .stream_id = stream_id, .max = max,
+                .stream_id = stream_id,
+                .max = max,
             } });
             // Informational; not tracked for loss recovery.
             _ = try self.sendShortHeaderPacket(fpos, null, false);

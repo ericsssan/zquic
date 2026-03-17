@@ -11,7 +11,6 @@ pub const STREAM_BUF_SIZE: usize = 32768;
 /// Recv buffer stays at 32KB (app consumes promptly via peekContiguous/inline borrow).
 pub const SEND_BUF_SIZE: usize = 65536;
 
-
 pub const StreamState = enum(u8) {
     open,
     half_closed_local, // we sent FIN
