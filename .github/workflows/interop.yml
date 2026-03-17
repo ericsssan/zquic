@@ -60,53 +60,24 @@ jobs:
         run: |
           cd runner
           mkdir -p logs
-          IMPL="-r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest"
-
-          # Run handshake first (fastest sanity check)
           python3 run.py \
             --server zquic \
-            --test handshake \
-            --log-dir logs/handshake \
-            --json results_handshake.json \
-            $IMPL || true
-
-          # Run transfer, retry, keyupdate against all clients
-          python3 run.py \
-            --server zquic \
-            --test transfer,retry,keyupdate \
-            --log-dir logs/transfer_retry_keyupdate \
-            --json results_trk.json \
-            $IMPL || true
-
-          # v2 only works with quiche (only RFC 9369-compliant client)
-          python3 run.py \
-            --server zquic \
-            --client quiche \
-            --test v2 \
-            --log-dir logs/v2 \
-            --json results_v2.json \
-            $IMPL || true
-
-          # Copy last results file for README update step
-          cp results_v2.json results.json 2>/dev/null || \
-          cp results_trk.json results.json 2>/dev/null || \
-          cp results_handshake.json results.json 2>/dev/null || true
+            --log-dir logs \
+            --json results.json \
+            -r zquic=ghcr.io/${{ github.repository_owner }}/zquic-interop:latest \
+            || true
 
       - name: Check results
         if: always()
         run: |
           cd runner
-          echo "## Interop Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          for f in results_handshake.json results_trk.json results_v2.json; do
-            [ -f "$f" ] || continue
+          [ -f results.json ] || { echo "No results file found"; exit 0; }
 
-            # Print to log
-            echo "--- $f ---"
-            jq -r '.results | flatten | .[] | "\(.name): \(.result)"' "$f" 2>/dev/null || true
+          # Print to log
+          jq -r '.results | flatten | .[] | "\(.name): \(.result)"' results.json 2>/dev/null || true
 
-            # Build summary table from JSON
-            python3 - "$f" >> "$GITHUB_STEP_SUMMARY" << 'PYEOF'
+          # Build summary table
+          python3 - results.json >> "$GITHUB_STEP_SUMMARY" << 'PYEOF'
           import json, sys
 
           with open(sys.argv[1]) as f:
@@ -137,6 +108,8 @@ jobs:
 
           symbols = {"succeeded": "pass", "failed": "FAIL", "unsupported": "n/a"}
 
+          print("## Interop Results")
+          print()
           print(f"| Test | {' | '.join(clients)} |")
           print(f"| --- |{' :---: |' * len(clients)}")
           for test in tests:
@@ -152,9 +125,7 @@ jobs:
                       pass
                   row += f" {sym} |"
               print(row)
-          print()
           PYEOF
-          done
 
       - name: Update README with results table
         if: always() && hashFiles('runner/results.json') != ''
@@ -267,8 +238,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: interop-results
-          path: |
-            runner/results_handshake.json
-            runner/results_trk.json
-            runner/results_v2.json
+          path: runner/results.json
           retention-days: 30
