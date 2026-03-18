@@ -779,7 +779,7 @@ test "retry: validate_addr=true, no token: retry_sent event and Retry packet que
 
     // A Retry packet must be in the send queue
     var out: [256]u8 = undefined;
-    const n = conn.send(&out);
+    const n = conn.send(&out, 0);
     try testing.expect(n > 0);
     // Retry first byte is 0xff (v1: type bits 0b11, unused=0xf)
     try testing.expectEqual(@as(u8, 0xff), out[0]);

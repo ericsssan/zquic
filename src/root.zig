@@ -11,7 +11,7 @@
 //!   // On datagram receipt:
 //!   try conn.receive(udp_payload, src_addr, now_ns, io);
 //!   // Drain outgoing datagrams:
-//!   while (conn.send(&out_buf)) |n| { socket.send(out_buf[0..n]); }
+//!   while (conn.send(&out_buf, now_ns)) |n| { socket.send(out_buf[0..n]); }
 //!   // Timer:
 //!   if (conn.nextTimeout()) |deadline_ns| { ... }
 //!   conn.tick(now_ns);
@@ -26,6 +26,8 @@ pub const stream = @import("quic/stream.zig");
 pub const flow_control = @import("quic/flow_control.zig");
 pub const congestion = struct {
     pub const cubic = @import("quic/congestion/cubic.zig");
+    pub const bbr = @import("quic/congestion/bbr.zig");
+    pub const cc = @import("quic/congestion/cc.zig");
 };
 pub const connection_id = @import("quic/connection_id.zig");
 

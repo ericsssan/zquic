@@ -4,7 +4,7 @@
 //! The connection is driven by:
 //!
 //!   connection.receive(data, src) — feed a received UDP datagram
-//!   connection.send(out)          — drain the next UDP datagram to transmit
+//!   connection.send(out, now_ns)   — drain the next UDP datagram to transmit
 //!   connection.nextTimeout()      — nanosecond deadline for tick()
 //!   connection.tick(now_ns)       — drive timer-based events
 //!
@@ -21,7 +21,7 @@ const varint = @import("varint.zig");
 const cid_mod = @import("connection_id.zig");
 const stream_mod = @import("stream.zig");
 const flow_control = @import("flow_control.zig");
-const cubic_mod = @import("congestion/cubic.zig");
+const cc_mod = @import("congestion/cc.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 
 const ConnectionId = cid_mod.ConnectionId;
@@ -149,7 +149,11 @@ const CRYPTO_STAGE_DEPTH = 16;
 /// Maximum bytes in a single staged CRYPTO fragment (conservatively > max QUIC payload).
 pub const CRYPTO_STAGE_FRAG = 1400;
 /// Maximum number of pending stream retransmits when send queue is full.
-const MAX_PENDING_RETX = 32;
+/// Must be large enough to handle worst-case burst losses when pacing
+/// keeps the send queue non-empty during loss detection.  The epoch 2
+/// sent buffer holds up to 128 packets, each with up to 1 stream frame
+/// in practice, so 128 covers the realistic worst case.
+const MAX_PENDING_RETX = 128;
 
 /// A single buffered out-of-order CRYPTO fragment.
 const CryptoStagedFrag = struct {
@@ -161,6 +165,17 @@ const CryptoStagedFrag = struct {
 const SendSlot = struct {
     buf: [MAX_SEND_PACKET_SIZE]u8,
     len: usize,
+};
+
+/// Per-slot metadata for deferred wire-time accounting.
+/// Stored in parallel with SendSlot; consumed by send() to call
+/// loss.onPacketSent at wire time rather than queue time.
+const SendMeta = struct {
+    pn: u64 = 0,
+    epoch: u8 = 0,
+    size: u16 = 0,
+    ack_eliciting: bool = false,
+    frame_info: loss_recovery_mod.SentFrameInfo = .{},
 };
 
 // ---------------------------------------------------------------------------
@@ -269,7 +284,7 @@ pub fn Connection(comptime max_streams: usize) type {
         conn_flow: flow_control.FlowController,
 
         // Congestion control
-        congestion: cubic_mod.Cubic,
+        congestion: cc_mod.CongestionControl,
 
         // Loss recovery (RTT estimation, sent-packet tracking, PTO)
         loss: loss_recovery_mod.LossRecovery,
@@ -282,8 +297,13 @@ pub fn Connection(comptime max_streams: usize) type {
 
         // Send queue (ring buffer of ready-to-send packets)
         sq: [SEND_QUEUE_DEPTH]SendSlot,
+        sq_meta: [SEND_QUEUE_DEPTH]SendMeta,
         sq_head: usize,
         sq_tail: usize,
+        /// Bytes in the send queue (ack-eliciting only) that have not yet
+        /// been handed to the socket.  Complements loss.bytes_in_flight which
+        /// counts wire-sent bytes only.
+        bytes_queued: u64,
 
         // Timers
         idle_deadline_ns: ?i64,
@@ -572,15 +592,17 @@ pub fn Connection(comptime max_streams: usize) type {
                     config.initial_max_data,
                     config.initial_max_data,
                 ),
-                .congestion = cubic_mod.Cubic.init(),
+                .congestion = cc_mod.CongestionControl.init(),
                 .loss = loss_recovery_mod.LossRecovery.init(),
                 .current_time_ns = 0,
                 .cached_max_ack_delay_ns = 25_000_000,
                 .cached_ack_delay_exp = 3,
                 .idle_timeout_i64 = idle_timeout_i64,
                 .sq = undefined,
+                .sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH,
                 .sq_head = 0,
                 .sq_tail = 0,
+                .bytes_queued = 0,
                 .idle_deadline_ns = null,
                 .pto_deadline_ns = null,
                 .drain_deadline_ns = null,
@@ -760,14 +782,57 @@ pub fn Connection(comptime max_streams: usize) type {
             }
         }
 
+        /// Store per-packet metadata for deferred wire-time accounting.
+        /// Called immediately after enqueueSend() succeeds (sq_tail already
+        /// advanced), so the metadata is written to the slot that was just filled.
+        fn storeSendMeta(self: *Self, pn: u64, epoch: u8, size: usize, ack_eliciting: bool, fi: loss_recovery_mod.SentFrameInfo) void {
+            const idx = (self.sq_tail - 1) & (SEND_QUEUE_DEPTH - 1);
+            const sz: u16 = @intCast(@min(size, 0xffff));
+            self.sq_meta[idx] = .{
+                .pn = pn,
+                .epoch = epoch,
+                .size = sz,
+                .ack_eliciting = ack_eliciting,
+                .frame_info = fi,
+            };
+            if (ack_eliciting) {
+                self.bytes_queued += sz;
+            }
+        }
+
         /// Write the next UDP payload to `out`. Returns bytes written (0 = nothing pending).
-        pub fn send(self: *Self, out: []u8) usize {
+        /// `now_ns` is the wall-clock time used for wire-time accounting (loss recovery,
+        /// pacing, and PTO arming).
+        pub fn send(self: *Self, out: []u8, now_ns: i64) usize {
             // RFC 9000 §10.2: draining state — must not send anything.
             if (self.hot.state == .draining) return 0;
-            if (self.sq_head == self.sq_tail) return 0;
-            const slot = &self.sq[self.sq_head & (SEND_QUEUE_DEPTH - 1)];
+            if (self.sq_head == self.sq_tail) {
+                // Nothing to send — if cwnd has room, we are app-limited.
+                if (self.loss.bytes_in_flight + self.bytes_queued < self.congestion.cwnd) {
+                    self.loss.delivery.app_limited = true;
+                }
+                return 0;
+            }
+            const mask = SEND_QUEUE_DEPTH - 1;
+            const meta = self.sq_meta[self.sq_head & mask];
+            // Pacing gate: refill tokens and check if we can send.
+            const pacing_tokens = self.congestion.pacing.refill(self.congestion.cwnd, now_ns);
+            if (meta.ack_eliciting and pacing_tokens < meta.size and self.congestion.pacing.rate > 0) {
+                return 0;
+            }
+            const slot = &self.sq[self.sq_head & mask];
             const n = @min(slot.len, out.len);
             @memcpy(out[0..n], slot.buf[0..n]);
+            // Wire-time accounting: register with loss recovery now that the
+            // packet is actually leaving the machine.
+            self.loss.onPacketSent(meta.pn, meta.epoch, meta.size, meta.ack_eliciting, now_ns, meta.frame_info);
+            if (meta.ack_eliciting) {
+                self.bytes_queued -|= meta.size;
+                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+            }
+            if (self.congestion.pacing.rate > 0) {
+                self.congestion.pacing.consume(n);
+            }
             self.sq_head += 1;
             self.bytes_sent += n;
             self.pkts_sent += 1;
@@ -775,13 +840,18 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         /// Returns the nanosecond deadline when `tick()` must be called,
-        /// or null if no timer is active.
+        /// or null if no timer is active.  Includes the pacing deadline when
+        /// the send queue is non-empty so the event loop wakes to drain it.
         pub fn nextTimeout(self: *const Self) ?i64 {
             const idle = self.idle_deadline_ns orelse std.math.maxInt(i64);
             const pto = self.pto_deadline_ns orelse std.math.maxInt(i64);
             const drain = self.drain_deadline_ns orelse std.math.maxInt(i64);
             const tl = self.time_loss_alarm_ns orelse std.math.maxInt(i64);
-            const m = @min(@min(@min(idle, pto), drain), tl);
+            const pacing: i64 = if (self.sq_head != self.sq_tail)
+                self.congestion.pacing.nextSendTime() orelse std.math.maxInt(i64)
+            else
+                std.math.maxInt(i64);
+            const m = @min(@min(@min(@min(idle, pto), drain), tl), pacing);
             return if (m == std.math.maxInt(i64)) null else m;
         }
 
@@ -917,7 +987,7 @@ pub fn Connection(comptime max_streams: usize) type {
                             );
                         }
                         if (tl_result.newly_lost > 0) {
-                            self.congestion.onPacketLost(now_ns);
+                            self.congestion.onPacketLost(tl_result.bytes_lost, now_ns);
                             self.processLostFrames(tl_result);
                         }
                         // Reschedule if there are still candidates.
@@ -1008,9 +1078,11 @@ pub fn Connection(comptime max_streams: usize) type {
             // Retransmissions (processLostFrames) bypass this check so loss recovery
             // is never blocked by a temporarily-reduced cwnd after a loss event.
             // Estimate packet size as data.len + 64 bytes of header/AEAD overhead.
-            if (self.loss.bytes_in_flight + data.len + 64 > self.congestion.cwnd) {
+            if (self.loss.bytes_in_flight + self.bytes_queued + data.len + 64 > self.congestion.cwnd) {
                 return error.CongestionWindowFull;
             }
+            // Clear app-limited flag: we are actively sending.
+            self.loss.delivery.app_limited = false;
             try self.queueStreamData(stream_id, data, fin);
         }
 
@@ -2135,11 +2207,10 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
 
-            // Feed acknowledgement data to CUBIC
+            // Feed acknowledgement data to congestion controller
             if (result.newly_acked > 0) {
                 self.congestion.onAckReceived(
-                    result.bytes_acked,
-                    self.loss.rtt.smoothed_rtt,
+                    result.delivery_rate_sample,
                     self.current_time_ns,
                 );
                 self.loss.resetPtoCount();
@@ -2147,7 +2218,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // One congestion event per loss detection (RFC 9438 §5.6)
             if (result.newly_lost > 0) {
-                self.congestion.onPacketLost(self.current_time_ns);
+                self.congestion.onPacketLost(result.bytes_lost, self.current_time_ns);
             }
 
             // Persistent congestion: collapse cwnd when loss span > 3×PTO (RFC 9002 §6.1.2)
@@ -2160,9 +2231,10 @@ pub fn Connection(comptime max_streams: usize) type {
             if (ack.has_ecn) {
                 const ce: u62 = @intCast(@min(ack.ecn_ce, std.math.maxInt(u62)));
                 if (ce > self.ecn_ce_seen[epoch]) {
+                    const ce_delta = ce - self.ecn_ce_seen[epoch];
                     self.ecn_ce_seen[epoch] = ce;
                     if (result.largest_acked_sent_ns) |_| {
-                        self.congestion.onPacketLost(self.current_time_ns);
+                        self.congestion.onEcnCe(ce_delta, self.current_time_ns);
                     }
                 }
             }
@@ -2468,7 +2540,7 @@ pub fn Connection(comptime max_streams: usize) type {
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(offset), .len = @intCast(chunk.len) } };
             fi.count = 1;
-            self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
+            self.storeSendMeta(pn, 0, hdr_len + ct_len, true, fi);
         }
 
         fn sendCryptoChunkEpoch1(self: *Self, chunk: []const u8, offset: u62, fpos: usize) !void {
@@ -2496,7 +2568,7 @@ pub fn Connection(comptime max_streams: usize) type {
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(offset), .len = @intCast(chunk.len) } };
             fi.count = 1;
-            self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
+            self.storeSendMeta(pn, 1, hdr_len + ct_len, true, fi);
         }
 
         // -----------------------------------------------------------------------
@@ -2595,7 +2667,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.count = 0; // ACK is not ack-eliciting; no frame info tracked
-                    self.loss.onPacketSent(pn, 0, hdr_len + ct_len, false, self.current_time_ns, fi);
+                    self.storeSendMeta(pn, 0, hdr_len + ct_len, false, fi);
                 },
                 1 => {
                     // Handshake packet: Long Header, handshake keys
@@ -2620,7 +2692,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.count = 0;
-                    self.loss.onPacketSent(pn, 1, hdr_len + ct_len, false, self.current_time_ns, fi);
+                    self.storeSendMeta(pn, 1, hdr_len + ct_len, false, fi);
                 },
                 2 => {
                     // 1-RTT packet: Short Header, app keys
@@ -2667,10 +2739,7 @@ pub fn Connection(comptime max_streams: usize) type {
             };
 
             if (fi) |frame_info| {
-                self.loss.onPacketSent(pn, 2, out_len, ack_eliciting, self.current_time_ns, frame_info);
-                if (ack_eliciting) {
-                    self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
-                }
+                self.storeSendMeta(pn, 2, out_len, ack_eliciting, frame_info);
             }
             return pn;
         }
@@ -2903,7 +2972,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     } };
                     fi.count = 1;
                     self.crypto_send_offset[0] += chunk_len;
-                    self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
+                    self.storeSendMeta(pn, 0, hdr_len + ct_len, true, fi);
                 },
                 1 => {
                     const hk = self.hs_keys.?.server;
@@ -2940,7 +3009,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     } };
                     fi.count = 1;
                     self.crypto_send_offset[1] += chunk_len;
-                    self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
+                    self.storeSendMeta(pn, 1, hdr_len + ct_len, true, fi);
                 },
                 else => unreachable,
             }
@@ -2954,7 +3023,6 @@ pub fn Connection(comptime max_streams: usize) type {
                 @memcpy(self.crypto_send_saved[epoch][old..end], chunk);
                 self.crypto_send_saved_len[epoch] = @intCast(end);
             }
-            self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
             return chunk_len;
         }
 
@@ -3031,7 +3099,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(sent), .len = @intCast(chunk.len) } };
                     fi.count = 1;
-                    self.loss.onPacketSent(pn, 0, hdr_len + ct_len, true, self.current_time_ns, fi);
+                    self.storeSendMeta(pn, 0, hdr_len + ct_len, true, fi);
                 } else {
                     const hk = self.hs_keys orelse break;
                     const pn = self.hot.tx_pn[1];
@@ -3057,7 +3125,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(sent), .len = @intCast(chunk.len) } };
                     fi.count = 1;
-                    self.loss.onPacketSent(pn, 1, hdr_len + ct_len, true, self.current_time_ns, fi);
+                    self.storeSendMeta(pn, 1, hdr_len + ct_len, true, fi);
                 }
 
                 sent += chunk.len;
@@ -3504,7 +3572,7 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Handle a source address change: reset congestion, request path validation.
         fn onPathMigration(self: *Self, new_addr: SocketAddr, io: std.Io) !void {
             // RFC 9000 §9.4: reset congestion controller on path change.
-            self.congestion = cubic_mod.Cubic.init();
+            self.congestion = cc_mod.CongestionControl.init();
             // RFC 9000 §9.4: reset amplification limit for the new path (separate from old path tracking).
             // Each path must independently satisfy the 3x amplification limit until validated.
             self.bytes_unvalidated_recv = 0;

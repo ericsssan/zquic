@@ -177,7 +177,7 @@ test "time-loss alarm fires for STREAM pkn with sub-threshold gap" {
     conn.queuePing() catch {};
 
     var buf: [1500]u8 = undefined;
-    while (conn.send(&buf) > 0) {}
+    while (conn.send(&buf, 0) > 0) {}
 
     // ACK [6..7],[1..3] — gap at [0,4,5]. pkn 5 gap = 2 < threshold 3.
     var ranges: [32]frame.AckRange = undefined;
@@ -185,7 +185,7 @@ test "time-loss alarm fires for STREAM pkn with sub-threshold gap" {
     ranges[1] = .{ .gap = 1, .ack_range = 2 };
     conn.current_time_ns = t0 + 100_000_000;
     conn.processAck(makeAck(7, 2, ranges), 2) catch {};
-    while (conn.send(&buf) > 0) {}
+    while (conn.send(&buf, 0) > 0) {}
 
     try testing.expect(conn.time_loss_alarm_ns != null);
     const alarm = conn.time_loss_alarm_ns.?;
@@ -194,7 +194,7 @@ test "time-loss alarm fires for STREAM pkn with sub-threshold gap" {
 
     var total: usize = 0;
     while (true) {
-        const n = conn.send(&buf);
+        const n = conn.send(&buf, 0);
         if (n == 0) break;
         total += n;
     }
@@ -224,25 +224,25 @@ test "full retransmission lifecycle: loss → retransmit → PTO → re-probe" {
     conn.queuePing() catch {};
 
     var buf: [1500]u8 = undefined;
-    while (conn.send(&buf) > 0) {}
+    while (conn.send(&buf, 0) > 0) {}
 
     var ranges: [32]frame.AckRange = undefined;
     ranges[0] = .{ .gap = 0, .ack_range = 1 };
     ranges[1] = .{ .gap = 1, .ack_range = 2 };
     conn.current_time_ns = t0 + 100_000_000;
     conn.processAck(makeAck(7, 2, ranges), 2) catch {};
-    while (conn.send(&buf) > 0) {}
+    while (conn.send(&buf, 0) > 0) {}
 
     const alarm = conn.time_loss_alarm_ns orelse return error.TestUnexpectedResult;
     conn.tick(alarm + 1);
-    while (conn.send(&buf) > 0) {}
+    while (conn.send(&buf, 0) > 0) {}
 
     try testing.expect(conn.pto_deadline_ns != null);
     const pto1 = conn.pto_deadline_ns.?;
     conn.tick(pto1 + 1);
 
     var probe_sent = false;
-    while (conn.send(&buf) > 0) {
+    while (conn.send(&buf, 0) > 0) {
         probe_sent = true;
     }
     try testing.expect(probe_sent);
@@ -276,7 +276,7 @@ test "PTO skips Initial retransmit when hs_keys exist to preserve budget for Han
     conn.retransmitCryptoSaved(1);
 
     var buf: [1500]u8 = undefined;
-    while (conn.send(&buf) > 0) {}
+    while (conn.send(&buf, 0) > 0) {}
 
     const remaining = (conn.bytes_unvalidated_recv *| 3) -| conn.bytes_unvalidated_sent;
     // Budget should be consumed by Handshake, not wasted on Initial
@@ -326,6 +326,9 @@ test "sendShortHeaderPacket arms PTO for ack-eliciting packets" {
     conn.current_time_ns = 1_000_000_000;
     conn.pto_deadline_ns = null;
     conn.queuePing() catch {};
+    // Move queued packet to wire so PTO is armed at wire-time.
+    var buf: [1500]u8 = undefined;
+    _ = conn.send(&buf, 0);
     try testing.expect(conn.pto_deadline_ns != null);
 }
 
@@ -338,7 +341,7 @@ test "processLostFrames retransmits STREAM directly when send queue has space" {
 
     conn.streamSend(0, &([_]u8{0xAA} ** 100), true) catch return error.TestUnexpectedResult;
     var buf: [1500]u8 = undefined;
-    while (conn.send(&buf) > 0) {}
+    while (conn.send(&buf, 0) > 0) {}
 
     var result = loss_recovery_mod.AckResult{};
     result.lost_frame_count = 1;
@@ -386,6 +389,9 @@ test "pending stream retransmit arms PTO when drained via tick" {
     conn.tick(t0 + 1);
 
     try testing.expectEqual(@as(u8, 0), conn.stream_pending_retx_count);
+    // Move queued packet to wire so bytes_in_flight and PTO are updated.
+    var buf2: [1500]u8 = undefined;
+    _ = conn.send(&buf2, 0);
     try testing.expect(conn.loss.bytes_in_flight > 0);
     try testing.expect(conn.pto_deadline_ns != null);
 }

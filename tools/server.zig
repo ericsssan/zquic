@@ -1033,10 +1033,11 @@ fn configureEcn(sock: *const net.Socket) !void {
 fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs) void {
     var messages: [SEND_BATCH]net.OutgoingMessage = undefined;
     var count: usize = 0;
+    const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
 
     // Phase 1: collect all outgoing packets into separate buffers.
     while (count < SEND_BATCH) {
-        const n = conn.send(&bufs.bufs[count]);
+        const n = conn.send(&bufs.bufs[count], now_ns);
         if (n == 0) break;
         messages[count] = .{
             .address = dest,

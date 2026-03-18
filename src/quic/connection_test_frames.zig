@@ -15,6 +15,7 @@ const frame = @import("frame.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 const stream_mod = @import("stream.zig");
 const tls = @import("tls.zig");
+const cc_mod = @import("congestion/cc.zig");
 const packet = @import("packet.zig");
 const crypto = @import("crypto.zig");
 const transport_params = @import("transport_params.zig");
@@ -64,7 +65,9 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     var conn = try Connection(16).accept(.{}, io);
 
     conn.congestion.cwnd = 100 * 1200;
-    conn.congestion.ssthresh = 0; // always in CUBIC phase
+    if (cc_mod.selected == .cubic) {
+        conn.congestion.ssthresh = 0; // always in CUBIC phase
+    }
 
     conn.current_time_ns = 0;
     conn.hot.tx_pn[0] = 9; // pretend pn=0..8 were sent
@@ -88,8 +91,12 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     conn.current_time_ns = 3_200_000_000;
     try conn.processAck(ack, 0);
 
-    // Persistent congestion → cwnd = 2 * MSS = 2904 (MSS=1452)
-    try testing.expectEqual(@as(u64, 2 * 1452), conn.congestion.cwnd);
+    // Persistent congestion: CUBIC → cwnd = 2*MSS, BBR → cwnd = 4*MSS (BBR_MIN_CWND).
+    if (cc_mod.selected == .cubic) {
+        try testing.expectEqual(@as(u64, 2 * 1452), conn.congestion.cwnd);
+    } else {
+        try testing.expectEqual(@as(u64, 4 * 1452), conn.congestion.cwnd);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +163,7 @@ test "security: amplification limit lifted after path_validated" {
     try conn.enqueueSend(&[_]u8{0x01} ** 100);
     // Verify the send queue actually accepted the bytes.
     var out: [MAX_PACKET_SIZE]u8 = undefined;
-    try testing.expect(conn.send(&out) > 0);
+    try testing.expect(conn.send(&out, 0) > 0);
 }
 
 // SEC-006: Frame-type per epoch enforcement
