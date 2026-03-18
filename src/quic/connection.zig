@@ -835,15 +835,17 @@ pub fn Connection(comptime max_streams: usize) type {
             }
             self.sq_head += 1;
 
-            // Coalesce: when the first packet is long-header (Initial/Handshake),
-            // append subsequent packets into the same UDP datagram (RFC 9000 §12.2).
-            // This includes the first 1-RTT packet (typically HANDSHAKE_DONE) so
-            // the entire handshake response travels as a single loss event.
+            // Coalesce: append consecutive long-header packets (epoch 0/1) into
+            // the same UDP datagram (RFC 9000 §12.2).  This halves handshake loss
+            // probability under lossy networks.  Do NOT coalesce 1-RTT packets —
+            // that breaks connection migration (Handshake ACK + 1-RTT data in one
+            // datagram confuses path validation).
             if (meta.epoch < 2) {
                 while (self.sq_head < self.sq_tail) {
                     const next_meta = self.sq_meta[self.sq_head & mask];
+                    if (next_meta.epoch >= 2) break;
                     const next_slot = &self.sq[self.sq_head & mask];
-                    if (total + next_slot.len > out.len) break; // won't fit
+                    if (total + next_slot.len > out.len) break;
                     @memcpy(out[total..][0..next_slot.len], next_slot.buf[0..next_slot.len]);
                     self.loss.onPacketSent(next_meta.pn, next_meta.epoch, next_meta.size, next_meta.ack_eliciting, now_ns, next_meta.frame_info);
                     if (next_meta.ack_eliciting) {
@@ -852,9 +854,6 @@ pub fn Connection(comptime max_streams: usize) type {
                     }
                     total += next_slot.len;
                     self.sq_head += 1;
-                    // Stop after first 1-RTT packet — don't coalesce data packets
-                    // (that would defeat pacing).
-                    if (next_meta.epoch >= 2) break;
                 }
             }
 
