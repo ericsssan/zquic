@@ -108,11 +108,16 @@ fn extractDcid(data: []const u8) ?[CID_LEN]u8 {
 }
 
 /// Find a connection slot by its local DCID.
+/// Also checks first_initial_dcid so that retransmitted client Initials
+/// (which use the original random DCID, not the server's SCID) are routed
+/// to the existing connection instead of creating a duplicate.
 fn findConnByDcid(slots: *const [MAX_CONNS]?*ConnSlot, dcid: [CID_LEN]u8) ?*ConnSlot {
     for (slots.*) |slot_opt| {
         const slot = slot_opt orelse continue;
         if (std.mem.eql(u8, &slot.conn.local_cid.bytes, &dcid)) return slot;
         if (std.mem.eql(u8, &slot.conn.alt_local_cid.bytes, &dcid)) return slot;
+        if (slot.conn.first_initial_dcid_len == CID_LEN and
+            std.mem.eql(u8, slot.conn.first_initial_dcid[0..CID_LEN], &dcid)) return slot;
     }
     return null;
 }
