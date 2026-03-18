@@ -4,21 +4,35 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Congestion control algorithm selection: bbr (default) or cubic.
+    const Algorithm = enum { bbr, cubic };
+    const congestion = b.option(Algorithm, "congestion", "Congestion control algorithm: bbr (default) or cubic") orelse .bbr;
+    const congestion_cubic = congestion == .cubic;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "congestion_cubic", congestion_cubic);
+    const build_options_mod = build_options.createModule();
+
     // Public module: consumers import this as @import("zquic")
     const zquic_mod = b.addModule("zquic", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
     });
 
     // Static library artifact
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_mod.addImport("build_options", build_options_mod);
     const lib = b.addLibrary(.{
         .name = "zquic",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = lib_mod,
     });
     b.installArtifact(lib);
 
@@ -83,6 +97,8 @@ pub fn build(b: *std.Build) void {
         "src/quic/stream.zig",
         "src/quic/flow_control.zig",
         "src/quic/congestion/cubic.zig",
+        "src/quic/congestion/bbr.zig",
+        "src/quic/congestion/common.zig",
         "src/quic/transport_params.zig",
         "src/quic/loss_recovery.zig",
         "src/quic/tls.zig",
@@ -104,6 +120,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+        mod.addImport("build_options", build_options_mod);
         const t = b.addTest(.{ .root_module = mod });
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);

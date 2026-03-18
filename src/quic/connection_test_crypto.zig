@@ -11,6 +11,7 @@ const SocketAddr = conn_mod.SocketAddr;
 const frame = @import("frame.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 const tls = @import("tls.zig");
+const cc_mod = @import("congestion/cc.zig");
 const packet = @import("packet.zig");
 const crypto = @import("crypto.zig");
 const transport_params = @import("transport_params.zig");
@@ -76,8 +77,13 @@ test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
 
     // CE count recorded
     try testing.expectEqual(@as(u62, 1), conn.ecn_ce_seen[2]);
-    // cwnd must have been reduced (congestion event)
-    try testing.expect(conn.congestion.cwnd < initial_cwnd);
+    // Congestion event: CUBIC reduces cwnd, BBR reduces inflight_hi.
+    if (cc_mod.selected == .cubic) {
+        try testing.expect(conn.congestion.cwnd < initial_cwnd);
+    } else {
+        // BBR: inflight_hi should have been reduced by onEcnCe.
+        try testing.expect(conn.congestion.inflight_hi < std.math.maxInt(u64));
+    }
 }
 
 test "ecn: CE count non-increase is ignored (monotonic guard)" {

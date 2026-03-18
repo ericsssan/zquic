@@ -1,0 +1,7 @@
+.zig-cache
+zig-cache
+zig-out
+.git
+.github
+.claude
+.serena
