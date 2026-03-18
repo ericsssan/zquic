@@ -803,6 +803,10 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Write the next UDP payload to `out`. Returns bytes written (0 = nothing pending).
         /// `now_ns` is the wall-clock time used for wire-time accounting (loss recovery,
         /// pacing, and PTO arming).
+        ///
+        /// RFC 9000 §12.2: coalesces consecutive long-header packets (Initial +
+        /// Handshake) into a single UDP datagram so they share one loss event
+        /// instead of being independently dropped.
         pub fn send(self: *Self, out: []u8, now_ns: i64) usize {
             // RFC 9000 §10.2: draining state — must not send anything.
             if (self.hot.state == .draining) return 0;
@@ -821,22 +825,42 @@ pub fn Connection(comptime max_streams: usize) type {
                 return 0;
             }
             const slot = &self.sq[self.sq_head & mask];
-            const n = @min(slot.len, out.len);
-            @memcpy(out[0..n], slot.buf[0..n]);
-            // Wire-time accounting: register with loss recovery now that the
-            // packet is actually leaving the machine.
+            var total = @min(slot.len, out.len);
+            @memcpy(out[0..total], slot.buf[0..total]);
+            // Wire-time accounting for the first packet.
             self.loss.onPacketSent(meta.pn, meta.epoch, meta.size, meta.ack_eliciting, now_ns, meta.frame_info);
             if (meta.ack_eliciting) {
                 self.bytes_queued -|= meta.size;
                 self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
             }
-            if (self.congestion.pacing.rate > 0) {
-                self.congestion.pacing.consume(n);
-            }
             self.sq_head += 1;
-            self.bytes_sent += n;
+
+            // Coalesce: append consecutive long-header packets (epoch 0/1) into
+            // the same UDP datagram.  This halves handshake loss probability under
+            // lossy networks (one datagram = one loss chance vs two).
+            if (meta.epoch < 2) {
+                while (self.sq_head < self.sq_tail) {
+                    const next_meta = self.sq_meta[self.sq_head & mask];
+                    if (next_meta.epoch >= 2) break; // don't coalesce 1-RTT
+                    const next_slot = &self.sq[self.sq_head & mask];
+                    if (total + next_slot.len > out.len) break; // won't fit
+                    @memcpy(out[total..][0..next_slot.len], next_slot.buf[0..next_slot.len]);
+                    self.loss.onPacketSent(next_meta.pn, next_meta.epoch, next_meta.size, next_meta.ack_eliciting, now_ns, next_meta.frame_info);
+                    if (next_meta.ack_eliciting) {
+                        self.bytes_queued -|= next_meta.size;
+                        self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                    }
+                    total += next_slot.len;
+                    self.sq_head += 1;
+                }
+            }
+
+            if (self.congestion.pacing.rate > 0) {
+                self.congestion.pacing.consume(total);
+            }
+            self.bytes_sent += total;
             self.pkts_sent += 1;
-            return n;
+            return total;
         }
 
         /// Returns the nanosecond deadline when `tick()` must be called,
@@ -914,7 +938,7 @@ pub fn Connection(comptime max_streams: usize) type {
                                 // (not just our own previous PINGs). Without this guard,
                                 // PTO sends infinite PINGs after all transfers complete:
                                 // each PING creates in-flight state → PTO fires → PING → loop.
-                                // Limit to 2 consecutive idle PINGs, then let idle timeout close.
+                                // Limit to 6 consecutive idle PINGs, then let idle timeout close.
                                 if (self.idle_ping_count < 6) {
                                     self.queuePing() catch {};
                                     self.idle_ping_count += 1;
