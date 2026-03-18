@@ -19,12 +19,15 @@ pub const K_GRANULARITY_NS: u64 = 1_000_000; // 1ms minimum timer granularity
 pub const K_INITIAL_RTT_NS: u64 = 10_000_000; // 10ms — balanced conservative estimate
 pub const MAX_SENT: usize = 256; // Ring buffer capacity
 pub const MAX_FRAMES_PER_PACKET: usize = 4;
-// Per-ACK capacity for acked/lost frame tracking.
+// Per-ACK capacity for lost frame tracking.
 // Lost frames: detectLoss defers packets that don't fit to the next alarm round
 // (see detectLoss — skips eviction instead of silently dropping retransmit info).
-// Acked frames: each ACK typically covers only a few newly-acked packets in
-// practice, so 64 is sufficient for acked_frames.
 pub const MAX_LOSS_EVENTS: usize = 64;
+// Acked frames: must match the largest epoch's sent buffer (EPOCH_SIZES[2] = 128)
+// so that a single ACK covering all in-flight packets never overflows.  Overflow
+// silently drops frame info, preventing send_acked from advancing (same class of
+// bug as SACK overflow — permanent stream buffer stall).
+pub const MAX_ACKED_FRAMES: usize = MAX_SENT / 2; // 128 — matches epoch 2
 
 // ---------------------------------------------------------------------------
 // FrameInfo — per-frame metadata for retransmission
@@ -117,6 +120,26 @@ pub const SentPacket = struct {
     ack_eliciting: bool,
     in_flight: bool,
     valid: bool, // true = slot occupied
+
+    // BBR delivery rate tracking:
+    delivered: u64 = 0, // total bytes delivered at send time
+    delivered_ns: i64 = 0, // timestamp of last delivery at send time
+    first_sent_ns: i64 = 0, // send time of first packet in current delivery sample
+    is_app_limited: bool = false, // was sender app-limited when this was sent?
+};
+
+/// Per-ACK delivery rate sample, passed to the congestion controller.
+pub const DeliveryRateSample = @import("congestion/common.zig").DeliveryRateSample;
+
+/// Connection-level delivery tracking counters (lives on LossRecovery).
+pub const DeliveryState = struct {
+    delivered: u64 = 0, // cumulative bytes delivered
+    delivered_ns: i64 = 0, // time of most recent delivery
+    first_sent_ns: i64 = 0, // send time of first undelivered packet
+    app_limited: bool = false, // currently app-limited?
+
+    // Round-trip counting (BBR uses rounds, not wall clock).
+    next_round_delivered: u64 = 0,
 };
 
 pub const AckedRange = struct { low: u64, high: u64 };
@@ -139,8 +162,23 @@ pub const AckResult = struct {
     lost_frame_count: usize = 0,
     /// Epoch for each lost packet (parallel to lost_frames)
     lost_epochs: [MAX_LOSS_EVENTS]u8 = undefined,
-    acked_frames: [MAX_LOSS_EVENTS]SentFrameInfo = undefined,
+    acked_frames: [MAX_ACKED_FRAMES]SentFrameInfo = undefined,
     acked_frame_count: usize = 0,
+    /// Delivery rate sample for BBR (computed by LossRecovery.onAckReceived).
+    delivery_rate_sample: DeliveryRateSample = .{},
+    // Internal: delivery snapshot from the highest-pn acked packet.
+    // Used only within LossRecovery to compute delivery_rate_sample.
+    delivery_snap: DeliverySnapshot = .{},
+};
+
+/// Internal snapshot of delivery metadata from the highest-pn acked packet.
+const DeliverySnapshot = struct {
+    delivered: u64 = 0,
+    delivered_ns: i64 = 0,
+    first_sent_ns: i64 = 0,
+    sent_ns: i64 = 0,
+    is_app_limited: bool = false,
+    pn: u64 = 0,
 };
 
 /// Returned by remove() — carries both the packet metadata and its frame info.
@@ -229,9 +267,20 @@ pub const SentPacketTable = struct {
                 if (entry.pkt.in_flight) {
                     bif.* = if (bif.* >= entry.pkt.size) bif.* - entry.pkt.size else 0;
                 }
-                if (result.acked_frame_count < MAX_LOSS_EVENTS) {
+                if (result.acked_frame_count < MAX_ACKED_FRAMES) {
                     result.acked_frames[result.acked_frame_count] = entry.fi;
                     result.acked_frame_count += 1;
+                }
+                // Track the highest-pn acked packet's delivery metadata for rate computation.
+                if (entry.pkt.pn >= result.delivery_snap.pn) {
+                    result.delivery_snap = .{
+                        .pn = entry.pkt.pn,
+                        .delivered = entry.pkt.delivered,
+                        .delivered_ns = entry.pkt.delivered_ns,
+                        .first_sent_ns = entry.pkt.first_sent_ns,
+                        .sent_ns = entry.pkt.sent_ns,
+                        .is_app_limited = entry.pkt.is_app_limited,
+                    };
                 }
             }
         }
@@ -359,6 +408,8 @@ pub const LossRecovery = struct {
     largest_acked: [3]u64, // per epoch [Initial, Handshake, 1-RTT]
     last_ack_eliciting_ns: ?i64,
     pto_count: u32,
+    /// Delivery rate tracking for BBR.
+    delivery: DeliveryState = .{},
 
     pub fn init() LossRecovery {
         return .{
@@ -368,6 +419,7 @@ pub const LossRecovery = struct {
             .largest_acked = [_]u64{0} ** 3,
             .last_ack_eliciting_ns = null,
             .pto_count = 0,
+            .delivery = .{},
         };
     }
 
@@ -382,6 +434,18 @@ pub const LossRecovery = struct {
         frame_info: SentFrameInfo,
     ) void {
         const sz: u16 = @intCast(@min(size, @as(usize, 0xffff)));
+        // Snapshot delivery state into the sent packet for delivery rate computation.
+        // Bootstrap: on the very first send, delivered_ns is 0 which would make the
+        // first ACK's ack_elapsed equal to the full wall-clock timestamp, producing a
+        // near-zero delivery rate.  Seed it with the first send time so the initial
+        // rate sample reflects the actual RTT.
+        if (self.delivery.delivered_ns == 0) {
+            self.delivery.delivered_ns = now_ns;
+        }
+        // Update first_sent_ns if this is the first packet since last ACK.
+        if (self.delivery.first_sent_ns == 0) {
+            self.delivery.first_sent_ns = now_ns;
+        }
         // add() evicts any existing occupant at pn % MAX_SENT.
         // If the evicted packet was still in flight, subtract its size from bytes_in_flight
         // to avoid double-counting (the in-flight accounting for the evicted packet is lost).
@@ -393,6 +457,10 @@ pub const LossRecovery = struct {
             .ack_eliciting = ack_eliciting,
             .in_flight = ack_eliciting,
             .valid = true,
+            .delivered = self.delivery.delivered,
+            .delivered_ns = self.delivery.delivered_ns,
+            .first_sent_ns = self.delivery.first_sent_ns,
+            .is_app_limited = self.delivery.app_limited,
         }, frame_info)) |evicted| {
             if (evicted.in_flight) {
                 self.bytes_in_flight -|= evicted.size;
@@ -434,9 +502,20 @@ pub const LossRecovery = struct {
             }
         }
 
+        // Capture inflight before ACKs for the delivery rate sample.
+        const prior_inflight = self.bytes_in_flight;
+
         // 3. Remove all acknowledged packets
         for (ranges) |r| {
             self.sent.ackRange(r.low, r.high, epoch, &result, &self.bytes_in_flight);
+        }
+
+        // 3b. Update delivery counters (needed before step 4-5, which don't use them).
+        if (result.newly_acked > 0) {
+            self.delivery.delivered += result.bytes_acked;
+            self.delivery.delivered_ns = now_ns;
+            // Reset first_sent_ns so the next send snapshot picks up fresh timing.
+            self.delivery.first_sent_ns = 0;
         }
 
         // 4. Compute time threshold: max(9/8 × max(srtt, latest_rtt), K_GRANULARITY_NS)
@@ -455,6 +534,36 @@ pub const LossRecovery = struct {
             &result,
             &self.bytes_in_flight,
         );
+
+        // 5b. Build delivery rate sample AFTER detectLoss so bytes_lost is populated.
+        if (result.newly_acked > 0) {
+            const snap = result.delivery_snap;
+            const delivered_delta = self.delivery.delivered -| snap.delivered;
+            const ack_elapsed: u64 = if (now_ns > snap.delivered_ns)
+                @intCast(now_ns - snap.delivered_ns)
+            else
+                1;
+            const send_elapsed: u64 = if (snap.sent_ns > snap.first_sent_ns)
+                @intCast(snap.sent_ns - snap.first_sent_ns)
+            else
+                1;
+            const interval = @max(ack_elapsed, send_elapsed);
+
+            const round_start = snap.delivered >= self.delivery.next_round_delivered;
+            if (round_start) {
+                self.delivery.next_round_delivered = self.delivery.delivered;
+            }
+
+            result.delivery_rate_sample = .{
+                .delivery_rate = delivered_delta *| 1_000_000_000 / interval,
+                .is_app_limited = snap.is_app_limited,
+                .rtt_ns = self.rtt.smoothed_rtt,
+                .bytes_acked = result.bytes_acked,
+                .bytes_lost = result.bytes_lost,
+                .prior_inflight = prior_inflight,
+                .round_start = round_start,
+            };
+        }
 
         // 6. Persistent congestion detection (RFC 9002 §6.1.2).
         // If the span between the earliest and latest ack-eliciting lost packets
