@@ -71,12 +71,12 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
 
     conn.current_time_ns = 0;
     conn.hot.tx_pn[0] = 9; // pretend pn=0..8 were sent
-    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(2, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(3, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(4, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(5, 0, 1200, true, 3_200_000_000, .{});
-    conn.loss.onPacketSent(8, 0, 1200, true, 3_200_000_000, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(2, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(3, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(4, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(5, 0, 1200, true, 3_200_000_000, 3_200_000_000, .{});
+    conn.loss.onPacketSent(8, 0, 1200, true, 3_200_000_000, 3_200_000_000, .{});
 
     const ack = frame.AckFrame{
         .largest_acked = 8,

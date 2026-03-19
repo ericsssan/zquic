@@ -175,6 +175,11 @@ const SendMeta = struct {
     epoch: u8 = 0,
     size: u16 = 0,
     ack_eliciting: bool = false,
+    /// Queue-time timestamp for delivery rate computation.  Wire-time
+    /// (now_ns in send()) is used for loss detection timing, but delivery
+    /// rate must use queue-time to avoid pacing delays inflating
+    /// send_elapsed and depressing BBR's bandwidth estimate.
+    queued_ns: i64 = 0,
     frame_info: loss_recovery_mod.SentFrameInfo = .{},
 };
 
@@ -793,6 +798,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .epoch = epoch,
                 .size = sz,
                 .ack_eliciting = ack_eliciting,
+                .queued_ns = self.current_time_ns,
                 .frame_info = fi,
             };
             if (ack_eliciting) {
@@ -820,15 +826,19 @@ pub fn Connection(comptime max_streams: usize) type {
             const mask = SEND_QUEUE_DEPTH - 1;
             const meta = self.sq_meta[self.sq_head & mask];
             // Pacing gate: refill tokens and check if we can send.
+            // Bypassed when the CC is probing (e.g., BBR Startup) to avoid a
+            // negative feedback loop where a low initial estimate throttles sends.
             const pacing_tokens = self.congestion.pacing.refill(self.congestion.cwnd, now_ns);
-            if (meta.ack_eliciting and pacing_tokens < meta.size and self.congestion.pacing.rate > 0) {
+            if (meta.ack_eliciting and pacing_tokens < meta.size and
+                self.congestion.pacing.rate > 0 and self.congestion.shouldPace())
+            {
                 return 0;
             }
             const slot = &self.sq[self.sq_head & mask];
             var total = @min(slot.len, out.len);
             @memcpy(out[0..total], slot.buf[0..total]);
             // Wire-time accounting for the first packet.
-            self.loss.onPacketSent(meta.pn, meta.epoch, meta.size, meta.ack_eliciting, now_ns, meta.frame_info);
+            self.loss.onPacketSent(meta.pn, meta.epoch, meta.size, meta.ack_eliciting, now_ns, meta.queued_ns, meta.frame_info);
             if (meta.ack_eliciting) {
                 self.bytes_queued -|= meta.size;
                 self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
@@ -847,7 +857,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     const next_slot = &self.sq[self.sq_head & mask];
                     if (total + next_slot.len > out.len) break;
                     @memcpy(out[total..][0..next_slot.len], next_slot.buf[0..next_slot.len]);
-                    self.loss.onPacketSent(next_meta.pn, next_meta.epoch, next_meta.size, next_meta.ack_eliciting, now_ns, next_meta.frame_info);
+                    self.loss.onPacketSent(next_meta.pn, next_meta.epoch, next_meta.size, next_meta.ack_eliciting, now_ns, next_meta.queued_ns, next_meta.frame_info);
                     if (next_meta.ack_eliciting) {
                         self.bytes_queued -|= next_meta.size;
                         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);

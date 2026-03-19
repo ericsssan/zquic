@@ -238,7 +238,7 @@ fn fuzzLossRecoveryLoop(_: void, input: FuzzInput) anyerror!void {
         switch (op) {
             0 => {
                 // Send a packet
-                lr.onPacketSent(pn, epoch, 1200, ack_eliciting, now_ns, .{});
+                lr.onPacketSent(pn, epoch, 1200, ack_eliciting, now_ns, now_ns, .{});
                 pn += 1;
                 now_ns += 1_000_000; // +1ms
             },

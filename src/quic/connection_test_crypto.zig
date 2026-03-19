@@ -59,7 +59,7 @@ test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
 
     // Record a sent packet so largest_acked_sent_ns is populated
     conn.hot.tx_pn[2] = 2; // pretend pn=0..1 were sent in epoch 2
-    conn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+    conn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, 1_000_000_000, .{});
 
     const initial_cwnd = conn.congestion.cwnd;
 
@@ -95,12 +95,12 @@ test "ecn: CE count non-increase is ignored (monotonic guard)" {
     conn_ecn.current_time_ns = 1_000_000_000;
     conn_ecn.ecn_ce_seen[2] = 5; // already seen 5
     conn_ecn.hot.tx_pn[2] = 2; // pretend pn=0..1 were sent
-    conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+    conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, 1_000_000_000, .{});
 
     var conn_plain = try Connection(1).accept(.{}, io);
     conn_plain.current_time_ns = 1_000_000_000;
     conn_plain.hot.tx_pn[2] = 2;
-    conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+    conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, 1_000_000_000, .{});
 
     const ack_ecn = frame.AckFrame{
         .largest_acked = 1,
@@ -140,12 +140,12 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
     var conn_ecn = try Connection(1).accept(.{}, io);
     conn_ecn.current_time_ns = 1_000_000_000;
     conn_ecn.hot.tx_pn[2] = 2;
-    conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+    conn_ecn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, 1_000_000_000, .{});
 
     var conn_plain = try Connection(1).accept(.{}, io);
     conn_plain.current_time_ns = 1_000_000_000;
     conn_plain.hot.tx_pn[2] = 2;
-    conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+    conn_plain.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, 1_000_000_000, .{});
 
     const ack_ecn = frame.AckFrame{
         .largest_acked = 1,
@@ -184,7 +184,7 @@ test "ecn: has_ecn=false ACK does not touch ecn_ce_seen" {
     conn.current_time_ns = 1_000_000_000;
     conn.ecn_ce_seen[2] = 99; // pre-set to a non-zero value
     conn.hot.tx_pn[2] = 2;
-    conn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, .{});
+    conn.loss.onPacketSent(1, 2, 1200, true, 1_000_000_000, 1_000_000_000, .{});
 
     const ack = frame.AckFrame{
         .largest_acked = 1,
@@ -683,7 +683,7 @@ test "connection: processAck multi-range gap decoding does not ack gap packets" 
     // Register 8 in-flight packets (pn 0-7) in epoch 2 (1-RTT).
     conn.hot.tx_pn[2] = 8; // pretend pn 0-7 were sent
     for (0..8) |pn| {
-        conn.loss.onPacketSent(@intCast(pn), 2, 1200, true, conn.current_time_ns, .{});
+        conn.loss.onPacketSent(@intCast(pn), 2, 1200, true, conn.current_time_ns, conn.current_time_ns, .{});
     }
     try testing.expectEqual(@as(u64, 8 * 1200), conn.loss.bytes_in_flight);
 
@@ -1936,7 +1936,7 @@ test "connection: ACK ack_delay scaled by cached_ack_delay_exp" {
     conn.hot.tx_pn[2] = 1; // pretend we sent packet #0
     // Seed loss recovery with a sent packet so RTT can update.
     const fi = loss_recovery_mod.SentFrameInfo{};
-    conn.loss.onPacketSent(0, 2, 100, true, 0, fi);
+    conn.loss.onPacketSent(0, 2, 100, true, 0, 0, fi);
 
     const ack_f: frame.Frame = .{
         .ack = .{

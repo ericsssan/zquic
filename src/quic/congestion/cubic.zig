@@ -59,6 +59,11 @@ pub const Cubic = struct {
         return self.cwnd > 0;
     }
 
+    /// CUBIC always paces after the first ACK sets the pacing rate.
+    pub fn shouldPace(_: *const Cubic) bool {
+        return true;
+    }
+
     /// Called when an ACK is received with a delivery rate sample.
     /// CUBIC uses only bytes_acked and rtt_ns from the sample.
     pub fn onAckReceived(self: *Cubic, sample: DeliveryRateSample, now_ns: i64) void {

@@ -203,6 +203,14 @@ pub const Bbr = struct {
         return self.cwnd > 0;
     }
 
+    /// Whether the pacing gate should block sends.  During Startup, BBR
+    /// needs to probe above the current bandwidth estimate — blocking on
+    /// pacing tokens creates a negative feedback loop where a low initial
+    /// estimate throttles sends, preventing BBR from discovering capacity.
+    pub fn shouldPace(self: *const Bbr) bool {
+        return self.filled_pipe;
+    }
+
     /// Called when an ACK is received with a delivery rate sample.
     pub fn onAckReceived(self: *Bbr, sample: DeliveryRateSample, now_ns: i64) void {
         // Increment round count (needed for filter windows), but DON'T reset

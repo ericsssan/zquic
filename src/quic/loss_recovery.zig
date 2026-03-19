@@ -114,7 +114,8 @@ pub const RttEstimator = struct {
 
 pub const SentPacket = struct {
     pn: u64,
-    sent_ns: i64,
+    sent_ns: i64, // wire time — for loss detection / RTT measurement
+    queued_ns: i64 = 0, // queue time — for delivery rate (avoids pacing inflation)
     size: u16,
     epoch: u8,
     ack_eliciting: bool,
@@ -278,7 +279,7 @@ pub const SentPacketTable = struct {
                         .delivered = entry.pkt.delivered,
                         .delivered_ns = entry.pkt.delivered_ns,
                         .first_sent_ns = entry.pkt.first_sent_ns,
-                        .sent_ns = entry.pkt.sent_ns,
+                        .sent_ns = entry.pkt.queued_ns, // queue time, not wire time
                         .is_app_limited = entry.pkt.is_app_limited,
                     };
                 }
@@ -424,6 +425,12 @@ pub const LossRecovery = struct {
     }
 
     /// Record a newly-sent packet.
+    /// `now_ns`    — wire time (when the packet actually leaves the machine).
+    ///               Used for sent_ns (loss detection timing).
+    /// `queued_ns` — queue time (when the application queued the packet).
+    ///               Used for delivery rate snapshots so that pacing delays
+    ///               do not inflate send_elapsed and depress BBR's bandwidth
+    ///               estimate.
     pub fn onPacketSent(
         self: *LossRecovery,
         pn: u64,
@@ -431,6 +438,7 @@ pub const LossRecovery = struct {
         size: usize,
         ack_eliciting: bool,
         now_ns: i64,
+        queued_ns: i64,
         frame_info: SentFrameInfo,
     ) void {
         const sz: u16 = @intCast(@min(size, @as(usize, 0xffff)));
@@ -440,11 +448,11 @@ pub const LossRecovery = struct {
         // near-zero delivery rate.  Seed it with the first send time so the initial
         // rate sample reflects the actual RTT.
         if (self.delivery.delivered_ns == 0) {
-            self.delivery.delivered_ns = now_ns;
+            self.delivery.delivered_ns = queued_ns;
         }
         // Update first_sent_ns if this is the first packet since last ACK.
         if (self.delivery.first_sent_ns == 0) {
-            self.delivery.first_sent_ns = now_ns;
+            self.delivery.first_sent_ns = queued_ns;
         }
         // add() evicts any existing occupant at pn % MAX_SENT.
         // If the evicted packet was still in flight, subtract its size from bytes_in_flight
@@ -452,6 +460,7 @@ pub const LossRecovery = struct {
         if (self.sent.add(.{
             .pn = pn,
             .sent_ns = now_ns,
+            .queued_ns = queued_ns,
             .size = sz,
             .epoch = epoch,
             .ack_eliciting = ack_eliciting,
@@ -735,7 +744,7 @@ test "sent_table: onPacketSent increments bytes_in_flight; ackRange decrements i
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    lr.onPacketSent(5, 0, 1200, true, 0, .{});
+    lr.onPacketSent(5, 0, 1200, true, 0, 0, .{});
     try testing.expectEqual(@as(u64, 1200), lr.bytes_in_flight);
 
     var result = AckResult{};
@@ -752,7 +761,7 @@ test "loss_detection: packet threshold — pn 1-7 declared lost when largest_ack
     // Send pn 1..10 all at time 0
     var pn: u64 = 1;
     while (pn <= 10) : (pn += 1) {
-        lr.onPacketSent(pn, 0, 1200, true, 0, .{});
+        lr.onPacketSent(pn, 0, 1200, true, 0, 0, .{});
     }
 
     // ACK only pn=10; all others remain unacked
@@ -770,7 +779,7 @@ test "loss_detection: time threshold — old packet detected as lost" {
     var lr = LossRecovery.init();
 
     // Send pn=1000 at time 0; pn=1 not sent (not in table)
-    lr.onPacketSent(1000, 0, 1200, true, 0, .{});
+    lr.onPacketSent(1000, 0, 1200, true, 0, 0, .{});
 
     // ACK pn=1 (not in table — no RTT update, initial values used)
     // Initial smoothed_rtt = 333ms, time_threshold ≈ 375ms
@@ -811,7 +820,7 @@ test "sent_table: lastAckElicitingNs returns sent_ns of highest in-flight pn" {
 test "pto: deadline is clamped at 2^5 backoff" {
     const testing = std.testing;
     var lr = LossRecovery.init();
-    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    lr.onPacketSent(1, 0, 1200, true, 0, 0, .{});
 
     const d0 = lr.ptoDeadline(25_000_000).?;
 
@@ -840,7 +849,7 @@ test "rtt: ack_delay exceeding sample_ns does not underflow adjusted_rtt" {
 test "loss_recovery: onAckReceived with empty ranges slice is safe" {
     const testing = std.testing;
     var lr = LossRecovery.init();
-    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    lr.onPacketSent(1, 0, 1200, true, 0, 0, .{});
     const result = lr.onAckReceived(1, 0, &[_]AckedRange{}, 0, 0, 25_000_000);
     // No ranges → nothing acked, nothing lost
     try testing.expectEqual(@as(u32, 0), result.newly_acked);
@@ -855,14 +864,14 @@ test "sent_table: eviction decrements bytes_in_flight to avoid double-counting" 
     const region = SentPacketTable.EPOCH_SIZES[2]; // 128
     var pn: u64 = 0;
     while (pn < region) : (pn += 1) {
-        lr.onPacketSent(pn, 2, 1200, true, 0, .{});
+        lr.onPacketSent(pn, 2, 1200, true, 0, 0, .{});
     }
     const bif_after = lr.bytes_in_flight;
     try testing.expectEqual(@as(u64, region * 1200), bif_after);
 
     // Send pn=128: maps to same slot as pn=0, evicting it.
     // bytes_in_flight should stay the same (evict 1200, add 1200).
-    lr.onPacketSent(region, 2, 1200, true, 0, .{});
+    lr.onPacketSent(region, 2, 1200, true, 0, 0, .{});
     try testing.expectEqual(bif_after, lr.bytes_in_flight);
 }
 
@@ -871,14 +880,14 @@ test "loss_detection: last_ack_eliciting_ns updated after packets declared lost"
     var lr = LossRecovery.init();
 
     // Send one ack-eliciting packet
-    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    lr.onPacketSent(1, 0, 1200, true, 0, 0, .{});
     try testing.expect(lr.last_ack_eliciting_ns != null);
 
     // ACK a much higher pn to trigger loss via packet threshold for pn=1
     // Send pn 2..5 so we have some acked
     var i: u64 = 2;
     while (i <= 10) : (i += 1) {
-        lr.onPacketSent(i, 0, 1200, true, 0, .{});
+        lr.onPacketSent(i, 0, 1200, true, 0, 0, .{});
     }
     const ranges = [_]AckedRange{.{ .low = 10, .high = 10 }};
     _ = lr.onAckReceived(10, 0, &ranges, 0, 0, 25_000_000);
@@ -892,7 +901,7 @@ test "loss_detection: last_ack_eliciting_ns updated after packets declared lost"
 test "pto: deadline saturates on extreme pto values" {
     const testing = std.testing;
     var lr = LossRecovery.init();
-    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    lr.onPacketSent(1, 0, 1200, true, 0, 0, .{});
 
     // Force an extreme smoothed_rtt that would cause overflow without saturation
     lr.rtt.smoothed_rtt = std.math.maxInt(u64) / 4;
@@ -910,7 +919,7 @@ test "pto: deadline doubles per onPtoFired; resets after resetPtoCount" {
     var lr = LossRecovery.init();
 
     // Send one ack-eliciting packet at time 0
-    lr.onPacketSent(1, 0, 1200, true, 0, .{});
+    lr.onPacketSent(1, 0, 1200, true, 0, 0, .{});
 
     const d0 = lr.ptoDeadline(25_000_000);
     try testing.expect(d0 != null);
@@ -968,8 +977,8 @@ test "frame_info: detectLoss populates lost_frames in AckResult" {
     var fi = SentFrameInfo{};
     fi.frames[0] = .{ .stream = .{ .stream_id = 0, .offset = 0, .len = 100, .fin = false } };
     fi.count = 1;
-    lr.onPacketSent(1, 0, 100, true, 0, fi);
-    lr.onPacketSent(10, 0, 100, true, 0, .{});
+    lr.onPacketSent(1, 0, 100, true, 0, 0, fi);
+    lr.onPacketSent(10, 0, 100, true, 0, 0, .{});
 
     const ranges = [_]AckedRange{.{ .low = 10, .high = 10 }};
     const result = lr.onAckReceived(10, 0, &ranges, 0, 0, 25_000_000);
@@ -991,7 +1000,7 @@ test "frame_info: acked packets appear in acked_frames not lost_frames" {
     var fi = SentFrameInfo{};
     fi.frames[0] = .ping;
     fi.count = 1;
-    lr.onPacketSent(1, 0, 50, true, 0, fi);
+    lr.onPacketSent(1, 0, 50, true, 0, 0, fi);
 
     const ranges = [_]AckedRange{.{ .low = 1, .high = 1 }};
     const result = lr.onAckReceived(1, 0, &ranges, 0, 0, 25_000_000);
@@ -1014,7 +1023,7 @@ test "frame_info: MAX_LOSS_EVENTS caps lost_frames output" {
     const N: u64 = MAX_LOSS_EVENTS + 4; // 68
     var pn: u64 = 0;
     while (pn < N) : (pn += 1) {
-        lr.onPacketSent(pn, 2, 100, true, 0, .{});
+        lr.onPacketSent(pn, 2, 100, true, 0, 0, .{});
     }
     const top_pn = N - 1;
     const ranges = [_]AckedRange{.{ .low = top_pn, .high = top_pn }};
@@ -1031,10 +1040,10 @@ test "sent_table: power-of-two slot collision evicts correctly" {
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    lr.onPacketSent(0, 0, 1200, true, 1_000, .{});
+    lr.onPacketSent(0, 0, 1200, true, 1_000, 1_000, .{});
     try testing.expect(lr.sent.get(0, 0) != null);
 
-    lr.onPacketSent(MAX_SENT, 0, 1200, true, 2_000, .{}); // maps to slot 0, evicts pn=0
+    lr.onPacketSent(MAX_SENT, 0, 1200, true, 2_000, 2_000, .{}); // maps to slot 0, evicts pn=0
     try testing.expectEqual(@as(?SentPacket, null), lr.sent.get(0, 0)); // pn=0 gone
     try testing.expect(lr.sent.get(MAX_SENT, 0) != null); // pn=256 present
 }
@@ -1055,14 +1064,14 @@ test "frame_info: ring buffer eviction preserves new packet frame info" {
     // Fill the ring buffer with MAX_SENT packets (no frame info)
     var pn: u64 = 0;
     while (pn < MAX_SENT) : (pn += 1) {
-        lr.onPacketSent(pn, 0, 100, true, 0, .{});
+        lr.onPacketSent(pn, 0, 100, true, 0, 0, .{});
     }
 
     // Send one more that evicts slot 0 (pn=0), record handshake_done frame info
     var fi = SentFrameInfo{};
     fi.frames[0] = .handshake_done;
     fi.count = 1;
-    lr.onPacketSent(MAX_SENT, 0, 100, true, 0, fi);
+    lr.onPacketSent(MAX_SENT, 0, 100, true, 0, 0, fi);
 
     // The new packet's frame info should be stored at slot MAX_SENT % MAX_SENT = 0
     const removed = lr.sent.remove(MAX_SENT, 0).?;
@@ -1083,7 +1092,7 @@ test "sent_table: 128 concurrent unacked packets coexist without eviction" {
     // Send 128 packets with distinct packet numbers 0..127 in epoch 2
     var pn: u64 = 0;
     while (pn < 128) : (pn += 1) {
-        lr.onPacketSent(pn, 2, 1200, true, @as(i64, @intCast(pn)) * 1000, .{});
+        lr.onPacketSent(pn, 2, 1200, true, @as(i64, @intCast(pn)) * 1000, @as(i64, @intCast(pn)) * 1000, .{});
     }
 
     // All 128 must still be present (no eviction for pn < region size)
@@ -1134,8 +1143,8 @@ test "valid_per_epoch: detectLoss decrements on loss" {
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    lr.onPacketSent(1, 0, 100, true, 0, .{});
-    lr.onPacketSent(5, 0, 100, true, 0, .{});
+    lr.onPacketSent(1, 0, 100, true, 0, 0, .{});
+    lr.onPacketSent(5, 0, 100, true, 0, 0, .{});
     try testing.expectEqual(@as(u16, 2), lr.sent.valid_per_epoch[0]);
 
     // ACK pn=5, which triggers loss detection for pn=1 (pn+3 <= 5)
@@ -1157,12 +1166,12 @@ test "persistent_congestion: loss span > 3xPTO sets flag" {
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    lr.onPacketSent(1, 0, 1200, true, 0, .{});
-    lr.onPacketSent(2, 0, 1200, true, 0, .{});
-    lr.onPacketSent(3, 0, 1200, true, 0, .{});
-    lr.onPacketSent(4, 0, 1200, true, 0, .{});
-    lr.onPacketSent(5, 0, 1200, true, 3_200_000_000, .{});
-    lr.onPacketSent(8, 0, 1200, true, 3_200_000_000, .{});
+    lr.onPacketSent(1, 0, 1200, true, 0, 0, .{});
+    lr.onPacketSent(2, 0, 1200, true, 0, 0, .{});
+    lr.onPacketSent(3, 0, 1200, true, 0, 0, .{});
+    lr.onPacketSent(4, 0, 1200, true, 0, 0, .{});
+    lr.onPacketSent(5, 0, 1200, true, 3_200_000_000, 3_200_000_000, .{});
+    lr.onPacketSent(8, 0, 1200, true, 3_200_000_000, 3_200_000_000, .{});
 
     const ranges = [_]AckedRange{.{ .low = 8, .high = 8 }};
     const result = lr.onAckReceived(8, 0, &ranges, 0, 3_200_000_000, 25_000_000);
@@ -1176,10 +1185,10 @@ test "persistent_congestion: loss span <= 3xPTO does not set flag" {
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    lr.onPacketSent(1, 0, 1200, true, 0, .{});
-    lr.onPacketSent(2, 0, 1200, true, 0, .{});
-    lr.onPacketSent(3, 0, 1200, true, 0, .{});
-    lr.onPacketSent(8, 0, 1200, true, 0, .{});
+    lr.onPacketSent(1, 0, 1200, true, 0, 0, .{});
+    lr.onPacketSent(2, 0, 1200, true, 0, 0, .{});
+    lr.onPacketSent(3, 0, 1200, true, 0, 0, .{});
+    lr.onPacketSent(8, 0, 1200, true, 0, 0, .{});
 
     const ranges = [_]AckedRange{.{ .low = 8, .high = 8 }};
     const result = lr.onAckReceived(8, 0, &ranges, 0, 0, 25_000_000);
@@ -1338,7 +1347,7 @@ test "time_loss_alarm: timeLossAlarmNs returns null when largest_acked is 0 in a
     var lr = LossRecovery.init();
 
     // No packets have been acked yet → largest_acked = 0 for all epochs
-    lr.onPacketSent(1, 2, 100, true, 0, .{});
+    lr.onPacketSent(1, 2, 100, true, 0, 0, .{});
     try testing.expectEqual(@as(?i64, null), lr.timeLossAlarmNs(25_000_000));
 }
 
@@ -1351,8 +1360,8 @@ test "time_loss_alarm: timeLossAlarmNs fires after time threshold + max_ack_dela
     // pn=1 packet threshold check: 1+3=4 > 2 → NOT lost by pkt threshold.
     // time_threshold ≈ 9/8 × 40ms = 45ms; max_ack_delay = 25ms.
     // Alarm fires at 0 + 45ms + 25ms = 70ms.
-    lr.onPacketSent(1, 2, 100, true, 0, .{});
-    lr.onPacketSent(2, 2, 100, true, 0, .{});
+    lr.onPacketSent(1, 2, 100, true, 0, 0, .{});
+    lr.onPacketSent(2, 2, 100, true, 0, 0, .{});
 
     const ranges = [_]AckedRange{.{ .low = 2, .high = 2 }};
     _ = lr.onAckReceived(2, 0, &ranges, 2, 40_000_000, 25_000_000);

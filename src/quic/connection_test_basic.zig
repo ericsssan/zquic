@@ -152,7 +152,7 @@ test "loss: onPacketSent wires bytes_in_flight and pto_deadline" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 1_000_000;
-    conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns, conn.current_time_ns, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
     try testing.expect(conn.loss.ptoDeadline(conn.cached_max_ack_delay_ns) != null);
 }
@@ -181,7 +181,7 @@ test "loss: onAckReceived decrements bytes_in_flight" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 0;
-    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
 
     const ranges = [_]loss_recovery_mod.AckedRange{.{ .low = 1, .high = 1 }};
@@ -216,7 +216,7 @@ test "connection: processAck uses packet epoch not connection epoch" {
     conn.current_time_ns = 0;
     conn.hot.tx_pn[0] = 2; // pretend pn=0 and pn=1 were sent in epoch 0
 
-    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
 
     const ack = frame.AckFrame{
@@ -976,7 +976,7 @@ test "loss: multi-packet loss triggers single congestion event" {
     conn.hot.tx_pn[0] = 11; // pretend pn=0..10 were sent
     var pn: u64 = 1;
     while (pn <= 10) : (pn += 1) {
-        conn.loss.onPacketSent(pn, 0, 1200, true, 0, .{});
+        conn.loss.onPacketSent(pn, 0, 1200, true, 0, 0, .{});
     }
 
     // ACK only pn=10; pn=1..7 satisfy K_PACKET_THRESHOLD and are declared lost.
