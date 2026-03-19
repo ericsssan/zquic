@@ -903,6 +903,12 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
 
+            // Flush any Handshake CRYPTO that was buffered when amplification limit
+            // blocked the initial send.  This must run on every tick — not just in
+            // receive() — because under high loss the client's packets may never
+            // arrive to trigger receive(), leaving the pending HS data unsent.
+            self.flushPendingHsCrypto();
+
             // Drain any deferred CRYPTO and stream retransmits before generating new traffic
             self.drainPendingCryptoRetx();
             self.drainPendingStreamRetx();
