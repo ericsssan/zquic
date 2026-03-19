@@ -826,8 +826,6 @@ pub fn Connection(comptime max_streams: usize) type {
             const mask = SEND_QUEUE_DEPTH - 1;
             var meta = self.sq_meta[self.sq_head & mask];
             // Pacing gate: refill tokens and check if we can send.
-            // Bypassed when the CC is probing (e.g., BBR Startup) to avoid a
-            // negative feedback loop where a low initial estimate throttles sends.
             const pacing_tokens = self.congestion.pacing.refill(self.congestion.cwnd, now_ns);
             if (meta.ack_eliciting and pacing_tokens < meta.size and
                 self.congestion.pacing.rate > 0 and self.congestion.shouldPace())
@@ -2315,6 +2313,15 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Refresh PTO timer and time-loss alarm after any ACK.
             self.pto_deadline_ns = self.loss.ptoDeadline(max_ack_delay_ns);
+            // With wire-time accounting, retransmissions queued by processLostFrames
+            // are in bytes_queued (not bytes_in_flight).  ptoDeadline returns null
+            // when bytes_in_flight == 0.  Force-arm PTO when queued data exists so
+            // the server doesn't go silent while pacing drains retransmissions.
+            if (self.pto_deadline_ns == null and self.bytes_queued > 0) {
+                const pto_base = self.loss.rtt.ptoBase(max_ack_delay_ns);
+                const max_i64: u64 = @as(u64, std.math.maxInt(i64));
+                self.pto_deadline_ns = self.current_time_ns +| @as(i64, @intCast(@min(pto_base, max_i64)));
+            }
             // RFC 9002 §6.2.2.1: server MUST keep PTO armed during handshake even
             // when bytes_in_flight == 0.  The peer may have ACKed our Handshake CRYPTO
             // at the QUIC level but not yet processed it at the TLS level (e.g. gaps in

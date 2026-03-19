@@ -396,6 +396,16 @@ pub const Bbr = struct {
     // -----------------------------------------------------------------------
 
     fn updateStartup(self: *Bbr, sample: DeliveryRateSample) void {
+        // Check loss on EVERY ACK, not just round_start.  CUBIC detects loss
+        // immediately and reduces cwnd; BBR must do the same to avoid growing
+        // cwnd from 58 KB to 200+ KB during a single lossy round.  Without
+        // this, the Startup burst overwhelms shallow queues and recovery
+        // from 200+ lost packets exceeds the 64 KB stream buffer.
+        if (self.isExcessiveLoss()) {
+            self.enterDrain();
+            return;
+        }
+
         if (!sample.round_start) return;
 
         // Check for bandwidth plateau.
@@ -407,7 +417,7 @@ pub const Bbr = struct {
             self.full_bw_count += 1;
         }
 
-        if (self.full_bw_count >= BBR_FULL_BW_COUNT or self.isExcessiveLoss()) {
+        if (self.full_bw_count >= BBR_FULL_BW_COUNT) {
             self.enterDrain();
         }
     }
@@ -415,7 +425,11 @@ pub const Bbr = struct {
     fn enterDrain(self: *Bbr) void {
         self.state = .drain;
         self.filled_pipe = true;
-        self.pacing_gain = BBR_DRAIN_PACING_GAIN;
+        // Use 1.0× pacing gain during Drain instead of 0.346×.  The cwnd
+        // target (BDP × cwnd_gain) already limits inflight; the ultra-low
+        // Drain rate (0.346×) makes retransmission recovery 6× slower than
+        // CUBIC's post-loss rate, causing the server to appear dead.
+        self.pacing_gain = 1.0;
         self.cwnd_gain = BBR_CWND_GAIN;
         // If Startup exited due to loss, the cwnd is massively inflated.
         // Set inflight_hi to BDP so cwnd drains properly and ProbeBW starts
@@ -457,7 +471,8 @@ pub const Bbr = struct {
         // retransmissions and ACK aggregation in real networks.
         self.cwnd_gain = BBR_CWND_GAIN;
         self.pacing_gain = switch (phase) {
-            .down => BBR_PROBE_BW_DOWN_PACING_GAIN,
+            .down => 1.0, // Use 1.0× instead of 0.9× — on shallow queues,
+            // 0.9× is too slow for loss recovery and causes server stalls.
             .cruise, .refill => 1.0,
             .up => BBR_PROBE_BW_UP_PACING_GAIN,
         };
@@ -531,10 +546,6 @@ pub const Bbr = struct {
         self.cwnd_gain = 1.0;
         self.probe_rtt_done_ns = null;
         self.probe_rtt_round_done = false;
-        // Reset min_rtt to force re-measurement (Linux BBR v3 behavior).
-        // Without this, a stale min_rtt from early Startup persists and
-        // makes BDP permanently inaccurate.
-        self.min_rtt_ns = std.math.maxInt(u64);
     }
 
     fn updateProbeRtt(self: *Bbr, sample: DeliveryRateSample, now_ns: i64) void {
