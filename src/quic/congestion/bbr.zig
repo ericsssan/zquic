@@ -212,12 +212,11 @@ pub const Bbr = struct {
         return self.cwnd > 0;
     }
 
-    /// Whether the pacing gate should block sends.  During Startup, BBR
-    /// needs to probe above the current bandwidth estimate — blocking on
-    /// pacing tokens creates a negative feedback loop where a low initial
-    /// estimate throttles sends, preventing BBR from discovering capacity.
-    pub fn shouldPace(self: *const Bbr) bool {
-        return self.filled_pipe;
+    /// Whether the pacing gate should block sends.  Always true — the
+    /// bootstrapped initial pacing rate prevents the low-estimate feedback
+    /// loop while still smoothing bursts to avoid queue overflow.
+    pub fn shouldPace(_: *const Bbr) bool {
+        return true;
     }
 
     /// Called when an ACK is received with a delivery rate sample.
