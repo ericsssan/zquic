@@ -169,14 +169,14 @@ pub const Bbr = struct {
     probe_up_rounds: u64, // rounds in UP phase
 
     pub fn init() Bbr {
-        // Bootstrap pacing rate: initial_cwnd / initial_rtt × startup_gain.
-        // Without this, rate stays 0 until the first ACK, then jumps to a
-        // low value based on an underestimated delivery rate, throttling
-        // Startup's ability to probe link capacity.
+        // Bootstrap pacing rate: initial_cwnd / initial_rtt (no startup gain).
+        // Using startup_gain (2.885×) here causes the initial burst to overflow
+        // shallow queues (25 packets fill in 12ms at 4.2 MB/s).  Without the
+        // gain, rate ≈ 1.45 MB/s which stays close to typical link rates.
+        // BBR still discovers capacity through cwnd doubling each round.
         const initial_rate: u64 = @intFromFloat(
             @as(f64, @floatFromInt(INITIAL_CWND)) * 1_000_000_000.0 /
-                @as(f64, @floatFromInt(10_000_000)) * // K_INITIAL_RTT_NS = 10ms
-                BBR_STARTUP_PACING_GAIN,
+                @as(f64, @floatFromInt(10_000_000)), // K_INITIAL_RTT_NS = 10ms
         );
         return .{
             .cwnd = INITIAL_CWND,
@@ -417,13 +417,15 @@ pub const Bbr = struct {
         self.filled_pipe = true;
         self.pacing_gain = BBR_DRAIN_PACING_GAIN;
         self.cwnd_gain = BBR_CWND_GAIN;
-        // Set inflight_hi to current cwnd (pre-drain) as initial upper bound
-        // for subsequent ProbeBW phases.  Also keep cwnd at this level during
-        // Drain: the pacing gain (0.346) already limits new data, and
-        // retransmissions (which bypass the cwnd check) need inflight room
-        // to drain properly.  Reducing cwnd below current inflight with heavy
-        // retransmission loss creates a deadlock where inflight never drains.
-        self.inflight_hi = self.cwnd;
+        // If Startup exited due to loss, the cwnd is massively inflated.
+        // Set inflight_hi to BDP so cwnd drains properly and ProbeBW starts
+        // with a reasonable bound.  Without this, inflight_hi stays at the
+        // Startup peak and cwnd never converges to the actual capacity.
+        if (self.isExcessiveLoss()) {
+            self.inflight_hi = @max(self.bdp(), BBR_MIN_CWND);
+        } else {
+            self.inflight_hi = self.cwnd;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -431,6 +433,11 @@ pub const Bbr = struct {
     // -----------------------------------------------------------------------
 
     fn updateDrain(self: *Bbr, sample: DeliveryRateSample) void {
+        // Apply loss bounding during Drain — continued loss from the Startup
+        // burst should reduce inflight_hi toward BDP, not stay at the peak.
+        if (sample.round_start and self.isExcessiveLoss()) {
+            self.applyLossBounding(true);
+        }
         // Exit Drain when bytes in flight ≤ BDP.
         if (sample.prior_inflight <= self.bdp()) {
             self.enterProbeBw(.down);
@@ -524,6 +531,10 @@ pub const Bbr = struct {
         self.cwnd_gain = 1.0;
         self.probe_rtt_done_ns = null;
         self.probe_rtt_round_done = false;
+        // Reset min_rtt to force re-measurement (Linux BBR v3 behavior).
+        // Without this, a stale min_rtt from early Startup persists and
+        // makes BDP permanently inaccurate.
+        self.min_rtt_ns = std.math.maxInt(u64);
     }
 
     fn updateProbeRtt(self: *Bbr, sample: DeliveryRateSample, now_ns: i64) void {
