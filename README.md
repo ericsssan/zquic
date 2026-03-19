@@ -8,9 +8,11 @@ A QUIC protocol library for Zig. Sans-I/O — you own the socket; the library ow
 - TLS 1.3 server handshake with AES-128-GCM and ChaCha20-Poly1305 (RFC 9001)
 - Session resumption and 0-RTT
 - Loss recovery, RTT estimation, PTO (RFC 9002)
-- CUBIC congestion control (RFC 9438)
+- CUBIC and BBR v3 congestion control (RFC 9438)
 - Stream multiplexing and flow control
 - Path migration and NAT rebinding
+- Pacing with wire-time accounting
+- Packet coalescing (RFC 9000 §12.2)
 - PMTUD, retry tokens, key rotation, ECN
 - Ed25519 and P-256 certificates
 - Zero external dependencies
@@ -18,8 +20,10 @@ A QUIC protocol library for Zig. Sans-I/O — you own the socket; the library ow
 ## Build
 
 ```sh
-zig build test    # run tests
-zig build         # build server binary
+zig build test                  # run tests (default: BBR)
+zig build test -Dcongestion=cubic  # run tests with CUBIC
+zig build                       # build server binary
+zig build -Dcongestion=cubic    # build with CUBIC
 ```
 
 Requires Zig 0.16.0-dev or later.
