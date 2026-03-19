@@ -824,7 +824,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 return 0;
             }
             const mask = SEND_QUEUE_DEPTH - 1;
-            const meta = self.sq_meta[self.sq_head & mask];
+            var meta = self.sq_meta[self.sq_head & mask];
             // Pacing gate: refill tokens and check if we can send.
             // Bypassed when the CC is probing (e.g., BBR Startup) to avoid a
             // negative feedback loop where a low initial estimate throttles sends.
@@ -832,7 +832,32 @@ pub fn Connection(comptime max_streams: usize) type {
             if (meta.ack_eliciting and pacing_tokens < meta.size and
                 self.congestion.pacing.rate > 0 and self.congestion.shouldPace())
             {
-                return 0;
+                // Pacing blocks this ack-eliciting packet.  Scan ahead for a
+                // non-ack-eliciting packet (e.g., ACK-only) that can skip the
+                // gate — the server must always respond to client packets even
+                // when retransmissions are pacing-gated, otherwise the client
+                // sees a dead connection and idle-closes.
+                var found = false;
+                var scan = self.sq_head + 1;
+                while (scan < self.sq_tail) {
+                    const scan_meta = self.sq_meta[scan & mask];
+                    if (!scan_meta.ack_eliciting) {
+                        // Swap this non-ack-eliciting packet to the front.
+                        const scan_slot_idx = scan & mask;
+                        const head_slot_idx = self.sq_head & mask;
+                        const tmp_meta = self.sq_meta[head_slot_idx];
+                        self.sq_meta[head_slot_idx] = self.sq_meta[scan_slot_idx];
+                        self.sq_meta[scan_slot_idx] = tmp_meta;
+                        const tmp_buf = self.sq[head_slot_idx];
+                        self.sq[head_slot_idx] = self.sq[scan_slot_idx];
+                        self.sq[scan_slot_idx] = tmp_buf;
+                        meta = self.sq_meta[self.sq_head & mask];
+                        found = true;
+                        break;
+                    }
+                    scan += 1;
+                }
+                if (!found) return 0;
             }
             const slot = &self.sq[self.sq_head & mask];
             var total = @min(slot.len, out.len);

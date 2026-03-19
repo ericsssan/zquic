@@ -363,13 +363,10 @@ pub const Bbr = struct {
             return;
         }
 
-        // During Drain, keep cwnd at inflight_hi (the pre-drain cwnd) so
-        // retransmissions for Startup losses have room.  Pacing gain (0.346)
-        // limits new data; cwnd just needs to accommodate in-flight bytes.
-        if (self.state == .drain) {
-            self.cwnd = @max(self.inflight_hi, BBR_MIN_CWND);
-            return;
-        }
+        // During Drain, use BDP × cwnd_gain as the target (same as ProbeBW)
+        // so bytes_in_flight can actually drop below BDP, allowing Drain to
+        // exit.  Previously cwnd was locked to inflight_hi (the Startup peak),
+        // which kept bif far above BDP and trapped BBR in Drain permanently.
 
         // Target = BDP × cwnd_gain + extra_acked headroom.
         var target_f: f64 = @as(f64, @floatFromInt(self.bdp())) * self.cwnd_gain +

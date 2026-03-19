@@ -58,7 +58,14 @@ pub const Pacing = struct {
             return self.tokens;
         }
         const elapsed_ns: u64 = @intCast(@max(now_ns - self.last_refill_ns, 0));
-        self.last_refill_ns = now_ns;
+        // Only advance the timestamp when time has actually elapsed.
+        // Repeated calls with the same now_ns (within a drainSend batch)
+        // must NOT reset last_refill_ns, otherwise nextSendTime() computes
+        // a deadline that's already in the past, causing the event loop to
+        // spin instead of sleeping until enough tokens accumulate.
+        if (elapsed_ns > 0) {
+            self.last_refill_ns = now_ns;
+        }
         // Use u128 to avoid saturation on fast links (e.g., 1 GB/s × 1s overflows u64).
         const new_tokens: u64 = @intCast(@min(
             @as(u128, self.rate) * elapsed_ns / 1_000_000_000,
