@@ -169,9 +169,18 @@ pub const Bbr = struct {
     probe_up_rounds: u64, // rounds in UP phase
 
     pub fn init() Bbr {
+        // Bootstrap pacing rate: initial_cwnd / initial_rtt × startup_gain.
+        // Without this, rate stays 0 until the first ACK, then jumps to a
+        // low value based on an underestimated delivery rate, throttling
+        // Startup's ability to probe link capacity.
+        const initial_rate: u64 = @intFromFloat(
+            @as(f64, @floatFromInt(INITIAL_CWND)) * 1_000_000_000.0 /
+                @as(f64, @floatFromInt(10_000_000)) * // K_INITIAL_RTT_NS = 10ms
+                BBR_STARTUP_PACING_GAIN,
+        );
         return .{
             .cwnd = INITIAL_CWND,
-            .pacing = .{},
+            .pacing = .{ .rate = initial_rate, .tokens = INITIAL_CWND, .last_refill_ns = 0 },
             .state = .startup,
             .probe_bw_phase = .down,
             .max_bw = 0,
