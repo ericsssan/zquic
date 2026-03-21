@@ -614,8 +614,10 @@ test "connection: migration resets congestion" {
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 5000 } };
     var empty = [_]u8{};
     try conn.receive(&empty, new_src, 0, 0, io);
-    // RFC 9002 §7.2: initial_window = min(10*1452, max(14720, 2*1452)) = 14520.
-    try testing.expectEqual(@as(u64, 14520), conn.congestion.cwnd);
+    // Congestion state (cwnd) is preserved across migration to avoid throughput
+    // collapse during rapid address changes.  RTT and PTO are reset instead.
+    try testing.expectEqual(@as(u64, 999_999), conn.congestion.cwnd);
+    try testing.expect(!conn.loss.rtt.initialized); // RTT was reset
 }
 
 test "connection: migration sets path_validated false" {

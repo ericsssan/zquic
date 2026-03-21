@@ -267,6 +267,10 @@ pub fn Connection(comptime max_streams: usize) type {
         peer_scid: [20]u8 = [_]u8{0} ** 20,
         peer_scid_len: u8 = 0,
         peer_addr: SocketAddr,
+        /// Previous peer address (before last migration).  Packets from this
+        /// address are silently accepted without triggering re-migration, since
+        /// they are late arrivals from the old path.
+        prev_peer_addr: ?SocketAddr,
 
         // Crypto
         initial_keys: crypto.InitialKeys,
@@ -583,6 +587,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .alt_local_reset_token = alt_local_reset_token,
                 .peer_cid = ConnectionId.zero,
                 .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
+                .prev_peer_addr = null,
                 .initial_keys = .{
                     .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
                     .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
@@ -714,11 +719,12 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Path migration detection (RFC 9000 §9): only in established state,
             // and only when the peer has not disabled active migration.
+            // Ignore packets from the previous peer address — those are late
+            // arrivals from the old path and must not trigger re-migration.
             if (self.hot.state == .established and !self.peer_addr.eql(src)) {
-                if (!self.peer_disable_migration) {
+                const is_prev = if (self.prev_peer_addr) |prev| prev.eql(src) else false;
+                if (!is_prev and !self.peer_disable_migration) {
                     if (SocketAddr.isPortOnlyChange(self.peer_addr, src)) {
-                        // RFC 9000 §9.3.1: port-only change is likely NAT rebinding.
-                        // Skip congestion reset and path validation to preserve throughput.
                         self.onNatRebind(src, io) catch {};
                     } else {
                         self.onPathMigration(src, io) catch {};
@@ -826,36 +832,16 @@ pub fn Connection(comptime max_streams: usize) type {
             const mask = SEND_QUEUE_DEPTH - 1;
             var meta = self.sq_meta[self.sq_head & mask];
             // Pacing gate: refill tokens and check if we can send.
+            // Bypass pacing when nothing is in flight — there is no congestion
+            // to pace for, and blocking here creates a death spiral where the
+            // delivery rate collapses (no data sent → no ACKs → rate drops →
+            // pacing blocks even harder).
             const pacing_tokens = self.congestion.pacing.refill(self.congestion.cwnd, now_ns);
             if (meta.ack_eliciting and pacing_tokens < meta.size and
-                self.congestion.pacing.rate > 0 and self.congestion.shouldPace())
+                self.congestion.pacing.rate > 0 and self.congestion.shouldPace() and
+                self.loss.bytes_in_flight > 0)
             {
-                // Pacing blocks this ack-eliciting packet.  Scan ahead for a
-                // non-ack-eliciting packet (e.g., ACK-only) that can skip the
-                // gate — the server must always respond to client packets even
-                // when retransmissions are pacing-gated, otherwise the client
-                // sees a dead connection and idle-closes.
-                var found = false;
-                var scan = self.sq_head + 1;
-                while (scan < self.sq_tail) {
-                    const scan_meta = self.sq_meta[scan & mask];
-                    if (!scan_meta.ack_eliciting) {
-                        // Swap this non-ack-eliciting packet to the front.
-                        const scan_slot_idx = scan & mask;
-                        const head_slot_idx = self.sq_head & mask;
-                        const tmp_meta = self.sq_meta[head_slot_idx];
-                        self.sq_meta[head_slot_idx] = self.sq_meta[scan_slot_idx];
-                        self.sq_meta[scan_slot_idx] = tmp_meta;
-                        const tmp_buf = self.sq[head_slot_idx];
-                        self.sq[head_slot_idx] = self.sq[scan_slot_idx];
-                        self.sq[scan_slot_idx] = tmp_buf;
-                        meta = self.sq_meta[self.sq_head & mask];
-                        found = true;
-                        break;
-                    }
-                    scan += 1;
-                }
-                if (!found) return 0;
+                return 0;
             }
             const slot = &self.sq[self.sq_head & mask];
             var total = @min(slot.len, out.len);
@@ -1219,6 +1205,28 @@ pub fn Connection(comptime max_streams: usize) type {
         // Internal packet processing
         // -----------------------------------------------------------------------
 
+        /// Compute the wire size of a long-header QUIC packet from its unprotected
+        /// header fields.  Used to skip an unprocessable packet in a coalesced
+        /// datagram without dropping the subsequent packets.
+        fn skipLongHeaderPacket(data: []const u8, raw_dcid_len: u8, raw_pkt_type: packet.PacketType) usize {
+            // Position after: first_byte(1) + version(4) + dcid_len(1) + dcid + scid_len(1) + scid
+            var pos: usize = 6 + @as(usize, raw_dcid_len);
+            if (pos >= data.len) return data.len;
+            const scid_len = data[pos];
+            pos += 1 + @as(usize, scid_len);
+            if (pos > data.len) return data.len;
+            // Initial packets carry a token before the Length field.
+            if (raw_pkt_type == .initial) {
+                const tok_r = varint.decode(data[pos..]) orelse return data.len;
+                pos += tok_r.len + @as(usize, @intCast(tok_r.value));
+                if (pos > data.len) return data.len;
+            }
+            // Length varint: covers PN bytes + ciphertext + AEAD tag.
+            const len_r = varint.decode(data[pos..]) orelse return data.len;
+            pos += len_r.len;
+            return @min(pos + @as(usize, @intCast(len_r.value)), data.len);
+        }
+
         pub fn processOnePacket(self: *Self, data: []u8, src: SocketAddr, io: std.Io) !usize {
             if (data.len == 0) return 0;
 
@@ -1289,21 +1297,29 @@ pub fn Connection(comptime max_streams: usize) type {
             // In established state, all Initial packets (even with matching DCID) must be
             // silently dropped. This handles late/retransmitted Initial packets and new
             // connection attempts that happen to use the same server local_cid.
+            // Skip just this one packet so coalesced Handshake/1-RTT packets can proceed.
             if (raw_pkt_type == .initial and self.hot.state == .established) {
-                return data.len;
+                return skipLongHeaderPacket(data, raw_dcid_len, raw_pkt_type);
             }
 
             // For handshake state Initial packets, validate DCID against the client's original
             // DCID stored from the first Initial.  RFC 9000 §7.2: a client MUST NOT change its
             // Destination CID before receiving the server's first Initial packet, so all Initial
             // retransmissions (including those carrying fragmented ClientHello bytes) must carry
-            // the same variable-length DCID.  The old check compared against local_cid (fixed
-            // 8 bytes) and silently dropped every packet whose dcid_len > 8.
+            // the same variable-length DCID.  However, once the client receives the server's
+            // first Initial, it switches to the server's SCID for all subsequent packets
+            // (RFC 9000 §7.2), so the coalesced Initial ACK uses our local_cid.
+            // Accept both the original DCID and our own local_cid/alt_local_cid.
             if (raw_pkt_type == .initial and self.hot.state == .handshake and
                 self.first_initial_dcid_len > 0)
             {
-                if (!std.mem.eql(u8, raw_dcid, self.first_initial_dcid[0..self.first_initial_dcid_len])) {
-                    return data.len; // Different DCID: belongs to a different connection.
+                const matches_first = std.mem.eql(u8, raw_dcid, self.first_initial_dcid[0..self.first_initial_dcid_len]);
+                const matches_local = raw_dcid_len == cid_mod.len and std.mem.eql(u8, raw_dcid[0..cid_mod.len], &self.local_cid.bytes);
+                const matches_alt = raw_dcid_len == cid_mod.len and std.mem.eql(u8, raw_dcid[0..cid_mod.len], &self.alt_local_cid.bytes);
+                if (!matches_first and !matches_local and !matches_alt) {
+                    // Different DCID: skip just this Initial packet (not the entire
+                    // datagram) so coalesced Handshake/1-RTT packets can still be processed.
+                    return skipLongHeaderPacket(data, raw_dcid_len, raw_pkt_type);
                 }
             }
 
@@ -2377,6 +2393,30 @@ pub fn Connection(comptime max_streams: usize) type {
             }
         }
 
+        /// Declare all in-flight packets in `epoch` as lost: invalidate their
+        /// sent-table entries, reset bytes_in_flight, and queue their stream
+        /// frames for retransmission.  Used on path migration to clean up
+        /// packets that were sent to the old address and will never be ACKed.
+        fn declareEpochLost(self: *Self, epoch: u8) void {
+            const sent = &self.loss.sent;
+            for (&sent.slots, 0..) |*slot, idx| {
+                if (!slot.valid or slot.epoch != epoch) continue;
+                if (slot.in_flight) {
+                    self.loss.bytes_in_flight -|= slot.size;
+                }
+                // Queue stream frames from this packet for retransmission.
+                const fi = sent.frame_info[idx];
+                for (fi.frames[0..fi.count]) |f| {
+                    switch (f) {
+                        .stream => |s| self.deferStreamRetx(s.stream_id, s.offset, s.len, s.fin),
+                        else => {},
+                    }
+                }
+                slot.valid = false;
+                if (epoch < 3) sent.valid_per_epoch[epoch] -|= 1;
+            }
+        }
+
         pub fn processLostFrames(self: *Self, result: loss_recovery_mod.AckResult) void {
             // Sized to MAX_SEND_PACKET_SIZE so getSendData never returns more bytes than
             // encryptAndEnqueueStreamFrame can encode into pkt_scratch without overflow.
@@ -2391,23 +2431,22 @@ pub fn Connection(comptime max_streams: usize) type {
                                 // adjacent buffered data beyond the lost frame boundary).
                                 const n = @min(st.getSendData(s.offset, &stream_retx_buf), s.len);
                                 if (n > 0 or s.fin) {
-                                    self.encryptAndEnqueueStreamFrame(
-                                        s.stream_id,
-                                        s.offset,
-                                        stream_retx_buf[0..n],
-                                        s.fin,
-                                    ) catch {
-                                        // Send queue full — defer for retry in drainPendingStreamRetx()
-                                        if (self.stream_pending_retx_count < MAX_PENDING_RETX) {
-                                            self.stream_pending_retx[self.stream_pending_retx_count] = .{
-                                                .stream_id = s.stream_id,
-                                                .offset = s.offset,
-                                                .len = @intCast(n),
-                                                .fin = s.fin,
-                                            };
-                                            self.stream_pending_retx_count += 1;
-                                        }
+                                    // Cap retransmission queueing to avoid bytes_queued
+                                    // exceeding cwnd.  When bytes_queued is already at
+                                    // or above cwnd, defer remaining retransmissions.
+                                    const enqueued = enq: {
+                                        if (self.bytes_queued + n + 64 > self.congestion.cwnd) break :enq false;
+                                        self.encryptAndEnqueueStreamFrame(
+                                            s.stream_id,
+                                            s.offset,
+                                            stream_retx_buf[0..n],
+                                            s.fin,
+                                        ) catch break :enq false;
+                                        break :enq true;
                                     };
+                                    if (!enqueued) {
+                                        self.deferStreamRetx(s.stream_id, s.offset, @intCast(n), s.fin);
+                                    }
                                 }
                             }
                         },
@@ -2446,6 +2485,18 @@ pub fn Connection(comptime max_streams: usize) type {
                         .max_stream_data, .none => {},
                     }
                 }
+            }
+        }
+
+        fn deferStreamRetx(self: *Self, stream_id: u62, offset: u62, len: u16, fin: bool) void {
+            if (self.stream_pending_retx_count < MAX_PENDING_RETX) {
+                self.stream_pending_retx[self.stream_pending_retx_count] = .{
+                    .stream_id = stream_id,
+                    .offset = offset,
+                    .len = len,
+                    .fin = fin,
+                };
+                self.stream_pending_retx_count += 1;
             }
         }
 
@@ -2812,9 +2863,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 return err;
             };
 
-            if (fi) |frame_info| {
-                self.storeSendMeta(pn, 2, out_len, ack_eliciting, frame_info);
-            }
+            self.storeSendMeta(pn, 2, out_len, ack_eliciting, fi orelse .{});
             return pn;
         }
 
@@ -3405,6 +3454,23 @@ pub fn Connection(comptime max_streams: usize) type {
             var fpos: usize = 0;
             fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .path_challenge = .{ .data = data } });
             _ = self.sendShortHeaderPacket(fpos, null, false) catch return;
+            self.moveLastToFront();
+        }
+
+        /// Move the last enqueued packet to the front of the send queue.
+        /// Used for PATH_CHALLENGE so it is the first packet sent on a new
+        /// path, bypassing any pacing-blocked data without reordering the FIFO.
+        fn moveLastToFront(self: *Self) void {
+            if (self.sq_tail -% self.sq_head < 2) return; // only 0-1 items, nothing to move
+            const mask = SEND_QUEUE_DEPTH - 1;
+            const tail_idx = (self.sq_tail -% 1) & mask;
+            self.sq_head -%= 1;
+            const head_idx = self.sq_head & mask;
+            if (head_idx != tail_idx) {
+                self.sq[head_idx] = self.sq[tail_idx];
+                self.sq_meta[head_idx] = self.sq_meta[tail_idx];
+            }
+            self.sq_tail -%= 1;
         }
 
         /// Process a NEW_CONNECTION_ID frame: store the CID and retire entries below retire_prior_to.
@@ -3645,13 +3711,28 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Handle a source address change: reset congestion, request path validation.
         fn onPathMigration(self: *Self, new_addr: SocketAddr, io: std.Io) !void {
-            // RFC 9000 §9.4: reset congestion controller on path change.
-            self.congestion = cc_mod.CongestionControl.init();
+            // RFC 9000 §9.4 permits resetting congestion state on migration,
+            // but resetting cwnd to INITIAL_CWND kills throughput: the server
+            // must re-probe bandwidth from scratch after every address change.
+            // Instead, preserve the congestion controller and just reset RTT
+            // (the new path may have different latency) and PTO backoff.
+            self.loss.rtt = loss_recovery_mod.RttEstimator{};
+            self.loss.pto_count = 0;
+            // Declare all in-flight 1-RTT packets as lost: they were sent to the
+            // old address and will never be ACKed.  Extract their stream frames
+            // and queue for retransmission on the new path.  Without this,
+            // bytes_in_flight stays elevated (blocking new data via cwnd check)
+            // and loss detection creates a retransmit amplification loop.
+            self.declareEpochLost(2);
+            self.time_loss_alarm_ns = null;
+            self.pto_deadline_ns = null;
             // RFC 9000 §9.4: reset amplification limit for the new path (separate from old path tracking).
             // Each path must independently satisfy the 3x amplification limit until validated.
             self.bytes_unvalidated_recv = 0;
             self.bytes_unvalidated_sent = 0;
             // Immediately adopt new address (RFC 9000 §9.3.1).
+            // Save old address so late-arriving packets don't trigger re-migration.
+            self.prev_peer_addr = self.peer_addr;
             self.peer_addr = new_addr;
             // RFC 9000 §9.3: reset path validation on migration — must re-validate new path.
             self.path_validated = false;
@@ -3667,6 +3748,7 @@ pub fn Connection(comptime max_streams: usize) type {
         /// source port changed.  Preserves congestion state for throughput.
         fn onNatRebind(self: *Self, new_addr: SocketAddr, io: std.Io) !void {
             // Adopt new address without resetting congestion or path validation.
+            self.prev_peer_addr = self.peer_addr;
             self.peer_addr = new_addr;
             // Still send PATH_CHALLENGE to confirm reachability on the new port.
             var challenge: [8]u8 = undefined;

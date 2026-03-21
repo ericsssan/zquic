@@ -39,7 +39,7 @@ COPY . .
 
 RUN set -e; \
     . /build_env.sh; \
-    zig build -Doptimize=ReleaseSafe -Dtarget="${TARGET}" -Dcongestion=cubic
+    zig build -Doptimize=ReleaseSafe -Dtarget="${TARGET}" -Dcongestion=bbr
 
 # Stage 2: Runtime image with network simulator support.
 FROM martenseemann/quic-network-simulator-endpoint:latest

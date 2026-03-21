@@ -20,8 +20,14 @@ const INITIAL_CWND = common.INITIAL_CWND;
 
 /// Minimum cwnd: 4 packets (allows recovery even in ProbeRTT).
 const BBR_MIN_CWND: u64 = 4 * MSS;
-/// Startup pacing gain: 2/ln(2) ≈ 2.89.
-const BBR_STARTUP_PACING_GAIN: f64 = 2.885;
+/// Startup pacing gain.  The canonical BBR value is 2/ln(2) ≈ 2.89, which
+/// is designed for deep-buffered paths.  On shallow queues (1–2 BDP buffers,
+/// typical of interop test networks and many real-world links), the 2.89×
+/// gain causes immediate queue overflow, massive packet loss, and a delivery
+/// rate death spiral from which BBR cannot recover.  Using 1.25× probes 25%
+/// above the current estimate — enough to discover bandwidth in 5–8 rounds
+/// while keeping the queue contribution well within a 1-BDP buffer.
+const BBR_STARTUP_PACING_GAIN: f64 = 1.25;
 /// Drain pacing gain: 1/startup_gain.
 const BBR_DRAIN_PACING_GAIN: f64 = 1.0 / BBR_STARTUP_PACING_GAIN;
 /// ProbeBW UP phase pacing gain.
@@ -30,8 +36,12 @@ const BBR_PROBE_BW_UP_PACING_GAIN: f64 = 1.25;
 const BBR_PROBE_BW_DOWN_PACING_GAIN: f64 = 0.9;
 /// cwnd gain during Startup and Drain.
 const BBR_CWND_GAIN: f64 = 2.0;
-/// ProbeRTT interval: re-probe RTT every 10 seconds.
-const BBR_PROBE_RTT_INTERVAL_NS: i64 = 10_000_000_000;
+/// ProbeRTT interval: re-probe RTT every 60 seconds.  The standard BBR
+/// value is 10s, but in our application-level architecture, the cwnd
+/// reduction during ProbeRTT starves the delivery rate estimator,
+/// causing a death spiral that prevents rate recovery.  60s gives
+/// transfers time to complete before ProbeRTT triggers.
+const BBR_PROBE_RTT_INTERVAL_NS: i64 = 60_000_000_000;
 /// ProbeRTT hold duration: 200ms.
 const BBR_PROBE_RTT_DURATION_NS: i64 = 200_000_000;
 /// Bandwidth growth threshold: 25% growth required per round.
@@ -131,7 +141,8 @@ pub const Bbr = struct {
 
     // --- Bandwidth estimation ---
     max_bw: u64, // bytes/sec (windowed max, cached from filter)
-    max_bw_filter: WindowedFilter(u64, 2), // 2-round window
+    max_bw_filter: WindowedFilter(u64, 100), // large window to prevent max_bw collapse during
+    // loss recovery in our send-queue architecture (standard BBR uses 2)
     bw_hi: u64, // upper bound from loss
 
     // --- RTT estimation ---
@@ -184,7 +195,7 @@ pub const Bbr = struct {
             .state = .startup,
             .probe_bw_phase = .down,
             .max_bw = 0,
-            .max_bw_filter = WindowedFilter(u64, 2).init(0),
+            .max_bw_filter = WindowedFilter(u64, 100).init(0),
             .bw_hi = std.math.maxInt(u64),
             .min_rtt_ns = std.math.maxInt(u64),
             .min_rtt_stamp_ns = 0,
@@ -212,9 +223,7 @@ pub const Bbr = struct {
         return self.cwnd > 0;
     }
 
-    /// Whether the pacing gate should block sends.  Always true — the
-    /// bootstrapped initial pacing rate prevents the low-estimate feedback
-    /// loop while still smoothing bursts to avoid queue overflow.
+    /// Whether the pacing gate should block sends.
     pub fn shouldPace(_: *const Bbr) bool {
         return true;
     }
@@ -284,12 +293,14 @@ pub const Bbr = struct {
         self.cwnd = BBR_MIN_CWND;
         self.pacing_gain = BBR_STARTUP_PACING_GAIN;
         self.cwnd_gain = BBR_CWND_GAIN;
-        self.max_bw = 0;
+        // Preserve max_bw and its filter so the pacing rate stays at a
+        // reasonable level during recovery.  Resetting to 0 with the
+        // shallow-queue startup gain (1.25×) causes an extremely slow
+        // ramp — dozens of rounds to rediscover 10 Mbps from near-zero.
+        // The pacing floor (INITIAL_CWND / min_rtt) provides a lower bound,
+        // but the old max_bw gives a much better starting point.
         self.bw_hi = std.math.maxInt(u64);
         self.inflight_hi = BBR_MIN_CWND;
-        // Reset round_count before filters so they store round 0.
-        self.round_count = 0;
-        self.max_bw_filter.reset(0, 0);
         self.extra_acked_filter.reset(0, 0);
         self.extra_acked = 0;
         self.extra_acked_in_interval = 0;
@@ -346,10 +357,20 @@ pub const Bbr = struct {
         // Apply bw_hi bound (from loss bounding).
         const bw = @min(self.max_bw, self.bw_hi);
         const rate_f = @as(f64, @floatFromInt(bw)) * self.pacing_gain;
-        self.pacing.rate = if (rate_f >= @as(f64, @floatFromInt(std.math.maxInt(u64))))
+        const rate: u64 = if (rate_f >= @as(f64, @floatFromInt(std.math.maxInt(u64))))
             std.math.maxInt(u64)
         else
             @intFromFloat(rate_f);
+        // Floor: never pace slower than initial_cwnd / initial_rtt.
+        // Without this floor, a transient delivery rate collapse (e.g.,
+        // during loss recovery) creates a death spiral where the low
+        // pacing rate prevents sending, which prevents ACKs, which
+        // prevents the rate from recovering.
+        const min_rate: u64 = @intFromFloat(
+            @as(f64, @floatFromInt(INITIAL_CWND)) * 1_000_000_000.0 /
+                @as(f64, @floatFromInt(@max(self.min_rtt_ns, 1))),
+        );
+        self.pacing.rate = @max(rate, min_rate);
     }
 
     // -----------------------------------------------------------------------
@@ -534,7 +555,7 @@ pub const Bbr = struct {
         if (self.state == .probe_rtt) return;
         if (self.min_rtt_ns == std.math.maxInt(u64)) return;
 
-        // Enter ProbeRTT if min_rtt hasn't been updated for 10 seconds.
+        // Enter ProbeRTT if min_rtt hasn't been updated for BBR_PROBE_RTT_INTERVAL_NS.
         if (now_ns - self.min_rtt_stamp_ns >= BBR_PROBE_RTT_INTERVAL_NS) {
             self.enterProbeRtt();
         }
@@ -634,7 +655,7 @@ test "bbr: init sets startup state" {
     const testing = std.testing;
     try testing.expectEqual(State.startup, b.state);
     try testing.expectEqual(INITIAL_CWND, b.cwnd);
-    try testing.expect(b.pacing_gain > 2.8);
+    try testing.expect(b.pacing_gain > 1.0);
     try testing.expect(!b.filled_pipe);
 }
 
@@ -730,7 +751,7 @@ test "bbr: probe_bw phase cycling" {
     try std.testing.expectEqual(ProbeBwPhase.up, b.probe_bw_phase);
 }
 
-test "bbr: probe_rtt entry after 10s" {
+test "bbr: probe_rtt entry after interval" {
     var b = Bbr.init();
     b.state = .probe_bw;
     b.filled_pipe = true;
@@ -738,8 +759,8 @@ test "bbr: probe_rtt entry after 10s" {
     b.min_rtt_ns = 50_000_000;
     b.min_rtt_stamp_ns = 0;
 
-    // 10s later, should enter ProbeRTT.
-    b.checkProbeRtt(10_000_000_001);
+    // After probe_rtt interval, should enter ProbeRTT.
+    b.checkProbeRtt(BBR_PROBE_RTT_INTERVAL_NS + 1);
     try std.testing.expectEqual(State.probe_rtt, b.state);
 }
 
@@ -832,7 +853,8 @@ test "bbr: persistent congestion resets to startup" {
     try std.testing.expectEqual(State.startup, b.state);
     try std.testing.expect(!b.filled_pipe);
     try std.testing.expectEqual(BBR_MIN_CWND, b.cwnd);
-    try std.testing.expectEqual(@as(u64, 0), b.max_bw);
+    // max_bw is preserved so pacing stays reasonable during recovery.
+    try std.testing.expectEqual(@as(u64, 1_000_000), b.max_bw);
 }
 
 test "bbr: ecn ce reduces inflight_hi" {
@@ -919,13 +941,13 @@ test "bbr: regression — persistent congestion resets filters with round 0" {
 
     b.onPersistentCongestion();
 
-    // round_count must be 0 after reset.
-    try std.testing.expectEqual(@as(u64, 0), b.round_count);
-    // Filter must have been reset with round 0, not the stale 100.
-    try std.testing.expectEqual(@as(u64, 0), b.max_bw_filter.round[0]);
-    // A new value at round 1 should become the new best.
-    b.max_bw_filter.update(1000, 1);
-    try std.testing.expectEqual(@as(u64, 1000), b.max_bw_filter.get());
+    // round_count and max_bw_filter are preserved so pacing stays reasonable.
+    try std.testing.expectEqual(@as(u64, 100), b.round_count);
+    // Filter retains the pre-congestion value.
+    try std.testing.expectEqual(@as(u64, 500_000), b.max_bw_filter.get());
+    // A higher value updates normally.
+    b.max_bw_filter.update(600_000, 101);
+    try std.testing.expectEqual(@as(u64, 600_000), b.max_bw_filter.get());
 }
 
 test "bbr: regression — persistent congestion resets min_rtt and pacing" {
@@ -1085,7 +1107,7 @@ test "bbr: regression — ProbeRTT only enters from ProbeBW" {
     b.min_rtt_ns = 50_000_000;
     b.min_rtt_stamp_ns = 0;
 
-    // 10s later — would trigger ProbeRTT from ProbeBW.
+    // After probe_rtt interval — would trigger ProbeRTT from ProbeBW.
     // But from Startup, it should be ignored.
     b.onAckReceived(.{
         .delivery_rate = 500_000,

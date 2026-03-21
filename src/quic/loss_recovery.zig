@@ -279,7 +279,7 @@ pub const SentPacketTable = struct {
                         .delivered = entry.pkt.delivered,
                         .delivered_ns = entry.pkt.delivered_ns,
                         .first_sent_ns = entry.pkt.first_sent_ns,
-                        .sent_ns = entry.pkt.queued_ns, // queue time, not wire time
+                        .sent_ns = entry.pkt.sent_ns, // wire time
                         .is_app_limited = entry.pkt.is_app_limited,
                     };
                 }
@@ -443,16 +443,19 @@ pub const LossRecovery = struct {
     ) void {
         const sz: u16 = @intCast(@min(size, @as(usize, 0xffff)));
         // Snapshot delivery state into the sent packet for delivery rate computation.
-        // Bootstrap: on the very first send, delivered_ns is 0 which would make the
-        // first ACK's ack_elapsed equal to the full wall-clock timestamp, producing a
-        // near-zero delivery rate.  Seed it with the first send time so the initial
-        // rate sample reflects the actual RTT.
+        // All timestamps use wire-time (now_ns) — the moment the packet actually
+        // leaves the machine.  An earlier approach used queue-time (queued_ns) to
+        // avoid pacing-delay inflation of send_elapsed, but that caused stale
+        // timestamps when packets sat in the send queue during recovery, collapsing
+        // the delivery rate and creating a death spiral.  Wire-time may slightly
+        // underestimate bandwidth when pacing adds inter-packet delay, but the
+        // estimate self-corrects as the pacing rate converges to the true BW.
         if (self.delivery.delivered_ns == 0) {
-            self.delivery.delivered_ns = queued_ns;
+            self.delivery.delivered_ns = now_ns;
         }
         // Update first_sent_ns if this is the first packet since last ACK.
         if (self.delivery.first_sent_ns == 0) {
-            self.delivery.first_sent_ns = queued_ns;
+            self.delivery.first_sent_ns = now_ns;
         }
         // add() evicts any existing occupant at pn % MAX_SENT.
         // If the evicted packet was still in flight, subtract its size from bytes_in_flight

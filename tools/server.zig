@@ -233,7 +233,10 @@ pub fn main(init: std.process.Init) !void {
     // Determine the testcase; exit 127 if unsupported.
     // Check this FIRST before attempting to load certs, so that compliance
     // checks with unsupported testcases exit cleanly with 127.
-    const testcase = init.environ_map.get("TESTCASE") orelse "transfer";
+    const testcase = init.environ_map.get("TESTCASE") orelse {
+        std.debug.print("TESTCASE not set, exiting\n", .{});
+        std.process.exit(127);
+    };
     var is_supported = false;
     for (supported_cases) |s| {
         if (std.mem.eql(u8, testcase, s)) {
@@ -554,6 +557,13 @@ fn processPacket(
                 }
                 break;
             },
+            .path_migrated => {
+                // Update send destination from the connection's authoritative
+                // peer address.  Without this, late-arriving packets from the
+                // old address (via s.peer_addr = from) route sends to the
+                // stale address.
+                s.peer_addr = socketAddrToIp(s.conn.peer_addr);
+            },
             else => {},
         }
     }
@@ -733,9 +743,11 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
             t.active = false;
             return true;
         }
-        // hq-interop: no file → already closed
+        // hq-interop: no file → send FIN so client gets a clean close
+        // instead of waiting until idle timeout.
+        conn.streamSend(t.stream_id, &.{}, true) catch return false;
         t.active = false;
-        return false;
+        return true;
     };
 
     // H3: send HEADERS frame first (:status 200)
@@ -1147,6 +1159,13 @@ fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {
     return switch (addr) {
         .ip4 => |a| .{ .v4 = .{ .addr = a.bytes, .port = a.port } },
         .ip6 => |a| .{ .v6 = .{ .addr = a.bytes, .port = a.port } },
+    };
+}
+
+fn socketAddrToIp(addr: quic.SocketAddr) net.IpAddress {
+    return switch (addr) {
+        .v4 => |a| .{ .ip4 = .{ .bytes = a.addr, .port = a.port } },
+        .v6 => |a| .{ .ip6 = .{ .bytes = a.addr, .port = a.port } },
     };
 }
 

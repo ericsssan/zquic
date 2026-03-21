@@ -122,6 +122,9 @@ pub fn build(b: *std.Build) void {
         });
         mod.addImport("build_options", build_options_mod);
         const t = b.addTest(.{ .root_module = mod });
+        // Connection(16) is ~2.2 MB; Debug mode disables copy elision, creating
+        // ~16 MB of stack frames in accept() + test.  64 MB gives enough headroom.
+        t.stack_size = 64 * 1024 * 1024;
         const run = b.addRunArtifact(t);
         test_step.dependOn(&run.step);
     }
@@ -136,5 +139,6 @@ pub fn build(b: *std.Build) void {
     server_test_mod.addImport("http3", http3_mod);
     server_test_mod.addImport("qpack", qpack_mod);
     const server_test = b.addTest(.{ .root_module = server_test_mod });
+    server_test.stack_size = 64 * 1024 * 1024;
     test_step.dependOn(&b.addRunArtifact(server_test).step);
 }
