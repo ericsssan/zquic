@@ -242,8 +242,12 @@ pub const Bbr = struct {
             self.max_bw = self.max_bw_filter.get();
         }
 
-        // Update min RTT.
-        if (sample.rtt_ns > 0 and sample.rtt_ns < self.min_rtt_ns) {
+        // Update min RTT.  Reject the RTT estimator's bootstrap value
+        // (K_INITIAL_RTT = 10ms) — the first ACK carries this placeholder
+        // before a real measurement exists, and accepting it poisons min_rtt
+        // making BDP far too small (Drain never exits, throughput collapses).
+        const K_INITIAL_RTT_NS: u64 = 10_000_000;
+        if (sample.rtt_ns > 0 and sample.rtt_ns != K_INITIAL_RTT_NS and sample.rtt_ns < self.min_rtt_ns) {
             self.min_rtt_ns = sample.rtt_ns;
             self.min_rtt_stamp_ns = now_ns;
         }
