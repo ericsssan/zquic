@@ -279,7 +279,6 @@ pub const Bbr = struct {
         if (self.state == .probe_bw) {
             self.checkProbeRtt(now_ns);
         }
-
     }
 
     /// Called on packet loss. BBR v3 uses loss for inflight bounding.
