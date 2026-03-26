@@ -224,8 +224,15 @@ pub const Bbr = struct {
     }
 
     /// Whether the pacing gate should block sends.
-    pub fn shouldPace(_: *const Bbr) bool {
-        return true;
+    /// Disable pacing during Startup: the application-level token bucket
+    /// can't match the bursty send pattern needed for bandwidth discovery.
+    /// After the initial burst depletes tokens, the pacing gate locks the
+    /// server to 1 packet per ACK (token drip-feed), preventing cwnd from
+    /// filling.  Bypassing pacing lets Startup send at cwnd speed — like
+    /// TCP slow start — so bandwidth is discovered in 4–6 RTTs.  Once
+    /// filled_pipe is set (Startup complete), pacing is enforced.
+    pub fn shouldPace(self: *const Bbr) bool {
+        return self.filled_pipe;
     }
 
     /// Called when an ACK is received with a delivery rate sample.
