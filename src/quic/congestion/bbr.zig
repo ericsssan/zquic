@@ -546,7 +546,9 @@ pub const Bbr = struct {
     fn applyLossBounding(self: *Bbr, excessive_loss: bool) void {
         if (excessive_loss) {
             self.bw_hi = @max(applyBeta(self.bw_hi), self.max_bw);
-            self.inflight_hi = @max(applyBeta(self.inflight_hi), self.bdp());
+            // Floor at BDP to prevent spiral: repeated 0.7× reductions after
+            // blackhole recovery would collapse inflight_hi to near-zero.
+            self.inflight_hi = @max(applyBeta(self.inflight_hi), @max(self.bdp(), BBR_MIN_CWND));
         }
     }
 

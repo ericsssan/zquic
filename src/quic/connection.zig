@@ -1026,6 +1026,9 @@ pub fn Connection(comptime max_streams: usize) type {
                         const tns = self.loss.timeThresholdNs();
                         var tl_result = loss_recovery_mod.AckResult{};
                         for (0..3) |epoch_idx| {
+                            // Skip Initial/Handshake epochs once established — keys
+                            // are zeroed, so any retransmit would panic on invalid suite.
+                            if (self.hot.state == .established and epoch_idx < 2) continue;
                             const la = self.loss.largest_acked[epoch_idx];
                             if (la == 0) continue;
                             self.loss.sent.detectLoss(
@@ -3714,18 +3717,22 @@ pub fn Connection(comptime max_streams: usize) type {
             // RFC 9000 §9.4 permits resetting congestion state on migration,
             // but resetting cwnd to INITIAL_CWND kills throughput: the server
             // must re-probe bandwidth from scratch after every address change.
-            // Instead, preserve the congestion controller and just reset RTT
-            // (the new path may have different latency) and PTO backoff.
+            // Instead, preserve the congestion controller.  Reset smoothed_rtt
+            // and rtt_var (the new path may differ), but KEEP min_rtt — resetting
+            // it to the 10ms default causes time-loss thresholds (9/8 × 10ms) to
+            // fire before retransmitted packets can be ACKed on a 30ms path,
+            // creating an infinite retransmission loop.
+            const saved_min_rtt = self.loss.rtt.min_rtt;
             self.loss.rtt = loss_recovery_mod.RttEstimator{};
+            self.loss.rtt.min_rtt = saved_min_rtt;
             self.loss.pto_count = 0;
-            // Declare all in-flight 1-RTT packets as lost: they were sent to the
-            // old address and will never be ACKed.  Extract their stream frames
-            // and queue for retransmission on the new path.  Without this,
-            // bytes_in_flight stays elevated (blocking new data via cwnd check)
-            // and loss detection creates a retransmit amplification loop.
-            self.declareEpochLost(2);
+            // Don't proactively retransmit all in-flight packets — many may
+            // have already been received by the client (ACKs still in transit).
+            // Instead, reset bytes_in_flight to unblock the cwnd check and let
+            // PTO handle retransmission of truly lost packets.
+            self.loss.bytes_in_flight = 0;
             self.time_loss_alarm_ns = null;
-            self.pto_deadline_ns = null;
+            self.pto_deadline_ns = self.current_time_ns +| @as(i64, @intCast(self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns)));
             // RFC 9000 §9.4: reset amplification limit for the new path (separate from old path tracking).
             // Each path must independently satisfy the 3x amplification limit until validated.
             self.bytes_unvalidated_recv = 0;

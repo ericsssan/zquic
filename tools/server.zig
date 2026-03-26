@@ -209,12 +209,11 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
 
         if (slot.peer_addr) |pa| {
             // Retry H3 control streams if initial send failed (queue was full).
+            const send_sock = slotSendSock(slot, sock, cm_sock_ptr);
             if (g_is_h3 and !slot.h3_control_sent and slot.conn.app_keys != null) {
                 sendH3ControlStreams(slot);
             }
-            flushTransfers(slot, www_dir, io);
-            const send_sock = slotSendSock(slot, sock, cm_sock_ptr);
-            drainSend(&slot.conn, send_sock, io, &pa, send_bufs);
+            flushTransfers(slot, www_dir, io, send_sock, &pa, send_bufs);
         }
     }
 }
@@ -569,8 +568,7 @@ fn processPacket(
     }
 
     if (!slot_freed) {
-        flushTransfers(s, www_dir, io);
-        drainSend(&s.conn, active_sock, io, &from, send_bufs);
+        flushTransfers(s, www_dir, io, active_sock, &from, send_bufs);
     }
 }
 
@@ -687,7 +685,7 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
 /// the congestion window is small (e.g. initial cwnd = 10 packets): without
 /// interleaving, stream 0 would fill the window and streams 4/8 would get no
 /// packets at all, stalling their offset-0 delivery.
-fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
+fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io, send_sock: *const net.Socket, dest: *const net.IpAddress, send_bufs: *SendBufs) void {
     const conn = &slot.conn;
     const transfers = &slot.transfers;
     _ = www;
@@ -705,18 +703,30 @@ fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
         activatePending(transfers, &slot.pending[slot.pending_count], io);
     }
     // Outer loop: repeat passes until nothing was sent (CC/queue fully blocked).
+    // After each transfer advance, drain what pacing allows so bytes_in_flight
+    // stays current.  Without this, bytes_in_flight=0 during the fill phase and
+    // the cwnd check is blind — either starving the pipe (with bytes_queued) or
+    // flooding the send queue (without it).
     while (true) {
         var sent_any = false;
         for (transfers) |*t| {
             if (!t.active) continue;
-            if (g_is_h3) {
-                if (advanceTransferOneH3(conn, t, io)) sent_any = true;
-            } else {
-                if (advanceTransferOne(conn, t, io)) sent_any = true;
-            }
+            const progress = if (g_is_h3)
+                advanceTransferOneH3(conn, t, io)
+            else
+                advanceTransferOne(conn, t, io);
+            if (progress) sent_any = true;
         }
         if (!sent_any) break;
+        // Drain pacing-gated packets after each round-robin pass so
+        // bytes_in_flight stays current for the next pass's cwnd check.
+        drainSend(conn, send_sock, io, dest, send_bufs);
     }
+    // Always drain: tick() and receive() may have enqueued PATH_CHALLENGE,
+    // ACKs, or retransmissions independent of transfer progress.  Without
+    // this, those packets are stranded when all transfers are blocked
+    // (buffer full, amplification limit), causing path validation to stall.
+    drainSend(conn, send_sock, io, dest, send_bufs);
 }
 
 /// Send exactly one chunk from the transfer. Returns true if progress was made.
