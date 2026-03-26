@@ -483,8 +483,8 @@ pub const Bbr = struct {
         if (sample.round_start and self.isExcessiveLoss()) {
             self.applyLossBounding(true);
         }
-        // Exit Drain when bytes in flight ≤ BDP.
-        if (sample.prior_inflight <= self.bdp()) {
+        // Exit Drain when bytes in flight ≤ BDP (+ 1 MSS headroom).
+        if (sample.prior_inflight <= self.bdp() + MSS) {
             self.enterProbeBw(.down);
         }
     }
@@ -523,7 +523,11 @@ pub const Bbr = struct {
 
         switch (self.probe_bw_phase) {
             .down => {
-                if (sample.prior_inflight <= self.bdp()) {
+                // 1 MSS headroom: at steady state, bytes_in_flight sits at
+                // ~BDP.  Without headroom the strict <= check fails by a
+                // fraction of a packet, trapping BBR in DOWN permanently.
+                // max_bw then decays (100-round window), collapsing throughput.
+                if (sample.prior_inflight <= self.bdp() + MSS) {
                     self.enterProbeBw(.cruise);
                 }
             },
