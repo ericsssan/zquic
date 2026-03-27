@@ -31,7 +31,7 @@ Requires Zig 0.16.0-dev or later.
 ## Interop Results
 
 <!-- INTEROP_START -->
-Tested against ngtcp2 client — 22/22 passing, goodput 9394 kbps on 10 Mbps link:
+Tested against ngtcp2 client — 22/22 passing, goodput 9429 kbps on 10 Mbps link:
 
 | Result | Test cases |
 | :---: | --- |
