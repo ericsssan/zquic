@@ -947,7 +947,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 if (self.pto_deadline_ns) |d| {
                     if (now_ns >= d) {
                         self.loss.onPtoFired();
-                        if (self.app_keys != null) {
+                        if (self.hot.state == .established) {
                             // Post-handshake PTO: retransmit PATH_CHALLENGE if pending (RFC 9000 §9.2),
                             // drain pending stream retransmits, probe with unacked stream data,
                             // or send a 1-RTT PING probe (RFC 9002 §6.2).
