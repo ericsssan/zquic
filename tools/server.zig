@@ -496,7 +496,7 @@ fn processPacket(
     // rebinds back to the original path (or sim stops NAT'ing through CM),
     // the server must follow.  Without this, use_cm_sock stays true forever
     // and data sent via CM socket can't reach clients on the original network.
-    s.use_cm_sock = is_cm_socket;
+    if (s.use_cm_sock != is_cm_socket) s.use_cm_sock = is_cm_socket;
 
     const ecn_bits: u2 = 0;
     s.conn.receive(data, ipToSocketAddr(from), now_ns, ecn_bits, io) catch |err| {

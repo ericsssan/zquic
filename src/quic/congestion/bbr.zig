@@ -357,6 +357,15 @@ pub const Bbr = struct {
         return @max(result, BBR_MIN_CWND);
     }
 
+    /// BDP with headroom for Drain/DOWN exit checks.  At steady state,
+    /// bytes_in_flight sits at ~BDP; a strict <= bdp() fails by a fraction
+    /// of a packet.  Use max(MSS, bdp/32) so headroom scales from ~1 MSS
+    /// at 10 Mbps to ~12 MB at 100 Gbps.
+    fn bdpHeadroom(self: *const Bbr) u64 {
+        const b = self.bdp();
+        return b +| @max(MSS, b / 32);
+    }
+
     // -----------------------------------------------------------------------
     // Internal: Pacing rate
     // -----------------------------------------------------------------------
@@ -482,10 +491,11 @@ pub const Bbr = struct {
         if (sample.round_start and self.isExcessiveLoss()) {
             self.applyLossBounding(true);
         }
-        // Exit Drain when inflight ≤ BDP.  1 MSS headroom: at steady state
-        // bytes_in_flight sits at ~BDP; without it the strict <= fails by a
-        // fraction of a packet, stalling the state machine permanently.
-        if (sample.prior_inflight <= self.bdp() + MSS) {
+        // Exit Drain when inflight ≈ BDP.  Headroom prevents the strict <=
+        // from failing by a fraction of a packet at steady state, which would
+        // stall the state machine permanently.  Scale with BDP so headroom
+        // stays meaningful at 100 Gbps (where MSS alone is negligible).
+        if (sample.prior_inflight <= self.bdpHeadroom()) {
             self.enterProbeBw(.down);
         }
     }
@@ -525,7 +535,7 @@ pub const Bbr = struct {
         switch (self.probe_bw_phase) {
             .down => {
                 // Same headroom rationale as Drain exit above.
-                if (sample.prior_inflight <= self.bdp() + MSS) {
+                if (sample.prior_inflight <= self.bdpHeadroom()) {
                     self.enterProbeBw(.cruise);
                 }
             },
@@ -1131,4 +1141,82 @@ test "bbr: regression — ProbeRTT only enters from ProbeBW" {
 
     // Must still be in Startup (or Drain if BW plateau hit), NOT ProbeRTT.
     try std.testing.expect(b.state != .probe_rtt);
+}
+
+// ---------------------------------------------------------------------------
+// Tests for Startup pacing bypass, ProbeBW DOWN headroom, bdpHeadroom scaling
+// ---------------------------------------------------------------------------
+
+test "bbr: shouldPace disabled during Startup, enabled after" {
+    var b = Bbr.init();
+    // Startup: pacing disabled.
+    try std.testing.expect(!b.shouldPace());
+    try std.testing.expect(!b.filled_pipe);
+
+    // After enterDrain: filled_pipe = true, pacing enabled.
+    b.enterDrain();
+    try std.testing.expect(b.shouldPace());
+    try std.testing.expect(b.filled_pipe);
+
+    // After persistent congestion: back to Startup, pacing disabled.
+    b.onPersistentCongestion();
+    try std.testing.expect(!b.shouldPace());
+    try std.testing.expect(!b.filled_pipe);
+}
+
+test "bbr: ProbeBW DOWN exits with headroom when inflight ≈ BDP" {
+    var b = Bbr.init();
+    b.state = .probe_bw;
+    b.probe_bw_phase = .down;
+    b.filled_pipe = true;
+    b.max_bw = 1_000_000; // 1 MB/s
+    b.min_rtt_ns = 100_000_000; // 100ms → BDP = 100,000
+
+    // Inflight exactly at BDP: strict <= would pass, headroom also passes.
+    b.updateProbeBw(.{ .prior_inflight = 100_000, .round_start = true });
+    try std.testing.expectEqual(ProbeBwPhase.cruise, b.probe_bw_phase);
+
+    // Reset to DOWN. Inflight slightly above BDP but within headroom.
+    b.probe_bw_phase = .down;
+    b.probe_bw_rounds = 0;
+    // BDP + MSS/2: strict <= bdp() would FAIL, but headroom saves it.
+    b.updateProbeBw(.{ .prior_inflight = 100_000 + MSS / 2, .round_start = true });
+    try std.testing.expectEqual(ProbeBwPhase.cruise, b.probe_bw_phase);
+
+    // Reset to DOWN. Inflight way above headroom: must stay in DOWN.
+    b.probe_bw_phase = .down;
+    b.probe_bw_rounds = 0;
+    b.updateProbeBw(.{ .prior_inflight = 200_000, .round_start = true });
+    try std.testing.expectEqual(ProbeBwPhase.down, b.probe_bw_phase);
+}
+
+test "bbr: Drain exits with headroom when inflight ≈ BDP" {
+    var b = Bbr.init();
+    b.state = .drain;
+    b.filled_pipe = true;
+    b.max_bw = 1_000_000;
+    b.min_rtt_ns = 100_000_000; // BDP = 100,000
+
+    // Inflight slightly above BDP but within headroom: exits Drain.
+    b.updateDrain(.{ .prior_inflight = 100_000 + MSS / 2 });
+    try std.testing.expectEqual(State.probe_bw, b.state);
+}
+
+test "bbr: bdpHeadroom scales with BDP" {
+    var b = Bbr.init();
+
+    // 10 Mbps / 30ms: BDP = 37,500. Headroom = max(MSS, 37500/32) = max(1452, 1171) = MSS.
+    b.max_bw = 1_250_000;
+    b.min_rtt_ns = 30_000_000;
+    const bdp_10m = b.bdp();
+    try std.testing.expectEqual(@as(u64, 37_500), bdp_10m);
+    try std.testing.expectEqual(bdp_10m + MSS, b.bdpHeadroom());
+
+    // 100 Gbps / 30ms: BDP = 375,000,000. Headroom = max(MSS, 375M/32) = 11,718,750.
+    b.max_bw = 12_500_000_000;
+    b.min_rtt_ns = 30_000_000;
+    const bdp_100g = b.bdp();
+    try std.testing.expectEqual(@as(u64, 375_000_000), bdp_100g);
+    // At 100 Gbps, headroom = bdp/32 (much larger than MSS).
+    try std.testing.expectEqual(bdp_100g + bdp_100g / 32, b.bdpHeadroom());
 }
