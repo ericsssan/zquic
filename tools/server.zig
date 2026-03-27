@@ -488,13 +488,15 @@ fn processPacket(
     // BEFORE processing the incoming packet, so PATH_CHALLENGE is the first
     // frame sent from the new address (required by interop test).
     if (is_cm_socket and !s.use_cm_sock) {
-        s.use_cm_sock = true;
         var challenge: [8]u8 = undefined;
         io.random(&challenge);
         s.conn.sendPathChallenge(challenge) catch {};
-    } else if (is_cm_socket) {
-        // Already on CM socket, no action needed
     }
+    // Track the CURRENT socket — not a one-way flag.  When the client
+    // rebinds back to the original path (or sim stops NAT'ing through CM),
+    // the server must follow.  Without this, use_cm_sock stays true forever
+    // and data sent via CM socket can't reach clients on the original network.
+    s.use_cm_sock = is_cm_socket;
 
     const ecn_bits: u2 = 0;
     s.conn.receive(data, ipToSocketAddr(from), now_ns, ecn_bits, io) catch |err| {
@@ -513,7 +515,14 @@ fn processPacket(
         s.last_logged_generation = s.conn.current_key_generation;
     }
 
-    const active_sock = slotSendSock(s, sock, cm_sock_ptr);
+    // Send responses on the SAME socket the request arrived on.
+    // Using the global use_cm_sock flag would route original-socket ACK
+    // responses through the CM socket, which can't reach the original
+    // network — causing data loss after migration.
+    const active_sock = if (is_cm_socket)
+        (cm_sock_ptr orelse sock)
+    else
+        sock;
 
     // Process connection events.
     var slot_freed = false;
