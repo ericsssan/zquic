@@ -41,7 +41,7 @@ const PendingTransfer = struct {
 const ConnSlot = struct {
     conn: Conn,
     peer_addr: ?net.IpAddress = null,
-    /// When true, send responses through the CM socket (after preferred_address migration).
+    /// True when the most recent packet arrived on the CM socket.
     use_cm_sock: bool = false,
     transfers: [MAX_TRANSFERS]FileTransfer = [_]FileTransfer{.{}} ** MAX_TRANSFERS,
     /// Parsed requests deferred because all transfer slots were occupied.
@@ -515,14 +515,7 @@ fn processPacket(
         s.last_logged_generation = s.conn.current_key_generation;
     }
 
-    // Send responses on the SAME socket the request arrived on.
-    // Using the global use_cm_sock flag would route original-socket ACK
-    // responses through the CM socket, which can't reach the original
-    // network — causing data loss after migration.
-    const active_sock = if (is_cm_socket)
-        (cm_sock_ptr orelse sock)
-    else
-        sock;
+    const active_sock = slotSendSock(s, sock, cm_sock_ptr);
 
     // Process connection events.
     var slot_freed = false;
