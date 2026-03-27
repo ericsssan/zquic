@@ -31,11 +31,23 @@ Requires Zig 0.16.0-dev or later.
 ## Interop Results
 
 <!-- INTEROP_START -->
-Tested against ngtcp2 client — 22/22 passing, goodput 9429 kbps on 10 Mbps link:
+Tested against 11 QUIC clients via [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) on a 10 Mbps / 30 ms RTT link:
 
-| Result | Test cases |
-| :---: | --- |
-| ✅ Pass (22/22) | handshake, transfer, longrtt, chacha20, multiplexing, retry, resumption, zerortt, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration |
+| Client | Tests | Goodput |
+| --- | --- | --- |
+| ngtcp2 | 22/22 | 9432 kbps |
+| quic-go | 20/20 | 9507 kbps |
+| quiche | 18/18 | — |
+| neqo | 19/22 | — |
+| kwik | 19/21 | 7849 kbps |
+| picoquic | 16/22 | — |
+| mvfst | 12/16 | 9496 kbps |
+| aioquic | 13/21 | 9190 kbps |
+| lsquic | — | 9454 kbps |
+| msquic | — | 7937 kbps |
+| quinn | — | 9462 kbps |
+
+Test cases: handshake, transfer, longrtt, chacha20, multiplexing, retry, resumption, zerortt, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration
 <!-- INTEROP_END -->
 
 ## Limitations
