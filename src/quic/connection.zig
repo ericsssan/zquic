@@ -3728,9 +3728,11 @@ pub fn Connection(comptime max_streams: usize) type {
             self.loss.pto_count = 0;
             // Don't proactively retransmit all in-flight packets — many may
             // have already been received by the client (ACKs still in transit).
-            // Instead, reset bytes_in_flight to unblock the cwnd check and let
-            // PTO handle retransmission of truly lost packets.
+            // Reset bytes_in_flight to unblock the cwnd check and clear
+            // in_flight flags so old packets don't subtract from the counter
+            // when later ACKed (which would desync bif and kill PTO).
             self.loss.bytes_in_flight = 0;
+            self.loss.sent.clearInflight();
             self.time_loss_alarm_ns = null;
             self.pto_deadline_ns = self.current_time_ns +| @as(i64, @intCast(self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns)));
             // RFC 9000 §9.4: reset amplification limit for the new path (separate from old path tracking).

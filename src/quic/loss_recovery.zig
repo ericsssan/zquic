@@ -237,6 +237,16 @@ pub const SentPacketTable = struct {
         return evicted;
     }
 
+    /// Clear in_flight on all valid packets.  Used during path migration:
+    /// bytes_in_flight is reset to 0, so old packets must not subtract
+    /// from it when later ACKed.  Packets remain valid for delivery rate
+    /// tracking and ACK processing.
+    pub fn clearInflight(self: *SentPacketTable) void {
+        for (&self.slots) |*slot| {
+            if (slot.valid) slot.in_flight = false;
+        }
+    }
+
     /// O(1) lookup. Returns null if slot is empty or belongs to a different pn/epoch.
     pub fn get(self: *const SentPacketTable, pn: u64, epoch: u8) ?SentPacket {
         const idx = slotIndex(pn, epoch);

@@ -127,6 +127,7 @@ fn allocateSlot(slots: *[MAX_CONNS]?*ConnSlot, config: quic.Config, io: std.Io) 
     for (slots) |*s_opt| {
         if (s_opt.* == null) {
             const slot = try page_allocator.create(ConnSlot);
+            errdefer page_allocator.destroy(slot);
             slot.* = .{
                 .conn = try Conn.accept(config, io),
             };
@@ -587,6 +588,7 @@ fn activatePending(transfers: *[MAX_TRANSFERS]FileTransfer, p: *const PendingTra
     t.active = true;
     t.stream_id = p.stream_id;
     t.offset = 0;
+    t.h3_headers_sent = false;
     @memcpy(t.path[0..p.path_len], p.path[0..p.path_len]);
     t.path_len = p.path_len;
     t.file = std.Io.Dir.openFileAbsolute(io, t.path[0..t.path_len], .{}) catch null;
@@ -828,30 +830,37 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
 // ---------------------------------------------------------------------------
 
 /// Open the three server-initiated unidirectional streams required by RFC 9114.
+/// Streams are sent individually so a partial failure (queue full) can be
+/// retried without re-sending already-succeeded streams.
 fn sendH3ControlStreams(s: *ConnSlot) void {
     const conn = &s.conn;
     // Stream IDs: server-initiated unidirectional = 4*n + 3 → 3, 7, 11
+    const stream_ids = [_]u62{ 3, 7, 11 };
+    const stream_types = [_]u64{
+        http3.StreamType.control,
+        http3.StreamType.qpack_encoder,
+        http3.StreamType.qpack_decoder,
+    };
 
-    // 1. Control stream (type 0x00) + SETTINGS frame
-    var ctrl_buf: [64]u8 = undefined;
-    var pos: usize = 0;
-    // Stream type 0x00 (control)
-    pos += http3.varint.encode(ctrl_buf[pos..], http3.StreamType.control) catch return;
-    // SETTINGS frame (empty — all defaults)
-    pos += http3.frame.writeHeader(ctrl_buf[pos..], http3.FrameType.settings, 0) catch return;
-    conn.streamSend(3, ctrl_buf[0..pos], false) catch return;
-
-    // 2. QPACK encoder stream (type 0x02)
-    var enc_buf: [4]u8 = undefined;
-    const enc_len = http3.varint.encode(&enc_buf, http3.StreamType.qpack_encoder) catch return;
-    conn.streamSend(7, enc_buf[0..enc_len], false) catch return;
-
-    // 3. QPACK decoder stream (type 0x03)
-    var dec_buf: [4]u8 = undefined;
-    const dec_len = http3.varint.encode(&dec_buf, http3.StreamType.qpack_decoder) catch return;
-    conn.streamSend(11, dec_buf[0..dec_len], false) catch return;
-
-    s.h3_control_sent = true;
+    var all_sent = true;
+    for (stream_ids, stream_types) |sid, stype| {
+        // Skip streams that were already sent in a previous partial attempt.
+        if (conn.streams.get(sid)) |st| {
+            if (st.send_offset > 0) continue;
+        }
+        var buf: [64]u8 = undefined;
+        var pos: usize = 0;
+        pos += http3.varint.encode(buf[pos..], stype) catch return;
+        // Control stream also needs an empty SETTINGS frame.
+        if (stype == http3.StreamType.control) {
+            pos += http3.frame.writeHeader(buf[pos..], http3.FrameType.settings, 0) catch return;
+        }
+        conn.streamSend(sid, buf[0..pos], false) catch {
+            all_sent = false;
+            continue;
+        };
+    }
+    if (all_sent) s.h3_control_sent = true;
 }
 
 /// Parse an H3 request from a bidirectional stream and register a FileTransfer.
