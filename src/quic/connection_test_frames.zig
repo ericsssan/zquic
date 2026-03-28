@@ -468,14 +468,14 @@ test "security: shouldThrottleVersionNeg round-robin eviction after 4 versions" 
 test "connection: current_key_phase defaults false" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection(16).accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.current_key_phase);
 }
 
 test "connection: key_update_pending defaults false" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection(16).accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.key_update_pending);
 }
 

@@ -981,12 +981,12 @@ test "connection: accept() initializes quic_version to V1 for client version ech
     // TLS layer may negotiate to another version via version_information.
 
     // Test with default V1 config
-    var conn_v1 = try Connection(1).accept(.{}, io);
+    const conn_v1 = try Connection(1).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.quic_version);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
 
     // Test with V2 config - still starts with V1, configured version stored separately
-    var conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    const conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v2.quic_version);
     try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
 }
@@ -1589,7 +1589,7 @@ test "security: initial keys zeroized after 1-RTT establishment" {
 test "connection: version negotiation - initial and quic versions track separately" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    const conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
 
     // Initially, both start with V1 (RFC 9368 compatible VN).
     // When a client Initial packet arrives, both get set to the client's version.
@@ -1606,18 +1606,18 @@ test "connection: version negotiation - server_configured_version set from confi
     const io = std.testing.io;
 
     // Test with default v1
-    var conn_v1 = try Connection(1).accept(.{}, io);
+    const conn_v1 = try Connection(1).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
 
     // Test with configured v2
-    var conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    const conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
 }
 
 test "connection: version negotiation - initial_version set from client Initial" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
+    const conn = try Connection(16).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
 
     // At initialization, both are set to V1 (not the configured version)
     // When a client Initial packet arrives, both get set to the client's version

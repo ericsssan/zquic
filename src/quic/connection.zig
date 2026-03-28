@@ -830,7 +830,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 return 0;
             }
             const mask = SEND_QUEUE_DEPTH - 1;
-            var meta = self.sq_meta[self.sq_head & mask];
+            const meta = self.sq_meta[self.sq_head & mask];
             // Pacing gate: refill tokens and check if we can send.
             // Bypass pacing when nothing is in flight — there is no congestion
             // to pace for, and blocking here creates a death spiral where the

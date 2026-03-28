@@ -85,6 +85,22 @@ pub fn build(b: *std.Build) void {
     const verify_step = b.step("verify-key-rotation", "Run key rotation verification");
     verify_step.dependOn(&run_verify.step);
 
+    // Throughput benchmark
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("zquic", zquic_mod);
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench);
+    const run_bench = b.addRunArtifact(bench);
+    const bench_step = b.step("bench", "Run throughput benchmark");
+    bench_step.dependOn(&run_bench.step);
+
     // Per-module unit tests
     const test_step = b.step("test", "Run unit tests");
     const test_files = [_][]const u8{
@@ -111,6 +127,10 @@ pub fn build(b: *std.Build) void {
         "src/quic/connection_test_handshakecorruption.zig",
         "src/quic/fuzz.zig",
         "src/quic/connection_test_resumption.zig",
+        "src/quic/tls_client.zig",
+        "src/quic/test_harness.zig",
+        "src/quic/netsim.zig",
+        "src/quic/integration_test.zig",
         "tools/pem.zig",
     };
 

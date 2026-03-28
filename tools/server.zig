@@ -1032,7 +1032,7 @@ fn configureEcn(sock: *const net.Socket) !void {
     // Enable ECT(0) marking on outgoing IPv4 packets: IP_TOS with ECT(0)=0x02
     // ECT(0) = 0b0000 0010 in DSCP/ECN bits (RFC 3168)
     const tos_value: c_int = 0x02; // ECT(0)
-    var tos_bytes = std.mem.asBytes(&tos_value);
+    const tos_bytes = std.mem.asBytes(&tos_value);
     const tos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_TOS, tos_bytes.ptr, @sizeOf(c_int));
     if (tos_result < 0) {
         const err = @as(i32, @intCast(-tos_result));
@@ -1041,7 +1041,7 @@ fn configureEcn(sock: *const net.Socket) !void {
 
     // Enable receiving IPv4 ECN bits: IP_RECVTOS
     const recvtos_value: c_int = 1;
-    var recvtos_bytes = std.mem.asBytes(&recvtos_value);
+    const recvtos_bytes = std.mem.asBytes(&recvtos_value);
     const recvtos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_RECVTOS, recvtos_bytes.ptr, @sizeOf(c_int));
     if (recvtos_result < 0) {
         const err = @as(i32, @intCast(-recvtos_result));
@@ -1050,7 +1050,7 @@ fn configureEcn(sock: *const net.Socket) !void {
 
     // Enable ECT(0) marking on outgoing IPv6 packets: IPV6_TCLASS
     const tclass_value: c_int = 0x02; // ECT(0)
-    var tclass_bytes = std.mem.asBytes(&tclass_value);
+    const tclass_bytes = std.mem.asBytes(&tclass_value);
     const tclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_TCLASS, tclass_bytes.ptr, @sizeOf(c_int));
     if (tclass_result < 0) {
         const err = @as(i32, @intCast(-tclass_result));
@@ -1059,7 +1059,7 @@ fn configureEcn(sock: *const net.Socket) !void {
 
     // Enable receiving IPv6 ECN bits: IPV6_RECVTCLASS
     const recvtclass_value: c_int = 1;
-    var recvtclass_bytes = std.mem.asBytes(&recvtclass_value);
+    const recvtclass_bytes = std.mem.asBytes(&recvtclass_value);
     const recvtclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_RECVTCLASS, recvtclass_bytes.ptr, @sizeOf(c_int));
     if (recvtclass_result < 0) {
         const err = @as(i32, @intCast(-recvtclass_result));

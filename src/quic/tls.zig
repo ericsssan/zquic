@@ -1716,7 +1716,7 @@ test "tls: ALPN: EncryptedExtensions omits ALPN when empty" {
 test "tls: ALPN: no required_alpn skips check entirely" {
     // A server with required_alpn_len == 0 should accept any ClientHello regardless of ALPN.
     const io = std.testing.io;
-    var server = try TlsServer.init(io);
+    const server = try TlsServer.init(io);
     // Default: required_alpn_len is 0; negotiated_alpn_len stays 0.
     try std.testing.expectEqual(@as(u8, 0), server.required_alpn_len);
     try std.testing.expectEqual(@as(u8, 0), server.negotiated_alpn_len);
