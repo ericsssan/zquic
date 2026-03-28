@@ -64,6 +64,10 @@ const supported_cases = [_][]const u8{
 
 /// True when TESTCASE=http3 — uses H3 framing instead of HTTP/0.9.
 var g_is_h3: bool = false;
+/// Accumulated SSLKEYLOG data for all connections.  Written to /logs/keys.log
+/// in full on each update so createFileAbsolute truncation doesn't lose data.
+var g_keylog_buf: [65536]u8 = undefined;
+var g_keylog_len: usize = 0;
 
 // IPv4/IPv6 addresses for preferred_address in connectionmigration test (interop runner addresses).
 // server4:  193.167.100.100  (0xc1, 0xa7, 0x64, 0x64)
@@ -1133,13 +1137,7 @@ fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
         if (pos >= buf.len - 256) break;
     }
 
-    // Overwrite the keylog file with all generations (directory /logs created by Dockerfile)
-    const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
-    defer file.close(io);
-    file.writePositionalAll(io, buf[0..pos], 0) catch return;
-    // Sync multiple times to guarantee disk flush before docker cp
-    file.sync(io) catch {};
-    file.sync(io) catch {};
+    appendKeyLog(io, buf[0..pos]);
 }
 
 /// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
@@ -1167,12 +1165,18 @@ fn writeKeyLog(conn: *const Conn, io: std.Io) void {
     line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_0 {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(secrets_0.server, .lower) }) catch return;
     pos += line.len;
 
-    // Write keylog file (directory /logs created by Dockerfile)
+    appendKeyLog(io, buf[0..pos]);
+}
+
+fn appendKeyLog(io: std.Io, data: []const u8) void {
+    // Accumulate in memory, write full buffer each time (createFileAbsolute truncates).
+    const n = @min(data.len, g_keylog_buf.len - g_keylog_len);
+    if (n == 0) return;
+    @memcpy(g_keylog_buf[g_keylog_len..][0..n], data[0..n]);
+    g_keylog_len += n;
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
-    file.writePositionalAll(io, buf[0..pos], 0) catch return;
-    // Sync multiple times to guarantee disk flush before docker cp
-    file.sync(io) catch {};
+    file.writePositionalAll(io, g_keylog_buf[0..g_keylog_len], 0) catch return;
     file.sync(io) catch {};
 }
 
