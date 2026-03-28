@@ -15,6 +15,7 @@ const frame = @import("frame.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 const stream_mod = @import("stream.zig");
 const tls = @import("tls.zig");
+const cc_mod = @import("congestion/cc.zig");
 const packet = @import("packet.zig");
 const crypto = @import("crypto.zig");
 const transport_params = @import("transport_params.zig");
@@ -64,16 +65,18 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     var conn = try Connection(16).accept(.{}, io);
 
     conn.congestion.cwnd = 100 * 1200;
-    conn.congestion.ssthresh = 0; // always in CUBIC phase
+    if (cc_mod.selected == .cubic) {
+        conn.congestion.ssthresh = 0; // always in CUBIC phase
+    }
 
     conn.current_time_ns = 0;
     conn.hot.tx_pn[0] = 9; // pretend pn=0..8 were sent
-    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(2, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(3, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(4, 0, 1200, true, 0, .{});
-    conn.loss.onPacketSent(5, 0, 1200, true, 3_200_000_000, .{});
-    conn.loss.onPacketSent(8, 0, 1200, true, 3_200_000_000, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(2, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(3, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(4, 0, 1200, true, 0, 0, .{});
+    conn.loss.onPacketSent(5, 0, 1200, true, 3_200_000_000, 3_200_000_000, .{});
+    conn.loss.onPacketSent(8, 0, 1200, true, 3_200_000_000, 3_200_000_000, .{});
 
     const ack = frame.AckFrame{
         .largest_acked = 8,
@@ -88,8 +91,12 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     conn.current_time_ns = 3_200_000_000;
     try conn.processAck(ack, 0);
 
-    // Persistent congestion → cwnd = 2 * MSS = 2904 (MSS=1452)
-    try testing.expectEqual(@as(u64, 2 * 1452), conn.congestion.cwnd);
+    // Persistent congestion: CUBIC → cwnd = 2*MSS, BBR → cwnd = 4*MSS (BBR_MIN_CWND).
+    if (cc_mod.selected == .cubic) {
+        try testing.expectEqual(@as(u64, 2 * 1452), conn.congestion.cwnd);
+    } else {
+        try testing.expectEqual(@as(u64, 4 * 1452), conn.congestion.cwnd);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +163,7 @@ test "security: amplification limit lifted after path_validated" {
     try conn.enqueueSend(&[_]u8{0x01} ** 100);
     // Verify the send queue actually accepted the bytes.
     var out: [MAX_PACKET_SIZE]u8 = undefined;
-    try testing.expect(conn.send(&out) > 0);
+    try testing.expect(conn.send(&out, 0) > 0);
 }
 
 // SEC-006: Frame-type per epoch enforcement
@@ -607,8 +614,10 @@ test "connection: migration resets congestion" {
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 10, 0, 0, 1 }, .port = 5000 } };
     var empty = [_]u8{};
     try conn.receive(&empty, new_src, 0, 0, io);
-    // RFC 9002 §7.2: initial_window = min(10*1452, max(14720, 2*1452)) = 14520.
-    try testing.expectEqual(@as(u64, 14520), conn.congestion.cwnd);
+    // Congestion state (cwnd) is preserved across migration to avoid throughput
+    // collapse during rapid address changes.  RTT and PTO are reset instead.
+    try testing.expectEqual(@as(u64, 999_999), conn.congestion.cwnd);
+    try testing.expect(!conn.loss.rtt.initialized); // RTT was reset
 }
 
 test "connection: migration sets path_validated false" {

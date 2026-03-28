@@ -396,14 +396,13 @@ test "PMTUD: probe packet is marked ack-eliciting" {
     // Queue probe at realistic size (< MAX_PACKET_SIZE)
     try conn.queuePmtudProbe(1200);
 
-    // Verify it was registered in loss recovery as ack-eliciting
-    // (The onPacketSent call in queuePmtudProbe passes true for ack_eliciting)
+    // Verify the probe was queued and its send-queue metadata is ack-eliciting.
+    // (onPacketSent records into loss.sent only when send() dequeues the packet;
+    // here we verify the queue metadata directly.)
     try testing.expect(conn.pmtud_probing != null);
-    const pn = conn.pmtud_probing.?.packet_number;
-
-    // Look up in loss recovery to verify it was tracked
-    const sent_pkt = conn.loss.sent.get(pn, 2); // epoch 2 = 1-RTT
-    try testing.expect(sent_pkt != null);
+    try testing.expect(conn.sq_head < conn.sq_tail); // packet is in the send queue
+    const meta = conn.sq_meta[(conn.sq_tail -% 1) & (conn_mod.SEND_QUEUE_DEPTH - 1)];
+    try testing.expect(meta.ack_eliciting);
 }
 
 test "PMTUD: doesn't probe if already at maximum" {
@@ -779,7 +778,7 @@ test "retry: validate_addr=true, no token: retry_sent event and Retry packet que
 
     // A Retry packet must be in the send queue
     var out: [256]u8 = undefined;
-    const n = conn.send(&out);
+    const n = conn.send(&out, 0);
     try testing.expect(n > 0);
     // Retry first byte is 0xff (v1: type bits 0b11, unused=0xf)
     try testing.expectEqual(@as(u8, 0xff), out[0]);

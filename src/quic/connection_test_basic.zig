@@ -17,6 +17,7 @@ const frame = @import("frame.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 const stream_mod = @import("stream.zig");
 const tls = @import("tls.zig");
+const cc_mod = @import("congestion/cc.zig");
 
 test "connection: hot struct is 64 bytes" {
     const testing = std.testing;
@@ -39,7 +40,7 @@ test "connection: send returns 0 when queue empty" {
     var conn = try Connection(16).accept(.{}, io);
     var out: [MAX_PACKET_SIZE]u8 = undefined;
     const testing = std.testing;
-    try testing.expectEqual(@as(usize, 0), conn.send(&out));
+    try testing.expectEqual(@as(usize, 0), conn.send(&out, 0));
 }
 
 test "connection: enqueue and drain send queue" {
@@ -49,7 +50,7 @@ test "connection: enqueue and drain send queue" {
     try conn.enqueueSend(&data);
 
     var out: [8]u8 = undefined;
-    const n = conn.send(&out);
+    const n = conn.send(&out, 0);
     const testing = std.testing;
     try testing.expectEqual(@as(usize, 4), n);
     try testing.expectEqualSlices(u8, &data, out[0..n]);
@@ -84,7 +85,7 @@ test "connection: unknown version triggers VN response" {
 
     // A Version Negotiation packet should be queued.
     var out: [64]u8 = undefined;
-    const n = conn.send(&out);
+    const n = conn.send(&out, 0);
     try testing.expect(n > 0);
 
     // VN packet has version 0x00000000.
@@ -115,7 +116,7 @@ test "connection: ver=0 packet does not trigger VN response" {
 
     // No VN response must be queued for a ver=0 packet.
     var out: [64]u8 = undefined;
-    const n = conn.send(&out);
+    const n = conn.send(&out, 0);
     try testing.expectEqual(@as(usize, 0), n);
 }
 
@@ -151,7 +152,7 @@ test "loss: onPacketSent wires bytes_in_flight and pto_deadline" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 1_000_000;
-    conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, conn.current_time_ns, conn.current_time_ns, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
     try testing.expect(conn.loss.ptoDeadline(conn.cached_max_ack_delay_ns) != null);
 }
@@ -180,7 +181,7 @@ test "loss: onAckReceived decrements bytes_in_flight" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.current_time_ns = 0;
-    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
 
     const ranges = [_]loss_recovery_mod.AckedRange{.{ .low = 1, .high = 1 }};
@@ -204,7 +205,7 @@ test "connection: send queue full returns SendQueueFull error" {
 
     // Drain one slot: now there is room again
     var out: [8]u8 = undefined;
-    _ = conn.send(&out);
+    _ = conn.send(&out, 0);
     try conn.enqueueSend(&data); // must succeed now
 }
 
@@ -215,7 +216,7 @@ test "connection: processAck uses packet epoch not connection epoch" {
     conn.current_time_ns = 0;
     conn.hot.tx_pn[0] = 2; // pretend pn=0 and pn=1 were sent in epoch 0
 
-    conn.loss.onPacketSent(1, 0, 1200, true, 0, .{});
+    conn.loss.onPacketSent(1, 0, 1200, true, 0, 0, .{});
     try testing.expectEqual(@as(u64, 1200), conn.loss.bytes_in_flight);
 
     const ack = frame.AckFrame{
@@ -314,7 +315,7 @@ test "connection: version 0 packet is silently ignored" {
 
     // No packet should be queued (VN response is NOT sent for version-0 packets).
     var out: [64]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), conn.send(&out));
+    try testing.expectEqual(@as(usize, 0), conn.send(&out, 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +574,7 @@ test "close: draining state suppresses send()" {
     // Queue something
     try conn.enqueueSend(&[_]u8{0x01});
     var out: [8]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), conn.send(&out));
+    try testing.expectEqual(@as(usize, 0), conn.send(&out, 0));
 }
 
 test "close: nextTimeout includes drain_deadline" {
@@ -831,21 +832,21 @@ test "security: VN rate limit suppresses same version within 60s" {
     // First unknown version: send VN
     conn.receive(&pkt, src, 0, 0, io) catch {};
     var out: [64]u8 = undefined;
-    try testing.expect(conn.send(&out) > 0);
+    try testing.expect(conn.send(&out, 0) > 0);
 
     // Same version within 60s: throttle (no VN)
     conn.receive(&pkt, src, 30_000_000_000, 0, io) catch {}; // +30s
-    try testing.expectEqual(@as(usize, 0), conn.send(&out));
+    try testing.expectEqual(@as(usize, 0), conn.send(&out, 0));
 
     // Different unknown version within 60s of first: send VN (different version)
     std.mem.writeInt(u32, pkt[1..5], 0x00000003, .big); // different version
     conn.receive(&pkt, src, 35_000_000_000, 0, io) catch {};
-    try testing.expect(conn.send(&out) > 0);
+    try testing.expect(conn.send(&out, 0) > 0);
 
     // First version after 60s: send VN again (cooldown expired)
     std.mem.writeInt(u32, pkt[1..5], 0x00000002, .big);
     conn.receive(&pkt, src, 61_000_000_000, 0, io) catch {}; // +61s
-    try testing.expect(conn.send(&out) > 0);
+    try testing.expect(conn.send(&out, 0) > 0);
 }
 
 test "event_queue: wraparound maintains FIFO order" {
@@ -965,7 +966,9 @@ test "loss: multi-packet loss triggers single congestion event" {
     conn.current_time_ns = 1_000_000_000;
 
     // Force CUBIC into congestion avoidance with a known large window.
-    conn.congestion.ssthresh = 0; // cwnd always > ssthresh=0 → CUBIC always used
+    if (cc_mod.selected == .cubic) {
+        conn.congestion.ssthresh = 0; // cwnd always > ssthresh=0 → CUBIC always used
+    }
     conn.congestion.cwnd = 100 * 1200; // 120000 bytes (100 × MSS)
     const initial_cwnd = conn.congestion.cwnd;
 
@@ -973,7 +976,7 @@ test "loss: multi-packet loss triggers single congestion event" {
     conn.hot.tx_pn[0] = 11; // pretend pn=0..10 were sent
     var pn: u64 = 1;
     while (pn <= 10) : (pn += 1) {
-        conn.loss.onPacketSent(pn, 0, 1200, true, 0, .{});
+        conn.loss.onPacketSent(pn, 0, 1200, true, 0, 0, .{});
     }
 
     // ACK only pn=10; pn=1..7 satisfy K_PACKET_THRESHOLD and are declared lost.
@@ -989,8 +992,14 @@ test "loss: multi-packet loss triggers single congestion event" {
     };
     try conn.processAck(ack, 0);
 
-    const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(initial_cwnd)) * 0.7);
-    try testing.expectEqual(expected, conn.congestion.cwnd);
+    if (cc_mod.selected == .cubic) {
+        // CUBIC: cwnd reduced by BETA_CUBIC (0.7).
+        const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(initial_cwnd)) * 0.7);
+        try testing.expectEqual(expected, conn.congestion.cwnd);
+    } else {
+        // BBR: loss doesn't directly reduce cwnd (handled via delivery rate).
+        try testing.expect(conn.congestion.cwnd > 0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1031,7 +1040,7 @@ test "connection: PATH_CHALLENGE without app_keys is silently consumed (no panic
     conn.processFrames(buf[0..n], 2, null) catch {};
 
     var out: [64]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), conn.send(&out));
+    try testing.expectEqual(@as(usize, 0), conn.send(&out, 0));
 }
 
 test "connection: PATH_RESPONSE is silently consumed" {
@@ -1046,7 +1055,7 @@ test "connection: PATH_RESPONSE is silently consumed" {
     // No event, no packet queued
     try testing.expectEqual(@as(?Event, null), conn.pollEvent());
     var out: [64]u8 = undefined;
-    try testing.expectEqual(@as(usize, 0), conn.send(&out));
+    try testing.expectEqual(@as(usize, 0), conn.send(&out, 0));
 }
 
 // ---------------------------------------------------------------------------
@@ -1189,7 +1198,7 @@ test "connection: Version Negotiation DCID echoes full client SCID (RFC 9000 §6
 
     // Grab the VN packet from the send queue.
     var out: [256]u8 = undefined;
-    const n = conn.send(&out);
+    const n = conn.send(&out, 0);
     try testing.expect(n > 0);
 
     // First byte: long header (0x80 set).

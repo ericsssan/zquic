@@ -276,7 +276,8 @@ pub const Stream = struct {
     /// Cumulative bytes acknowledged on the send side.
     send_acked: u64,
     /// Out-of-order (SACK) acknowledged ranges waiting for the gap to be filled.
-    /// Bounded by STREAM_BUF_SIZE / min_chunk ≈ 32 entries in practice.
+    /// Adjacent/overlapping entries are merged on insertion; when full, the two
+    /// closest ranges are coalesced so no ACK info is ever silently dropped.
     sack_ranges: [32]struct { offset: u64, end: u64 },
     sack_count: u8,
     /// FIN has been queued for sending.
@@ -532,12 +533,71 @@ pub const Stream = struct {
             // Drain any SACK ranges that are now contiguous.
             self.flushSackRanges();
         } else {
-            // Out-of-order: save for when the gap is filled.
-            if (self.sack_count < self.sack_ranges.len) {
-                self.sack_ranges[self.sack_count] = .{ .offset = offset, .end = end };
-                self.sack_count += 1;
+            // Out-of-order: merge with existing range or insert new entry.
+            var merged = false;
+            for (self.sack_ranges[0..self.sack_count]) |*r| {
+                // Merge if adjacent or overlapping.
+                if (offset <= r.end and end >= r.offset) {
+                    r.offset = @min(r.offset, offset);
+                    r.end = @max(r.end, end);
+                    merged = true;
+                    break;
+                }
+            }
+            if (!merged) {
+                if (self.sack_count < self.sack_ranges.len) {
+                    self.sack_ranges[self.sack_count] = .{ .offset = offset, .end = end };
+                    self.sack_count += 1;
+                } else {
+                    // Array full — coalesce the two closest ranges to make room.
+                    // This guarantees no ACK information is ever silently dropped.
+                    self.coalesceClosest();
+                    self.sack_ranges[self.sack_count] = .{ .offset = offset, .end = end };
+                    self.sack_count += 1;
+                }
             }
         }
+    }
+
+    /// When the SACK array is full, merge the two closest (smallest gap)
+    /// ranges into one, freeing a slot.  The merged range covers both
+    /// original ranges plus the gap between them — those gap bytes are
+    /// "optimistically" marked as acked.  This is safe: the gap bytes were
+    /// either already acked (contiguous ACK we missed) or lost and will be
+    /// retransmitted (the retransmit ACK will be a no-op since the range
+    /// already covers them).  The key guarantee: no ACK information is ever
+    /// silently dropped, so send_acked always advances and the send buffer
+    /// never permanently stalls.
+    fn coalesceClosest(self: *Stream) void {
+        if (self.sack_count < 2) return;
+        var best_gap: u64 = std.math.maxInt(u64);
+        var best_i: usize = 0;
+        var best_j: usize = 1;
+        for (0..self.sack_count) |i| {
+            for (i + 1..self.sack_count) |j| {
+                const a = self.sack_ranges[i];
+                const b = self.sack_ranges[j];
+                // Gap between two non-overlapping ranges.
+                const gap = if (a.end <= b.offset)
+                    b.offset - a.end
+                else if (b.end <= a.offset)
+                    a.offset - b.end
+                else
+                    0; // overlapping — merge for free
+                if (gap < best_gap) {
+                    best_gap = gap;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+        // Merge j into i, remove j.
+        self.sack_ranges[best_i] = .{
+            .offset = @min(self.sack_ranges[best_i].offset, self.sack_ranges[best_j].offset),
+            .end = @max(self.sack_ranges[best_i].end, self.sack_ranges[best_j].end),
+        };
+        self.sack_count -= 1;
+        self.sack_ranges[best_j] = self.sack_ranges[self.sack_count];
     }
 
     /// Apply buffered SACK ranges that are now contiguous with send_acked.
@@ -939,9 +999,9 @@ test "stream_send: multiple out-of-order SACK ranges resolved in one flush" {
     s.send_offset = 3600;
 
     s.onAcked(1200, 1200); // out-of-order
-    s.onAcked(2400, 1200); // out-of-order
+    s.onAcked(2400, 1200); // out-of-order, merged with [1200,2400) → [1200,3600)
     try testing.expectEqual(@as(u64, 0), s.send_acked);
-    try testing.expectEqual(@as(usize, 2), s.sack_count);
+    try testing.expectEqual(@as(usize, 1), s.sack_count);
 
     s.onAcked(0, 1200); // fills gap → cascades through 1200 and 2400
     try testing.expectEqual(@as(u64, 3600), s.send_acked);

@@ -362,13 +362,14 @@ phase_verify_setup() {
     echo -e "${GREEN}✓${NC} zquic Docker image ready"
 
     # Verify implementations.json includes zquic
-    if grep -q '"zquic"' "$INTEROP_DIR/implementations.json"; then
-        echo -e "${GREEN}✓${NC} zquic registered in implementations.json"
+    local impl_file="$INTEROP_DIR/implementations_quic.json"
+    if grep -q '"zquic"' "$impl_file" 2>/dev/null; then
+        echo -e "${GREEN}✓${NC} zquic registered in implementations_quic.json"
     else
-        echo -e "${YELLOW}⚠${NC} zquic not in implementations.json, adding it..."
-        python3 << 'PYTHON_SCRIPT'
-import json
-config_file = '$INTEROP_DIR/implementations.json'
+        echo -e "${YELLOW}⚠${NC} zquic not in implementations_quic.json, adding it..."
+        python3 - "$impl_file" << 'PYTHON_SCRIPT'
+import json, sys
+config_file = sys.argv[1]
 with open(config_file, 'r') as f:
     config = json.load(f)
 if 'zquic' not in config:
@@ -380,7 +381,7 @@ if 'zquic' not in config:
     with open(config_file, 'w') as f:
         json.dump(config, f, indent=2)
 PYTHON_SCRIPT
-        echo -e "${GREEN}✓${NC} zquic added to implementations.json"
+        echo -e "${GREEN}✓${NC} zquic added to implementations_quic.json"
     fi
 
     echo ""

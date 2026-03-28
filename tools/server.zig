@@ -41,7 +41,7 @@ const PendingTransfer = struct {
 const ConnSlot = struct {
     conn: Conn,
     peer_addr: ?net.IpAddress = null,
-    /// When true, send responses through the CM socket (after preferred_address migration).
+    /// True when the most recent packet arrived on the CM socket.
     use_cm_sock: bool = false,
     transfers: [MAX_TRANSFERS]FileTransfer = [_]FileTransfer{.{}} ** MAX_TRANSFERS,
     /// Parsed requests deferred because all transfer slots were occupied.
@@ -64,6 +64,10 @@ const supported_cases = [_][]const u8{
 
 /// True when TESTCASE=http3 — uses H3 framing instead of HTTP/0.9.
 var g_is_h3: bool = false;
+/// Accumulated SSLKEYLOG data for all connections.  Written to /logs/keys.log
+/// in full on each update so createFileAbsolute truncation doesn't lose data.
+var g_keylog_buf: [65536]u8 = undefined;
+var g_keylog_len: usize = 0;
 
 // IPv4/IPv6 addresses for preferred_address in connectionmigration test (interop runner addresses).
 // server4:  193.167.100.100  (0xc1, 0xa7, 0x64, 0x64)
@@ -108,11 +112,16 @@ fn extractDcid(data: []const u8) ?[CID_LEN]u8 {
 }
 
 /// Find a connection slot by its local DCID.
+/// Also checks first_initial_dcid so that retransmitted client Initials
+/// (which use the original random DCID, not the server's SCID) are routed
+/// to the existing connection instead of creating a duplicate.
 fn findConnByDcid(slots: *const [MAX_CONNS]?*ConnSlot, dcid: [CID_LEN]u8) ?*ConnSlot {
     for (slots.*) |slot_opt| {
         const slot = slot_opt orelse continue;
         if (std.mem.eql(u8, &slot.conn.local_cid.bytes, &dcid)) return slot;
         if (std.mem.eql(u8, &slot.conn.alt_local_cid.bytes, &dcid)) return slot;
+        if (slot.conn.first_initial_dcid_len == CID_LEN and
+            std.mem.eql(u8, slot.conn.first_initial_dcid[0..CID_LEN], &dcid)) return slot;
     }
     return null;
 }
@@ -122,6 +131,7 @@ fn allocateSlot(slots: *[MAX_CONNS]?*ConnSlot, config: quic.Config, io: std.Io) 
     for (slots) |*s_opt| {
         if (s_opt.* == null) {
             const slot = try page_allocator.create(ConnSlot);
+            errdefer page_allocator.destroy(slot);
             slot.* = .{
                 .conn = try Conn.accept(config, io),
             };
@@ -204,12 +214,11 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
 
         if (slot.peer_addr) |pa| {
             // Retry H3 control streams if initial send failed (queue was full).
+            const send_sock = slotSendSock(slot, sock, cm_sock_ptr);
             if (g_is_h3 and !slot.h3_control_sent and slot.conn.app_keys != null) {
                 sendH3ControlStreams(slot);
             }
-            flushTransfers(slot, www_dir, io);
-            const send_sock = slotSendSock(slot, sock, cm_sock_ptr);
-            drainSend(&slot.conn, send_sock, io, &pa, send_bufs);
+            flushTransfers(slot, www_dir, io, send_sock, &pa, send_bufs);
         }
     }
 }
@@ -228,7 +237,10 @@ pub fn main(init: std.process.Init) !void {
     // Determine the testcase; exit 127 if unsupported.
     // Check this FIRST before attempting to load certs, so that compliance
     // checks with unsupported testcases exit cleanly with 127.
-    const testcase = init.environ_map.get("TESTCASE") orelse "transfer";
+    const testcase = init.environ_map.get("TESTCASE") orelse {
+        std.debug.print("TESTCASE not set, exiting\n", .{});
+        std.process.exit(127);
+    };
     var is_supported = false;
     for (supported_cases) |s| {
         if (std.mem.eql(u8, testcase, s)) {
@@ -481,13 +493,15 @@ fn processPacket(
     // BEFORE processing the incoming packet, so PATH_CHALLENGE is the first
     // frame sent from the new address (required by interop test).
     if (is_cm_socket and !s.use_cm_sock) {
-        s.use_cm_sock = true;
         var challenge: [8]u8 = undefined;
         io.random(&challenge);
         s.conn.sendPathChallenge(challenge) catch {};
-    } else if (is_cm_socket) {
-        // Already on CM socket, no action needed
     }
+    // Track the CURRENT socket — not a one-way flag.  When the client
+    // rebinds back to the original path (or sim stops NAT'ing through CM),
+    // the server must follow.  Without this, use_cm_sock stays true forever
+    // and data sent via CM socket can't reach clients on the original network.
+    if (s.use_cm_sock != is_cm_socket) s.use_cm_sock = is_cm_socket;
 
     const ecn_bits: u2 = 0;
     s.conn.receive(data, ipToSocketAddr(from), now_ns, ecn_bits, io) catch |err| {
@@ -549,13 +563,19 @@ fn processPacket(
                 }
                 break;
             },
+            .path_migrated => {
+                // Update send destination from the connection's authoritative
+                // peer address.  Without this, late-arriving packets from the
+                // old address (via s.peer_addr = from) route sends to the
+                // stale address.
+                s.peer_addr = socketAddrToIp(s.conn.peer_addr);
+            },
             else => {},
         }
     }
 
     if (!slot_freed) {
-        flushTransfers(s, www_dir, io);
-        drainSend(&s.conn, active_sock, io, &from, send_bufs);
+        flushTransfers(s, www_dir, io, active_sock, &from, send_bufs);
     }
 }
 
@@ -572,6 +592,7 @@ fn activatePending(transfers: *[MAX_TRANSFERS]FileTransfer, p: *const PendingTra
     t.active = true;
     t.stream_id = p.stream_id;
     t.offset = 0;
+    t.h3_headers_sent = false;
     @memcpy(t.path[0..p.path_len], p.path[0..p.path_len]);
     t.path_len = p.path_len;
     t.file = std.Io.Dir.openFileAbsolute(io, t.path[0..t.path_len], .{}) catch null;
@@ -672,7 +693,7 @@ fn startTransfer(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io) v
 /// the congestion window is small (e.g. initial cwnd = 10 packets): without
 /// interleaving, stream 0 would fill the window and streams 4/8 would get no
 /// packets at all, stalling their offset-0 delivery.
-fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
+fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io, send_sock: *const net.Socket, dest: *const net.IpAddress, send_bufs: *SendBufs) void {
     const conn = &slot.conn;
     const transfers = &slot.transfers;
     _ = www;
@@ -690,18 +711,30 @@ fn flushTransfers(slot: *ConnSlot, www: []const u8, io: std.Io) void {
         activatePending(transfers, &slot.pending[slot.pending_count], io);
     }
     // Outer loop: repeat passes until nothing was sent (CC/queue fully blocked).
+    // After each transfer advance, drain what pacing allows so bytes_in_flight
+    // stays current.  Without this, bytes_in_flight=0 during the fill phase and
+    // the cwnd check is blind — either starving the pipe (with bytes_queued) or
+    // flooding the send queue (without it).
     while (true) {
         var sent_any = false;
         for (transfers) |*t| {
             if (!t.active) continue;
-            if (g_is_h3) {
-                if (advanceTransferOneH3(conn, t, io)) sent_any = true;
-            } else {
-                if (advanceTransferOne(conn, t, io)) sent_any = true;
-            }
+            const progress = if (g_is_h3)
+                advanceTransferOneH3(conn, t, io)
+            else
+                advanceTransferOne(conn, t, io);
+            if (progress) sent_any = true;
         }
         if (!sent_any) break;
+        // Drain pacing-gated packets after each round-robin pass so
+        // bytes_in_flight stays current for the next pass's cwnd check.
+        drainSend(conn, send_sock, io, dest, send_bufs);
     }
+    // Always drain: tick() and receive() may have enqueued PATH_CHALLENGE,
+    // ACKs, or retransmissions independent of transfer progress.  Without
+    // this, those packets are stranded when all transfers are blocked
+    // (buffer full, amplification limit), causing path validation to stall.
+    drainSend(conn, send_sock, io, dest, send_bufs);
 }
 
 /// Send exactly one chunk from the transfer. Returns true if progress was made.
@@ -728,9 +761,11 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
             t.active = false;
             return true;
         }
-        // hq-interop: no file → already closed
+        // hq-interop: no file → send FIN so client gets a clean close
+        // instead of waiting until idle timeout.
+        conn.streamSend(t.stream_id, &.{}, true) catch return false;
         t.active = false;
-        return false;
+        return true;
     };
 
     // H3: send HEADERS frame first (:status 200)
@@ -799,30 +834,37 @@ fn advanceTransferGeneric(conn: *Conn, t: *FileTransfer, io: std.Io, is_h3: bool
 // ---------------------------------------------------------------------------
 
 /// Open the three server-initiated unidirectional streams required by RFC 9114.
+/// Streams are sent individually so a partial failure (queue full) can be
+/// retried without re-sending already-succeeded streams.
 fn sendH3ControlStreams(s: *ConnSlot) void {
     const conn = &s.conn;
     // Stream IDs: server-initiated unidirectional = 4*n + 3 → 3, 7, 11
+    const stream_ids = [_]u62{ 3, 7, 11 };
+    const stream_types = [_]u64{
+        http3.StreamType.control,
+        http3.StreamType.qpack_encoder,
+        http3.StreamType.qpack_decoder,
+    };
 
-    // 1. Control stream (type 0x00) + SETTINGS frame
-    var ctrl_buf: [64]u8 = undefined;
-    var pos: usize = 0;
-    // Stream type 0x00 (control)
-    pos += http3.varint.encode(ctrl_buf[pos..], http3.StreamType.control) catch return;
-    // SETTINGS frame (empty — all defaults)
-    pos += http3.frame.writeHeader(ctrl_buf[pos..], http3.FrameType.settings, 0) catch return;
-    conn.streamSend(3, ctrl_buf[0..pos], false) catch return;
-
-    // 2. QPACK encoder stream (type 0x02)
-    var enc_buf: [4]u8 = undefined;
-    const enc_len = http3.varint.encode(&enc_buf, http3.StreamType.qpack_encoder) catch return;
-    conn.streamSend(7, enc_buf[0..enc_len], false) catch return;
-
-    // 3. QPACK decoder stream (type 0x03)
-    var dec_buf: [4]u8 = undefined;
-    const dec_len = http3.varint.encode(&dec_buf, http3.StreamType.qpack_decoder) catch return;
-    conn.streamSend(11, dec_buf[0..dec_len], false) catch return;
-
-    s.h3_control_sent = true;
+    var all_sent = true;
+    for (stream_ids, stream_types) |sid, stype| {
+        // Skip streams that were already sent in a previous partial attempt.
+        if (conn.streams.get(sid)) |st| {
+            if (st.send_offset > 0) continue;
+        }
+        var buf: [64]u8 = undefined;
+        var pos: usize = 0;
+        pos += http3.varint.encode(buf[pos..], stype) catch return;
+        // Control stream also needs an empty SETTINGS frame.
+        if (stype == http3.StreamType.control) {
+            pos += http3.frame.writeHeader(buf[pos..], http3.FrameType.settings, 0) catch return;
+        }
+        conn.streamSend(sid, buf[0..pos], false) catch {
+            all_sent = false;
+            continue;
+        };
+    }
+    if (all_sent) s.h3_control_sent = true;
 }
 
 /// Parse an H3 request from a bidirectional stream and register a FileTransfer.
@@ -1033,10 +1075,11 @@ fn configureEcn(sock: *const net.Socket) !void {
 fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs) void {
     var messages: [SEND_BATCH]net.OutgoingMessage = undefined;
     var count: usize = 0;
+    const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
 
     // Phase 1: collect all outgoing packets into separate buffers.
     while (count < SEND_BATCH) {
-        const n = conn.send(&bufs.bufs[count]);
+        const n = conn.send(&bufs.bufs[count], now_ns);
         if (n == 0) break;
         messages[count] = .{
             .address = dest,
@@ -1094,13 +1137,7 @@ fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
         if (pos >= buf.len - 256) break;
     }
 
-    // Overwrite the keylog file with all generations (directory /logs created by Dockerfile)
-    const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
-    defer file.close(io);
-    file.writePositionalAll(io, buf[0..pos], 0) catch return;
-    // Sync multiple times to guarantee disk flush before docker cp
-    file.sync(io) catch {};
-    file.sync(io) catch {};
+    appendKeyLog(io, buf[0..pos]);
 }
 
 /// Write an SSLKEYLOG file so network analyzers (Wireshark/tshark) can decrypt
@@ -1128,12 +1165,18 @@ fn writeKeyLog(conn: *const Conn, io: std.Io) void {
     line = std.fmt.bufPrint(buf[pos..], "SERVER_TRAFFIC_SECRET_0 {s} {s}\n", .{ random_hex, std.fmt.bytesToHex(secrets_0.server, .lower) }) catch return;
     pos += line.len;
 
-    // Write keylog file (directory /logs created by Dockerfile)
+    appendKeyLog(io, buf[0..pos]);
+}
+
+fn appendKeyLog(io: std.Io, data: []const u8) void {
+    // Accumulate in memory, write full buffer each time (createFileAbsolute truncates).
+    const n = @min(data.len, g_keylog_buf.len - g_keylog_len);
+    if (n == 0) return;
+    @memcpy(g_keylog_buf[g_keylog_len..][0..n], data[0..n]);
+    g_keylog_len += n;
     const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
     defer file.close(io);
-    file.writePositionalAll(io, buf[0..pos], 0) catch return;
-    // Sync multiple times to guarantee disk flush before docker cp
-    file.sync(io) catch {};
+    file.writePositionalAll(io, g_keylog_buf[0..g_keylog_len], 0) catch return;
     file.sync(io) catch {};
 }
 
@@ -1141,6 +1184,13 @@ fn ipToSocketAddr(addr: net.IpAddress) quic.SocketAddr {
     return switch (addr) {
         .ip4 => |a| .{ .v4 = .{ .addr = a.bytes, .port = a.port } },
         .ip6 => |a| .{ .v6 = .{ .addr = a.bytes, .port = a.port } },
+    };
+}
+
+fn socketAddrToIp(addr: quic.SocketAddr) net.IpAddress {
+    return switch (addr) {
+        .v4 => |a| .{ .ip4 = .{ .bytes = a.addr, .port = a.port } },
+        .v6 => |a| .{ .ip6 = .{ .bytes = a.addr, .port = a.port } },
     };
 }
 

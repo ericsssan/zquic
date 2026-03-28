@@ -6,18 +6,16 @@
 //! C = 0.4.
 
 const std = @import("std");
+const common = @import("common.zig");
+const DeliveryRateSample = common.DeliveryRateSample;
+const MSS = common.MSS;
+const INITIAL_CWND = common.INITIAL_CWND;
 
 /// RFC 9438 §5.1: C = 0.4 (in segments). Since our cwnd is in bytes,
 /// scale by MSS to get the correct growth rate: C_bytes = 0.4 × MSS.
 /// Without this scaling, K is MSS× too large and CUBIC degenerates to AIMD.
 const C: f64 = 0.4 * @as(f64, @floatFromInt(MSS));
 const BETA_CUBIC: f64 = 0.7;
-/// RFC 9002 §7.2: max_datagram_size for congestion control.
-/// Matches MAX_SEND_PACKET_SIZE (1452) — the actual UDP payload we send.
-const MSS: u64 = 1452;
-/// RFC 9002 §7.2: initial_window = min(10 * mds, max(14720, 2 * mds))
-/// = min(14520, max(14720, 2904)) = 14520.
-const INITIAL_CWND: u64 = @min(10 * MSS, @max(14720, 2 * MSS));
 
 pub const Cubic = struct {
     /// Congestion window in bytes.
@@ -39,16 +37,8 @@ pub const Cubic = struct {
     /// growth when (target - cwnd) * MSS < cwnd.
     cwnd_remainder: u64,
 
-    // Pacing state: spread packets evenly across the RTT instead of bursting.
-    // Without pacing, all cwnd bytes are sent instantly on ACK, overflowing
-    // shallow queues and causing loss.  Pacing targets ~95% link utilization.
-    /// Pacing rate in bytes per second.  Updated on every ACK.
-    pacing_rate: u64,
-    /// Pacing token bucket: bytes allowed to send now.  Refilled each tick
-    /// based on elapsed time × pacing_rate.
-    pacing_tokens: u64,
-    /// Timestamp of last token refill (ns).
-    pacing_last_refill_ns: i64,
+    /// Pacing state (shared token bucket).
+    pacing: common.Pacing,
 
     pub fn init() Cubic {
         return .{
@@ -60,9 +50,7 @@ pub const Cubic = struct {
             .cwnd_at_epoch = 0,
             .w_est = 0,
             .cwnd_remainder = 0,
-            .pacing_rate = 0,
-            .pacing_tokens = INITIAL_CWND, // allow initial burst
-            .pacing_last_refill_ns = 0,
+            .pacing = .{},
         };
     }
 
@@ -71,26 +59,30 @@ pub const Cubic = struct {
         return self.cwnd > 0;
     }
 
-    /// Called when an ACK is received.
-    /// `bytes_acked` — bytes acknowledged.
-    /// `rtt_ns`      — smoothed RTT in nanoseconds.
-    /// `now_ns`      — current time in nanoseconds.
-    pub fn onAckReceived(self: *Cubic, bytes_acked: u64, rtt_ns: u64, now_ns: i64) void {
+    /// CUBIC always paces after the first ACK sets the pacing rate.
+    pub fn shouldPace(_: *const Cubic) bool {
+        return true;
+    }
+
+    /// Called when an ACK is received with a delivery rate sample.
+    /// CUBIC uses only bytes_acked and rtt_ns from the sample.
+    pub fn onAckReceived(self: *Cubic, sample: DeliveryRateSample, now_ns: i64) void {
+        const bytes_acked = sample.bytes_acked;
+        const rtt_ns = sample.rtt_ns;
         if (self.cwnd < self.ssthresh) {
             // Slow start: double cwnd per RTT (exponential growth).
             self.cwnd += bytes_acked;
         } else {
             self.updateCwndCubic(bytes_acked, rtt_ns, now_ns);
         }
-        // Update pacing rate: cwnd / srtt (bytes per second).
-        // During slow start, pace at 2× to allow exponential growth.
-        // In congestion avoidance, pace at 1.25× cwnd/srtt for headroom.
+        // Update pacing rate: 2× cwnd/RTT.  Enforced by the pacing gate
+        // in send() which uses wire-time accounting for bytes_in_flight.
         if (rtt_ns > 0) {
-            const base_rate = self.cwnd *| 1_000_000_000 / rtt_ns;
-            // Pace at 2× cwnd/RTT: allows CUBIC to probe above current cwnd
-            // without being throttled by the pacing rate. The congestion window
-            // is the real limit; pacing just smooths burst timing.
-            self.pacing_rate = base_rate *| 2;
+            const base_rate: u64 = @intCast(@min(
+                @as(u128, self.cwnd) * 1_000_000_000 / rtt_ns,
+                std.math.maxInt(u64),
+            ));
+            self.pacing.rate = base_rate *| 2;
         }
     }
 
@@ -101,11 +93,15 @@ pub const Cubic = struct {
         self.ssthresh = self.cwnd;
         self.epoch_start_ns = null;
         self.cwnd_remainder = 0;
+        // Reset pacing so stale rate/tokens from the old path don't cause bursts.
+        self.pacing = .{};
     }
 
     /// Called on packet loss (e.g., timeout or three duplicate ACKs).
+    /// `bytes_lost` — total bytes lost (unused by CUBIC, used by BBR).
     /// `now_ns` — current time in nanoseconds.
-    pub fn onPacketLost(self: *Cubic, now_ns: i64) void {
+    pub fn onPacketLost(self: *Cubic, bytes_lost: u64, now_ns: i64) void {
+        _ = bytes_lost;
         const MIN_CWND: u64 = 8 * MSS;
         self.w_max = @floatFromInt(self.cwnd);
         self.cwnd = @intFromFloat(@as(f64, @floatFromInt(self.cwnd)) * BETA_CUBIC);
@@ -124,30 +120,20 @@ pub const Cubic = struct {
         self.k = computeK(self.w_max, self.cwnd_at_epoch);
     }
 
-    /// Refill pacing tokens based on elapsed time.  Call at the start of each
-    /// send opportunity (tick or post-ACK).  Returns the number of bytes
-    /// allowed to send.  Tokens are capped at 2×cwnd to allow modest bursts
-    /// (e.g., after ACK batching) without unlimited accumulation.
+    /// Called on ECN CE marks. CUBIC treats ECN the same as packet loss.
+    pub fn onEcnCe(self: *Cubic, ce_count: u64, now_ns: i64) void {
+        _ = ce_count;
+        self.onPacketLost(0, now_ns);
+    }
+
+    /// Refill pacing tokens. Delegates to shared Pacing.
     pub fn pacingRefill(self: *Cubic, now_ns: i64) u64 {
-        if (self.pacing_rate == 0) {
-            // No pacing rate yet (before first ACK) — allow full cwnd.
-            return self.cwnd;
-        }
-        if (self.pacing_last_refill_ns == 0) {
-            self.pacing_last_refill_ns = now_ns;
-            return self.pacing_tokens;
-        }
-        const elapsed_ns: u64 = @intCast(@max(now_ns - self.pacing_last_refill_ns, 0));
-        self.pacing_last_refill_ns = now_ns;
-        // tokens += pacing_rate × elapsed_seconds
-        const new_tokens = self.pacing_rate *| elapsed_ns / 1_000_000_000;
-        self.pacing_tokens = @min(self.pacing_tokens +| new_tokens, self.cwnd *| 2);
-        return self.pacing_tokens;
+        return self.pacing.refill(self.cwnd, now_ns);
     }
 
     /// Consume pacing tokens after sending a packet.
     pub fn pacingConsume(self: *Cubic, bytes: u64) void {
-        self.pacing_tokens -|= bytes;
+        self.pacing.consume(bytes);
     }
 
     fn updateCwndCubic(self: *Cubic, bytes_acked: u64, rtt_ns: u64, now_ns: i64) void {
@@ -217,7 +203,7 @@ test "cubic: slow start doubles" {
     const testing = std.testing;
     var c = Cubic.init();
     const initial = c.cwnd;
-    c.onAckReceived(initial, 10_000_000, 0);
+    c.onAckReceived(.{ .bytes_acked = initial, .rtt_ns = 10_000_000 }, 0);
     try testing.expect(c.cwnd >= initial);
 }
 
@@ -226,7 +212,7 @@ test "cubic: loss reduces window" {
     var c = Cubic.init();
     c.cwnd = 100 * MSS;
     const before = c.cwnd;
-    c.onPacketLost(1_000_000_000);
+    c.onPacketLost(0, 1_000_000_000);
     try testing.expect(c.cwnd < before);
     try testing.expectEqual(c.cwnd, c.ssthresh);
 }
@@ -235,14 +221,14 @@ test "cubic: cwnd grows after loss" {
     const testing = std.testing;
     var c = Cubic.init();
     c.cwnd = 50 * MSS;
-    c.onPacketLost(0);
+    c.onPacketLost(0, 0);
     const after_loss = c.cwnd;
     const rtt_ns: u64 = 50_000_000; // 50ms
     // Simulate several ACK events
     var t: i64 = 100_000_000;
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        c.onAckReceived(MSS, rtt_ns, t);
+        c.onAckReceived(.{ .bytes_acked = MSS, .rtt_ns = rtt_ns }, t);
         t += @intCast(rtt_ns);
     }
     try testing.expect(c.cwnd >= after_loss);
@@ -260,7 +246,7 @@ test "cubic: onAckReceived with zero bytes is a no-op" {
     const testing = std.testing;
     var c = Cubic.init();
     const before = c.cwnd;
-    c.onAckReceived(0, 50_000_000, 1_000_000_000);
+    c.onAckReceived(.{ .bytes_acked = 0, .rtt_ns = 50_000_000 }, 1_000_000_000);
     try testing.expectEqual(before, c.cwnd);
 }
 
@@ -269,9 +255,9 @@ test "cubic: slow start adds bytes_acked directly to cwnd" {
     var c = Cubic.init();
     // ssthresh = maxInt(u64) by default — we are in slow start
     const initial = c.cwnd;
-    c.onAckReceived(MSS, 50_000_000, 1_000_000_000);
+    c.onAckReceived(.{ .bytes_acked = MSS, .rtt_ns = 50_000_000 }, 1_000_000_000);
     try testing.expectEqual(initial + MSS, c.cwnd);
-    c.onAckReceived(2 * MSS, 50_000_000, 1_050_000_000);
+    c.onAckReceived(.{ .bytes_acked = 2 * MSS, .rtt_ns = 50_000_000 }, 1_050_000_000);
     try testing.expectEqual(initial + 3 * MSS, c.cwnd);
 }
 
@@ -280,11 +266,11 @@ test "cubic: epoch_start_ns null sentinel prevents spurious reset at clock=0" {
     var c = Cubic.init();
     // Force into CUBIC phase by setting ssthresh below cwnd
     c.cwnd = 50 * MSS;
-    c.onPacketLost(0); // epoch_start_ns = Some(0), not null
+    c.onPacketLost(0, 0); // epoch_start_ns = Some(0), not null
     const cwnd_after_loss = c.cwnd;
 
     // ACK at t=1ms: epoch should NOT reinitialize (epoch_start_ns is Some(0), not null)
-    c.onAckReceived(MSS, 50_000_000, 1_000_000); // 1ms later
+    c.onAckReceived(.{ .bytes_acked = MSS, .rtt_ns = 50_000_000 }, 1_000_000); // 1ms later
     // cwnd must be >= post-loss cwnd (no spurious reset)
     try testing.expect(c.cwnd >= cwnd_after_loss);
     // epoch_start_ns must still be Some(0), not changed
@@ -295,7 +281,7 @@ test "cubic: w_est accumulates across ACKs in CUBIC phase" {
     const testing = std.testing;
     var c = Cubic.init();
     c.cwnd = 50 * MSS;
-    c.onPacketLost(0);
+    c.onPacketLost(0, 0);
     const w_est_after_loss = c.w_est;
 
     // Set up a scenario where w_cubic < w_est so TCP-friendly phase is active.
@@ -306,7 +292,7 @@ test "cubic: w_est accumulates across ACKs in CUBIC phase" {
     c.cwnd_at_epoch = @floatFromInt(c.cwnd);
     c.w_est = @as(f64, @floatFromInt(c.cwnd)) + 1000.0; // w_est > w_cubic initially
 
-    c.onAckReceived(MSS, 50_000_000, 100_000_000);
+    c.onAckReceived(.{ .bytes_acked = MSS, .rtt_ns = 50_000_000 }, 100_000_000);
     try testing.expect(c.w_est > w_est_after_loss);
 }
 
@@ -314,10 +300,10 @@ test "cubic: non-monotonic clock (negative t_ns) is a no-op" {
     const testing = std.testing;
     var c = Cubic.init();
     c.cwnd = 50 * MSS;
-    c.onPacketLost(1_000_000_000);
+    c.onPacketLost(0, 1_000_000_000);
     const cwnd_before = c.cwnd;
 
-    c.onAckReceived(MSS, 50_000_000, 500_000_000);
+    c.onAckReceived(.{ .bytes_acked = MSS, .rtt_ns = 50_000_000 }, 500_000_000);
     try testing.expectEqual(cwnd_before, c.cwnd);
 }
 
@@ -334,7 +320,7 @@ test "cubic: single loss event reduces cwnd by exactly BETA_CUBIC" {
     var c = Cubic.init();
     c.cwnd = 100 * MSS; // 120000 bytes
     const before = c.cwnd;
-    c.onPacketLost(1_000_000_000);
+    c.onPacketLost(0, 1_000_000_000);
     // Expected: floor(120000 * 0.7) = 84000, but minimum is 8*MSS
     const expected: u64 = @intFromFloat(@as(f64, @floatFromInt(before)) * BETA_CUBIC);
     const MIN_CWND: u64 = 8 * MSS;
@@ -356,7 +342,7 @@ test "cubic: large window growth does not stall" {
     const initial = c.cwnd;
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
-        c.onAckReceived(MSS, 100_000_000, 10_000_000_000);
+        c.onAckReceived(.{ .bytes_acked = MSS, .rtt_ns = 100_000_000 }, 10_000_000_000);
     }
     try testing.expect(c.cwnd > initial + 100);
 }
@@ -384,7 +370,7 @@ test "cubic: loss reduction is exactly BETA_CUBIC * cwnd" {
     const testing = std.testing;
     var c = Cubic.init();
     c.cwnd = 10 * MSS; // 12000 bytes
-    c.onPacketLost(0);
+    c.onPacketLost(0, 0);
     // Expected: floor(12000 * 0.7) = 8400, but floored to MIN_CWND = 8*MSS = 9600.
     // When floor applies, w_max is clipped to MIN_CWND to prevent K ≈ 18s pathology.
     try testing.expectEqual(@as(u64, 8 * MSS), c.cwnd);
@@ -406,7 +392,7 @@ test "cubic: cwnd_remainder uses saturating arithmetic on extreme target" {
     c.epoch_start_ns = 0;
     c.cwnd_at_epoch = @floatFromInt(c.cwnd);
 
-    c.onAckReceived(1, 10_000_000, 400_000 * 1_000_000_000);
+    c.onAckReceived(.{ .bytes_acked = 1, .rtt_ns = 10_000_000 }, 400_000 * 1_000_000_000);
 
     try testing.expect(c.cwnd >= MSS);
     try testing.expect(c.cwnd > MSS);
