@@ -75,9 +75,16 @@ fn WindowedFilter(comptime T: type, comptime window: u64) type {
 
         pub fn update(self: *Self, val: T, round: u64) void {
             // If new value >= current best, it becomes the new best.
+            // Demote old entries rather than resetting all three to the
+            // same round — otherwise all three expire simultaneously
+            // and the filter collapses to whatever the current sample is.
             if (val >= self.val[0]) {
-                self.val = .{ val, val, val };
-                self.round = .{ round, round, round };
+                self.val[2] = self.val[1];
+                self.round[2] = self.round[1];
+                self.val[1] = self.val[0];
+                self.round[1] = self.round[0];
+                self.val[0] = val;
+                self.round[0] = round;
                 return;
             }
 
@@ -823,6 +830,27 @@ test "bbr: windowed filter expires old values" {
     // After window expires (round 4, window=2), old value should be replaced.
     f.update(100, 4);
     try std.testing.expectEqual(@as(u64, 100), f.get());
+}
+
+test "bbr: windowed filter demotes on new best, preventing simultaneous expiry" {
+    const Filter = WindowedFilter(u64, 10);
+    var f = Filter.init(0);
+    // Startup peak at round 5.
+    f.update(1000, 5);
+    try std.testing.expectEqual(@as(u64, 1000), f.get());
+    // Slightly higher peak at round 8 (inflated Startup sample).
+    f.update(1050, 8);
+    try std.testing.expectEqual(@as(u64, 1050), f.get());
+    // ProbeBW DOWN samples at 950 (below peak) — enter as second/third.
+    f.update(950, 12);
+    f.update(960, 15);
+    // After 10 rounds from peak (round 18): peak at round 8 expires.
+    // The demoted second-best (1000 from round 5) also expired (18-5=13>=10).
+    // But 960 from round 15 is still valid (18-15=3<10).
+    f.update(700, 18);
+    // Without demotion fix: all three expire → get() = 700.
+    // With demotion fix: 960 (round 15) survives → get() = 960.
+    try std.testing.expectEqual(@as(u64, 960), f.get());
 }
 
 test "bbr: loss bounding reduces inflight_hi" {
