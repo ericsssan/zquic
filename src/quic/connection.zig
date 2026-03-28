@@ -876,6 +876,15 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             }
 
+            // RFC 9000 §14.1: datagrams carrying ack-eliciting Initial packets
+            // MUST be at least 1200 bytes.  Pad after coalescing so the Handshake
+            // portion fills the datagram (reducing the number of separate packets
+            // needed for the cert chain) instead of wasting space on PADDING frames.
+            if (meta.epoch == 0 and meta.ack_eliciting and total < 1200 and out.len >= 1200) {
+                @memset(out[total..1200], 0);
+                total = 1200;
+            }
+
             if (self.congestion.pacing.rate > 0) {
                 self.congestion.pacing.consume(total);
             }
