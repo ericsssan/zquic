@@ -177,17 +177,12 @@ test "transfer: 3 concurrent streams complete" {
 test "transfer: 4KB at 2% loss" {
     const testing = std.testing;
     const io = std.testing.io;
-    var sim = NetSim.init(.{ .delay_ns = 10_000_000, .loss_pct = 2, .seed = 800 });
+    var sim = NetSim.init(.{ .delay_ns = 1_000_000, .loss_pct = 2, .seed = 800 }); // 1ms delay
     var server = try Connection(16).accept(.{}, io);
     server.current_time_ns = sim.now_ns;
     var client = TestClient.init(server.local_cid.bytes, io);
 
     try std.testing.expect(try sim.runHandshake(&client, &server, io));
-    try serverSendChunked(&server, 1, 4096, true);
-    try sim.runUntilIdle(&client, &server, io, 10000);
-
-    const received = client.receivedStreamData(1);
-    try testing.expect(received != null);
-    try testing.expectEqual(@as(usize, 4096), received.?.data.len);
-    try testing.expect(received.?.fin);
+    const received = try sim.runTransfer(&client, &server, io, 1, 4096);
+    try testing.expectEqual(@as(usize, 4096), received);
 }

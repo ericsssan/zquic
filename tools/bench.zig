@@ -8,11 +8,8 @@
 const std = @import("std");
 const zquic = @import("zquic");
 const Connection = zquic.Connection;
-const SocketAddr = zquic.SocketAddr;
 const NetSim = zquic.netsim.NetSim;
 const TestClient = zquic.test_harness.TestClient;
-
-const CLIENT_ADDR: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 12345 } };
 
 const Scenario = struct {
     name: []const u8,
@@ -25,25 +22,26 @@ const scenarios = [_]Scenario{
     .{ .name = "1KB x 1 stream, 50ms RTT", .data_bytes = 1024, .stream_count = 1, .rtt_ms = 50 },
     .{ .name = "64KB x 1 stream, 50ms RTT", .data_bytes = 64 * 1024, .stream_count = 1, .rtt_ms = 50 },
     .{ .name = "256KB x 1 stream, 50ms RTT", .data_bytes = 256 * 1024, .stream_count = 1, .rtt_ms = 50 },
+    .{ .name = "1MB x 1 stream, 50ms RTT", .data_bytes = 1024 * 1024, .stream_count = 1, .rtt_ms = 50 },
     .{ .name = "64KB x 3 streams, 50ms RTT", .data_bytes = 64 * 1024, .stream_count = 3, .rtt_ms = 50 },
 };
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     try stdout.print("\n=== zquic throughput benchmark ===\n\n", .{});
-    try stdout.print("{s:<35} {s:>12} {s:>12} {s:>14}\n", .{ "Scenario", "Goodput kbps", "Handshake us", "Virtual ms" });
-    try stdout.print("{s:-<75}\n", .{""});
+    try stdout.print("{s:<35} {s:>10} {s:>12} {s:>12}\n", .{ "Scenario", "Received", "Goodput kbps", "Handshake us" });
+    try stdout.print("{s:-<71}\n", .{""});
 
     for (scenarios) |s| {
         const result = runScenario(s) catch |err| {
             try stdout.print("{s:<35} ERROR: {}\n", .{ s.name, err });
             continue;
         };
-        try stdout.print("{s:<35} {d:>12.0} {d:>12} {d:>11}\n", .{
+        try stdout.print("{s:<35} {d:>8}KB {d:>12.0} {d:>12}\n", .{
             s.name,
+            result.bytes_received / 1024,
             result.goodput_kbps,
             result.handshake_us,
-            @divFloor(result.transfer_ns, 1_000_000),
         });
     }
     try stdout.print("\n", .{});
@@ -52,7 +50,7 @@ pub fn main() !void {
 const BenchResult = struct {
     goodput_kbps: f64,
     handshake_us: i64,
-    transfer_ns: i64,
+    bytes_received: usize,
 };
 
 fn runScenario(s: Scenario) !BenchResult {
@@ -70,39 +68,28 @@ fn runScenario(s: Scenario) !BenchResult {
     const hs_end = sim.now_ns;
     const handshake_us = @divFloor(hs_end - hs_start, 1000);
 
-    // Queue data on server streams in 1KB chunks (max packet payload ~1400B)
+    // Transfer data on each stream
     const per_stream = s.data_bytes / s.stream_count;
-    const chunk_size: usize = 1024;
-    var chunk: [chunk_size]u8 = undefined;
-    @memset(&chunk, 0xAB);
+    const transfer_start = sim.now_ns;
+    var total_received: usize = 0;
 
     for (0..s.stream_count) |si| {
-        const stream_id: u62 = @intCast(1 + si * 4); // server-initiated bidi
-        var remaining = per_stream;
-        while (remaining > 0) {
-            const send_len = @min(remaining, chunk_size);
-            const fin = remaining <= chunk_size;
-            server.streamSend(stream_id, chunk[0..send_len], fin) catch break;
-            remaining -= send_len;
-        }
+        const stream_id: u62 = @intCast(1 + si * 4);
+        const received = try sim.runTransfer(&client, &server, io, stream_id, per_stream);
+        total_received += received;
     }
 
-    // Transfer
-    const transfer_start = sim.now_ns;
-    try sim.runUntilIdle(&client, &server, io, 50000);
     const transfer_end = sim.now_ns;
     const transfer_ns = transfer_end - transfer_start;
 
-    // Compute goodput
-    const bytes_received = client.totalReceivedBytes();
     const goodput_kbps: f64 = if (transfer_ns > 0)
-        @as(f64, @floatFromInt(bytes_received)) * 8.0 / @as(f64, @floatFromInt(transfer_ns)) * 1_000_000_000.0 / 1000.0
+        @as(f64, @floatFromInt(total_received)) * 8.0 / @as(f64, @floatFromInt(transfer_ns)) * 1_000_000_000.0 / 1000.0
     else
         0;
 
     return .{
         .goodput_kbps = goodput_kbps,
         .handshake_us = handshake_us,
-        .transfer_ns = transfer_ns,
+        .bytes_received = total_received,
     };
 }

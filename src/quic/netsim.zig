@@ -33,6 +33,8 @@ pub const NetSimConfig = struct {
     loss_pct: u8 = 0,
     /// Byte corruption probability [0..100].
     corruption_pct: u8 = 0,
+    /// Reorder probability [0..100]. Affected packets get 2× extra delay.
+    reorder_pct: u8 = 0,
     /// Bandwidth cap in bytes/second (0 = unlimited).
     bandwidth_bps: u64 = 0,
     /// Maximum queue depth (packets). Excess packets are silently dropped.
@@ -72,8 +74,17 @@ pub const NetSim = struct {
         var pkt = &self.queue[self.queue_len];
         @memcpy(pkt.data[0..data.len], data);
         pkt.len = data.len;
-        pkt.delivery_ns = self.now_ns + self.config.delay_ns;
         pkt.dir = dir;
+
+        // Reorder: some packets get extra delay, arriving after later packets
+        var delay = self.config.delay_ns;
+        if (self.config.reorder_pct > 0) {
+            const roll = self.prng.random().intRangeAtMost(u8, 0, 99);
+            if (roll < self.config.reorder_pct) {
+                delay *= 2; // arrives 2× later → out of order
+            }
+        }
+        pkt.delivery_ns = self.now_ns + delay;
 
         // Corruption: flip random bytes
         if (self.config.corruption_pct > 0) {
@@ -305,6 +316,77 @@ pub const NetSim = struct {
                 }
             }
         }
+    }
+
+    /// Send `total_bytes` on `stream_id`, interleaving with the event loop
+    /// so the congestion window can grow via ACKs. Returns bytes received.
+    pub fn runTransfer(
+        self: *NetSim,
+        client: *TestClient,
+        server: *Connection(16),
+        io: std.Io,
+        stream_id: u62,
+        total_bytes: usize,
+    ) !usize {
+        const chunk_size: usize = 1024;
+        var chunk: [chunk_size]u8 = undefined;
+        @memset(&chunk, 0xAB);
+        var queued: usize = 0;
+
+        var ticks: usize = 0;
+        while (ticks < 500000) : (ticks += 1) {
+            // Try to queue as much as cwnd allows
+            while (queued < total_bytes) {
+                const len = @min(total_bytes - queued, chunk_size);
+                const fin = queued + len == total_bytes;
+                server.streamSend(stream_id, chunk[0..len], fin) catch break;
+                queued += len;
+            }
+
+            self.drainServerSend(server);
+
+            if (client.totalReceivedBytes() >= total_bytes) break;
+
+            const net_time = self.nextDeliveryTime();
+            const server_time = server.nextTimeout();
+            const next_time = minOptional(net_time, server_time) orelse {
+                if (queued >= total_bytes) break;
+                // cwnd-blocked, no events — advance 1 RTT so pacing refills
+                self.now_ns += self.config.delay_ns * 2;
+                server.tick(self.now_ns);
+                self.drainServerSend(server);
+                continue;
+            };
+
+            self.advanceTo(next_time);
+
+            if (server_time) |st| {
+                if (self.now_ns >= st) {
+                    server.tick(self.now_ns);
+                    self.drainServerSend(server);
+                }
+            }
+
+            while (self.deliver()) |pkt| {
+                switch (pkt.dir) {
+                    .c2s => {
+                        server.receive(pkt.data, CLIENT_ADDR, self.now_ns, 0, io) catch {};
+                        self.drainServerSend(server);
+                    },
+                    .s2c => {
+                        const prev_pn = client.largest_rx_pn;
+                        client.processServerDatagram(pkt.data) catch {};
+                        if (client.largest_rx_pn > prev_pn or (prev_pn == 0 and client.tls.state == .established)) {
+                            var ack_buf: [MAX_DGRAM]u8 = undefined;
+                            const ack_len = client.buildAck(&ack_buf, @intCast(client.largest_rx_pn));
+                            self.send(ack_buf[0..ack_len], .c2s);
+                        }
+                    },
+                }
+            }
+        }
+
+        return client.totalReceivedBytes();
     }
 
     fn drainServerSend(self: *NetSim, server: *Connection(16)) void {
