@@ -863,6 +863,11 @@ pub fn Connection(comptime max_streams: usize) type {
             // Queue the ClientHello as an Initial CRYPTO frame.
             try self.queueTlsOutput(ch_buf[0..ch_len]);
 
+            // If PSK was offered, set 0-RTT keys for early data sending.
+            if (tls_client.early_keys) |ek| {
+                self.zero_rtt_keys = ek;
+            }
+
             return self;
         }
 
@@ -1322,7 +1327,7 @@ pub fn Connection(comptime max_streams: usize) type {
             }
             // Check buffer capacity before any mutation so the operation is all-or-nothing.
             if (st.sendBufferFree() < data.len) return error.BufferFull;
-            if (self.hot.state != .established) return error.StreamNotWritable;
+            if (self.hot.state != .established and self.zero_rtt_keys == null) return error.StreamNotWritable;
             // Congestion window gate for new sends only (RFC 9002 §7).
             // Retransmissions (processLostFrames) bypass this check so loss recovery
             // is never blocked by a temporarily-reduced cwnd after a loss event.
@@ -3706,14 +3711,60 @@ pub fn Connection(comptime max_streams: usize) type {
             _ = try self.sendShortHeaderPacket(fpos, fi, true);
         }
 
+        /// Build a 0-RTT long header packet containing a STREAM frame.
+        fn encryptAndEnqueueZeroRttStreamFrame(self: *Self, id: u62, offset: u62, data: []const u8, fin: bool, zk: crypto.PacketKeys) !void {
+            self.idle_ping_count = 0;
+            var fpos: usize = 0;
+            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream = .{
+                .stream_id = id,
+                .offset = offset,
+                .fin = fin,
+                .data = data,
+            } });
+            const pn = self.hot.tx_pn[2]; // 0-RTT shares the 1-RTT PN space (epoch 2)
+            self.hot.tx_pn[2] += 1;
+            const ct_len = fpos + 16;
+            const slot_buf = try self.reserveSendSlot(ct_len + 30);
+            const hdr_len = packet.encodeLongHeader(
+                slot_buf,
+                .zero_rtt,
+                self.quic_version,
+                self.peer_scid[0..self.peer_scid_len],
+                self.ourScidBytes(),
+                &.{},
+                @intCast(pn),
+                ct_len,
+            );
+            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) {
+                self.hot.tx_pn[2] -= 1;
+                return error.PacketTooLarge;
+            }
+            crypto.encryptPayload(zk, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(zk, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+            self.commitSendSlot(hdr_len + ct_len);
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .{ .stream = .{
+                .stream_id = id,
+                .offset = offset,
+                .len = @intCast(@min(data.len, 0xffff)),
+                .fin = fin,
+            } };
+            fi.count = 1;
+            self.storeSendMeta(pn, 2, hdr_len + ct_len, true, fi);
+        }
+
         fn queueStreamData(self: *Self, id: u62, data: []const u8, fin: bool) !void {
-            if (self.app_keys == null) return;
+            if (self.app_keys == null and self.zero_rtt_keys == null) return;
 
             const st = self.streams.getOrCreate(id) orelse return;
             const offset: u62 = @intCast(st.send_offset);
             // Enqueue the packet first; if the send queue is full this returns an error
             // and no state is changed (send_buf and send_offset remain unmodified).
-            try self.encryptAndEnqueueStreamFrame(id, offset, data, fin);
+            if (self.app_keys != null) {
+                try self.encryptAndEnqueueStreamFrame(id, offset, data, fin);
+            } else if (self.zero_rtt_keys) |zk| {
+                try self.encryptAndEnqueueZeroRttStreamFrame(id, offset, data, fin, zk);
+            } else return;
             // Only after the packet is successfully queued: buffer for retransmission
             // and advance the send offset.
             _ = st.bufferSendData(data);

@@ -94,6 +94,10 @@ pub const TlsClient = struct {
     /// Stored ticket to offer in the next ClientHello (set externally).
     /// When set, buildClientHello includes pre_shared_key extension.
     offer_ticket: bool = false,
+    /// 0-RTT: client_early_traffic_secret derived after ClientHello when offering PSK.
+    client_early_traffic_secret: [32]u8 = [_]u8{0} ** 32,
+    /// 0-RTT packet keys (derived from client_early_traffic_secret).
+    early_keys: ?crypto.PacketKeys = null,
 
     // CRYPTO data accumulation buffer (matches TlsServer pattern for fragmented data).
     read_buf: [8192]u8,
@@ -317,6 +321,23 @@ pub const TlsClient = struct {
         // Hash into transcript
         self.transcript.update(out[0..pos]);
         self.state = .wait_server_hello;
+
+        // Derive 0-RTT keys if offering a PSK ticket (RFC 8446 §7.1).
+        // client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", H(CH))
+        // Must happen AFTER transcript includes ClientHello.
+        if (self.offer_ticket and self.has_ticket) {
+            const zero32 = [_]u8{0} ** 32;
+            const early_secret = HkdfSha256.extract(&zero32, &self.ticket_psk);
+            var ch_hash: [32]u8 = undefined;
+            var ch_snap = self.transcript;
+            ch_snap.final(&ch_hash);
+            crypto.hkdfExpandLabel(&self.client_early_traffic_secret, early_secret, "c e traffic", &ch_hash);
+            self.early_keys = crypto.derivePacketKeysWithSuite(
+                self.client_early_traffic_secret,
+                self.quic_version,
+                self.negotiated_cipher,
+            );
+        }
 
         return pos;
     }

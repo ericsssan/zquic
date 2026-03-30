@@ -661,6 +661,52 @@ test "pair: PSK resumption — server issues ticket, client resumes" {
     try testing.expectEqual(@as(usize, 4096), received);
 }
 
+test "pair: 0-RTT early data accepted by server" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    const tls_mod = @import("tls.zig");
+
+    const ticket_key: [32]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } ++ .{ 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 };
+
+    // First connection: full handshake to get a ticket
+    var sim1 = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9200 });
+    var server1 = try Connection(16).accept(.{ .ticket_key = &ticket_key }, io);
+    server1.current_time_ns = sim1.now_ns;
+    var client1 = try Connection(16).connect(.{}, io);
+    client1.current_time_ns = sim1.now_ns;
+
+    try testing.expect(try sim1.runPairHandshake(&client1, &server1, io));
+    try sim1.runPairIdle(&client1, &server1, io);
+
+    const ticket: tls_mod.SessionTicket = client1.getSessionTicket() orelse return;
+    try testing.expect(ticket.identity_len > 0);
+
+    // Second connection: PSK resumption with 0-RTT early data
+    var sim2 = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9201 });
+    var server2 = try Connection(16).accept(.{ .ticket_key = &ticket_key }, io);
+    server2.current_time_ns = sim2.now_ns;
+    var client2 = try Connection(16).connect(.{ .session_ticket = ticket }, io);
+    client2.current_time_ns = sim2.now_ns;
+
+    // Client should have 0-RTT keys
+    try testing.expect(client2.zero_rtt_keys != null);
+
+    // Send early data BEFORE handshake completes
+    var payload: [512]u8 = undefined;
+    @memset(&payload, 0xEE);
+    try client2.streamSend(0, &payload, true);
+
+    // Complete the handshake (which also delivers the 0-RTT data)
+    try testing.expect(try sim2.runPairHandshake(&client2, &server2, io));
+    try sim2.runPairIdle(&client2, &server2, io);
+
+    // Server should have received the early data
+    var recv_buf: [1024]u8 = undefined;
+    const received = server2.streamRecv(0, &recv_buf);
+    try testing.expectEqual(@as(usize, 512), received);
+    try testing.expectEqual(@as(u8, 0xEE), recv_buf[0]);
+}
+
 test "pair: bidirectional simultaneous transfer" {
     const io = std.testing.io;
     const testing = std.testing;
