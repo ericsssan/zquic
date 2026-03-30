@@ -20,6 +20,7 @@ const packet_mod = @import("packet.zig");
 const transport_params = @import("transport_params.zig");
 const tls_client = @import("tls_client.zig");
 pub const TlsClient = tls_client.TlsClient;
+pub const SessionTicket = tls_client.SessionTicket;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Sha256 = std.crypto.hash.sha2.Sha256;

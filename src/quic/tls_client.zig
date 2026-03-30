@@ -37,6 +37,16 @@ pub const TlsClientState = enum(u8) {
     established,
 };
 
+/// Opaque session ticket for PSK resumption across connections.
+pub const SessionTicket = struct {
+    identity: [256]u8,
+    identity_len: u16,
+    psk: [32]u8,
+    age_add: u32,
+    cipher: crypto.CipherSuite,
+    received_ns: i64,
+};
+
 pub const TlsClient = struct {
     state: TlsClientState,
     ecdh_kp: X25519.KeyPair,
@@ -68,6 +78,23 @@ pub const TlsClient = struct {
     alpn: [32]u8 = [_]u8{0} ** 32,
     alpn_len: u8 = 0,
 
+    // PSK / session resumption fields
+    resumption_master_secret: [32]u8,
+    /// Received session ticket (opaque identity for PSK extension).
+    ticket_identity: [256]u8 = [_]u8{0} ** 256,
+    ticket_identity_len: u16 = 0,
+    /// PSK derived from resumption_master_secret + ticket_nonce.
+    ticket_psk: [32]u8 = [_]u8{0} ** 32,
+    /// Obfuscated ticket age (from NewSessionTicket.ticket_age_add).
+    ticket_age_add: u32 = 0,
+    /// Timestamp (ns) when ticket was received — used to compute ticket age.
+    ticket_received_ns: i64 = 0,
+    /// True when a valid session ticket is stored and can be used for PSK.
+    has_ticket: bool = false,
+    /// Stored ticket to offer in the next ClientHello (set externally).
+    /// When set, buildClientHello includes pre_shared_key extension.
+    offer_ticket: bool = false,
+
     // CRYPTO data accumulation buffer (matches TlsServer pattern for fragmented data).
     read_buf: [8192]u8,
     read_len: usize,
@@ -98,6 +125,7 @@ pub const TlsClient = struct {
             .negotiated_cipher = .aes_128_gcm,
             .quic_version = packet_mod.QUIC_VERSION_1,
             .peer_transport_params = .{},
+            .resumption_master_secret = [_]u8{0} ** 32,
             .read_buf = undefined,
             .read_len = 0,
             .crypto_bytes_total = 0,
@@ -199,6 +227,55 @@ pub const TlsClient = struct {
             pos += alpn_data.len;
         }
 
+        // PSK extensions (must be last — RFC 8446 §4.2.11)
+        var binder_pos: usize = 0; // position of the binder for later fixup
+        if (self.offer_ticket and self.has_ticket) {
+            // psk_key_exchange_modes (0x002d): psk_dhe_ke(1)
+            std.mem.writeInt(u16, out[pos..][0..2], 0x002d, .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], 2, .big); // ext len
+            pos += 2;
+            out[pos] = 1; // modes list len
+            pos += 1;
+            out[pos] = 1; // psk_dhe_ke
+            pos += 1;
+
+            // early_data (0x002a): signal willingness for 0-RTT
+            std.mem.writeInt(u16, out[pos..][0..2], 0x002a, .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], 0, .big); // empty ext
+            pos += 2;
+
+            // pre_shared_key (0x0029) — MUST be last
+            std.mem.writeInt(u16, out[pos..][0..2], 0x0029, .big);
+            pos += 2;
+            const psk_ext_start = pos;
+            pos += 2; // ext length placeholder
+
+            // identities list: len(2) + [identity_len(2) + identity + obfuscated_age(4)]
+            const id_entry_len: u16 = 2 + self.ticket_identity_len + 4;
+            std.mem.writeInt(u16, out[pos..][0..2], id_entry_len, .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], self.ticket_identity_len, .big);
+            pos += 2;
+            @memcpy(out[pos..][0..self.ticket_identity_len], self.ticket_identity[0..self.ticket_identity_len]);
+            pos += self.ticket_identity_len;
+            // obfuscated_ticket_age: ticket_age_ms + ticket_age_add
+            std.mem.writeInt(u32, out[pos..][0..4], self.ticket_age_add, .big);
+            pos += 4;
+
+            // binders list: len(2) + [binder_len(1) + binder(32)]
+            std.mem.writeInt(u16, out[pos..][0..2], 33, .big); // 1 + 32
+            pos += 2;
+            out[pos] = 32; // binder length
+            pos += 1;
+            binder_pos = pos;
+            @memset(out[pos..][0..32], 0); // placeholder, computed below
+            pos += 32;
+
+            std.mem.writeInt(u16, out[psk_ext_start..][0..2], @intCast(pos - psk_ext_start - 2), .big);
+        }
+
         // Fill extensions total length
         std.mem.writeInt(u16, out[ext_start..][0..2], @intCast(pos - ext_start - 2), .big);
 
@@ -208,6 +285,34 @@ pub const TlsClient = struct {
         out[1] = @intCast((body_len >> 16) & 0xff);
         out[2] = @intCast((body_len >> 8) & 0xff);
         out[3] = @intCast(body_len & 0xff);
+
+        // Compute PSK binder if offering a ticket
+        if (self.offer_ticket and self.has_ticket and binder_pos > 0) {
+            // early_secret = HKDF-Extract(0, PSK)
+            const zero32 = [_]u8{0} ** 32;
+            const early_secret = HkdfSha256.extract(&zero32, &self.ticket_psk);
+
+            // binder_key = Derive-Secret(early_secret, "res binder", "")
+            var binder_key: [32]u8 = undefined;
+            crypto.hkdfExpandLabel(&binder_key, early_secret, "res binder", &tls.sha256_empty);
+
+            // finished_key = HKDF-Expand-Label(binder_key, "finished", "", 32)
+            var finished_key: [32]u8 = undefined;
+            crypto.hkdfExpandLabel(&finished_key, binder_key, "finished", "");
+
+            // Transcript hash = H(truncated ClientHello) — everything before binders list
+            // binder_pos - 33 points to binders_list_len; binder_pos - 32 is start of binder
+            const truncated_len = binder_pos - 33; // up to (not including) binders list len
+            var trunc_hash: Sha256 = Sha256.init(.{});
+            trunc_hash.update(out[0..truncated_len]);
+            var trunc_digest: [32]u8 = undefined;
+            trunc_hash.final(&trunc_digest);
+
+            // binder = HMAC(finished_key, truncated_transcript_hash)
+            var binder: [32]u8 = undefined;
+            Hmac256.create(&binder, &trunc_digest, &finished_key);
+            @memcpy(out[binder_pos..][0..32], &binder);
+        }
 
         // Hash into transcript
         self.transcript.update(out[0..pos]);
@@ -420,6 +525,16 @@ pub const TlsClient = struct {
         out[3] = 32;
         @memcpy(out[4..][0..32], &verify_data);
 
+        // Add client Finished to transcript for resumption_master_secret derivation.
+        self.transcript.update(out[0..36]);
+
+        // Derive resumption_master_secret (RFC 8446 §7.1):
+        // res_master = Derive-Secret(master_secret, "res master", transcript_through_CF)
+        var cf_snap = self.transcript;
+        var cf_hash: [32]u8 = undefined;
+        cf_snap.final(&cf_hash);
+        crypto.hkdfExpandLabel(&self.resumption_master_secret, self.master_secret, "res master", &cf_hash);
+
         return 36;
     }
 
@@ -468,7 +583,12 @@ pub const TlsClient = struct {
                 self.read_len = 0;
                 return self.buildClientFinished(out);
             },
-            .established => return 0,
+            .established => {
+                // Post-handshake messages: NewSessionTicket (type 4).
+                self.processPostHandshake(self.read_buf[0..self.read_len]);
+                self.read_len = 0;
+                return 0;
+            },
         }
     }
 
@@ -485,6 +605,84 @@ pub const TlsClient = struct {
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.client_app_secret)));
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.server_app_secret)));
         std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.ecdh_kp.secret_key)));
+    }
+
+    /// Parse post-handshake TLS messages (NewSessionTicket = type 4).
+    fn processPostHandshake(self: *TlsClient, data: []const u8) void {
+        var pos: usize = 0;
+        while (pos + 4 <= data.len) {
+            const msg_type = data[pos];
+            const msg_len = readU24(data[pos + 1 ..][0..3]);
+            const msg_end = pos + 4 + msg_len;
+            if (msg_end > data.len) break;
+
+            if (msg_type == 4) { // NewSessionTicket
+                self.parseNewSessionTicket(data[pos + 4 .. msg_end]);
+            }
+            pos = msg_end;
+        }
+    }
+
+    /// Parse NewSessionTicket body and store ticket for future resumption.
+    fn parseNewSessionTicket(self: *TlsClient, body: []const u8) void {
+        // ticket_lifetime(4) + ticket_age_add(4) + ticket_nonce_len(1) + nonce + ticket_len(2) + ticket + extensions
+        if (body.len < 13) return;
+        var p: usize = 0;
+
+        // ticket_lifetime (4 bytes, seconds)
+        _ = std.mem.readInt(u32, body[p..][0..4], .big);
+        p += 4;
+
+        // ticket_age_add (4 bytes)
+        self.ticket_age_add = std.mem.readInt(u32, body[p..][0..4], .big);
+        p += 4;
+
+        // ticket_nonce (variable length)
+        const nonce_len = body[p];
+        p += 1;
+        if (p + nonce_len > body.len) return;
+        const nonce = body[p..][0..nonce_len];
+        p += nonce_len;
+
+        // ticket (variable length — this is the opaque identity)
+        if (p + 2 > body.len) return;
+        const ticket_len = @as(u16, body[p]) << 8 | body[p + 1];
+        p += 2;
+        if (p + ticket_len > body.len) return;
+        if (ticket_len > self.ticket_identity.len) return; // too large
+        @memcpy(self.ticket_identity[0..ticket_len], body[p..][0..ticket_len]);
+        self.ticket_identity_len = ticket_len;
+        p += ticket_len;
+
+        // Derive PSK from resumption_master_secret + nonce (RFC 8446 §4.6.1)
+        crypto.hkdfExpandLabel(&self.ticket_psk, self.resumption_master_secret, "resumption", nonce);
+
+        self.has_ticket = true;
+    }
+
+    /// Returns the stored session ticket for use in a future connection.
+    /// Caller should save this and pass it to a new TlsClient via `setTicket()`.
+    pub fn getTicket(self: *const TlsClient) ?SessionTicket {
+        if (!self.has_ticket) return null;
+        return .{
+            .identity = self.ticket_identity,
+            .identity_len = self.ticket_identity_len,
+            .psk = self.ticket_psk,
+            .age_add = self.ticket_age_add,
+            .cipher = self.negotiated_cipher,
+            .received_ns = self.ticket_received_ns,
+        };
+    }
+
+    /// Set a previously received session ticket for PSK resumption.
+    pub fn setTicket(self: *TlsClient, ticket: SessionTicket) void {
+        self.ticket_identity = ticket.identity;
+        self.ticket_identity_len = ticket.identity_len;
+        self.ticket_psk = ticket.psk;
+        self.ticket_age_add = ticket.age_add;
+        self.negotiated_cipher = ticket.cipher;
+        self.has_ticket = true;
+        self.offer_ticket = true;
     }
 
     pub fn peerTransportParams(self: *const TlsClient) transport_params.TransportParams {

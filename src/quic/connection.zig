@@ -217,6 +217,8 @@ pub const Config = struct {
     /// Initial QUIC version (0x00000001 = v1, 0x6b3343cf = v2).
     /// Overridden by client's version in first Initial packet.
     initial_quic_version: u32 = packet.QUIC_VERSION_1,
+    /// Session ticket from a previous connection for PSK resumption.
+    session_ticket: ?tls.SessionTicket = null,
     /// Maximum number of client-initiated bidirectional streams to advertise.
     initial_max_streams_bidi: u64 = 100,
     /// Maximum number of client-initiated unidirectional streams to advertise.
@@ -697,6 +699,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 const n = @min(config.alpn.len, @as(usize, 32));
                 @memcpy(tls_client.alpn[0..n], config.alpn[0..n]);
                 tls_client.alpn_len = @intCast(n);
+            }
+
+            // Set session ticket for PSK resumption
+            if (config.session_ticket) |ticket| {
+                tls_client.setTicket(ticket);
             }
 
             const local_cid = ConnectionId.generate(0, io);
@@ -1353,6 +1360,14 @@ pub fn Connection(comptime max_streams: usize) type {
         pub fn streamFinished(self: *Self, stream_id: u62) bool {
             const st = self.streams.get(stream_id) orelse return false;
             return st.state == .half_closed_remote or st.state == .closed;
+        }
+
+        /// Returns the stored session ticket (if server sent NewSessionTicket).
+        pub fn getSessionTicket(self: *const Self) ?tls.SessionTicket {
+            return switch (self.tls_state) {
+                .client => |*c| c.getTicket(),
+                .server => null,
+            };
         }
 
         /// Initiate a connection close.  Transitions to closing, queues a CONNECTION_CLOSE,
