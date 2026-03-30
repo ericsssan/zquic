@@ -23,6 +23,7 @@ const Scenario = struct {
     rtt_ms: u32,
     loss_pct: u8 = 0,
     kind: ScenarioKind = .transfer,
+    sender_is_client: bool = true,
 };
 
 const scenarios = [_]Scenario{
@@ -38,11 +39,16 @@ const scenarios = [_]Scenario{
     .{ .name = "1MB c→s, 50ms RTT", .data_bytes = 1024 * 1024, .rtt_ms = 50 },
 
     // Server → Client transfers
-    .{ .name = "64KB s→c, 50ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 50 },
-    .{ .name = "256KB s→c, 50ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 50 },
+    .{ .name = "64KB s→c, 50ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 50, .sender_is_client = false },
+    .{ .name = "256KB s→c, 50ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 50, .sender_is_client = false },
+    .{ .name = "1MB s→c, 50ms RTT", .data_bytes = 1024 * 1024, .rtt_ms = 50, .sender_is_client = false },
 
     // Multi-stream
     .{ .name = "64KB x 3 streams, 50ms RTT", .data_bytes = 64 * 1024, .stream_count = 3, .rtt_ms = 50 },
+
+    // High RTT
+    .{ .name = "64KB c→s, 200ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 200 },
+    .{ .name = "256KB c→s, 200ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 200 },
 
     // Loss scenarios
     .{ .name = "4KB c→s, 50ms RTT 2% loss", .data_bytes = 4096, .rtt_ms = 50, .loss_pct = 2 },
@@ -172,14 +178,15 @@ fn runScenario(s: Scenario, iteration: usize) !BenchResult {
         return runBidi(&sim, client_ptr, server_ptr, io, s.data_bytes, handshake_us);
     }
 
-    // Transfer data: client → server on client-initiated bidi streams
+    // Transfer data on bidi streams
     const per_stream = s.data_bytes / s.stream_count;
     const transfer_start = sim.now_ns;
     var total_received: usize = 0;
 
     for (0..s.stream_count) |si| {
-        const stream_id: u62 = @intCast(si * 4); // client-initiated bidi
-        const received = try sim.runPairTransfer(client_ptr, server_ptr, io, true, stream_id, per_stream);
+        // client-initiated bidi: 0, 4, 8, ...  server-initiated bidi: 1, 5, 9, ...
+        const stream_id: u62 = if (s.sender_is_client) @intCast(si * 4) else @intCast(1 + si * 4);
+        const received = try sim.runPairTransfer(client_ptr, server_ptr, io, s.sender_is_client, stream_id, per_stream);
         total_received += received;
     }
 

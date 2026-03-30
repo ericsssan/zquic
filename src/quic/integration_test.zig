@@ -864,3 +864,194 @@ test "pair: MAX_STREAMS allows opening more streams after close" {
     // Server's peer_max_streams_bidi should have grown
     try testing.expect(server.peer_max_streams_bidi >= 2);
 }
+
+test "pair: NEW_CONNECTION_ID stored by client after handshake" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9170 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // Server sends NEW_CONNECTION_ID in HANDSHAKE_DONE.
+    // Client should have stored the server's alt CID in peer_cid_table.
+    var valid_cids: usize = 0;
+    for (client.peer_cid_table) |entry| {
+        if (entry.valid) valid_cids += 1;
+    }
+    try testing.expect(valid_cids >= 1);
+}
+
+test "pair: client-initiated close and draining" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9120 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // Client initiates close
+    try client.close(0x42, true, "bye");
+    try testing.expect(client.hot.state == .closing);
+
+    // Deliver CONNECTION_CLOSE to server
+    var out: [1500]u8 = undefined;
+    while (true) {
+        const n = client.send(&out, sim.now_ns);
+        if (n == 0) break;
+        const server_addr: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 4433 } };
+        server.receive(out[0..n], server_addr, sim.now_ns + 25_000_000, 0, io) catch {};
+    }
+
+    // Server should enter draining state after receiving CONNECTION_CLOSE
+    try testing.expect(server.hot.state == .draining or server.hot.state == .closed);
+
+    // Server should have a connection_closed event with the error code
+    var found_close = false;
+    while (server.pollEvent()) |ev| {
+        switch (ev) {
+            .connection_closed => |cc| {
+                try testing.expectEqual(@as(u62, 0x42), cc.error_code);
+                try testing.expect(cc.is_app);
+                found_close = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(found_close);
+}
+
+test "pair: stream FIN verified by receiver" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9130 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // Client sends data with FIN
+    var payload: [256]u8 = undefined;
+    @memset(&payload, 0xBB);
+    try client.streamSend(0, &payload, true);
+    try sim.runPairIdle(&client, &server, io);
+
+    // Server reads data
+    var recv_buf: [512]u8 = undefined;
+    const n = server.streamRecv(0, &recv_buf);
+    try testing.expectEqual(@as(usize, 256), n);
+    try testing.expectEqual(@as(u8, 0xBB), recv_buf[0]);
+
+    // Stream should be finished after reading all data + FIN
+    try testing.expect(server.streamFinished(0));
+}
+
+test "pair: 1MB transfer" {
+    const io = std.testing.io;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9140 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try std.testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    const received = try sim.runPairTransfer(&client, &server, io, true, 0, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), received);
+}
+
+test "pair: transfer at 200ms RTT" {
+    const io = std.testing.io;
+    var sim = NetSim.init(.{ .delay_ns = 100_000_000, .seed = 9150 }); // 200ms RTT
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try std.testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    const received = try sim.runPairTransfer(&client, &server, io, true, 0, 16384);
+    try std.testing.expectEqual(@as(usize, 16384), received);
+}
+
+test "pair: flow control with small initial_max_data" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    // Both sides advertise only 4KB initial_max_data
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9160 });
+    var server = try Connection(16).accept(.{ .initial_max_data = 4096 }, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{ .initial_max_data = 4096 }, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // First stream: 4KB fits within the initial window
+    const r1 = try sim.runPairTransfer(&client, &server, io, true, 0, 4096);
+    try testing.expectEqual(@as(usize, 4096), r1);
+
+    // After first transfer, receiver's MAX_DATA should have grown
+    try sim.runPairIdle(&client, &server, io);
+
+    // Second stream: another 4KB — window should have grown via MAX_DATA
+    const r2 = try sim.runPairTransfer(&client, &server, io, true, 4, 4096);
+    try testing.expectEqual(@as(usize, 4096), r2);
+}
+
+test "pair: three independent connections via same netsim" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9180 });
+
+    // Connection 1
+    var s1 = try Connection(16).accept(.{}, io);
+    s1.current_time_ns = sim.now_ns;
+    var c1 = try Connection(16).connect(.{}, io);
+    c1.current_time_ns = sim.now_ns;
+    try testing.expect(try sim.runPairHandshake(&c1, &s1, io));
+
+    // Connection 2
+    var s2 = try Connection(16).accept(.{}, io);
+    s2.current_time_ns = sim.now_ns;
+    var c2 = try Connection(16).connect(.{}, io);
+    c2.current_time_ns = sim.now_ns;
+    try testing.expect(try sim.runPairHandshake(&c2, &s2, io));
+
+    // Connection 3
+    var s3 = try Connection(16).accept(.{}, io);
+    s3.current_time_ns = sim.now_ns;
+    var c3 = try Connection(16).connect(.{}, io);
+    c3.current_time_ns = sim.now_ns;
+    try testing.expect(try sim.runPairHandshake(&c3, &s3, io));
+
+    // All three should be established
+    try testing.expectEqual(ConnState.established, c1.hot.state);
+    try testing.expectEqual(ConnState.established, c2.hot.state);
+    try testing.expectEqual(ConnState.established, c3.hot.state);
+
+    // Transfer on each
+    try sim.runPairIdle(&c1, &s1, io);
+    try sim.runPairIdle(&c2, &s2, io);
+    try sim.runPairIdle(&c3, &s3, io);
+
+    const r1 = try sim.runPairTransfer(&c1, &s1, io, true, 0, 4096);
+    const r2 = try sim.runPairTransfer(&c2, &s2, io, true, 0, 4096);
+    const r3 = try sim.runPairTransfer(&c3, &s3, io, true, 0, 4096);
+    try testing.expectEqual(@as(usize, 4096), r1);
+    try testing.expectEqual(@as(usize, 4096), r2);
+    try testing.expectEqual(@as(usize, 4096), r3);
+}
