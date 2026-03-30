@@ -462,9 +462,9 @@ pub fn encodeRetry(
 pub fn longHeaderPnOffset(buf: []const u8, version: u32) !usize {
     if (buf.len < 7) return error.PacketTooShort;
 
-    const dcid_len = buf[5];
+    const dcid_len: usize = buf[5];
     if (buf.len < 6 + dcid_len + 1) return error.PacketTooShort;
-    const scid_len = buf[6 + dcid_len];
+    const scid_len: usize = buf[6 + dcid_len];
 
     var pos: usize = 6 + dcid_len + 1 + scid_len;
     if (pos > buf.len) return error.PacketTooShort;

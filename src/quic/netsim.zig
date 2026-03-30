@@ -457,8 +457,7 @@ pub const NetSim = struct {
             const net_time = self.nextDeliveryTime();
             const client_time = client.nextTimeout();
             const server_time = server.nextTimeout();
-            var next_time = minOptional(net_time, client_time) orelse self.now_ns + 1_000_000;
-            if (server_time) |st| next_time = @min(next_time, st);
+            const next_time = minOptional(net_time, minOptional(client_time, server_time)) orelse self.now_ns + 1_000_000;
             if (next_time > self.now_ns + 30_000_000_000) break;
             self.advanceTo(next_time);
 
@@ -476,8 +475,10 @@ pub const NetSim = struct {
                 }
             }
 
-            // Deliver packets
-            if (self.deliver()) |pkt| {
+            // Deliver all ready packets
+            var delivered: usize = 0;
+            while (delivered < 64) : (delivered += 1) {
+                const pkt = self.deliver() orelse break;
                 switch (pkt.dir) {
                     .c2s => {
                         server.receive(pkt.data, CLIENT_ADDR, self.now_ns, 0, io) catch {};
