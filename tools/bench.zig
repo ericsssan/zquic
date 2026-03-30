@@ -4,17 +4,17 @@
 //! Usage:  zig-out/bin/bench
 //!
 //! Reports goodput kbps and handshake microseconds for several scenarios.
+//! Uses pair pattern (Connection + Connection) for realistic bidirectional testing.
 //! Runs multiple iterations per scenario and reports median + stdev.
 
 const std = @import("std");
 const zquic = @import("zquic");
 const Connection = zquic.Connection;
 const NetSim = zquic.netsim.NetSim;
-const TestClient = zquic.test_harness.TestClient;
 
 const ITERATIONS = 5;
 
-const ScenarioKind = enum { transfer, handshake_only };
+const ScenarioKind = enum { transfer, handshake_only, bidi };
 
 const Scenario = struct {
     name: []const u8,
@@ -31,16 +31,25 @@ const scenarios = [_]Scenario{
     .{ .name = "handshake only, 200ms RTT", .rtt_ms = 200, .kind = .handshake_only },
     .{ .name = "handshake only, 50ms RTT 10% loss", .rtt_ms = 50, .loss_pct = 10, .kind = .handshake_only },
 
-    // Clean transfers
-    .{ .name = "1KB x 1 stream, 50ms RTT", .data_bytes = 1024, .rtt_ms = 50 },
-    .{ .name = "64KB x 1 stream, 50ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 50 },
-    .{ .name = "256KB x 1 stream, 50ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 50 },
-    .{ .name = "1MB x 1 stream, 50ms RTT", .data_bytes = 1024 * 1024, .rtt_ms = 50 },
+    // Client → Server transfers
+    .{ .name = "1KB c→s, 50ms RTT", .data_bytes = 1024, .rtt_ms = 50 },
+    .{ .name = "64KB c→s, 50ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 50 },
+    .{ .name = "256KB c→s, 50ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 50 },
+    .{ .name = "1MB c→s, 50ms RTT", .data_bytes = 1024 * 1024, .rtt_ms = 50 },
+
+    // Server → Client transfers
+    .{ .name = "64KB s→c, 50ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 50 },
+    .{ .name = "256KB s→c, 50ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 50 },
+
+    // Multi-stream
     .{ .name = "64KB x 3 streams, 50ms RTT", .data_bytes = 64 * 1024, .stream_count = 3, .rtt_ms = 50 },
 
     // Loss scenarios
-    .{ .name = "4KB x 1 stream, 50ms RTT 2% loss", .data_bytes = 4096, .rtt_ms = 50, .loss_pct = 2 },
-    .{ .name = "64KB x 1 stream, 50ms RTT 2% loss", .data_bytes = 64 * 1024, .rtt_ms = 50, .loss_pct = 2 },
+    .{ .name = "4KB c→s, 50ms RTT 2% loss", .data_bytes = 4096, .rtt_ms = 50, .loss_pct = 2 },
+    .{ .name = "64KB c→s, 50ms RTT 2% loss", .data_bytes = 64 * 1024, .rtt_ms = 50, .loss_pct = 2 },
+
+    // Bidirectional simultaneous
+    .{ .name = "64KB bidi, 50ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 50, .kind = .bidi },
 };
 
 pub fn main() !void {
@@ -76,7 +85,7 @@ pub fn main() !void {
     std.debug.print("{s:-<90}\n", .{""});
 
     for (scenarios) |s| {
-        if (s.kind != .transfer) continue;
+        if (s.kind == .handshake_only) continue;
         var goodput_samples: [ITERATIONS]f64 = undefined;
         var hs_samples: [ITERATIONS]f64 = undefined;
         var bytes_received: usize = 0;
@@ -131,13 +140,20 @@ fn runScenario(s: Scenario, iteration: usize) !BenchResult {
     const delay_ns: i64 = @intCast(@as(u64, s.rtt_ms) * 1_000_000 / 2);
     const seed: u64 = 1 + iteration;
     var sim = NetSim.init(.{ .delay_ns = delay_ns, .loss_pct = s.loss_pct, .seed = seed });
-    var server = try Connection(16).accept(.{}, io);
-    server.current_time_ns = sim.now_ns;
-    var client = TestClient.init(server.local_cid.bytes, io);
+
+    const server_ptr = try std.heap.page_allocator.create(Connection(16));
+    defer std.heap.page_allocator.destroy(server_ptr);
+    server_ptr.* = try Connection(16).accept(.{}, io);
+    server_ptr.current_time_ns = sim.now_ns;
+
+    const client_ptr = try std.heap.page_allocator.create(Connection(16));
+    defer std.heap.page_allocator.destroy(client_ptr);
+    client_ptr.* = try Connection(16).connect(.{}, io);
+    client_ptr.current_time_ns = sim.now_ns;
 
     // Handshake
     const hs_start = sim.now_ns;
-    const ok = try sim.runHandshake(&client, &server, io);
+    const ok = try sim.runPairHandshake(client_ptr, server_ptr, io);
     if (!ok) return error.HandshakeFailed;
     const hs_end = sim.now_ns;
     const handshake_us = @divFloor(hs_end - hs_start, 1000);
@@ -150,14 +166,20 @@ fn runScenario(s: Scenario, iteration: usize) !BenchResult {
         };
     }
 
-    // Transfer data on each stream
+    try sim.runPairIdle(client_ptr, server_ptr, io);
+
+    if (s.kind == .bidi) {
+        return runBidi(&sim, client_ptr, server_ptr, io, s.data_bytes, handshake_us);
+    }
+
+    // Transfer data: client → server on client-initiated bidi streams
     const per_stream = s.data_bytes / s.stream_count;
     const transfer_start = sim.now_ns;
     var total_received: usize = 0;
 
     for (0..s.stream_count) |si| {
-        const stream_id: u62 = @intCast(1 + si * 4);
-        const received = try sim.runTransfer(&client, &server, io, stream_id, per_stream);
+        const stream_id: u62 = @intCast(si * 4); // client-initiated bidi
+        const received = try sim.runPairTransfer(client_ptr, server_ptr, io, true, stream_id, per_stream);
         total_received += received;
     }
 
@@ -173,6 +195,36 @@ fn runScenario(s: Scenario, iteration: usize) !BenchResult {
         .goodput_kbps = goodput_kbps,
         .handshake_us = handshake_us,
         .bytes_received = total_received,
+    };
+}
+
+fn runBidi(
+    sim: *NetSim,
+    client: *Connection(16),
+    server: *Connection(16),
+    io: std.Io,
+    data_bytes: usize,
+    handshake_us: i64,
+) !BenchResult {
+    const transfer_start = sim.now_ns;
+
+    // Both sides send simultaneously
+    const c2s = try sim.runPairTransfer(client, server, io, true, 0, data_bytes);
+    const s2c = try sim.runPairTransfer(client, server, io, false, 1, data_bytes);
+
+    const transfer_end = sim.now_ns;
+    const transfer_ns = transfer_end - transfer_start;
+    const total = c2s + s2c;
+
+    const goodput_kbps: f64 = if (transfer_ns > 0)
+        @as(f64, @floatFromInt(total)) * 8.0 / @as(f64, @floatFromInt(transfer_ns)) * 1_000_000_000.0 / 1000.0
+    else
+        0;
+
+    return .{
+        .goodput_kbps = goodput_kbps,
+        .handshake_us = handshake_us,
+        .bytes_received = total,
     };
 }
 

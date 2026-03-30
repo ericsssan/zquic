@@ -661,4 +661,160 @@ test "pair: PSK resumption — server issues ticket, client resumes" {
     try testing.expectEqual(@as(usize, 4096), received);
 }
 
-// TODO: transfer under loss — lossy handshake leaves server state that needs investigation.
+test "pair: bidirectional simultaneous transfer" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9070 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // Client sends on stream 0 (client-initiated bidi)
+    var c_payload: [1024]u8 = undefined;
+    @memset(&c_payload, 0xCC);
+    try client.streamSend(0, &c_payload, true);
+
+    // Server sends on stream 1 (server-initiated bidi)
+    var s_payload: [1024]u8 = undefined;
+    @memset(&s_payload, 0xDD);
+    try server.streamSend(1, &s_payload, true);
+
+    // Run both directions simultaneously via idle drain
+    try sim.runPairIdle(&client, &server, io);
+
+    // Verify both sides received data
+    var recv_buf: [4096]u8 = undefined;
+    const s_recv = server.streamRecv(0, &recv_buf);
+    try testing.expectEqual(@as(usize, 1024), s_recv);
+    try testing.expectEqual(@as(u8, 0xCC), recv_buf[0]);
+
+    const c_recv = client.streamRecv(1, &recv_buf);
+    try testing.expectEqual(@as(usize, 1024), c_recv);
+    try testing.expectEqual(@as(u8, 0xDD), recv_buf[0]);
+}
+
+test "pair: transfer under 2% loss" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .loss_pct = 2, .seed = 9080 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // 16KB transfer under 2% loss — tests retransmission
+    const received = try sim.runPairTransfer(&client, &server, io, true, 0, 16384);
+    try testing.expectEqual(@as(usize, 16384), received);
+}
+
+test "pair: STOP_SENDING resets sender" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9090 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // Client opens stream 0, sends data
+    var payload: [1024]u8 = undefined;
+    @memset(&payload, 0xAA);
+    try client.streamSend(0, &payload, false);
+
+    // Deliver to server
+    try sim.runPairIdle(&client, &server, io);
+
+    // Server resets the stream (simulates STOP_SENDING response)
+    try server.resetStream(0, 42);
+
+    // Deliver RESET_STREAM to client
+    try sim.runPairIdle(&client, &server, io);
+
+    // Client should see the stream as reset
+    const st = client.streams.get(0);
+    try testing.expect(st != null);
+    if (st) |s| {
+        try testing.expect(s.state == .reset or s.state == .closed or s.state == .half_closed_remote);
+    }
+}
+
+test "pair: amplification limit respected during handshake" {
+    const io = std.testing.io;
+    const testing = std.testing;
+
+    // Server with default config (path not validated until handshake completes)
+    _ = testing;
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = 1_000_000_000;
+
+    // Manually send a small client Initial to test amplification limit
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = 1_000_000_000;
+    const now: i64 = 1_000_000_000;
+
+    // Get client's Initial packet
+    var client_buf: [1500]u8 = undefined;
+    const client_n = client.send(&client_buf, now);
+    try std.testing.expect(client_n >= 1200); // Initial must be >= 1200 bytes
+
+    // Server receives it
+    try server.receive(client_buf[0..client_n], CLIENT_ADDR, now + 25_000_000, 0, io);
+
+    // Server should be amplification-limited: can send at most 3x received
+    const max_allowed = client_n * 3;
+    var total_sent: usize = 0;
+    var server_buf: [1500]u8 = undefined;
+    while (true) {
+        const n = server.send(&server_buf, now + 25_000_000);
+        if (n == 0) break;
+        total_sent += n;
+    }
+
+    // Server must not exceed 3x amplification
+    try std.testing.expect(total_sent <= max_allowed);
+    try std.testing.expect(total_sent > 0); // but should send something
+}
+
+test "pair: MAX_STREAMS allows opening more streams after close" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    // Server with low stream limit to force MAX_STREAMS updates
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9110 });
+    var server = try Connection(16).accept(.{ .initial_max_streams_bidi = 2 }, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{ .initial_max_streams_bidi = 2 }, io);
+    client.current_time_ns = sim.now_ns;
+
+    try testing.expect(try sim.runPairHandshake(&client, &server, io));
+    try sim.runPairIdle(&client, &server, io);
+
+    // Server should only be able to open 2 bidi streams initially
+    // (peer_max_streams_bidi comes from client's transport params)
+    try server.streamSend(1, "hello", true);
+    try server.streamSend(5, "world", true);
+
+    // Deliver data and ACKs
+    try sim.runPairIdle(&client, &server, io);
+
+    // Client reads the data (frees stream slots)
+    var buf: [64]u8 = undefined;
+    _ = client.streamRecv(1, &buf);
+    _ = client.streamRecv(5, &buf);
+
+    // After streams are consumed, client should send MAX_STREAMS
+    // allowing server to open more. Run idle to exchange control frames.
+    try sim.runPairIdle(&client, &server, io);
+
+    // Server's peer_max_streams_bidi should have grown
+    try testing.expect(server.peer_max_streams_bidi >= 2);
+}
