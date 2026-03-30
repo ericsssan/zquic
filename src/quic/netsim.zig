@@ -345,17 +345,17 @@ pub const NetSim = struct {
 
             self.drainServerSend(server);
 
-            if (client.totalReceivedBytes() >= total_bytes) break;
+            // Check if THIS stream's data has been fully received
+            if (client.receivedStreamData(stream_id)) |r| {
+                if (r.data.len >= total_bytes) break;
+            }
 
+            // Check for next event — network delivery or server timer
             const net_time = self.nextDeliveryTime();
             const server_time = server.nextTimeout();
             const next_time = minOptional(net_time, server_time) orelse {
-                if (queued >= total_bytes) break;
-                // cwnd-blocked, no events — advance 1 RTT so pacing refills
-                self.now_ns += self.config.delay_ns * 2;
-                server.tick(self.now_ns);
-                self.drainServerSend(server);
-                continue;
+                // No events. Transfer may be complete or stuck.
+                break;
             };
 
             self.advanceTo(next_time);
@@ -367,11 +367,14 @@ pub const NetSim = struct {
                 }
             }
 
-            while (self.deliver()) |pkt| {
+            // Deliver packets in batches. Limit prevents infinite ACK ping-pong
+            // (server sends control frames → client ACKs → server ACKs the ACK → ...)
+            var deliver_count: usize = 0;
+            while (deliver_count < 500) : (deliver_count += 1) {
+                const pkt = self.deliver() orelse break;
                 switch (pkt.dir) {
                     .c2s => {
                         server.receive(pkt.data, CLIENT_ADDR, self.now_ns, 0, io) catch {};
-                        self.drainServerSend(server);
                     },
                     .s2c => {
                         const prev_pn = client.largest_rx_pn;
@@ -384,9 +387,19 @@ pub const NetSim = struct {
                     },
                 }
             }
+
+            // After deliveries, push more data and drain server
+            while (queued < total_bytes) {
+                const len = @min(total_bytes - queued, chunk_size);
+                const fin = queued + len == total_bytes;
+                server.streamSend(stream_id, chunk[0..len], fin) catch break;
+                queued += len;
+            }
+            self.drainServerSend(server);
         }
 
-        return client.totalReceivedBytes();
+        if (client.receivedStreamData(stream_id)) |r| return r.data.len;
+        return 0;
     }
 
     fn drainServerSend(self: *NetSim, server: *Connection(16)) void {

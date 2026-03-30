@@ -27,24 +27,23 @@ const scenarios = [_]Scenario{
 };
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("\n=== zquic throughput benchmark ===\n\n", .{});
-    try stdout.print("{s:<35} {s:>10} {s:>12} {s:>12}\n", .{ "Scenario", "Received", "Goodput kbps", "Handshake us" });
-    try stdout.print("{s:-<71}\n", .{""});
+    _ = {}; // bench output via std.debug.print (stderr)
+    std.debug.print("\n=== zquic throughput benchmark ===\n\n", .{});
+    std.debug.print("{s:<35} {s:>10} {s:>12} {s:>12}\n", .{ "Scenario", "Received", "Goodput kbps", "Handshake us" });
+    std.debug.print("{s:-<71}\n", .{""});
 
     for (scenarios) |s| {
         const result = runScenario(s) catch |err| {
-            try stdout.print("{s:<35} ERROR: {}\n", .{ s.name, err });
-            continue;
+            std.debug.print("{s:<35} ERROR: {}\n", .{ s.name, err });
         };
-        try stdout.print("{s:<35} {d:>8}KB {d:>12.0} {d:>12}\n", .{
+        std.debug.print("{s:<35} {d:>8}KB {d:>12.0} {d:>12}\n", .{
             s.name,
             result.bytes_received / 1024,
             result.goodput_kbps,
             result.handshake_us,
         });
     }
-    try stdout.print("\n", .{});
+    std.debug.print("\n", .{});
 }
 
 const BenchResult = struct {
