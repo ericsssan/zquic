@@ -50,6 +50,10 @@ pub const TestClient = struct {
     largest_rx_pn: u64,
     /// Received stream data buffers.
     recv_streams: [MAX_STREAMS]RecvStream,
+    /// True if a CONNECTION_CLOSE frame was received.
+    received_close: bool,
+    /// Error code from the received CONNECTION_CLOSE frame.
+    close_error_code: u62,
 
     pub fn init(server_dcid_bytes: [CID_LEN]u8, io: std.Io) TestClient {
         var client_scid: [CID_LEN]u8 = undefined;
@@ -72,6 +76,8 @@ pub const TestClient = struct {
                 .fin = false,
                 .active = false,
             }} ** MAX_STREAMS,
+            .received_close = false,
+            .close_error_code = 0,
         };
     }
 
@@ -144,6 +150,16 @@ pub const TestClient = struct {
             .data = data,
         } });
 
+        return self.encrypt1Rtt(out, plaintext[0..pt_len]);
+    }
+
+    /// Build a 1-RTT MAX_STREAM_DATA frame to allow the server to send more data.
+    pub fn buildMaxStreamData(self: *TestClient, out: []u8, stream_id: u62, max_data: u62) usize {
+        var plaintext: [64]u8 = undefined;
+        const pt_len = frame.encodeFrame(&plaintext, .{ .max_stream_data = .{
+            .stream_id = stream_id,
+            .max_data = max_data,
+        } });
         return self.encrypt1Rtt(out, plaintext[0..pt_len]);
     }
 
@@ -347,6 +363,10 @@ pub const TestClient = struct {
                     };
                 },
                 .stream => |sf| self.bufferStreamData(sf),
+                .connection_close => |cc| {
+                    self.received_close = true;
+                    self.close_error_code = cc.error_code;
+                },
                 else => {},
             }
         }

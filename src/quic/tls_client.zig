@@ -61,6 +61,18 @@ pub const TlsClient = struct {
     quic_version: u32,
     peer_transport_params: transport_params.TransportParams,
 
+    // Our transport parameters to send in ClientHello (set by Connection).
+    our_transport_params: transport_params.TransportParams = .{},
+
+    // ALPN to offer in ClientHello.
+    alpn: [32]u8 = [_]u8{0} ** 32,
+    alpn_len: u8 = 0,
+
+    // CRYPTO data accumulation buffer (matches TlsServer pattern for fragmented data).
+    read_buf: [8192]u8,
+    read_len: usize,
+    crypto_bytes_total: u32,
+
     pub fn init(io: std.Io) TlsClient {
         const ecdh_kp = X25519.KeyPair.generate(io);
         var random: [32]u8 = undefined;
@@ -86,6 +98,9 @@ pub const TlsClient = struct {
             .negotiated_cipher = .aes_128_gcm,
             .quic_version = packet_mod.QUIC_VERSION_1,
             .peer_transport_params = .{},
+            .read_buf = undefined,
+            .read_len = 0,
+            .crypto_bytes_total = 0,
         };
     }
 
@@ -160,9 +175,29 @@ pub const TlsClient = struct {
         pos += 2;
         const tp_len_pos = pos;
         pos += 2; // ext data length placeholder
-        const tp_len = transport_params.encode(.{}, out[pos..]);
+        const tp_len = transport_params.encode(self.our_transport_params, out[pos..]);
         pos += tp_len;
         std.mem.writeInt(u16, out[tp_len_pos..][0..2], @intCast(tp_len), .big);
+
+        // ALPN (0x0010) — application_layer_protocol_negotiation
+        if (self.alpn_len > 0) {
+            const alpn_data = self.alpn[0..self.alpn_len];
+            std.mem.writeInt(u16, out[pos..][0..2], 0x0010, .big);
+            pos += 2;
+            // ext data length: 2 (list len) + 1 (proto len) + proto
+            const alpn_ext_len: u16 = @intCast(2 + 1 + alpn_data.len);
+            std.mem.writeInt(u16, out[pos..][0..2], alpn_ext_len, .big);
+            pos += 2;
+            // protocol list length
+            const alpn_list_len: u16 = @intCast(1 + alpn_data.len);
+            std.mem.writeInt(u16, out[pos..][0..2], alpn_list_len, .big);
+            pos += 2;
+            // protocol entry: length(1) + name
+            out[pos] = @intCast(alpn_data.len);
+            pos += 1;
+            @memcpy(out[pos..][0..alpn_data.len], alpn_data);
+            pos += alpn_data.len;
+        }
 
         // Fill extensions total length
         std.mem.writeInt(u16, out[ext_start..][0..2], @intCast(pos - ext_start - 2), .big);
@@ -334,6 +369,11 @@ pub const TlsClient = struct {
                 return;
             }
 
+            // EncryptedExtensions: extract server's transport parameters.
+            if (msg_type == 8) {
+                self.parseEncryptedExtensions(data[pos + 4 .. msg_end]);
+            }
+
             // Non-Finished message: add to transcript and skip
             self.transcript.update(data[pos..msg_end]);
             pos = msg_end;
@@ -384,9 +424,115 @@ pub const TlsClient = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Helpers
+    // Unified interface (matches TlsServer API)
     // -----------------------------------------------------------------------
 
+    /// Feed incoming CRYPTO frame bytes into the state machine.
+    /// Returns the number of bytes written to `out` (to be sent as CRYPTO frames).
+    pub fn processCrypto(self: *TlsClient, data: []const u8, out: []u8, io: std.Io) !usize {
+        _ = io;
+
+        // Cumulative CRYPTO cap (matches TlsServer).
+        const incoming: u32 = @intCast(@min(data.len, std.math.maxInt(u32)));
+        const new_total = self.crypto_bytes_total +| incoming;
+        if (new_total > 65536) return error.CryptoDataTooLarge;
+        self.crypto_bytes_total = new_total;
+
+        // Accumulate data
+        if (self.read_len + data.len > self.read_buf.len) return error.BufferOverflow;
+        @memcpy(self.read_buf[self.read_len..][0..data.len], data);
+        self.read_len += data.len;
+
+        switch (self.state) {
+            .idle => {
+                // Build ClientHello — input data is ignored (there is none).
+                const len = self.buildClientHello(out);
+                self.read_len = 0;
+                return len;
+            },
+            .wait_server_hello => {
+                // ServerHello may arrive in fragments; wait until parseable.
+                self.processServerHello(self.read_buf[0..self.read_len]) catch |err| switch (err) {
+                    error.TooShort => return 0, // not enough data yet
+                    else => return err,
+                };
+                self.read_len = 0;
+                return 0;
+            },
+            .wait_encrypted => {
+                // EE + Cert + CertVerify + Finished may arrive in fragments.
+                self.processHandshakeMessages(self.read_buf[0..self.read_len]) catch |err| switch (err) {
+                    error.TooShort, error.NoFinished => return 0, // not enough data yet
+                    else => return err,
+                };
+                self.read_len = 0;
+                return self.buildClientFinished(out);
+            },
+            .established => return 0,
+        }
+    }
+
+    pub fn isComplete(self: *const TlsClient) bool {
+        return self.state == .established;
+    }
+
+    /// Zero all secret key material.
+    pub fn deinit(self: *TlsClient) void {
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.handshake_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.master_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.client_hs_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.server_hs_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.client_app_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.server_app_secret)));
+        std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.ecdh_kp.secret_key)));
+    }
+
+    pub fn peerTransportParams(self: *const TlsClient) transport_params.TransportParams {
+        return self.peer_transport_params;
+    }
+
+    /// Parse EncryptedExtensions body to extract QUIC transport params and
+    /// perform compatible version negotiation (RFC 9369).
+    fn parseEncryptedExtensions(self: *TlsClient, body: []const u8) void {
+        if (body.len < 2) return;
+        const ext_list_len = @as(u16, body[0]) << 8 | body[1];
+        var epos: usize = 2;
+        const ext_end = @min(2 + @as(usize, ext_list_len), body.len);
+        while (epos + 4 <= ext_end) {
+            const ext_type = @as(u16, body[epos]) << 8 | body[epos + 1];
+            const ext_len = @as(u16, body[epos + 2]) << 8 | body[epos + 3];
+            epos += 4;
+            if (epos + ext_len > ext_end) break;
+            if (ext_type == EXT_QUIC_TRANSPORT_PARAMS) {
+                self.peer_transport_params = transport_params.decode(body[epos..][0..ext_len]) catch .{};
+                self.negotiateVersion();
+            }
+            epos += ext_len;
+        }
+    }
+
+    /// Compatible version negotiation (RFC 9369): if we sent version_information
+    /// and the server's version_information contains our preferred version,
+    /// upgrade quic_version so app keys use the negotiated version.
+    fn negotiateVersion(self: *TlsClient) void {
+        const our_vi = self.our_transport_params.version_information orelse return;
+        const server_vi = self.peer_transport_params.version_information orelse return;
+        const server_vi_len = self.peer_transport_params.version_information_len;
+        // Our preferred version is the first entry in our version_information.
+        const our_preferred = std.mem.readInt(u32, our_vi[0..4], .big);
+        if (our_preferred == self.quic_version) return; // already using preferred
+        // Check if server supports our preferred version.
+        if (server_vi_len >= 4 and server_vi_len % 4 == 0) {
+            var i: u8 = 0;
+            while (i < server_vi_len) : (i += 4) {
+                const ver = std.mem.readInt(u32, server_vi[i..][0..4], .big);
+                if (ver == our_preferred) {
+                    self.quic_version = our_preferred;
+                    return;
+                }
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------

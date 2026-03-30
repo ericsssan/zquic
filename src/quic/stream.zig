@@ -354,10 +354,22 @@ pub const Stream = struct {
 
     /// Flush inline borrow to ring buffer (safety net: called at start of
     /// next receive() before the recv buffer is overwritten).
+    /// Also advances recv_buf.wp for any out-of-order data (written via writeAt)
+    /// that is now contiguous after the inline range was filled.
     pub fn flushInline(self: *Stream) void {
         if (self.inline_recv) |data| {
             _ = self.recv_buf.write(data);
             self.inline_recv = null;
+            // The inline fast path advanced recv_offset and filled the gap list,
+            // but didn't advance recv_buf.wp for previously writeAt'd data that
+            // is now contiguous.  Sync wp to the contiguous frontier.
+            const new_frontier = self.gap_list.contiguousFrom(self.recv_offset);
+            if (new_frontier > self.recv_offset) {
+                const advance: usize = @intCast(new_frontier - self.recv_offset);
+                self.recv_buf.wp += advance;
+                self.recv_offset = new_frontier;
+            }
+            self.checkFinTransition();
         }
     }
 

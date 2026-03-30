@@ -353,7 +353,7 @@ test "drainPendingCryptoRetx skips epoch 2 without panic" {
     var conn = try Connection(16).accept(.{}, io);
     defer conn.deinit();
     conn.hot.state = .established;
-    conn.app_keys = conn.tls_state.app_keys;
+    conn.app_keys = conn.tls_state.appKeys();
 
     // Simulate a lost epoch-2 CRYPTO frame (NewSessionTicket)
     conn.crypto_pending_retx[0] = .{ .epoch = 2, .offset = 0, .len = 100 };

@@ -101,6 +101,8 @@ pub const NetSim = struct {
     /// Deliver the next packet (earliest delivery time). Returns null if queue
     /// is empty or no packet is ready (all delivery times in the future).
     /// Advances `now_ns` to the delivery time.
+    ///
+    /// The returned data slice is valid until the next call to send() or deliver().
     pub fn deliver(self: *NetSim) ?struct { data: []u8, dir: Direction } {
         if (self.queue_len == 0) return null;
 
@@ -117,20 +119,21 @@ pub const NetSim = struct {
         // Advance virtual clock
         if (min_time > self.now_ns) self.now_ns = min_time;
 
-        const pkt = &self.queue[min_idx];
-        const dir = pkt.dir;
-        const len = pkt.len;
+        const dir = self.queue[min_idx].dir;
+        const len = self.queue[min_idx].len;
 
-        // Swap-remove
-        if (min_idx != self.queue_len - 1) {
-            self.queue[min_idx] = self.queue[self.queue_len - 1];
+        // Swap-remove: move the packet we want to deliver to the end
+        // so its data survives the removal (valid until next send/deliver).
+        const last = self.queue_len - 1;
+        if (min_idx != last) {
+            const tmp = self.queue[last];
+            self.queue[last] = self.queue[min_idx];
+            self.queue[min_idx] = tmp;
         }
         self.queue_len -= 1;
 
-        // Return the data (still in the removed slot — safe until next send/deliver)
-        const removed = &self.queue[self.queue_len]; // now the swapped-out slot
-        _ = removed;
-        return .{ .data = pkt.data[0..len], .dir = dir };
+        // Data is now in self.queue[self.queue_len] (the just-removed slot).
+        return .{ .data = self.queue[self.queue_len].data[0..len], .dir = dir };
     }
 
     /// Return the earliest delivery time, or null if queue is empty.
@@ -304,10 +307,13 @@ pub const NetSim = struct {
                         self.drainServerSend(server);
                     },
                     .s2c => {
+                        const prev_rx = client.totalReceivedBytes();
                         const prev_pn = client.largest_rx_pn;
                         client.processServerDatagram(pkt.data) catch {};
-                        // ACK every received packet to drive congestion/flow control
-                        if (client.largest_rx_pn > prev_pn or (prev_pn == 0 and client.tls.state == .established)) {
+                        // Only ACK packets that carried new stream data (avoid ACK ping-pong)
+                        if (client.totalReceivedBytes() > prev_rx and
+                            (client.largest_rx_pn > prev_pn or (prev_pn == 0 and client.tls.state == .established)))
+                        {
                             var ack_buf: [MAX_DGRAM]u8 = undefined;
                             const ack_len = client.buildAck(&ack_buf, @intCast(client.largest_rx_pn));
                             self.send(ack_buf[0..ack_len], .c2s);
@@ -354,8 +360,20 @@ pub const NetSim = struct {
             const net_time = self.nextDeliveryTime();
             const server_time = server.nextTimeout();
             const next_time = minOptional(net_time, server_time) orelse {
-                // No events. Transfer may be complete or stuck.
-                break;
+                // No network or timer events pending.
+                // Advance by 1 RTT to let pacing tokens refill, then tick + drain.
+                self.advanceTo(self.now_ns + self.config.delay_ns * 2);
+                server.tick(self.now_ns);
+                while (queued < total_bytes) {
+                    const len2 = @min(total_bytes - queued, chunk_size);
+                    const fin2 = queued + len2 == total_bytes;
+                    server.streamSend(stream_id, chunk[0..len2], fin2) catch break;
+                    queued += len2;
+                }
+                self.drainServerSend(server);
+                // If still no events after refill, we're stuck — break.
+                if (self.nextDeliveryTime() == null and server.nextTimeout() == null) break;
+                continue;
             };
 
             self.advanceTo(next_time);
@@ -367,35 +385,43 @@ pub const NetSim = struct {
                 }
             }
 
-            // Deliver packets in batches. Limit prevents infinite ACK ping-pong
-            // (server sends control frames → client ACKs → server ACKs the ACK → ...)
+            // Deliver packets in batches. Limit prevents infinite loops from
+            // control frame ping-pong. Scale with transfer size for larger xfers.
+            const deliver_limit: usize = @max(1000, total_bytes / 10);
             var deliver_count: usize = 0;
-            while (deliver_count < 500) : (deliver_count += 1) {
+            while (deliver_count < deliver_limit) : (deliver_count += 1) {
                 const pkt = self.deliver() orelse break;
                 switch (pkt.dir) {
                     .c2s => {
                         server.receive(pkt.data, CLIENT_ADDR, self.now_ns, 0, io) catch {};
+                        // ACK opened cwnd — push more data immediately
+                        while (queued < total_bytes) {
+                            const len2 = @min(total_bytes - queued, chunk_size);
+                            const fin2 = queued + len2 == total_bytes;
+                            server.streamSend(stream_id, chunk[0..len2], fin2) catch break;
+                            queued += len2;
+                        }
+                        self.drainServerSend(server);
                     },
                     .s2c => {
+                        const prev_rx = client.totalReceivedBytes();
                         const prev_pn = client.largest_rx_pn;
                         client.processServerDatagram(pkt.data) catch {};
-                        if (client.largest_rx_pn > prev_pn or (prev_pn == 0 and client.tls.state == .established)) {
+                        const cur_rx = client.totalReceivedBytes();
+                        // Only ACK packets that carried new stream data (avoid ACK-of-ACK ping-pong)
+                        if (cur_rx > prev_rx and (client.largest_rx_pn > prev_pn or (prev_pn == 0 and client.tls.state == .established))) {
                             var ack_buf: [MAX_DGRAM]u8 = undefined;
                             const ack_len = client.buildAck(&ack_buf, @intCast(client.largest_rx_pn));
                             self.send(ack_buf[0..ack_len], .c2s);
+                            // Send MAX_STREAM_DATA to keep the flow control window open
+                            const new_max: u62 = @intCast(cur_rx + total_bytes);
+                            var msd_buf: [MAX_DGRAM]u8 = undefined;
+                            const msd_len = client.buildMaxStreamData(&msd_buf, stream_id, new_max);
+                            self.send(msd_buf[0..msd_len], .c2s);
                         }
                     },
                 }
             }
-
-            // After deliveries, push more data and drain server
-            while (queued < total_bytes) {
-                const len = @min(total_bytes - queued, chunk_size);
-                const fin = queued + len == total_bytes;
-                server.streamSend(stream_id, chunk[0..len], fin) catch break;
-                queued += len;
-            }
-            self.drainServerSend(server);
         }
 
         if (client.receivedStreamData(stream_id)) |r| return r.data.len;
@@ -410,9 +436,217 @@ pub const NetSim = struct {
             self.send(out[0..n], .s2c);
         }
     }
+
+    /// Drive a client Connection + server Connection until both reach established state.
+    /// Both endpoints use real Connection instances (not TestClient).
+    pub fn runPairHandshake(
+        self: *NetSim,
+        client: *Connection(16),
+        server: *Connection(16),
+        io: std.Io,
+    ) !bool {
+        // Drain client's initial send queue (contains ClientHello Initial).
+        self.drainEndpointSend(client, .c2s);
+
+        var ticks: usize = 0;
+        while (ticks < 10000) : (ticks += 1) {
+            if (client.hot.state == .established and server.hot.state == .established)
+                return true;
+
+            // Find next event time
+            const net_time = self.nextDeliveryTime();
+            const client_time = client.nextTimeout();
+            const server_time = server.nextTimeout();
+            var next_time = minOptional(net_time, client_time) orelse self.now_ns + 1_000_000;
+            if (server_time) |st| next_time = @min(next_time, st);
+            if (next_time > self.now_ns + 30_000_000_000) break;
+            self.advanceTo(next_time);
+
+            // Fire timers
+            if (client_time) |ct| {
+                if (self.now_ns >= ct) {
+                    client.tick(self.now_ns);
+                    self.drainEndpointSend(client, .c2s);
+                }
+            }
+            if (server_time) |st| {
+                if (self.now_ns >= st) {
+                    server.tick(self.now_ns);
+                    self.drainEndpointSend(server, .s2c);
+                }
+            }
+
+            // Deliver packets
+            if (self.deliver()) |pkt| {
+                switch (pkt.dir) {
+                    .c2s => {
+                        server.receive(pkt.data, CLIENT_ADDR, self.now_ns, 0, io) catch {};
+                        self.drainEndpointSend(server, .s2c);
+                    },
+                    .s2c => {
+                        client.receive(pkt.data, SERVER_ADDR, self.now_ns, 0, io) catch {};
+                        self.drainEndpointSend(client, .c2s);
+                    },
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Drive a transfer from sender to receiver. Returns total bytes received on the stream.
+    pub fn runPairTransfer(
+        self: *NetSim,
+        client: *Connection(16),
+        server: *Connection(16),
+        io: std.Io,
+        sender_is_client: bool,
+        stream_id: u62,
+        total_bytes: usize,
+    ) !usize {
+        const sender = if (sender_is_client) client else server;
+        const receiver = if (sender_is_client) server else client;
+        const send_dir: Direction = if (sender_is_client) .c2s else .s2c;
+        const chunk_size: usize = 1024;
+
+        var sent: usize = 0;
+        var total_received: usize = 0;
+        var recv_drain: [4096]u8 = undefined;
+
+        var ticks: usize = 0;
+        while (ticks < 500000) : (ticks += 1) {
+            // Try to enqueue more data
+            while (sent < total_bytes) {
+                const remaining = total_bytes - sent;
+                const this_chunk = @min(remaining, chunk_size);
+                var payload: [1024]u8 = undefined;
+                @memset(payload[0..this_chunk], 0xAB);
+                const fin = (sent + this_chunk >= total_bytes);
+                sender.streamSend(stream_id, payload[0..this_chunk], fin) catch break;
+                sent += this_chunk;
+            }
+            self.drainEndpointSend(sender, send_dir);
+
+            // Drain received data (advances flow control so peer can send more)
+            while (true) {
+                const n = receiver.streamRecv(stream_id, &recv_drain);
+                if (n == 0) break;
+                total_received += n;
+            }
+
+            if (total_received >= total_bytes) return total_received;
+
+            const net_time = self.nextDeliveryTime();
+            const ct = client.nextTimeout();
+            const st_time = server.nextTimeout();
+            var next_time = minOptional(net_time, ct) orelse self.now_ns + 10_000_000; // 10ms default
+            if (st_time) |s| next_time = @min(next_time, s);
+            if (next_time > self.now_ns + 30_000_000_000) break;
+            if (next_time <= self.now_ns) next_time = self.now_ns + 1_000_000; // 1ms min advance
+            self.advanceTo(next_time);
+
+            // Fire timers
+            if (ct) |t| {
+                if (self.now_ns >= t) {
+                    client.tick(self.now_ns);
+                    self.drainEndpointSend(client, .c2s);
+                }
+            }
+            if (st_time) |t| {
+                if (self.now_ns >= t) {
+                    server.tick(self.now_ns);
+                    self.drainEndpointSend(server, .s2c);
+                }
+            }
+
+            // Try draining sender again (pacing tokens may have refilled)
+            self.drainEndpointSend(sender, send_dir);
+            // If sender still has queued packets, advance time to refill pacing tokens
+            if (sender.sq_head != sender.sq_tail) {
+                self.now_ns += 1_000_000; // 1ms — enough for pacing refill
+                self.drainEndpointSend(sender, send_dir);
+            }
+
+            // Deliver all ready packets
+            var delivered: usize = 0;
+            while (delivered < 32) : (delivered += 1) {
+                const pkt = self.deliver() orelse break;
+                switch (pkt.dir) {
+                    .c2s => {
+                        server.receive(pkt.data, CLIENT_ADDR, self.now_ns, 0, io) catch {};
+                        self.drainEndpointSend(server, .s2c);
+                    },
+                    .s2c => {
+                        client.receive(pkt.data, SERVER_ADDR, self.now_ns, 0, io) catch {};
+                        self.drainEndpointSend(client, .c2s);
+                    },
+                }
+            }
+        }
+
+        // Final drain
+        while (true) {
+            const n = receiver.streamRecv(stream_id, &recv_drain);
+            if (n == 0) break;
+            total_received += n;
+        }
+        return total_received;
+    }
+
+    /// Drive both endpoints until no packets remain in flight and no timers are pending.
+    pub fn runPairIdle(
+        self: *NetSim,
+        client: *Connection(16),
+        server: *Connection(16),
+        io: std.Io,
+    ) !void {
+        var ticks: usize = 0;
+        while (ticks < 1000) : (ticks += 1) {
+            const net_time = self.nextDeliveryTime();
+            const ct = client.nextTimeout();
+            const st = server.nextTimeout();
+            const next_time = minOptional(net_time, minOptional(ct, st)) orelse break;
+            if (next_time > self.now_ns + 5_000_000_000) break; // 5s limit
+            self.advanceTo(next_time);
+
+            if (ct) |t| {
+                if (self.now_ns >= t) {
+                    client.tick(self.now_ns);
+                    self.drainEndpointSend(client, .c2s);
+                }
+            }
+            if (st) |t| {
+                if (self.now_ns >= t) {
+                    server.tick(self.now_ns);
+                    self.drainEndpointSend(server, .s2c);
+                }
+            }
+            if (self.deliver()) |pkt| {
+                switch (pkt.dir) {
+                    .c2s => {
+                        server.receive(pkt.data, CLIENT_ADDR, self.now_ns, 0, io) catch {};
+                        self.drainEndpointSend(server, .s2c);
+                    },
+                    .s2c => {
+                        client.receive(pkt.data, SERVER_ADDR, self.now_ns, 0, io) catch {};
+                        self.drainEndpointSend(client, .c2s);
+                    },
+                }
+            }
+        }
+    }
+
+    fn drainEndpointSend(self: *NetSim, endpoint: *Connection(16), dir: Direction) void {
+        var out: [MAX_DGRAM]u8 = undefined;
+        while (true) {
+            const n = endpoint.send(&out, self.now_ns);
+            if (n == 0) break;
+            self.send(out[0..n], dir);
+        }
+    }
 };
 
 const CLIENT_ADDR: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 12345 } };
+const SERVER_ADDR: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 4433 } };
 
 fn minOptional(a: ?i64, b: ?i64) ?i64 {
     if (a == null and b == null) return null;

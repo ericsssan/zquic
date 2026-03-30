@@ -69,6 +69,24 @@ pub fn build(b: *std.Build) void {
     const server_step = b.step("run-server", "Run interop server (default port 4433)");
     server_step.dependOn(&run_server.step);
 
+    // Interop client
+    const client_mod = b.createModule(.{
+        .root_source_file = b.path("tools/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_mod.addImport("zquic", zquic_mod);
+    const client = b.addExecutable(.{
+        .name = "client",
+        .root_module = client_mod,
+    });
+    client.stack_size = 64 * 1024 * 1024; // Connection is ~2.2MB
+    b.installArtifact(client);
+    const run_client = b.addRunArtifact(client);
+    if (b.args) |args| run_client.addArgs(args);
+    const client_step = b.step("run-client", "Run interop client");
+    client_step.dependOn(&run_client.step);
+
     // Key rotation verification tool
     const verify_mod = b.createModule(.{
         .root_source_file = b.path("tools/verify_key_rotation.zig"),
@@ -96,10 +114,27 @@ pub fn build(b: *std.Build) void {
         .name = "bench",
         .root_module = bench_mod,
     });
+    bench.stack_size = 64 * 1024 * 1024; // Connection(16) is ~2.2MB
     b.installArtifact(bench);
     const run_bench = b.addRunArtifact(bench);
     const bench_step = b.step("bench", "Run throughput benchmark");
     bench_step.dependOn(&run_bench.step);
+
+    // Micro-benchmarks
+    const microbench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/microbench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    microbench_mod.addImport("zquic", zquic_mod);
+    const microbench = b.addExecutable(.{
+        .name = "microbench",
+        .root_module = microbench_mod,
+    });
+    b.installArtifact(microbench);
+    const run_microbench = b.addRunArtifact(microbench);
+    const microbench_step = b.step("microbench", "Run micro-benchmarks");
+    microbench_step.dependOn(&run_microbench.step);
 
     // Per-module unit tests
     const test_step = b.step("test", "Run unit tests");
@@ -115,6 +150,7 @@ pub fn build(b: *std.Build) void {
         "src/quic/congestion/cubic.zig",
         "src/quic/congestion/bbr.zig",
         "src/quic/congestion/common.zig",
+        "src/quic/congestion/cc_test_harness.zig",
         "src/quic/transport_params.zig",
         "src/quic/loss_recovery.zig",
         "src/quic/tls.zig",

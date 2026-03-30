@@ -1112,7 +1112,7 @@ fn computeTimeout(deadline: ?i64) std.Io.Timeout {
 /// with all generations up to current. Called immediately after key rotation
 /// to ensure Wireshark can decrypt packets before connection closes.
 fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
-    const tls = &conn.tls_state;
+    const tls = &conn.tls_state.server;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
@@ -1145,7 +1145,7 @@ fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
 /// (the path the interop runner expects for server logs).
 /// Writes initial secrets at handshake, then appends rotated secrets dynamically.
 fn writeKeyLog(conn: *const Conn, io: std.Io) void {
-    const tls = &conn.tls_state;
+    const tls = &conn.tls_state.server;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;

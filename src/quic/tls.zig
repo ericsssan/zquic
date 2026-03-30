@@ -18,6 +18,8 @@ const std = @import("std");
 const crypto = @import("crypto.zig");
 const packet_mod = @import("packet.zig");
 const transport_params = @import("transport_params.zig");
+const tls_client = @import("tls_client.zig");
+pub const TlsClient = tls_client.TlsClient;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -97,6 +99,97 @@ pub const TlsState = enum(u8) {
     wait_client_finished,
     established,
     error_state,
+};
+
+// ---------------------------------------------------------------------------
+// TlsRole — tagged union for server/client TLS state machines
+// ---------------------------------------------------------------------------
+
+pub const TlsRole = union(enum) {
+    server: TlsServer,
+    client: TlsClient,
+
+    pub fn processCrypto(self: *TlsRole, data: []const u8, out: []u8, io: std.Io) !usize {
+        switch (self.*) {
+            inline else => |*s| return s.processCrypto(data, out, io),
+        }
+    }
+
+    pub fn isComplete(self: *const TlsRole) bool {
+        switch (self.*) {
+            inline else => |*s| return s.isComplete(),
+        }
+    }
+
+    pub fn deinit(self: *TlsRole) void {
+        switch (self.*) {
+            inline else => |*s| s.deinit(),
+        }
+    }
+
+    pub fn peerTransportParams(self: *const TlsRole) transport_params.TransportParams {
+        switch (self.*) {
+            inline else => |*s| return s.peerTransportParams(),
+        }
+    }
+
+    // -- Common field accessors via inline switch --
+
+    pub fn handshakeKeys(self: *const TlsRole) HandshakeKeys {
+        switch (self.*) {
+            inline else => |*s| return s.handshake_keys,
+        }
+    }
+
+    pub fn appKeys(self: *const TlsRole) AppKeys {
+        switch (self.*) {
+            inline else => |*s| return s.app_keys,
+        }
+    }
+
+    pub fn clientAppSecret(self: *const TlsRole) [32]u8 {
+        switch (self.*) {
+            inline else => |*s| return s.client_app_secret,
+        }
+    }
+
+    pub fn serverAppSecret(self: *const TlsRole) [32]u8 {
+        switch (self.*) {
+            inline else => |*s| return s.server_app_secret,
+        }
+    }
+
+    pub fn negotiatedCipher(self: *const TlsRole) crypto.CipherSuite {
+        switch (self.*) {
+            inline else => |*s| return s.negotiated_cipher,
+        }
+    }
+
+    pub fn getQuicVersion(self: *const TlsRole) u32 {
+        switch (self.*) {
+            inline else => |*s| return s.quic_version,
+        }
+    }
+
+    pub fn setQuicVersion(self: *TlsRole, version: u32) void {
+        switch (self.*) {
+            inline else => |*s| s.quic_version = version,
+        }
+    }
+
+    pub fn setOurTransportParams(self: *TlsRole, params: transport_params.TransportParams) void {
+        switch (self.*) {
+            inline else => |*s| s.our_transport_params = params,
+        }
+    }
+
+    /// Returns true if the TLS state machine is waiting for the first message (server: ClientHello, client: idle).
+    pub fn isInitial(self: *const TlsRole) bool {
+        return switch (self.*) {
+            .server => |s| s.state == .wait_client_hello,
+            .client => |s| s.state == .idle,
+        };
+    }
 };
 
 /// Parsed ClientHello data (what we need from it).

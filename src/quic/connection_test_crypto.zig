@@ -983,12 +983,12 @@ test "connection: accept() initializes quic_version to V1 for client version ech
     // Test with default V1 config
     const conn_v1 = try Connection(1).accept(.{}, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.quic_version);
-    try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server.server_configured_version);
 
     // Test with V2 config - still starts with V1, configured version stored separately
     const conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
     try testing.expectEqual(packet.QUIC_VERSION_1, conn_v2.quic_version);
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server.server_configured_version);
 }
 
 test "connection: rotateKeys toggles current_key_phase" {
@@ -1071,13 +1071,13 @@ test "connection: deriveSecretsForGeneration returns correct generation secrets"
     var conn = try Connection(16).accept(.{}, io);
 
     // Set initial secrets
-    conn.tls_state.client_app_secret = [_]u8{0xaa} ** 32;
-    conn.tls_state.server_app_secret = [_]u8{0xbb} ** 32;
+    conn.tls_state.server.client_app_secret = [_]u8{0xaa} ** 32;
+    conn.tls_state.server.server_app_secret = [_]u8{0xbb} ** 32;
 
     // Generation 0 should return the initial secrets
     const gen0 = conn.deriveSecretsForGeneration(0);
-    try testing.expectEqualSlices(u8, &conn.tls_state.client_app_secret, &gen0.client);
-    try testing.expectEqualSlices(u8, &conn.tls_state.server_app_secret, &gen0.server);
+    try testing.expectEqualSlices(u8, &conn.tls_state.server.client_app_secret, &gen0.client);
+    try testing.expectEqualSlices(u8, &conn.tls_state.server.server_app_secret, &gen0.server);
 
     // Generation 1 should be derived (different from gen 0)
     const gen1 = conn.deriveSecretsForGeneration(1);
@@ -1162,11 +1162,11 @@ test "connection: full key rotation flow - secret derivation for interop" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Simulate TLS handshake completion with real secret material
-    conn.tls_state.client_random = [_]u8{0x11} ** 32;
-    conn.tls_state.client_hs_secret = [_]u8{0x33} ** 32;
-    conn.tls_state.server_hs_secret = [_]u8{0x44} ** 32;
-    conn.tls_state.client_app_secret = [_]u8{0x55} ** 32;
-    conn.tls_state.server_app_secret = [_]u8{0x66} ** 32;
+    conn.tls_state.server.client_random = [_]u8{0x11} ** 32;
+    conn.tls_state.server.client_hs_secret = [_]u8{0x33} ** 32;
+    conn.tls_state.server.server_hs_secret = [_]u8{0x44} ** 32;
+    conn.tls_state.server.client_app_secret = [_]u8{0x55} ** 32;
+    conn.tls_state.server.server_app_secret = [_]u8{0x66} ** 32;
 
     // Setup application keys (simulating post-handshake state)
     conn.app_keys = .{
@@ -1174,12 +1174,12 @@ test "connection: full key rotation flow - secret derivation for interop" {
         .server = .{ .key = [_]u8{0xdd} ** 32, .iv = [_]u8{0xee} ** 12, .hp = [_]u8{0xff} ** 32, .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
-    conn.next_client_secret = crypto.deriveNextAppSecret(conn.tls_state.client_app_secret, packet.QUIC_VERSION_1);
-    conn.next_server_secret = crypto.deriveNextAppSecret(conn.tls_state.server_app_secret, packet.QUIC_VERSION_1);
+    conn.next_client_secret = crypto.deriveNextAppSecret(conn.tls_state.server.client_app_secret, packet.QUIC_VERSION_1);
+    conn.next_server_secret = crypto.deriveNextAppSecret(conn.tls_state.server.server_app_secret, packet.QUIC_VERSION_1);
 
     // Verify we can derive secrets BEFORE any key rotation
     const gen0_before = conn.deriveSecretsForGeneration(0);
-    try testing.expectEqualSlices(u8, &conn.tls_state.client_app_secret, &gen0_before.client);
+    try testing.expectEqualSlices(u8, &conn.tls_state.server.client_app_secret, &gen0_before.client);
 
     // Simulate client initiating key update (quic-go sends packets with key_phase=1)
     // Server detects mismatch and calls rotateKeys()
@@ -1233,11 +1233,11 @@ test "connection: packet encryption/decryption works with key rotation" {
 
     // Setup client connection
     var client = try Connection(16).accept(.{}, io);
-    client.tls_state.client_random = [_]u8{0xaa} ** 32;
-    client.tls_state.client_hs_secret = [_]u8{0xbb} ** 32;
-    client.tls_state.server_hs_secret = [_]u8{0xcc} ** 32;
-    client.tls_state.client_app_secret = [_]u8{0xdd} ** 32;
-    client.tls_state.server_app_secret = [_]u8{0xee} ** 32;
+    client.tls_state.server.client_random = [_]u8{0xaa} ** 32;
+    client.tls_state.server.client_hs_secret = [_]u8{0xbb} ** 32;
+    client.tls_state.server.server_hs_secret = [_]u8{0xcc} ** 32;
+    client.tls_state.server.client_app_secret = [_]u8{0xdd} ** 32;
+    client.tls_state.server.server_app_secret = [_]u8{0xee} ** 32;
 
     // Setup symmetric keys for encryption/decryption
     const test_key = [_]u8{0x42} ** 32;
@@ -1251,8 +1251,8 @@ test "connection: packet encryption/decryption works with key rotation" {
 
     // Setup for rotation
     client.next_app_keys = client.app_keys.?;
-    client.next_client_secret = crypto.deriveNextAppSecret(client.tls_state.client_app_secret, packet.QUIC_VERSION_1);
-    client.next_server_secret = crypto.deriveNextAppSecret(client.tls_state.server_app_secret, packet.QUIC_VERSION_1);
+    client.next_client_secret = crypto.deriveNextAppSecret(client.tls_state.server.client_app_secret, packet.QUIC_VERSION_1);
+    client.next_server_secret = crypto.deriveNextAppSecret(client.tls_state.server.server_app_secret, packet.QUIC_VERSION_1);
 
     // SCENARIO 1: Derive generation 0 keys
     const secrets_gen0 = client.deriveSecretsForGeneration(0);
@@ -1598,7 +1598,7 @@ test "connection: version negotiation - initial and quic versions track separate
     try testing.expectEqual(packet.QUIC_VERSION_1, conn.quic_version);
 
     // Server's configured version is stored separately
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn.tls_state.server_configured_version);
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn.tls_state.server.server_configured_version);
 }
 
 test "connection: version negotiation - server_configured_version set from config" {
@@ -1607,11 +1607,11 @@ test "connection: version negotiation - server_configured_version set from confi
 
     // Test with default v1
     const conn_v1 = try Connection(1).accept(.{}, io);
-    try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server_configured_version);
+    try testing.expectEqual(packet.QUIC_VERSION_1, conn_v1.tls_state.server.server_configured_version);
 
     // Test with configured v2
     const conn_v2 = try Connection(1).accept(.{ .initial_quic_version = packet.QUIC_VERSION_2 }, io);
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server_configured_version);
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn_v2.tls_state.server.server_configured_version);
 }
 
 test "connection: version negotiation - initial_version set from client Initial" {
@@ -1626,7 +1626,7 @@ test "connection: version negotiation - initial_version set from client Initial"
     try testing.expectEqual(packet.QUIC_VERSION_1, conn.quic_version);
 
     // Server's configured version is stored separately
-    try testing.expectEqual(packet.QUIC_VERSION_2, conn.tls_state.server_configured_version);
+    try testing.expectEqual(packet.QUIC_VERSION_2, conn.tls_state.server.server_configured_version);
 }
 
 test "stream recycling: configurable initial_max_streams_bidi stored in connection" {
