@@ -50,12 +50,19 @@ const scenarios = [_]Scenario{
     .{ .name = "64KB c→s, 200ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 200 },
     .{ .name = "256KB c→s, 200ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 200 },
 
+    // Low latency
+    .{ .name = "64KB c→s, 10ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 10 },
+    .{ .name = "1MB c→s, 10ms RTT", .data_bytes = 1024 * 1024, .rtt_ms = 10 },
+
     // Loss scenarios
     .{ .name = "4KB c→s, 50ms RTT 2% loss", .data_bytes = 4096, .rtt_ms = 50, .loss_pct = 2 },
     .{ .name = "64KB c→s, 50ms RTT 2% loss", .data_bytes = 64 * 1024, .rtt_ms = 50, .loss_pct = 2 },
+    .{ .name = "256KB c→s, 50ms RTT 1% loss", .data_bytes = 256 * 1024, .rtt_ms = 50, .loss_pct = 1 },
+    .{ .name = "1MB c→s, 50ms RTT 1% loss", .data_bytes = 1024 * 1024, .rtt_ms = 50, .loss_pct = 1 },
 
     // Bidirectional simultaneous
     .{ .name = "64KB bidi, 50ms RTT", .data_bytes = 64 * 1024, .rtt_ms = 50, .kind = .bidi },
+    .{ .name = "256KB bidi, 50ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 50, .kind = .bidi },
 };
 
 pub fn main() !void {
