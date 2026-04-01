@@ -24,14 +24,21 @@ const NOW: i64 = 1_000_000_000;
 /// `versions` = supported version list (4 bytes each, big-endian).
 fn buildVnPacket(buf: []u8, dcid: []const u8, scid: []const u8, versions: []const u32) usize {
     var pos: usize = 0;
-    buf[pos] = 0x80; pos += 1;
-    std.mem.writeInt(u32, buf[pos..][0..4], 0, .big); pos += 4;
-    buf[pos] = @intCast(dcid.len); pos += 1;
-    @memcpy(buf[pos..][0..dcid.len], dcid); pos += dcid.len;
-    buf[pos] = @intCast(scid.len); pos += 1;
-    @memcpy(buf[pos..][0..scid.len], scid); pos += scid.len;
+    buf[pos] = 0x80;
+    pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 0, .big);
+    pos += 4;
+    buf[pos] = @intCast(dcid.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..dcid.len], dcid);
+    pos += dcid.len;
+    buf[pos] = @intCast(scid.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..scid.len], scid);
+    pos += scid.len;
     for (versions) |v| {
-        std.mem.writeInt(u32, buf[pos..][0..4], v, .big); pos += 4;
+        std.mem.writeInt(u32, buf[pos..][0..4], v, .big);
+        pos += 4;
     }
     return pos;
 }

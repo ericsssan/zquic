@@ -667,6 +667,17 @@ pub const TlsServer = struct {
         //   H(CH || SH || EE || Cert || CertVerify || ServerFinished)).
         self.transcript.update(out[sf_start..pos]);
 
+        // RFC 9001 §4.1.2: Derive app keys now so the server can send 1-RTT packets
+        // before receiving the client Finished. The app traffic secrets use the
+        // transcript through ServerFinished only (RFC 8446 §7.1), which is exactly
+        // what self.transcript holds at this point.
+        {
+            var app_transcript = self.transcript;
+            var app_th: [32]u8 = undefined;
+            app_transcript.final(&app_th);
+            self.deriveAppKeys(&app_th);
+        }
+
         self.state = .wait_client_finished;
         return pos;
     }

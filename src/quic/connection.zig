@@ -1950,7 +1950,23 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         pub fn processShortHeaderPacket(self: *Self, data: []u8) !usize {
-            if (self.app_keys == null) return 0;
+            if (self.app_keys == null) {
+                // RFC 9001 §4.1.2: Server MAY consider handshake confirmed when it
+                // receives a valid 1-RTT packet. If TLS has derived app_keys but is
+                // still waiting for client Finished (wait_client_finished state), we
+                // can confirm early. completeHandshake() is idempotent — the normal
+                // Finished path is harmless if it fires afterwards.
+                if (self.config.is_server and self.hot.state == .handshake) {
+                    const can_early_confirm = switch (self.tls_state) {
+                        .server => |*s| s.state == .wait_client_finished,
+                        else => false,
+                    };
+                    if (can_early_confirm) {
+                        self.completeHandshake() catch {};
+                    }
+                }
+                if (self.app_keys == null) return 0;
+            }
 
             // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
             if (data.len > MAX_PACKET_SIZE) return 0;
@@ -2442,60 +2458,69 @@ pub fn Connection(comptime max_streams: usize) type {
             }
 
             if (self.tls_state.isComplete()) {
-                const app_keys = self.tls_state.appKeys();
-                self.app_keys = app_keys;
-                // Cache key schedule for the hot path (both AES and ChaCha20).
-                const rx_app = if (self.config.is_server) app_keys.client else app_keys.server;
-                self.cached_app_keys = crypto_simd.CachedKeyCtx.init(rx_app);
-                self.hot.state = .established;
-                // Defense-in-depth: zero initial keys after transition to 1-RTT (no longer needed)
-                std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.InitialKeys)]u8, @ptrCast(&self.initial_keys)));
-                // Discard any queued CRYPTO retransmits — they used handshake-epoch keys that
-                // the peer will discard once 1-RTT keys are established (RFC 9001 §4.9).
-                self.crypto_pending_retx_count = 0;
-                self.path_validated = true;
-                self.events.push(.connected);
+                try self.completeHandshake();
+            }
+        }
 
-                const cipher = self.tls_state.negotiatedCipher();
-                self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.clientAppSecret(), self.quic_version);
-                self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.serverAppSecret(), self.quic_version);
-                self.next_app_keys = tls.AppKeys{
-                    .client = crypto.derivePacketKeysWithSuite(self.next_client_secret, self.quic_version, cipher),
-                    .server = crypto.derivePacketKeysWithSuite(self.next_server_secret, self.quic_version, cipher),
-                };
-                // RFC 9001 §6.1: header protection key does not change with key updates.
-                if (self.app_keys) |cur| {
-                    self.next_app_keys.?.client.hp = cur.client.hp;
-                    self.next_app_keys.?.server.hp = cur.server.hp;
-                }
-                // Cache next-gen key schedule for fast key-update decrypt.
-                self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.rxNextAppKeys().?);
+        /// Finalize the handshake: set app_keys, transition to established, derive
+        /// key-update material, read peer transport params, and queue HANDSHAKE_DONE.
+        /// Idempotent: if already established, returns immediately (prevents double-call
+        /// when RFC 9001 §4.1.2 early-confirm via 1-RTT races the normal Finished path).
+        fn completeHandshake(self: *Self) !void {
+            if (self.hot.state == .established) return;
+            const app_keys = self.tls_state.appKeys();
+            self.app_keys = app_keys;
+            // Cache key schedule for the hot path (both AES and ChaCha20).
+            const rx_app = if (self.config.is_server) app_keys.client else app_keys.server;
+            self.cached_app_keys = crypto_simd.CachedKeyCtx.init(rx_app);
+            self.hot.state = .established;
+            // Defense-in-depth: zero initial keys after transition to 1-RTT (no longer needed)
+            std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.InitialKeys)]u8, @ptrCast(&self.initial_keys)));
+            // Discard any queued CRYPTO retransmits — they used handshake-epoch keys that
+            // the peer will discard once 1-RTT keys are established (RFC 9001 §4.9).
+            self.crypto_pending_retx_count = 0;
+            self.path_validated = true;
+            self.events.push(.connected);
 
-                const params = self.tls_state.peerTransportParams();
-                self.conn_flow.updateSendMax(params.initial_max_data);
-                self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
-                self.cached_ack_delay_exp = @intCast(@min(params.ack_delay_exponent, 20));
-                self.peer_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
+            const cipher = self.tls_state.negotiatedCipher();
+            self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.clientAppSecret(), self.quic_version);
+            self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.serverAppSecret(), self.quic_version);
+            self.next_app_keys = tls.AppKeys{
+                .client = crypto.derivePacketKeysWithSuite(self.next_client_secret, self.quic_version, cipher),
+                .server = crypto.derivePacketKeysWithSuite(self.next_server_secret, self.quic_version, cipher),
+            };
+            // RFC 9001 §6.1: header protection key does not change with key updates.
+            if (self.app_keys) |cur| {
+                self.next_app_keys.?.client.hp = cur.client.hp;
+                self.next_app_keys.?.server.hp = cur.server.hp;
+            }
+            // Cache next-gen key schedule for fast key-update decrypt.
+            self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.rxNextAppKeys().?);
 
-                const bidi_limit = @min(params.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62)));
-                const uni_limit = @min(params.initial_max_streams_uni, @as(u64, std.math.maxInt(u62)));
-                self.peer_max_streams_bidi = @intCast(bidi_limit);
-                self.peer_max_streams_uni = @intCast(uni_limit);
+            const params = self.tls_state.peerTransportParams();
+            self.conn_flow.updateSendMax(params.initial_max_data);
+            self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
+            self.cached_ack_delay_exp = @intCast(@min(params.ack_delay_exponent, 20));
+            self.peer_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
 
-                self.peer_disable_migration = params.disable_active_migration;
+            const bidi_limit = @min(params.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62)));
+            const uni_limit = @min(params.initial_max_streams_uni, @as(u64, std.math.maxInt(u62)));
+            self.peer_max_streams_bidi = @intCast(bidi_limit);
+            self.peer_max_streams_uni = @intCast(uni_limit);
 
-                // 0-RTT acceptance phase is over once handshake completes.
-                self.accepting_early_data = false;
+            self.peer_disable_migration = params.disable_active_migration;
 
-                // Server-only: schedule NewSessionTicket if ticket_key is configured.
-                if (self.config.is_server and self.config.ticket_key != null) {
-                    self.pending_new_session_ticket = true;
-                }
+            // 0-RTT acceptance phase is over once handshake completes.
+            self.accepting_early_data = false;
 
-                // Server sends HANDSHAKE_DONE; client does not.
-                if (self.config.is_server) {
-                    try self.queueHandshakeDone();
-                }
+            // Server-only: schedule NewSessionTicket if ticket_key is configured.
+            if (self.config.is_server and self.config.ticket_key != null) {
+                self.pending_new_session_ticket = true;
+            }
+
+            // Server sends HANDSHAKE_DONE; client does not.
+            if (self.config.is_server) {
+                try self.queueHandshakeDone();
             }
         }
 

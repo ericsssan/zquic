@@ -602,6 +602,11 @@ pub const NetSim = struct {
     ) !void {
         var ticks: usize = 0;
         while (ticks < 1000) : (ticks += 1) {
+            // Always drain both send queues first — callers may have enqueued data
+            // (e.g. via streamSend) without calling send() themselves.
+            self.drainEndpointSend(client, .c2s);
+            self.drainEndpointSend(server, .s2c);
+
             const net_time = self.nextDeliveryTime();
             const ct = client.nextTimeout();
             const st = server.nextTimeout();
