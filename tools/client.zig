@@ -1,6 +1,6 @@
 //! zquic interop client — quic-interop-runner compatible UDP client.
 //!
-//! Supported TESTCASE values: handshake, transfer, multiconnect, keyupdate, v2, ecn.
+//! Supported TESTCASE values: handshake, transfer, multiconnect, keyupdate, v2, ecn, resumption, zerortt.
 //! All other values cause exit(127) as required by the interop runner.
 //! HTTP/0.9: sends "GET /path\r\n" on client-initiated bidi streams.
 //! Downloads are saved to ${DOWNLOADS} directory.
@@ -22,6 +22,8 @@ const supported_cases = [_][]const u8{
     "keyupdate",
     "v2",
     "ecn",
+    "resumption",
+    "zerortt",
 };
 
 const ALPN = "hq-interop";
@@ -109,15 +111,34 @@ pub fn main(init: std.process.Init) !void {
         for (0..req_count) |i| {
             const paths = req_paths[i .. i + 1];
             const lens = req_path_lens[i .. i + 1];
-            try runConnection(config, &sock, effective_server_addr, io, testcase, paths, lens, 1, downloads_dir);
+            _ = try runConnection(config, &sock, effective_server_addr, io, testcase, paths, lens, 1, downloads_dir);
         }
+    } else if (std.mem.eql(u8, testcase, "resumption")) {
+        // Connection 1: download first half, collect session ticket.
+        const half = if (req_count > 1) req_count / 2 else req_count;
+        const ticket = try runConnection(config, &sock, effective_server_addr, io, testcase, &req_paths, &req_path_lens, half, downloads_dir);
+        // Connection 2: resume with PSK, download second half.
+        if (req_count > half) {
+            var config2 = config;
+            config2.session_ticket = ticket;
+            _ = try runConnection(config2, &sock, effective_server_addr, io, testcase, req_paths[half..], req_path_lens[half..], req_count - half, downloads_dir);
+        }
+    } else if (std.mem.eql(u8, testcase, "zerortt")) {
+        // Connection 1: download one file to warm up the ticket.
+        const ticket = try runConnection(config, &sock, effective_server_addr, io, testcase, req_paths[0..1], req_path_lens[0..1], 1, downloads_dir);
+        // Connection 2: reconnect with PSK + 0-RTT, send all requests.
+        var config2 = config;
+        config2.session_ticket = ticket;
+        _ = try runConnection(config2, &sock, effective_server_addr, io, testcase, &req_paths, &req_path_lens, req_count, downloads_dir);
     } else {
-        try runConnection(config, &sock, effective_server_addr, io, testcase, &req_paths, &req_path_lens, req_count, downloads_dir);
+        _ = try runConnection(config, &sock, effective_server_addr, io, testcase, &req_paths, &req_path_lens, req_count, downloads_dir);
     }
 
     std.debug.print("Client done\n", .{});
 }
 
+/// Run one QUIC connection, send `req_count` HTTP/0.9 requests, and return
+/// the session ticket emitted by the server (for resumption/0-RTT follow-up).
 fn runConnection(
     config: quic.Config,
     sock: *const net.Socket,
@@ -128,7 +149,7 @@ fn runConnection(
     req_path_lens: anytype,
     req_count: usize,
     downloads_dir: []const u8,
-) !void {
+) !?quic.tls.SessionTicket {
     const conn_ptr = try page_allocator.create(Conn);
     defer page_allocator.destroy(conn_ptr);
     conn_ptr.* = try Conn.connect(config, io);
@@ -140,8 +161,18 @@ fn runConnection(
     var send_buf: [MAX_DATAGRAM]u8 = undefined;
     drainSend(conn, sock, io, dest, &send_buf);
 
+    // For zerortt: send all requests immediately as 0-RTT if keys are available.
+    const is_zerortt = std.mem.eql(u8, testcase, "zerortt");
     var downloads: [MAX_DOWNLOADS]Download = [_]Download{.{}} ** MAX_DOWNLOADS;
     var requests_sent = false;
+
+    if (is_zerortt and config.session_ticket != null and conn.zero_rtt_keys != null) {
+        // 0-RTT path: send requests before handshake completes.
+        requests_sent = true;
+        sendRequests(conn, &downloads, req_paths, req_path_lens, req_count, downloads_dir);
+        drainSend(conn, sock, io, dest, &send_buf);
+    }
+
     var all_done = false;
 
     const timeout_5s: std.Io.Timeout = .{ .duration = .{ .raw = .{ .nanoseconds = 5_000_000_000 }, .clock = .awake } };
@@ -223,6 +254,8 @@ fn runConnection(
         }
     }
 
+    const ticket = conn.getSessionTicket();
+
     for (&downloads) |*d| {
         if (d.file) |f| f.close(io);
     }
@@ -230,6 +263,8 @@ fn runConnection(
     conn.close(0, true, "") catch {};
     drainSend(conn, sock, io, dest, &send_buf);
     conn.deinit();
+
+    return ticket;
 }
 
 fn sendRequests(
