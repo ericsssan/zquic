@@ -471,6 +471,10 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Included in subsequent Initial packets after receiving a Retry.
         retry_token: [128]u8 = [_]u8{0} ** 128,
         retry_token_len: u8 = 0,
+        /// Set after the client successfully processes a Version Negotiation packet.
+        /// Prevents infinite VN loops: once a version switch occurs, any subsequent
+        /// VN is ignored.
+        vn_handled: bool = false,
 
         /// Alternative local CID advertised to peer via NEW_CONNECTION_ID (sequence=1).
         /// Helps tshark track 1-RTT packets when the primary CID appears in client
@@ -1528,8 +1532,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 // v1 and v2 can negotiate together. Client chooses version by sending with that version.
                 // Server must respond with matching version (initial keys are version-specific).
                 if (self.hot.state == .idle) {
+                    // VN packets (ver=0) must never be processed as regular packets.
+                    // RFC 9000 §6.1: A server MUST NOT send VN in response to another VN.
+                    if (ver == 0) return data.len;
                     // Check if version is supported (v1 or v2).
-                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2 and ver != 0) {
+                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2) {
                         // Unsupported version; send Version Negotiation.
                         if (!self.shouldThrottleVersionNeg(ver)) {
                             self.sendVersionNeg(data) catch {};
@@ -1546,14 +1553,22 @@ pub fn Connection(comptime max_streams: usize) type {
                     // be updated by the TLS layer if compatible version negotiation negotiates a
                     // different version via version_information transport parameter.
                 } else {
+                    // RFC 9000 §6: Version Negotiation packet (ver=0).
+                    // Servers MUST NOT respond to VN packets; clients handle them during handshake.
+                    if (ver == 0) {
+                        if (!self.config.is_server and self.hot.state == .handshake and !self.vn_handled) {
+                            self.handleVersionNegotiation(data, io) catch {};
+                        }
+                        return data.len;
+                    }
                     // RFC 9369: During handshake, allow version changes for compatible version negotiation.
                     // Only reject version mismatches after the handshake is complete (connection established).
-                    if (self.hot.state == .established and ver != self.quic_version and ver != 0) {
+                    if (self.hot.state == .established and ver != self.quic_version) {
                         return data.len; // Silently drop mismatched version during 1-RTT
                     }
                     // During handshake, reject packets with unsupported versions (not v1 or v2).
                     // This prevents garbage packets with random version bytes from corrupting handshake.
-                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2 and ver != 0) {
+                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2) {
                         return data.len; // Silently drop unsupported version during handshake
                     }
                 }
@@ -3761,6 +3776,87 @@ pub fn Connection(comptime max_streams: usize) type {
             };
             self.tls_state = .{ .client = fresh_tls };
 
+            var ch_buf: [32768]u8 = undefined;
+            const ch_len = try self.tls_state.client.processCrypto(&.{}, &ch_buf, io);
+            try self.queueTlsOutput(ch_buf[0..ch_len]);
+        }
+
+        /// Process an incoming Version Negotiation packet (RFC 9000 §6.2).
+        /// Only called on client-mode connections during the handshake, and only once
+        /// (vn_handled prevents infinite version-switching loops).
+        fn handleVersionNegotiation(self: *Self, data: []const u8, io: std.Io) !void {
+            // VN format: first(1) + ver=0(4) + dcid_len(1) + dcid + scid_len(1) + scid + versions(n×4)
+            if (data.len < 7) return;
+            const dcid_len = data[5];
+            if (data.len < @as(usize, 6) + dcid_len + 1) return;
+            const dcid = data[6..][0..dcid_len];
+            const scid_len_pos: usize = 6 + dcid_len;
+            const scid_len = data[scid_len_pos];
+            const versions_start: usize = scid_len_pos + 1 + scid_len;
+            if (versions_start > data.len) return;
+            const versions_data = data[versions_start..];
+            if (versions_data.len < 4 or versions_data.len % 4 != 0) return;
+
+            // RFC 9000 §6.2: DCID in VN must match our SCID (prevents off-path spoofing).
+            const our_scid = self.ourScidBytes();
+            if (!std.mem.eql(u8, dcid, our_scid)) return;
+
+            // Scan the supported versions list.
+            // RFC 9000 §6.2: MUST discard VN if it contains the version we already sent.
+            // Also find the first version we support other than our current one.
+            var chosen: ?u32 = null;
+            var i: usize = 0;
+            while (i + 4 <= versions_data.len) : (i += 4) {
+                const v = std.mem.readInt(u32, versions_data[i..][0..4], .big);
+                if (v == self.initial_version) return; // MUST discard
+                if (chosen == null and (v == packet.QUIC_VERSION_1 or v == packet.QUIC_VERSION_2)) {
+                    chosen = v;
+                }
+            }
+            const new_ver = chosen orelse return; // no supported version found — give up
+
+            // Switch to new_ver: re-derive initial keys with a new random DCID.
+            self.vn_handled = true;
+            var new_dcid: [cid_mod.len]u8 = undefined;
+            io.random(&new_dcid);
+            self.initial_keys = crypto.deriveInitialKeys(&new_dcid, new_ver);
+            self.initial_version = new_ver;
+            self.quic_version = new_ver;
+            @memcpy(self.peer_scid[0..cid_mod.len], &new_dcid);
+            self.peer_scid_len = cid_mod.len;
+            @memcpy(self.first_initial_dcid[0..cid_mod.len], &new_dcid);
+            self.first_initial_dcid_len = cid_mod.len;
+
+            // Reset packet number and send queue.
+            self.hot.tx_pn[0] = 0;
+            self.sq_head = self.sq_tail;
+            self.bytes_queued = 0;
+            self.sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH;
+            self.crypto_send_offset[0] = 0;
+            self.crypto_send_saved_len[0] = 0;
+
+            // Re-build fresh TLS client for the new version.
+            var fresh_tls = tls.TlsClient.init(io);
+            if (self.config.alpn.len > 0) {
+                const n = @min(self.config.alpn.len, @as(usize, 32));
+                @memcpy(fresh_tls.alpn[0..n], self.config.alpn[0..n]);
+                fresh_tls.alpn_len = @intCast(n);
+            }
+            if (self.config.session_ticket) |ticket| {
+                fresh_tls.setTicket(ticket);
+            }
+            fresh_tls.our_transport_params = switch (self.tls_state) {
+                .client => |*c| c.our_transport_params,
+                else => return,
+            };
+            // Update the ISCI transport param to our SCID.
+            var isci: [20]u8 = [_]u8{0} ** 20;
+            @memcpy(isci[0..our_scid.len], our_scid);
+            fresh_tls.our_transport_params.initial_source_connection_id = isci;
+            fresh_tls.our_transport_params.initial_source_connection_id_len = @intCast(our_scid.len);
+            self.tls_state = .{ .client = fresh_tls };
+
+            // Re-build and queue a new ClientHello.
             var ch_buf: [32768]u8 = undefined;
             const ch_len = try self.tls_state.client.processCrypto(&.{}, &ch_buf, io);
             try self.queueTlsOutput(ch_buf[0..ch_len]);

@@ -13,8 +13,28 @@ const TestClient = test_harness.TestClient;
 const netsim = @import("netsim.zig");
 const NetSim = netsim.NetSim;
 
+const packet_mod = @import("packet.zig");
+
 const CLIENT_ADDR: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 12345 } };
 const NOW: i64 = 1_000_000_000;
+
+/// Build a Version Negotiation packet with a custom version list.
+/// `dcid` = client's SCID (echoed back as VN DCID).
+/// `scid` = server's source CID.
+/// `versions` = supported version list (4 bytes each, big-endian).
+fn buildVnPacket(buf: []u8, dcid: []const u8, scid: []const u8, versions: []const u32) usize {
+    var pos: usize = 0;
+    buf[pos] = 0x80; pos += 1;
+    std.mem.writeInt(u32, buf[pos..][0..4], 0, .big); pos += 4;
+    buf[pos] = @intCast(dcid.len); pos += 1;
+    @memcpy(buf[pos..][0..dcid.len], dcid); pos += dcid.len;
+    buf[pos] = @intCast(scid.len); pos += 1;
+    @memcpy(buf[pos..][0..scid.len], scid); pos += scid.len;
+    for (versions) |v| {
+        std.mem.writeInt(u32, buf[pos..][0..4], v, .big); pos += 4;
+    }
+    return pos;
+}
 
 // ---------------------------------------------------------------------------
 // Handshake tests
@@ -1370,4 +1390,72 @@ test "pair: Retry under 5% loss — handshake still completes" {
 
     const ok = try sim.runPairHandshake(&client, &server, io);
     try testing.expect(ok);
+}
+
+// ---------------------------------------------------------------------------
+// Version Negotiation tests
+// ---------------------------------------------------------------------------
+
+test "pair: VN — client discards VN containing its own version (RFC 9000 §6.2)" {
+    // A VN listing the version the client already uses MUST be discarded.
+    // The handshake must still complete normally afterwards.
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 1 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    // Drain client's initial CH so it's in-flight.
+    sim.drainEndpointSend(&client, .c2s);
+
+    // Build a VN listing only v1 (same version client is using) — must be discarded.
+    var vn_buf: [64]u8 = undefined;
+    const client_scid = client.local_cid.bytes;
+    const fake_server_scid = [_]u8{0xAA} ** 8;
+    const vn_len = buildVnPacket(&vn_buf, &client_scid, &fake_server_scid, &[_]u32{packet_mod.QUIC_VERSION_1});
+    // Deliver VN directly to client (simulates out-of-band packet from server).
+    try client.receive(vn_buf[0..vn_len], CLIENT_ADDR, sim.now_ns, 0, io);
+    // Client must not have switched versions (VN was discarded).
+    try testing.expectEqual(packet_mod.QUIC_VERSION_1, client.initial_version);
+    try testing.expect(!client.vn_handled);
+
+    // Handshake still completes normally.
+    const ok = try sim.runPairHandshake(&client, &server, io);
+    try testing.expect(ok);
+}
+
+test "pair: VN — client switches v1→v2 when VN lists only v2" {
+    // Server sends VN listing only v2. Client (using v1) switches to v2 and retries.
+    // The server accepts v2 → handshake completes.
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 2 });
+    // Server configured for v2.
+    var server = try Connection(16).accept(.{ .initial_quic_version = packet_mod.QUIC_VERSION_2 }, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io); // client starts with v1
+    client.current_time_ns = sim.now_ns;
+
+    // Deliver VN to client BEFORE draining its send queue.
+    // handleVersionNegotiation clears the send queue (discarding the v1 CH),
+    // then queues a fresh v2 CH. Only after that do we drain so the server
+    // only ever sees the v2 Initial.
+    var vn_buf: [64]u8 = undefined;
+    const client_scid = client.local_cid.bytes;
+    const fake_server_scid = [_]u8{0xBB} ** 8;
+    const vn_len = buildVnPacket(&vn_buf, &client_scid, &fake_server_scid, &[_]u32{packet_mod.QUIC_VERSION_2});
+    try client.receive(vn_buf[0..vn_len], CLIENT_ADDR, sim.now_ns, 0, io);
+
+    // Client must have switched to v2.
+    try testing.expectEqual(packet_mod.QUIC_VERSION_2, client.initial_version);
+    try testing.expect(client.vn_handled);
+
+    // Drain client's new CH (v2) into netsim and run the pair handshake.
+    sim.drainEndpointSend(&client, .c2s);
+    const ok = try sim.runPairHandshake(&client, &server, io);
+    try testing.expect(ok);
+    try testing.expectEqual(ConnState.established, client.hot.state);
+    try testing.expectEqual(ConnState.established, server.hot.state);
 }

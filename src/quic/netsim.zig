@@ -636,7 +636,7 @@ pub const NetSim = struct {
         }
     }
 
-    fn drainEndpointSend(self: *NetSim, endpoint: *Connection(16), dir: Direction) void {
+    pub fn drainEndpointSend(self: *NetSim, endpoint: *Connection(16), dir: Direction) void {
         var out: [MAX_DGRAM]u8 = undefined;
         while (true) {
             const n = endpoint.send(&out, self.now_ns);
