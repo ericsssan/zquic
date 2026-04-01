@@ -1,6 +1,6 @@
 //! zquic interop client — quic-interop-runner compatible UDP client.
 //!
-//! Supported TESTCASE values: handshake, transfer, multiconnect, keyupdate, v2, ecn, resumption, zerortt.
+//! Supported TESTCASE values: handshake, transfer, multiconnect, keyupdate, v2, ecn, resumption, zerortt, chacha20.
 //! All other values cause exit(127) as required by the interop runner.
 //! HTTP/0.9: sends "GET /path\r\n" on client-initiated bidi streams.
 //! Downloads are saved to ${DOWNLOADS} directory.
@@ -24,6 +24,7 @@ const supported_cases = [_][]const u8{
     "ecn",
     "resumption",
     "zerortt",
+    "chacha20",
 };
 
 const ALPN = "hq-interop";

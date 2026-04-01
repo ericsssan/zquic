@@ -29,6 +29,7 @@ const EXT_KEY_SHARE: u16 = 0x0033;
 const EXT_QUIC_TRANSPORT_PARAMS: u16 = 0x0039;
 const GROUP_X25519: u16 = 0x001d;
 const CIPHER_AES_128_GCM: u16 = @intFromEnum(crypto.CipherSuite.aes_128_gcm);
+const CIPHER_CHACHA20: u16 = @intFromEnum(crypto.CipherSuite.chacha20_poly1305);
 
 pub const TlsClientState = enum(u8) {
     idle,
@@ -160,10 +161,12 @@ pub const TlsClient = struct {
         @memcpy(out[pos..][0..self.session_id_len], self.legacy_session_id[0..self.session_id_len]);
         pos += self.session_id_len;
 
-        // cipher_suites: AES-128-GCM only
-        std.mem.writeInt(u16, out[pos..][0..2], 2, .big);
+        // cipher_suites: AES-128-GCM + ChaCha20-Poly1305 (4 bytes each = 8 bytes total)
+        std.mem.writeInt(u16, out[pos..][0..2], 4, .big);
         pos += 2;
         std.mem.writeInt(u16, out[pos..][0..2], CIPHER_AES_128_GCM, .big);
+        pos += 2;
+        std.mem.writeInt(u16, out[pos..][0..2], CIPHER_CHACHA20, .big);
         pos += 2;
 
         // compression_methods: null only
