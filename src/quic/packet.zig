@@ -454,6 +454,57 @@ pub fn encodeRetry(
     return pos;
 }
 
+/// Verify the Retry Integrity Tag of a Retry packet received by the client.
+///
+/// `retry_without_tag` — the Retry packet bytes, excluding the last 16 bytes (the tag).
+/// `odcid`            — the original DCID from the client's first Initial.
+/// `tag`              — the 16-byte integrity tag at the end of the Retry packet.
+/// `version`          — QUIC_VERSION_1 or QUIC_VERSION_2.
+///
+/// Returns true iff the tag is valid.
+pub fn verifyRetryIntegrity(
+    retry_without_tag: []const u8,
+    odcid: []const u8,
+    tag: *const [16]u8,
+    version: u32,
+) bool {
+    const integrity_key = if (version == QUIC_VERSION_2)
+        [_]u8{
+            0x8f, 0xb4, 0xb0, 0x1b, 0x56, 0xac, 0x48, 0xe2,
+            0x60, 0xfb, 0xcb, 0xce, 0xad, 0x7c, 0xcc, 0x92,
+        }
+    else
+        [_]u8{
+            0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
+            0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+        };
+    const integrity_nonce = if (version == QUIC_VERSION_2)
+        [_]u8{
+            0xd8, 0x69, 0x69, 0xbc, 0x2d, 0x7c, 0x6d, 0x99,
+            0x90, 0xef, 0xb0, 0x4a,
+        }
+    else
+        [_]u8{
+            0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2,
+            0x23, 0x98, 0x25, 0xbb,
+        };
+
+    var aad_buf: [512]u8 = undefined;
+    var aad_len: usize = 0;
+    aad_buf[aad_len] = @intCast(odcid.len);
+    aad_len += 1;
+    @memcpy(aad_buf[aad_len..][0..odcid.len], odcid);
+    aad_len += odcid.len;
+    const copy_len = @min(retry_without_tag.len, aad_buf.len - aad_len);
+    @memcpy(aad_buf[aad_len..][0..copy_len], retry_without_tag[0..copy_len]);
+    aad_len += copy_len;
+
+    var expected_tag: [16]u8 = undefined;
+    std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(&.{}, &expected_tag, &.{}, aad_buf[0..aad_len], integrity_nonce, integrity_key);
+
+    return std.crypto.timing_safe.eql([16]u8, expected_tag, tag.*);
+}
+
 /// Compute the byte offset of the packet-number field in a long-header packet.
 ///
 /// The packet type bits (5–4) are NOT header-protected, so this function is safe
@@ -736,6 +787,23 @@ test "packet: encodeRetry integrity tag matches RFC 9001 Appendix A.4 test vecto
         const expected_tag = [_]u8{ 0xc8, 0x64, 0x6c, 0xe8, 0xbf, 0xe3, 0x39, 0x52, 0xd9, 0x55, 0x54, 0x36, 0x65, 0xdc, 0xc7, 0xb6 };
         try testing.expectEqualSlices(u8, &expected_tag, buf[n - 16 .. n]);
     }
+}
+
+test "packet: verifyRetryIntegrity accepts valid tag and rejects tampered tag" {
+    // Build a valid Retry packet, then verify it passes, and verify a tampered tag fails.
+    const testing = std.testing;
+    const orig_dcid = [_]u8{ 0x83, 0x94, 0xc8, 0xf0, 0x3e, 0x51, 0x57, 0x08 };
+    const scid = ConnectionId{ .bytes = .{ 0xf0, 0x67, 0xa5, 0x50, 0x2a, 0x42, 0x62, 0xb5 } };
+    const token = "token";
+    var buf: [256]u8 = undefined;
+    const n = encodeRetry(&buf, &.{}, scid, token, &orig_dcid, QUIC_VERSION_1);
+    const tag: *const [16]u8 = buf[n - 16 ..][0..16];
+
+    try testing.expect(verifyRetryIntegrity(buf[0 .. n - 16], &orig_dcid, tag, QUIC_VERSION_1));
+
+    var bad_tag: [16]u8 = tag.*;
+    bad_tag[0] ^= 0xff;
+    try testing.expect(!verifyRetryIntegrity(buf[0 .. n - 16], &orig_dcid, &bad_tag, QUIC_VERSION_1));
 }
 
 test "packet: longHeaderType v2 rotates packet type bits" {

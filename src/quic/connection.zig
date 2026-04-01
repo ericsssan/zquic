@@ -467,6 +467,11 @@ pub fn Connection(comptime max_streams: usize) type {
         first_initial_dcid: [20]u8 = [_]u8{0} ** 20,
         first_initial_dcid_len: u8 = 0,
 
+        /// Retry token received from server (client-mode only, RFC 9000 §17.2.5).
+        /// Included in subsequent Initial packets after receiving a Retry.
+        retry_token: [128]u8 = [_]u8{0} ** 128,
+        retry_token_len: u8 = 0,
+
         /// Alternative local CID advertised to peer via NEW_CONNECTION_ID (sequence=1).
         /// Helps tshark track 1-RTT packets when the primary CID appears in client
         /// long-header DCID before the server's Initial SCID in the trace.
@@ -1635,7 +1640,13 @@ pub fn Connection(comptime max_streams: usize) type {
                 .initial => self.rxInitialKeys(),
                 .handshake => self.rxHsKeys() orelse return data.len,
                 .zero_rtt => if (self.zero_rtt_keys) |zk| zk else return data.len,
-                else => return data.len, // Retry: can't process
+                else => {
+                    // Retry packet: client-mode only.
+                    if (raw_pkt_type == .retry and !self.config.is_server) {
+                        self.handleRetry(data, ver, io) catch {};
+                    }
+                    return data.len;
+                },
             };
 
             // Compute offset of the packet-number field; validate buffer has space for HP sample.
@@ -2956,13 +2967,14 @@ pub fn Connection(comptime max_streams: usize) type {
             self.hot.tx_pn[0] += 1;
             const ct_len = fpos + 16;
             const slot_buf = try self.reserveSendSlot(ct_len + 30);
+            const retry_token_slice = self.retry_token[0..self.retry_token_len];
             const hdr_len = packet.encodeLongHeader(
                 slot_buf,
                 .initial,
                 packet_version,
                 self.peer_scid[0..self.peer_scid_len],
                 self.ourScidBytes(),
-                &.{},
+                retry_token_slice,
                 @intCast(pn),
                 ct_len,
             );
@@ -3675,6 +3687,83 @@ pub fn Connection(comptime max_streams: usize) type {
                 &self.local_cid.bytes,
             );
             try self.enqueueSend(vn_buf[0..vn_n]);
+        }
+
+        /// Handle a Retry packet received by the client (RFC 9000 §17.2.5).
+        /// Verifies the integrity tag, updates the DCID, stores the token, resets TLS,
+        /// and re-queues the ClientHello with the token included in the next Initial.
+        fn handleRetry(self: *Self, data: []const u8, ver: u32, io: std.Io) !void {
+            // Only clients handle Retry, only during handshake, and only once.
+            if (self.config.is_server) return;
+            if (self.hot.state != .handshake) return;
+            if (self.retry_token_len > 0) return; // already processed a Retry
+
+            // Parse Retry structure:
+            //   first(1) + ver(4) + dcid_len(1) + dcid + scid_len(1) + scid + token + tag(16)
+            if (data.len < 7 + 16) return;
+            const raw_dcid_len = data[5];
+            if (data.len < @as(usize, 6) + raw_dcid_len + 1 + 16) return;
+            const raw_scid_len = data[6 + raw_dcid_len];
+            const scid_start = 7 + raw_dcid_len;
+            if (data.len < scid_start + raw_scid_len + 16) return;
+            const scid = data[scid_start..][0..raw_scid_len];
+            const token_start = scid_start + raw_scid_len;
+            if (data.len < token_start + 16) return;
+            const token_end = data.len - 16;
+            const token = data[token_start..token_end];
+            const tag: *const [16]u8 = data[token_end..][0..16];
+
+            // Verify Retry Integrity Tag against original DCID.
+            const odcid = self.first_initial_dcid[0..self.first_initial_dcid_len];
+            if (!packet.verifyRetryIntegrity(data[0..token_end], odcid, tag, ver)) return;
+
+            // Store Retry token (capped at 128 bytes).
+            const store_len = @min(token.len, @as(usize, 128));
+            @memcpy(self.retry_token[0..store_len], token[0..store_len]);
+            self.retry_token_len = @intCast(store_len);
+
+            // Update DCID to Retry's SCID.
+            const new_len = @min(raw_scid_len, @as(u8, 20));
+            @memcpy(self.peer_scid[0..new_len], scid[0..new_len]);
+            self.peer_scid_len = new_len;
+            @memcpy(self.first_initial_dcid[0..new_len], scid[0..new_len]);
+            self.first_initial_dcid_len = new_len;
+
+            // Re-derive initial keys from the new DCID.
+            self.initial_keys = crypto.deriveInitialKeys(scid[0..new_len], ver);
+
+            // Reset Initial packet number (RFC 9000 §17.2.5 — client MUST reset PN).
+            self.hot.tx_pn[0] = 0;
+
+            // Clear send queue (discard old Initial packets).
+            self.sq_head = self.sq_tail;
+            self.bytes_queued = 0;
+            self.sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH;
+
+            // Reset crypto send state for epoch 0.
+            self.crypto_send_offset[0] = 0;
+            self.crypto_send_saved_len[0] = 0;
+
+            // Reset TLS client and re-build ClientHello.
+            var fresh_tls = tls.TlsClient.init(io);
+            if (self.config.alpn.len > 0) {
+                const n = @min(self.config.alpn.len, @as(usize, 32));
+                @memcpy(fresh_tls.alpn[0..n], self.config.alpn[0..n]);
+                fresh_tls.alpn_len = @intCast(n);
+            }
+            if (self.config.session_ticket) |ticket| {
+                fresh_tls.setTicket(ticket);
+            }
+            // Preserve transport params from the original TLS client.
+            fresh_tls.our_transport_params = switch (self.tls_state) {
+                .client => |*c| c.our_transport_params,
+                else => return,
+            };
+            self.tls_state = .{ .client = fresh_tls };
+
+            var ch_buf: [32768]u8 = undefined;
+            const ch_len = try self.tls_state.client.processCrypto(&.{}, &ch_buf, io);
+            try self.queueTlsOutput(ch_buf[0..ch_len]);
         }
 
         /// Build and enqueue a Retry packet (RFC 9000 §8.1).
