@@ -96,7 +96,6 @@ pub fn main(init: std.process.Init) !void {
     const effective_server_addr = &server_addr;
     defer sock.close(io);
 
-    // Create client connection
     const config: quic.Config = .{
         .is_server = false,
         .alpn = ALPN,
@@ -105,30 +104,50 @@ pub fn main(init: std.process.Init) !void {
         .initial_max_streams_uni = 100,
     };
 
+    if (std.mem.eql(u8, testcase, "multiconnect")) {
+        // Each request gets its own connection.
+        for (0..req_count) |i| {
+            const paths = req_paths[i .. i + 1];
+            const lens = req_path_lens[i .. i + 1];
+            try runConnection(config, &sock, effective_server_addr, io, testcase, paths, lens, 1, downloads_dir);
+        }
+    } else {
+        try runConnection(config, &sock, effective_server_addr, io, testcase, &req_paths, &req_path_lens, req_count, downloads_dir);
+    }
+
+    std.debug.print("Client done\n", .{});
+}
+
+fn runConnection(
+    config: quic.Config,
+    sock: *const net.Socket,
+    dest: *const net.IpAddress,
+    io: std.Io,
+    testcase: []const u8,
+    req_paths: anytype,
+    req_path_lens: anytype,
+    req_count: usize,
+    downloads_dir: []const u8,
+) !void {
     const conn_ptr = try page_allocator.create(Conn);
     defer page_allocator.destroy(conn_ptr);
     conn_ptr.* = try Conn.connect(config, io);
     const conn = conn_ptr;
 
-    // Set current time so idle timeout doesn't fire immediately
     const init_now: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
     conn.current_time_ns = init_now;
 
-    // Drain initial send queue (ClientHello)
     var send_buf: [MAX_DATAGRAM]u8 = undefined;
-    drainSend(conn, &sock, io, effective_server_addr, &send_buf);
+    drainSend(conn, sock, io, dest, &send_buf);
 
-    // Download state
     var downloads: [MAX_DOWNLOADS]Download = [_]Download{.{}} ** MAX_DOWNLOADS;
     var requests_sent = false;
     var all_done = false;
 
-    // Event loop
     const timeout_5s: std.Io.Timeout = .{ .duration = .{ .raw = .{ .nanoseconds = 5_000_000_000 }, .clock = .awake } };
     var idle_ticks: usize = 0;
 
     while (!all_done and idle_ticks < 100) {
-        // Compute timeout from connection timer
         const conn_timeout = conn.nextTimeout();
         const timeout = if (conn_timeout) |ct| blk: {
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
@@ -137,7 +156,6 @@ pub fn main(init: std.process.Init) !void {
             break :blk std.Io.Timeout{ .duration = .{ .raw = .{ .nanoseconds = delta }, .clock = .awake } };
         } else timeout_5s;
 
-        // Receive
         var recv_buf: [MAX_DATAGRAM]u8 = undefined;
         if (sock.receiveTimeout(io, &recv_buf, timeout)) |msg| {
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
@@ -145,34 +163,30 @@ pub fn main(init: std.process.Init) !void {
             conn.receive(recv_buf[0..msg.data.len], src_addr, now_ns, 0, io) catch |err| {
                 std.debug.print("recv error: {}\n", .{err});
             };
-            drainSend(conn, &sock, io, effective_server_addr, &send_buf);
+            drainSend(conn, sock, io, dest, &send_buf);
             idle_ticks = 0;
         } else |err| {
             if (err != error.Timeout) break;
             idle_ticks += 1;
         }
 
-        // Fire timer
         if (conn_timeout) |ct| {
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
             if (now_ns >= ct) {
                 conn.tick(now_ns);
-                drainSend(conn, &sock, io, effective_server_addr, &send_buf);
+                drainSend(conn, sock, io, dest, &send_buf);
             }
         }
 
-        // Process events
         while (conn.pollEvent()) |event| {
             switch (event) {
                 .connected => {
                     std.debug.print("Connected\n", .{});
-                    // Send requests on streams
                     if (!requests_sent) {
                         requests_sent = true;
-                        sendRequests(conn, &downloads, &req_paths, &req_path_lens, req_count, downloads_dir);
-                        drainSend(conn, &sock, io, effective_server_addr, &send_buf);
+                        sendRequests(conn, &downloads, req_paths, req_path_lens, req_count, downloads_dir);
+                        drainSend(conn, sock, io, dest, &send_buf);
                     }
-                    // Key update test: initiate key update after handshake
                     if (std.mem.eql(u8, testcase, "keyupdate")) {
                         conn.initiateKeyUpdate() catch {};
                     }
@@ -182,7 +196,6 @@ pub fn main(init: std.process.Init) !void {
                 },
                 .connection_closed => {
                     std.debug.print("Connection closed\n", .{});
-                    // Drain remaining stream data before exiting
                     for (&downloads) |*d| {
                         if (d.active) receiveStreamData(conn, &downloads, d.stream_id, io);
                     }
@@ -192,19 +205,15 @@ pub fn main(init: std.process.Init) !void {
             }
         }
 
-        // Check if all downloads are complete (FIN received on each stream)
         if (requests_sent and req_count > 0) {
             var completed: usize = 0;
             for (&downloads) |*d| {
                 if (!d.active) continue;
                 if (conn.streamFinished(d.stream_id)) completed += 1;
             }
-            if (completed >= req_count) {
-                all_done = true;
-            }
+            if (completed >= req_count) all_done = true;
         }
 
-        // For handshake test, just connecting is enough
         if (std.mem.eql(u8, testcase, "handshake") and conn.hot.state == .established) {
             all_done = true;
         }
@@ -214,24 +223,20 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Close downloads
     for (&downloads) |*d| {
         if (d.file) |f| f.close(io);
     }
 
-    // Clean close
     conn.close(0, true, "") catch {};
-    drainSend(conn, &sock, io, effective_server_addr, &send_buf);
+    drainSend(conn, sock, io, dest, &send_buf);
     conn.deinit();
-
-    std.debug.print("Client done\n", .{});
 }
 
 fn sendRequests(
     conn: *Conn,
     downloads: *[MAX_DOWNLOADS]Download,
-    req_paths: *[MAX_DOWNLOADS][256]u8,
-    req_path_lens: *[MAX_DOWNLOADS]usize,
+    req_paths: anytype,
+    req_path_lens: anytype,
     req_count: usize,
     downloads_dir: []const u8,
 ) void {

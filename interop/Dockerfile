@@ -50,6 +50,7 @@ LABEL org.opencontainers.image.title="zquic-interop" \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=builder /build/zig-out/bin/server /server
+COPY --from=builder /build/zig-out/bin/client /client
 COPY interop/run_endpoint.sh /run_endpoint.sh
 
 RUN chmod +x /run_endpoint.sh && mkdir -p /logs /certs
