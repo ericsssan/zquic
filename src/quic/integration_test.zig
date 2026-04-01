@@ -1303,3 +1303,71 @@ test "pair: streamReadable returns true when data available" {
     _ = server.streamRecv(0, &buf);
     try testing.expect(!server.streamReadable(0));
 }
+
+// ---------------------------------------------------------------------------
+// Retry / address validation tests
+// ---------------------------------------------------------------------------
+
+test "pair: Retry — server validates address, handshake completes" {
+    // Server with validate_addr=true sends Retry on first Initial.
+    // Client receives Retry, resets TLS, resends with token.
+    // Second Initial passes token validation and handshake completes.
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 1 });
+
+    const token_secret = [_]u8{0xAB} ** 32;
+    var server = try Connection(16).accept(.{
+        .validate_addr = true,
+        .token_secret = token_secret,
+    }, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    const ok = try sim.runPairHandshake(&client, &server, io);
+    try testing.expect(ok);
+    try testing.expectEqual(ConnState.established, client.hot.state);
+    try testing.expectEqual(ConnState.established, server.hot.state);
+}
+
+test "pair: Retry — transfer completes after address validation" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 2 });
+
+    const token_secret = [_]u8{0xCD} ** 32;
+    var server = try Connection(16).accept(.{
+        .validate_addr = true,
+        .token_secret = token_secret,
+    }, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    const ok = try sim.runPairHandshake(&client, &server, io);
+    try testing.expect(ok);
+    try sim.runPairIdle(&client, &server, io);
+
+    const received = try sim.runPairTransfer(&client, &server, io, true, 0, 16 * 1024);
+    try testing.expectEqual(@as(usize, 16 * 1024), received);
+}
+
+test "pair: Retry under 5% loss — handshake still completes" {
+    // Retry adds an extra RTT; even with loss the handshake should succeed.
+    const io = std.testing.io;
+    const testing = std.testing;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .loss_pct = 5, .seed = 77 });
+
+    const token_secret = [_]u8{0xEF} ** 32;
+    var server = try Connection(16).accept(.{
+        .validate_addr = true,
+        .token_secret = token_secret,
+    }, io);
+    server.current_time_ns = sim.now_ns;
+    var client = try Connection(16).connect(.{}, io);
+    client.current_time_ns = sim.now_ns;
+
+    const ok = try sim.runPairHandshake(&client, &server, io);
+    try testing.expect(ok);
+}

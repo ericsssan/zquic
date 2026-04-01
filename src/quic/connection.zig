@@ -3113,7 +3113,7 @@ pub fn Connection(comptime max_streams: usize) type {
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
-                        &.{},
+                        self.retry_token[0..self.retry_token_len],
                         @intCast(pn),
                         ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
                     );
@@ -3417,7 +3417,7 @@ pub fn Connection(comptime max_streams: usize) type {
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
-                        &.{},
+                        self.retry_token[0..self.retry_token_len],
                         @intCast(pn),
                         ct_len,
                     );
@@ -3552,7 +3552,7 @@ pub fn Connection(comptime max_streams: usize) type {
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
-                        &.{},
+                        self.retry_token[0..self.retry_token_len],
                         @intCast(pn),
                         ct_len,
                     );
