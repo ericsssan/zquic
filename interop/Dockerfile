@@ -9,7 +9,7 @@ FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ENV ZIG_VERSION=0.16.0-dev.2676+4e2cec265
+ENV ZIG_VERSION=0.16.0-dev.3028+a85495ca2
 
 # Auto-detect architecture and download appropriate Zig binary
 RUN set -e; \

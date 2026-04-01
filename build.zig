@@ -120,21 +120,23 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run throughput benchmark");
     bench_step.dependOn(&run_bench.step);
 
-    // Micro-benchmarks
-    const microbench_mod = b.createModule(.{
-        .root_source_file = b.path("tools/microbench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    microbench_mod.addImport("zquic", zquic_mod);
-    const microbench = b.addExecutable(.{
-        .name = "microbench",
-        .root_module = microbench_mod,
-    });
-    b.installArtifact(microbench);
-    const run_microbench = b.addRunArtifact(microbench);
-    const microbench_step = b.step("microbench", "Run micro-benchmarks");
-    microbench_step.dependOn(&run_microbench.step);
+    // Micro-benchmarks (macOS only — uses mach_absolute_time)
+    if (target.result.os.tag == .macos) {
+        const microbench_mod = b.createModule(.{
+            .root_source_file = b.path("tools/microbench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        microbench_mod.addImport("zquic", zquic_mod);
+        const microbench = b.addExecutable(.{
+            .name = "microbench",
+            .root_module = microbench_mod,
+        });
+        b.installArtifact(microbench);
+        const run_microbench = b.addRunArtifact(microbench);
+        const microbench_step = b.step("microbench", "Run micro-benchmarks");
+        microbench_step.dependOn(&run_microbench.step);
+    }
 
     // Per-module unit tests
     const test_step = b.step("test", "Run unit tests");
