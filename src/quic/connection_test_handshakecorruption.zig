@@ -404,7 +404,7 @@ test "processShortHeaderPacket silently drops when app_keys is null" {
     var fake_short: [64]u8 = undefined;
     @memset(&fake_short, 0);
     fake_short[0] = 0x40;
-    const consumed = conn.processShortHeaderPacket(&fake_short) catch 0;
+    const consumed = conn.processShortHeaderPacket(&fake_short, io) catch 0;
     try testing.expectEqual(@as(usize, 0), consumed);
 }
 

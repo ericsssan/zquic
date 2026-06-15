@@ -76,11 +76,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     client_mod.addImport("zquic", zquic_mod);
+    client_mod.addImport("http3", http3_mod);
+    client_mod.addImport("qpack", qpack_mod);
     const client = b.addExecutable(.{
         .name = "client",
         .root_module = client_mod,
     });
-    client.stack_size = 64 * 1024 * 1024; // Connection is ~2.2MB
+    client.stack_size = 64 * 1024 * 1024; // Connection is ~2.2MB; Zig _start raises rlimit to accommodate
     b.installArtifact(client);
     const run_client = b.addRunArtifact(client);
     if (b.args) |args| run_client.addArgs(args);

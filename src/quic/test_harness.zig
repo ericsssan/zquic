@@ -358,7 +358,7 @@ pub const TestClient = struct {
                 .crypto => |cf| {
                     if (pkt_type) |pt| switch (pt) {
                         .initial => try self.tls.processServerHello(cf.data),
-                        .handshake => try self.tls.processHandshakeMessages(cf.data),
+                        .handshake => _ = try self.tls.processHandshakeMessages(cf.data),
                         else => {},
                     };
                 },

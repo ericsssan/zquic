@@ -29,12 +29,15 @@ test "connection: tick clears shouldSendMaxStreamData after stream read" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    // Create a stream and simulate the application reading data (grows recv_max)
+    // Create a stream and simulate reading enough data to trigger MAX_STREAM_DATA
+    // (threshold = 25% of buffer size = STREAM_BUF_SIZE / 4)
     const st = conn.streams.getOrCreate(0).?;
-    try st.receiveData(0, "hello world", false);
-    var read_buf: [16]u8 = undefined;
+    const quarter = @import("stream.zig").STREAM_BUF_SIZE / 4;
+    var big_data: [quarter]u8 = undefined;
+    @memset(&big_data, 0x42);
+    try st.receiveData(0, &big_data, false);
+    var read_buf: [quarter]u8 = undefined;
     _ = st.read(&read_buf);
-    // recv_max has grown beyond last_sent_max_stream_data
     try testing.expect(st.shouldSendMaxStreamData());
 
     // Simulate established state with dummy app_keys (keys don't need to be valid
@@ -320,9 +323,8 @@ test "perf: flushPendingMaxStreamData not called when not established" {
     var conn = try Connection(16).accept(.{}, io);
 
     const st = conn.streams.getOrCreate(0).?;
-    try st.receiveData(0, "hello world", false);
-    var buf: [16]u8 = undefined;
-    _ = st.read(&buf);
+    // Force shouldSendMaxStreamData by setting last_sent below recv_max by >= threshold
+    st.last_sent_max_stream_data = 0;
     try testing.expect(st.shouldSendMaxStreamData());
 
     // tick() in idle state must NOT clear the flag (no flush).

@@ -46,6 +46,10 @@ pub const SessionTicket = struct {
     age_add: u32,
     cipher: crypto.CipherSuite,
     received_ns: i64,
+    /// Server's initial_max_streams_bidi from the previous session's transport
+    /// parameters.  Stored so the client can open streams as 0-RTT early data
+    /// before the new handshake completes (RFC 9001 §4.6.1 / RFC 9000 §7.4.1).
+    max_streams_bidi: u64 = 0,
 };
 
 pub const TlsClient = struct {
@@ -103,6 +107,10 @@ pub const TlsClient = struct {
     // CRYPTO data accumulation buffer (matches TlsServer pattern for fragmented data).
     read_buf: [8192]u8,
     read_len: usize,
+    /// Bytes of read_buf already fed to processHandshakeMessages (and added to
+    /// transcript).  Prevents re-adding messages when Handshake CRYPTO arrives in
+    /// multiple packets.
+    hs_processed_len: usize,
     crypto_bytes_total: u32,
 
     pub fn init(io: std.Io) TlsClient {
@@ -117,7 +125,8 @@ pub const TlsClient = struct {
             .ecdh_kp = ecdh_kp,
             .client_random = random,
             .legacy_session_id = session_id,
-            .session_id_len = 32,
+            // RFC 9001 §8.4: legacy_session_id MUST be zero-length in QUIC.
+            .session_id_len = 0,
             .transcript = Sha256.init(.{}),
             .handshake_secret = [_]u8{0} ** 32,
             .master_secret = [_]u8{0} ** 32,
@@ -133,6 +142,7 @@ pub const TlsClient = struct {
             .resumption_master_secret = [_]u8{0} ** 32,
             .read_buf = undefined,
             .read_len = 0,
+            .hs_processed_len = 0,
             .crypto_bytes_total = 0,
         };
     }
@@ -188,6 +198,43 @@ pub const TlsClient = struct {
         pos += 1;
         std.mem.writeInt(u16, out[pos..][0..2], TLS_VERSION_1_3, .big);
         pos += 2;
+
+        // signature_algorithms (0x000d): required by RFC 8446 §9.2
+        {
+            const algs = [_]u16{
+                0x0403, // ecdsa_secp256r1_sha256
+                0x0804, // rsa_pss_rsae_sha256
+                0x0401, // rsa_pkcs1_sha256
+                0x0503, // ecdsa_secp384r1_sha384
+                0x0805, // rsa_pss_rsae_sha384
+            };
+            std.mem.writeInt(u16, out[pos..][0..2], 0x000d, .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], @intCast(2 + algs.len * 2), .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], @intCast(algs.len * 2), .big);
+            pos += 2;
+            for (algs) |alg| {
+                std.mem.writeInt(u16, out[pos..][0..2], alg, .big);
+                pos += 2;
+            }
+        }
+
+        // supported_groups (0x000a): list groups for which we can do key exchange.
+        // RFC 8446 §4.2.7: must include all groups offered in key_share.
+        {
+            const groups = [_]u16{ 0x001d }; // X25519
+            std.mem.writeInt(u16, out[pos..][0..2], 0x000a, .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], @intCast(2 + groups.len * 2), .big);
+            pos += 2;
+            std.mem.writeInt(u16, out[pos..][0..2], @intCast(groups.len * 2), .big);
+            pos += 2;
+            for (groups) |g| {
+                std.mem.writeInt(u16, out[pos..][0..2], g, .big);
+                pos += 2;
+            }
+        }
 
         // key_share (0x0033): X25519 public key
         std.mem.writeInt(u16, out[pos..][0..2], EXT_KEY_SHARE, .big);
@@ -308,8 +355,8 @@ pub const TlsClient = struct {
             crypto.hkdfExpandLabel(&finished_key, binder_key, "finished", "");
 
             // Transcript hash = H(truncated ClientHello) — everything before binders list
-            // binder_pos - 33 points to binders_list_len; binder_pos - 32 is start of binder
-            const truncated_len = binder_pos - 33; // up to (not including) binders list len
+            // Layout before binder_pos: binders_list_len(2) + binder_len(1) = 3 bytes
+            const truncated_len = binder_pos - 3; // up to (not including) binders list
             var trunc_hash: Sha256 = Sha256.init(.{});
             trunc_hash.update(out[0..truncated_len]);
             var trunc_digest: [32]u8 = undefined;
@@ -388,6 +435,7 @@ pub const TlsClient = struct {
 
         var server_pub: [32]u8 = undefined;
         var has_key_share = false;
+        var psk_accepted = false;
 
         while (pos + 4 <= ext_end) {
             const ext_type = std.mem.readInt(u16, data[pos..][0..2], .big);
@@ -402,6 +450,9 @@ pub const TlsClient = struct {
                     @memcpy(&server_pub, data[pos + 4 ..][0..32]);
                     has_key_share = true;
                 }
+            } else if (ext_type == 0x0029 and ext_len == 2) {
+                // pre_shared_key extension: server selected our PSK (index 0).
+                psk_accepted = true;
             }
             pos += ext_len;
         }
@@ -415,16 +466,18 @@ pub const TlsClient = struct {
         self.transcript.update(data[0..sh_end]);
 
         // Run TLS 1.3 key schedule (RFC 8446 §7.1)
-        try self.runKeySchedule(shared);
+        // When PSK is accepted, early_secret uses the PSK; otherwise zero.
+        const psk_value: [32]u8 = if (psk_accepted and self.offer_ticket) self.ticket_psk else [_]u8{0} ** 32;
+        try self.runKeySchedule(shared, psk_value);
 
         self.state = .wait_encrypted;
     }
 
-    fn runKeySchedule(self: *TlsClient, shared_secret: [32]u8) !void {
+    fn runKeySchedule(self: *TlsClient, shared_secret: [32]u8, psk: [32]u8) !void {
         const zero32 = [_]u8{0} ** 32;
 
-        // Early Secret (no PSK)
-        const early_secret = HkdfSha256.extract(&zero32, &zero32);
+        // Early Secret: HKDF-Extract(0, PSK) — PSK is zero for non-resumption.
+        const early_secret = HkdfSha256.extract(&zero32, &psk);
 
         // Handshake Secret
         var derived: [32]u8 = undefined;
@@ -459,17 +512,25 @@ pub const TlsClient = struct {
     /// Process Handshake-epoch CRYPTO data: EncryptedExtensions + Certificate +
     /// CertificateVerify + Finished.  Skips cert verification; verifies Finished.
     /// After this call, app_keys are available.
-    pub fn processHandshakeMessages(self: *TlsClient, data: []const u8) !void {
+    ///
+    /// Returns the number of bytes consumed from `data`.  Incomplete messages (not
+    /// enough bytes yet) are signalled by returning the consumed count without
+    /// advancing past the incomplete message — the caller should retry with more
+    /// data starting at the returned offset.  Fatal errors (BadFinished) are still
+    /// returned as errors.
+    pub fn processHandshakeMessages(self: *TlsClient, data: []const u8) !usize {
         if (self.state != .wait_encrypted) return error.UnexpectedState;
 
         var pos: usize = 0;
 
         while (pos < data.len) {
-            if (pos + 4 > data.len) return error.TooShort;
+            // Incomplete header — need more data.
+            if (pos + 4 > data.len) return pos;
             const msg_type = data[pos];
             const msg_len = readU24(data[pos + 1 ..][0..3]);
             const msg_end = pos + 4 + msg_len;
-            if (msg_end > data.len) return error.TooShort;
+            // Incomplete body — need more data.
+            if (msg_end > data.len) return pos;
 
             if (msg_type == HS_FINISHED) {
                 if (msg_len != 32) return error.BadFinished;
@@ -495,7 +556,7 @@ pub const TlsClient = struct {
                 // Derive application keys using H(CH || SH || ... || SF)
                 self.deriveAppKeys();
                 self.state = .established;
-                return;
+                return msg_end;
             }
 
             // EncryptedExtensions: extract server's transport parameters.
@@ -508,7 +569,8 @@ pub const TlsClient = struct {
             pos = msg_end;
         }
 
-        return error.NoFinished;
+        // Consumed all complete messages but no Finished yet.
+        return pos;
     }
 
     fn deriveAppKeys(self: *TlsClient) void {
@@ -600,11 +662,15 @@ pub const TlsClient = struct {
             },
             .wait_encrypted => {
                 // EE + Cert + CertVerify + Finished may arrive in fragments.
-                self.processHandshakeMessages(self.read_buf[0..self.read_len]) catch |err| switch (err) {
-                    error.TooShort, error.NoFinished => return 0, // not enough data yet
-                    else => return err,
-                };
+                // Pass only the bytes not yet added to the transcript to avoid
+                // re-processing (and double-updating) messages already consumed.
+                const consumed = try self.processHandshakeMessages(
+                    self.read_buf[self.hs_processed_len..self.read_len],
+                );
+                self.hs_processed_len += consumed;
+                if (self.state != .established) return 0; // still waiting for more data
                 self.read_len = 0;
+                self.hs_processed_len = 0;
                 return self.buildClientFinished(out);
             },
             .established => {
@@ -695,6 +761,7 @@ pub const TlsClient = struct {
             .age_add = self.ticket_age_add,
             .cipher = self.negotiated_cipher,
             .received_ns = self.ticket_received_ns,
+            .max_streams_bidi = self.peer_transport_params.initial_max_streams_bidi,
         };
     }
 
@@ -803,7 +870,7 @@ test "tls_client: full key schedule matches server" {
     try testing.expectEqualSlices(u8, &server.handshake_keys.server.key, &client.handshake_keys.server.key);
 
     // Client processes EE + Cert + CertVerify + Finished
-    try client.processHandshakeMessages(server_out[sh_len..server_out_len]);
+    _ = try client.processHandshakeMessages(server_out[sh_len..server_out_len]);
 
     try testing.expect(client.state == .established);
 

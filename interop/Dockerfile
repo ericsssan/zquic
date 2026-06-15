@@ -35,6 +35,8 @@ RUN set -e; \
 ENV PATH="/zig:${PATH}"
 
 WORKDIR /build
+# Cache-bust arg must be declared after FROM to invalidate COPY + RUN steps.
+ARG CACHEBUST=1
 COPY . .
 
 RUN set -e; \
