@@ -80,16 +80,16 @@ pub const TlsClient = struct {
     our_transport_params: transport_params.TransportParams = .{},
 
     // ALPN to offer in ClientHello.
-    alpn: [32]u8 = [_]u8{0} ** 32,
+    alpn: [32]u8 = @as([32]u8, @splat(0)),
     alpn_len: u8 = 0,
 
     // PSK / session resumption fields
     resumption_master_secret: [32]u8,
     /// Received session ticket (opaque identity for PSK extension).
-    ticket_identity: [256]u8 = [_]u8{0} ** 256,
+    ticket_identity: [256]u8 = @as([256]u8, @splat(0)),
     ticket_identity_len: u16 = 0,
     /// PSK derived from resumption_master_secret + ticket_nonce.
-    ticket_psk: [32]u8 = [_]u8{0} ** 32,
+    ticket_psk: [32]u8 = @as([32]u8, @splat(0)),
     /// Obfuscated ticket age (from NewSessionTicket.ticket_age_add).
     ticket_age_add: u32 = 0,
     /// Timestamp (ns) when ticket was received — used to compute ticket age.
@@ -100,7 +100,7 @@ pub const TlsClient = struct {
     /// When set, buildClientHello includes pre_shared_key extension.
     offer_ticket: bool = false,
     /// 0-RTT: client_early_traffic_secret derived after ClientHello when offering PSK.
-    client_early_traffic_secret: [32]u8 = [_]u8{0} ** 32,
+    client_early_traffic_secret: [32]u8 = @as([32]u8, @splat(0)),
     /// 0-RTT packet keys (derived from client_early_traffic_secret).
     early_keys: ?crypto.PacketKeys = null,
 
@@ -128,18 +128,18 @@ pub const TlsClient = struct {
             // RFC 9001 §8.4: legacy_session_id MUST be zero-length in QUIC.
             .session_id_len = 0,
             .transcript = Sha256.init(.{}),
-            .handshake_secret = [_]u8{0} ** 32,
-            .master_secret = [_]u8{0} ** 32,
-            .client_hs_secret = [_]u8{0} ** 32,
-            .server_hs_secret = [_]u8{0} ** 32,
-            .client_app_secret = [_]u8{0} ** 32,
-            .server_app_secret = [_]u8{0} ** 32,
+            .handshake_secret = @as([32]u8, @splat(0)),
+            .master_secret = @as([32]u8, @splat(0)),
+            .client_hs_secret = @as([32]u8, @splat(0)),
+            .server_hs_secret = @as([32]u8, @splat(0)),
+            .client_app_secret = @as([32]u8, @splat(0)),
+            .server_app_secret = @as([32]u8, @splat(0)),
             .handshake_keys = undefined,
             .app_keys = undefined,
             .negotiated_cipher = .aes_128_gcm,
             .quic_version = packet_mod.QUIC_VERSION_1,
             .peer_transport_params = .{},
-            .resumption_master_secret = [_]u8{0} ** 32,
+            .resumption_master_secret = @as([32]u8, @splat(0)),
             .read_buf = undefined,
             .read_len = 0,
             .hs_processed_len = 0,
@@ -223,7 +223,7 @@ pub const TlsClient = struct {
         // supported_groups (0x000a): list groups for which we can do key exchange.
         // RFC 8446 §4.2.7: must include all groups offered in key_share.
         {
-            const groups = [_]u16{ 0x001d }; // X25519
+            const groups = [_]u16{0x001d}; // X25519
             std.mem.writeInt(u16, out[pos..][0..2], 0x000a, .big);
             pos += 2;
             std.mem.writeInt(u16, out[pos..][0..2], @intCast(2 + groups.len * 2), .big);
@@ -343,7 +343,7 @@ pub const TlsClient = struct {
         // Compute PSK binder if offering a ticket
         if (self.offer_ticket and self.has_ticket and binder_pos > 0) {
             // early_secret = HKDF-Extract(0, PSK)
-            const zero32 = [_]u8{0} ** 32;
+            const zero32 = @as([32]u8, @splat(0));
             const early_secret = HkdfSha256.extract(&zero32, &self.ticket_psk);
 
             // binder_key = Derive-Secret(early_secret, "res binder", "")
@@ -376,7 +376,7 @@ pub const TlsClient = struct {
         // client_early_traffic_secret = Derive-Secret(early_secret, "c e traffic", H(CH))
         // Must happen AFTER transcript includes ClientHello.
         if (self.offer_ticket and self.has_ticket) {
-            const zero32 = [_]u8{0} ** 32;
+            const zero32 = @as([32]u8, @splat(0));
             const early_secret = HkdfSha256.extract(&zero32, &self.ticket_psk);
             var ch_hash: [32]u8 = undefined;
             var ch_snap = self.transcript;
@@ -467,14 +467,14 @@ pub const TlsClient = struct {
 
         // Run TLS 1.3 key schedule (RFC 8446 §7.1)
         // When PSK is accepted, early_secret uses the PSK; otherwise zero.
-        const psk_value: [32]u8 = if (psk_accepted and self.offer_ticket) self.ticket_psk else [_]u8{0} ** 32;
+        const psk_value: [32]u8 = if (psk_accepted and self.offer_ticket) self.ticket_psk else @as([32]u8, @splat(0));
         try self.runKeySchedule(shared, psk_value);
 
         self.state = .wait_encrypted;
     }
 
     fn runKeySchedule(self: *TlsClient, shared_secret: [32]u8, psk: [32]u8) !void {
-        const zero32 = [_]u8{0} ** 32;
+        const zero32 = @as([32]u8, @splat(0));
 
         // Early Secret: HKDF-Extract(0, PSK) — PSK is zero for non-resumption.
         const early_secret = HkdfSha256.extract(&zero32, &psk);

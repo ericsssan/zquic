@@ -305,7 +305,7 @@ pub fn decode(buf: []const u8) !TransportParams {
             },
             TP_ORIGINAL_DESTINATION_CONNECTION_ID => {
                 if (param_len > 20) return error.InvalidParams;
-                var odcid: [20]u8 = [_]u8{0} ** 20;
+                var odcid: [20]u8 = @as([20]u8, @splat(0));
                 @memcpy(odcid[0..param_len], param_data);
                 params.original_destination_connection_id = odcid;
                 params.original_destination_connection_id_len = @intCast(param_len);
@@ -397,7 +397,7 @@ test "transport_params: round-trip encode/decode with non-default values" {
         .max_ack_delay_ms = 50,
         .active_connection_id_limit = 8,
         .disable_active_migration = true,
-        .stateless_reset_token = [_]u8{0xab} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0xab)),
         .initial_source_connection_id = null,
         .initial_source_connection_id_len = 0,
     };
@@ -431,11 +431,11 @@ test "transport_params: stateless_reset_token only encoded when non-null" {
     const decoded_without = try decode(buf[0..n_without]);
     try testing.expect(decoded_without.stateless_reset_token == null);
 
-    const with = TransportParams{ .stateless_reset_token = [_]u8{0x77} ** 16 };
+    const with = TransportParams{ .stateless_reset_token = @as([16]u8, @splat(0x77)) };
     const n_with = encode(with, &buf);
     const decoded_with = try decode(buf[0..n_with]);
     try testing.expect(decoded_with.stateless_reset_token != null);
-    try testing.expectEqualSlices(u8, &([_]u8{0x77} ** 16), &decoded_with.stateless_reset_token.?);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x77))), &decoded_with.stateless_reset_token.?);
 
     // The buffer with token must be larger than without.
     try testing.expect(n_with > n_without);
@@ -684,7 +684,7 @@ test "transport_params: original_destination_connection_id round-trip" {
 
     // Use an 8-byte ODCID (common case)
     const odcid_bytes = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    var odcid_raw: [20]u8 = [_]u8{0} ** 20;
+    var odcid_raw: [20]u8 = @as([20]u8, @splat(0));
     @memcpy(odcid_raw[0..8], &odcid_bytes);
     const params = TransportParams{
         .original_destination_connection_id = odcid_raw,
@@ -718,7 +718,7 @@ test "transport_params: both retry params encode/decode together" {
     var buf: [512]u8 = undefined;
 
     const odcid_bytes = [8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    var odcid_raw: [20]u8 = [_]u8{0} ** 20;
+    var odcid_raw: [20]u8 = @as([20]u8, @splat(0));
     @memcpy(odcid_raw[0..8], &odcid_bytes);
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
     const params = TransportParams{
@@ -804,9 +804,9 @@ test "transport_params: preferred_address round-trip with 8-byte CID" {
             .ipv4_port = 443,
             .ipv6_addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
             .ipv6_port = 8443,
-            .cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22 } ++ [_]u8{0} ** 12,
+            .cid = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22 } ++ @as([12]u8, @splat(0)),
             .cid_len = 8,
-            .reset_token = [_]u8{0x55} ** 16,
+            .reset_token = @as([16]u8, @splat(0x55)),
         },
     };
 
@@ -833,11 +833,11 @@ test "transport_params: preferred_address with maximum 20-byte CID" {
         .preferred_address = PreferredAddress{
             .ipv4_addr = [_]u8{ 10, 0, 0, 1 },
             .ipv4_port = 1234,
-            .ipv6_addr = [_]u8{0xfe} ++ [_]u8{0x80} ++ [_]u8{0} ** 6 ++ [_]u8{1} ** 8,
+            .ipv6_addr = [_]u8{0xfe} ++ [_]u8{0x80} ++ @as([6]u8, @splat(0)) ++ @as([8]u8, @splat(1)),
             .ipv6_port = 5678,
-            .cid = [_]u8{0x12} ** 20,
+            .cid = @as([20]u8, @splat(0x12)),
             .cid_len = 20,
-            .reset_token = [_]u8{0x77} ** 16,
+            .reset_token = @as([16]u8, @splat(0x77)),
         },
     };
 
@@ -859,11 +859,11 @@ test "transport_params: preferred_address with zero-length CID" {
         .preferred_address = PreferredAddress{
             .ipv4_addr = [_]u8{ 127, 0, 0, 1 },
             .ipv4_port = 9999,
-            .ipv6_addr = [_]u8{0} ** 16,
+            .ipv6_addr = @as([16]u8, @splat(0)),
             .ipv6_port = 9998,
-            .cid = [_]u8{0} ** 20,
+            .cid = @as([20]u8, @splat(0)),
             .cid_len = 0, // empty CID
-            .reset_token = [_]u8{0xaa} ** 16,
+            .reset_token = @as([16]u8, @splat(0xaa)),
         },
     };
 

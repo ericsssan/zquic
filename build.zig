@@ -65,7 +65,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(server);
     const run_server = b.addRunArtifact(server);
-    if (b.args) |args| run_server.addArgs(args);
+    run_server.addPassthruArgs();
     const server_step = b.step("run-server", "Run interop server (default port 4433)");
     server_step.dependOn(&run_server.step);
 
@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
     client.stack_size = 64 * 1024 * 1024; // Connection is ~2.2MB; Zig _start raises rlimit to accommodate
     b.installArtifact(client);
     const run_client = b.addRunArtifact(client);
-    if (b.args) |args| run_client.addArgs(args);
+    run_client.addPassthruArgs();
     const client_step = b.step("run-client", "Run interop client");
     client_step.dependOn(&run_client.step);
 

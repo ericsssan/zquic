@@ -66,7 +66,7 @@ test "ecn: CE count increase triggers congestion event (cwnd reduces)" {
     const ack = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -105,7 +105,7 @@ test "ecn: CE count non-increase is ignored (monotonic guard)" {
     const ack_ecn = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -115,7 +115,7 @@ test "ecn: CE count non-increase is ignored (monotonic guard)" {
     const ack_plain = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -150,7 +150,7 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
     const ack_ecn = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 10,
         .ect1 = 5,
@@ -160,7 +160,7 @@ test "ecn: CE count = 0 with has_ecn=true is a no-op (no congestion)" {
     const ack_plain = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -189,7 +189,7 @@ test "ecn: has_ecn=false ACK does not touch ecn_ce_seen" {
     const ack = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -236,7 +236,7 @@ test "connection: processLongHeaderPacket accepts QUIC_VERSION_2" {
     // PN is at enc_buf[hdr_len-4..hdr_len], sample is at enc_buf[hdr_len..hdr_len+16].
     crypto.applyHeaderProtection(keys.client, &enc_buf[0], enc_buf[hdr_len - 4 ..][0..4], enc_buf[hdr_len..][0..16]);
 
-    const result = conn.receive(enc_buf[0..total], .{ .v4 = .{ .addr = .{0} ** 4, .port = 1234 } }, 0, 0, io);
+    const result = conn.receive(enc_buf[0..total], .{ .v4 = .{ .addr = @splat(0), .port = 1234 } }, 0, 0, io);
     _ = result catch {};
 
     // Connection must have recorded quic_version = QUIC_VERSION_2 (not dropped as unknown).
@@ -291,9 +291,9 @@ test "connection: queueTlsOutput splits ServerHello into Initial epoch and rest 
     var conn = try Connection(16).accept(.{}, io);
 
     // Set up valid encryption keys.
-    const dcid = [_]u8{0x42} ** 8;
+    const dcid = @as([8]u8, @splat(0x42));
     conn.initial_keys = crypto.deriveInitialKeys(&dcid, packet.QUIC_VERSION_1);
-    const hs_secret = [_]u8{0xab} ** 32;
+    const hs_secret = @as([32]u8, @splat(0xab));
     conn.hs_keys = tls.HandshakeKeys{
         .client = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
         .server = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
@@ -473,7 +473,7 @@ test "connection: buildAckRangesFromBitmap all contiguous" {
     // Expected: one range with ack_range=3.
     const testing = std.testing;
     const bitmap: u64 = 0b1111; // bits 0,1,2,3 set
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 3), ranges[0].ack_range);
@@ -487,7 +487,7 @@ test "connection: buildAckRangesFromBitmap with gap" {
     // Note: gap encodes as (missing_packets - 1) per RFC 9000 reconstruction formula.
     const testing = std.testing;
     const bitmap: u64 = 0b110011; // bits 0,1,4,5 set
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 1), ranges[0].ack_range); // [N-1, N]
@@ -499,7 +499,7 @@ test "connection: buildAckRangesFromBitmap empty bitmap (CTZ optimization)" {
     // Empty bitmap should yield a single zero-length ACK range.
     const testing = std.testing;
     const bitmap: u64 = 0;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range);
@@ -509,7 +509,7 @@ test "connection: buildAckRangesFromBitmap full bitmap all ones (CTZ optimizatio
     // Full 64-bit bitmap should yield single range with ack_range=63.
     const testing = std.testing;
     const bitmap: u64 = 0xFFFFFFFFFFFFFFFF;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 63), ranges[0].ack_range);
@@ -519,7 +519,7 @@ test "connection: buildAckRangesFromBitmap single bit (CTZ optimization)" {
     // Single bit set: ack_range=0 (one packet)
     const testing = std.testing;
     const bitmap: u64 = 1;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range);
@@ -531,7 +531,7 @@ test "connection: buildAckRangesFromBitmap multiple gaps (CTZ optimization)" {
     // Total: 5 ranges (initial empty + 4 gaps/runs from iterations)
     const testing = std.testing;
     const bitmap: u64 = 0b10101010;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 5), count);
     // First range: empty (no leading 1s)
@@ -551,7 +551,7 @@ test "connection: buildAckRangesFromBitmap large gap (CTZ optimization)" {
     // Test large gap between ranges: 0b1...0001 (bit 0 and bit 63)
     const testing = std.testing;
     const bitmap: u64 = 0x8000000000000001; // bits 0 and 63 set
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // bit 0
@@ -563,7 +563,7 @@ test "connection: buildAckRangesFromBitmap leading zeros (CTZ optimization)" {
     // Test gap at start: 0b00001111 (bits 0-3 only)
     const testing = std.testing;
     const bitmap: u64 = 0x0F;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 1), count);
     try testing.expectEqual(@as(u62, 3), ranges[0].ack_range); // bits 0-3
@@ -575,7 +575,7 @@ test "connection: buildAckRangesFromBitmap trailing zeros (CTZ optimization)" {
     // This produces 2 ranges: empty first range, then gap=3 + ack_range=3.
     const testing = std.testing;
     const bitmap: u64 = 0xF0;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     try testing.expectEqual(@as(usize, 2), count);
     try testing.expectEqual(@as(u62, 0), ranges[0].ack_range); // first_run=0
@@ -588,7 +588,7 @@ test "connection: buildAckRangesFromBitmap complex pattern (CTZ optimization)" {
     // 0b11110000111100001111 = 4 blocks of 4 bits separated by 4-bit gaps
     const testing = std.testing;
     const bitmap: u64 = 0x0F0F0F0F;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     // Expected: 4 ranges (ack_range=3 each) with 3-bit gaps between them
     try testing.expectEqual(@as(usize, 4), count);
@@ -608,7 +608,7 @@ test "connection: buildAckRangesFromBitmap max range count capped at 32" {
     // Pattern: 0x5555555555555555 = bits 0,2,4,6,...,62 set (32 bits set)
     // This creates many separate ranges when gaps are included.
     const bitmap: u64 = 0x5555555555555555;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     // Should return at most 32 (the max capacity)
     try testing.expect(count <= 32);
@@ -619,7 +619,7 @@ test "connection: buildAckRangesFromBitmap byte pattern (CTZ optimization)" {
     // bits 8-15 set, bits 0-7 clear
     const testing = std.testing;
     const bitmap: u64 = 0x0000FF00;
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
     // Expected: gap of 8, run of 8
     try testing.expectEqual(@as(usize, 2), count);
@@ -696,7 +696,7 @@ test "connection: processAck multi-range gap decoding does not ack gap packets" 
         .ranges = [_]frame.AckRange{
             .{ .gap = 0, .ack_range = 2 }, // first range: [5, 7]
             .{ .gap = 0, .ack_range = 3 }, // gap=0 means 1 unacked; second range: [0, 3]
-        } ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 30,
+        } ++ @as([30]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 2,
         .ect0 = 0,
         .ect1 = 0,
@@ -729,9 +729,9 @@ test "connection: out-of-order 1-RTT packets are processed not dropped" {
     conn.hot.state = .established; // skip handshake
 
     // Derive app keys (simplified; just use a fixed 32-byte key for both directions).
-    const app_key = [_]u8{0xAA} ** 32;
-    const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 32;
+    const app_key = @as([32]u8, @splat(0xAA));
+    const app_iv = @as([12]u8, @splat(0xBB));
+    const app_hp = @as([32]u8, @splat(0xCC));
     conn.app_keys = tls.AppKeys{
         .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
         .server = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
@@ -808,7 +808,7 @@ test "connection: ACK with gap encodes correctly" {
     // Bit positions (LSB=0): bit 0,1 set, bit 2 clear, bits 3,4 set = 0b11011
     const testing = std.testing;
     const bitmap: u64 = 0b11011; // bits {0,1,3,4} set
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     const count = Connection(16).buildAckRangesFromBitmap(bitmap, &ranges);
 
     // Expected: 2 ranges
@@ -1001,12 +1001,12 @@ test "connection: rotateKeys toggles current_key_phase" {
 
     // Mock app_keys to allow rotation
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
-    conn.next_client_secret = [_]u8{0} ** 32;
-    conn.next_server_secret = [_]u8{0} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(0));
+    conn.next_server_secret = @as([32]u8, @splat(0));
 
     conn.rotateKeys();
     try testing.expect(conn.current_key_phase != initial_phase);
@@ -1020,12 +1020,12 @@ test "connection: multiple key rotations toggle key_phase correctly" {
     const initial_phase = conn.current_key_phase;
 
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
-    conn.next_client_secret = [_]u8{0} ** 32;
-    conn.next_server_secret = [_]u8{0} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(0));
+    conn.next_server_secret = @as([32]u8, @splat(0));
 
     conn.rotateKeys();
     const phase_after_1 = conn.current_key_phase;
@@ -1045,12 +1045,12 @@ test "connection: key generation counter increments on rotation" {
 
     // Setup for key rotation
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
-    conn.next_client_secret = [_]u8{0} ** 32;
-    conn.next_server_secret = [_]u8{0} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(0));
+    conn.next_server_secret = @as([32]u8, @splat(0));
 
     // After first rotation, should be generation 1
     conn.rotateKeys();
@@ -1071,8 +1071,8 @@ test "connection: deriveSecretsForGeneration returns correct generation secrets"
     var conn = try Connection(16).accept(.{}, io);
 
     // Set initial secrets
-    conn.tls_state.server.client_app_secret = [_]u8{0xaa} ** 32;
-    conn.tls_state.server.server_app_secret = [_]u8{0xbb} ** 32;
+    conn.tls_state.server.client_app_secret = @as([32]u8, @splat(0xaa));
+    conn.tls_state.server.server_app_secret = @as([32]u8, @splat(0xbb));
 
     // Generation 0 should return the initial secrets
     const gen0 = conn.deriveSecretsForGeneration(0);
@@ -1105,12 +1105,12 @@ test "connection: multiple sequential key rotations with generation tracking" {
 
     // Setup for multiple rotations
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
-    conn.next_client_secret = [_]u8{1} ** 32;
-    conn.next_server_secret = [_]u8{2} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(1));
+    conn.next_server_secret = @as([32]u8, @splat(2));
 
     // Perform 10 sequential rotations
     var i: u32 = 0;
@@ -1139,12 +1139,12 @@ test "connection: key_phase bit and key_generation independent" {
 
     // Setup for rotation
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
-    conn.next_client_secret = [_]u8{0} ** 32;
-    conn.next_server_secret = [_]u8{0} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(0));
+    conn.next_server_secret = @as([32]u8, @splat(0));
 
     // After 2 rotations:
     // - key_phase should return to initial (false->true->false)
@@ -1162,16 +1162,16 @@ test "connection: full key rotation flow - secret derivation for interop" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Simulate TLS handshake completion with real secret material
-    conn.tls_state.server.client_random = [_]u8{0x11} ** 32;
-    conn.tls_state.server.client_hs_secret = [_]u8{0x33} ** 32;
-    conn.tls_state.server.server_hs_secret = [_]u8{0x44} ** 32;
-    conn.tls_state.server.client_app_secret = [_]u8{0x55} ** 32;
-    conn.tls_state.server.server_app_secret = [_]u8{0x66} ** 32;
+    conn.tls_state.server.client_random = @as([32]u8, @splat(0x11));
+    conn.tls_state.server.client_hs_secret = @as([32]u8, @splat(0x33));
+    conn.tls_state.server.server_hs_secret = @as([32]u8, @splat(0x44));
+    conn.tls_state.server.client_app_secret = @as([32]u8, @splat(0x55));
+    conn.tls_state.server.server_app_secret = @as([32]u8, @splat(0x66));
 
     // Setup application keys (simulating post-handshake state)
     conn.app_keys = .{
-        .client = .{ .key = [_]u8{0xaa} ** 32, .iv = [_]u8{0xbb} ** 12, .hp = [_]u8{0xcc} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0xdd} ** 32, .iv = [_]u8{0xee} ** 12, .hp = [_]u8{0xff} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0xaa)), .iv = @as([12]u8, @splat(0xbb)), .hp = @as([32]u8, @splat(0xcc)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0xdd)), .iv = @as([12]u8, @splat(0xee)), .hp = @as([32]u8, @splat(0xff)), .suite = .aes_128_gcm },
     };
     conn.next_app_keys = conn.app_keys.?;
     conn.next_client_secret = crypto.deriveNextAppSecret(conn.tls_state.server.client_app_secret, packet.QUIC_VERSION_1);
@@ -1233,16 +1233,16 @@ test "connection: packet encryption/decryption works with key rotation" {
 
     // Setup client connection
     var client = try Connection(16).accept(.{}, io);
-    client.tls_state.server.client_random = [_]u8{0xaa} ** 32;
-    client.tls_state.server.client_hs_secret = [_]u8{0xbb} ** 32;
-    client.tls_state.server.server_hs_secret = [_]u8{0xcc} ** 32;
-    client.tls_state.server.client_app_secret = [_]u8{0xdd} ** 32;
-    client.tls_state.server.server_app_secret = [_]u8{0xee} ** 32;
+    client.tls_state.server.client_random = @as([32]u8, @splat(0xaa));
+    client.tls_state.server.client_hs_secret = @as([32]u8, @splat(0xbb));
+    client.tls_state.server.server_hs_secret = @as([32]u8, @splat(0xcc));
+    client.tls_state.server.client_app_secret = @as([32]u8, @splat(0xdd));
+    client.tls_state.server.server_app_secret = @as([32]u8, @splat(0xee));
 
     // Setup symmetric keys for encryption/decryption
-    const test_key = [_]u8{0x42} ** 32;
-    const test_iv = [_]u8{0x43} ** 12;
-    const test_hp = [_]u8{0x44} ** 32;
+    const test_key = @as([32]u8, @splat(0x42));
+    const test_iv = @as([12]u8, @splat(0x43));
+    const test_hp = @as([32]u8, @splat(0x44));
 
     client.app_keys = .{
         .client = .{ .key = test_key, .iv = test_iv, .hp = test_hp, .suite = .aes_128_gcm },
@@ -1316,8 +1316,8 @@ test "connection: processFrames marks STREAM frame as ack-eliciting" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm }, .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm } };
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm }, .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm } };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
     // Build a STREAM frame
     var buf: [256]u8 = undefined;
@@ -1342,7 +1342,7 @@ test "connection: processFrames does NOT mark PADDING as ack-eliciting" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm }, .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm } };
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm }, .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm } };
 
     // PADDING is all zeros
     const buf = [_]u8{ 0x00, 0x00, 0x00 };
@@ -1360,7 +1360,7 @@ test "connection: processFrames does NOT mark ACK as ack-eliciting" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.app_keys = tls.AppKeys{ .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm }, .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm } };
+    conn.app_keys = tls.AppKeys{ .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm }, .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm } };
 
     conn.hot.tx_pn[2] = 1; // pretend pn=0 was sent in epoch 2
 
@@ -1369,7 +1369,7 @@ test "connection: processFrames does NOT mark ACK as ack-eliciting" {
     const ack_frame = frame.Frame{ .ack = .{
         .largest_acked = 0,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -1403,7 +1403,7 @@ test "security: CRYPTO staging byte limit prevents memory pinning" {
     // Stage fragments up to the limit (16384 / 1400 = ~11 fragments of 1400 bytes)
     var offset: u64 = 0;
     for (0..12) |i| {
-        const buf = [_]u8{0} ** 1400;
+        const buf = @as([1400]u8, @splat(0));
         if (i < 11) {
             try conn.stageCryptoFrag(epoch, offset, &buf);
             offset += CRYPTO_STAGE_FRAG;
@@ -1433,7 +1433,7 @@ test "security: NEW_CONNECTION_ID out-of-order frames accepted (RFC 9000 §19.15
         .retire_prior_to = 0,
         .cid_len = 8,
         .cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
 
     // CID with seq=9 arrives out of order (seq < highest-seen but >= retire_prior_to=0):
@@ -1443,7 +1443,7 @@ test "security: NEW_CONNECTION_ID out-of-order frames accepted (RFC 9000 §19.15
         .retire_prior_to = 0,
         .cid_len = 8,
         .cid = [_]u8{ 2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
 
     // Both CIDs must be stored (seq=9 was valid — not yet retired).
@@ -1464,7 +1464,7 @@ test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {
         .retire_prior_to = 0,
         .cid_len = 8,
         .cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
 
     // Try to store CID with seq > 100 + 1000 (should be rejected)
@@ -1473,7 +1473,7 @@ test "security: NEW_CONNECTION_ID sequence bounded to prevent DoS" {
         .retire_prior_to = 0,
         .cid_len = 8,
         .cid = [_]u8{ 2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
 
     // Only the first CID should be stored
@@ -1493,7 +1493,7 @@ test "security: NEW_CONNECTION_ID sequence within bounds is accepted" {
         .retire_prior_to = 0,
         .cid_len = 8,
         .cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
 
     // Store CID with seq=1100 (= 100 + 1000, at boundary, should be accepted)
@@ -1502,7 +1502,7 @@ test "security: NEW_CONNECTION_ID sequence within bounds is accepted" {
         .retire_prior_to = 0,
         .cid_len = 8,
         .cid = [_]u8{ 2, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
 
     // Both CIDs should be stored
@@ -1864,7 +1864,7 @@ test "connection: NEW_TOKEN silently consumed in 1-RTT epoch" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const tok = [_]u8{0xab} ** 16;
+    const tok = @as([16]u8, @splat(0xab));
     var buf: [32]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .new_token = &tok });
     // Must not return an error.
@@ -1876,7 +1876,7 @@ test "security: NEW_TOKEN in Initial epoch returns ProtocolViolation" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const tok = [_]u8{0xab} ** 8;
+    const tok = @as([8]u8, @splat(0xab));
     var buf: [16]u8 = undefined;
     const n = frame.encodeFrame(&buf, .{ .new_token = &tok });
     try testing.expectError(error.ProtocolViolation, conn.processFrames(buf[0..n], 0, null));
@@ -1942,7 +1942,7 @@ test "connection: ACK ack_delay scaled by cached_ack_delay_exp" {
         .ack = .{
             .largest_acked = 0,
             .ack_delay = 10, // 10 * 2^5 µs = 320 µs
-            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+            .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
             .range_count = 1,
             .ect0 = 0,
             .ect1 = 0,
@@ -1967,7 +1967,7 @@ test "security: ACK for unsent packet returns ProtocolViolation" {
     const ack_f: frame.Frame = .{ .ack = .{
         .largest_acked = 5,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,

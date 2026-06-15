@@ -748,7 +748,7 @@ test "packet: encodeRetry integrity tag is 16 bytes" {
     const dcid = ConnectionId{ .bytes = .{ 1, 2, 3, 4, 5, 6, 7, 8 } };
     const scid = ConnectionId{ .bytes = .{ 9, 10, 11, 12, 13, 14, 15, 16 } };
     const odcid = ConnectionId{ .bytes = .{ 17, 18, 19, 20, 21, 22, 23, 24 } };
-    const token = [_]u8{0xAA} ** 62; // max size token
+    const token = @as([62]u8, @splat(0xAA)); // max size token
 
     const n = encodeRetry(&buf, &dcid.bytes, scid, &token, &odcid.bytes, QUIC_VERSION_1);
 

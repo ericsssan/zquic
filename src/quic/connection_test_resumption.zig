@@ -15,7 +15,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 test "ticket encrypt/decrypt round-trip preserves PSK, cipher, and ALPN" {
     const io = std.testing.io;
-    const ticket_key = [_]u8{0x42} ** 32;
+    const ticket_key = @as([32]u8, @splat(0x42));
 
     var server = try tls.TlsServer.init(io);
     defer server.deinit();
@@ -25,7 +25,7 @@ test "ticket encrypt/decrypt round-trip preserves PSK, cipher, and ALPN" {
     server.negotiated_alpn[0] = 'h';
     server.negotiated_alpn[1] = '3';
     server.current_time_ns = 1_000_000_000_000;
-    server.resumption_master_secret = [_]u8{0xAA} ** 32;
+    server.resumption_master_secret = @as([32]u8, @splat(0xAA));
 
     var nst_buf: [512]u8 = undefined;
     const nst_len = server.buildNewSessionTicket(&nst_buf);
@@ -50,13 +50,13 @@ test "ticket encrypt/decrypt round-trip preserves PSK, cipher, and ALPN" {
 
 test "ticket decrypt fails with wrong key" {
     const io = std.testing.io;
-    const ticket_key = [_]u8{0x42} ** 32;
-    const wrong_key = [_]u8{0x99} ** 32;
+    const ticket_key = @as([32]u8, @splat(0x42));
+    const wrong_key = @as([32]u8, @splat(0x99));
 
     var server = try tls.TlsServer.init(io);
     defer server.deinit();
     server.ticket_key = &ticket_key;
-    server.resumption_master_secret = [_]u8{0xBB} ** 32;
+    server.resumption_master_secret = @as([32]u8, @splat(0xBB));
     server.current_time_ns = 1_000_000;
 
     var nst_buf: [512]u8 = undefined;
@@ -69,8 +69,8 @@ test "ticket decrypt fails with wrong key" {
 }
 
 test "ticket decrypt fails with truncated data" {
-    const ticket_key = [_]u8{0x42} ** 32;
-    const short = [_]u8{0} ** 30;
+    const ticket_key = @as([32]u8, @splat(0x42));
+    const short = @as([30]u8, @splat(0));
     try testing.expect(tls.decryptTicket(&ticket_key, &short) == null);
 }
 
@@ -79,8 +79,8 @@ test "ticket decrypt fails with truncated data" {
 // ---------------------------------------------------------------------------
 
 test "PSK binder computation is deterministic" {
-    const zero32 = [_]u8{0} ** 32;
-    const psk = [_]u8{0xCC} ** 32;
+    const zero32 = @as([32]u8, @splat(0));
+    const psk = @as([32]u8, @splat(0xCC));
 
     const early_secret = HkdfSha256.extract(&zero32, &psk);
 
@@ -123,8 +123,8 @@ test "PSK key schedule produces different early_secret than zero PSK" {
     var server_zero = try tls.TlsServer.init(io);
     defer server_zero.deinit();
 
-    const shared = [_]u8{0x55} ** 32;
-    const psk = [_]u8{0xDD} ** 32;
+    const shared = @as([32]u8, @splat(0x55));
+    const psk = @as([32]u8, @splat(0xDD));
 
     try server_psk.runKeySchedule(shared, psk);
     try server_zero.runKeySchedule(shared, null);
@@ -140,9 +140,9 @@ test "NewSessionTicket has correct message type and lifetime" {
     const io = std.testing.io;
     var server = try tls.TlsServer.init(io);
     defer server.deinit();
-    const ticket_key = [_]u8{0x11} ** 32;
+    const ticket_key = @as([32]u8, @splat(0x11));
     server.ticket_key = &ticket_key;
-    server.resumption_master_secret = [_]u8{0x22} ** 32;
+    server.resumption_master_secret = @as([32]u8, @splat(0x22));
     server.current_time_ns = 42;
 
     var buf: [512]u8 = undefined;
@@ -170,8 +170,8 @@ test "NewSessionTicket returns 0 when no ticket_key" {
 // ---------------------------------------------------------------------------
 
 test "0-RTT keys differ from 1-RTT keys" {
-    const early_secret = [_]u8{0xEE} ** 32;
-    const ch_hash = [_]u8{0xFF} ** 32;
+    const early_secret = @as([32]u8, @splat(0xEE));
+    const ch_hash = @as([32]u8, @splat(0xFF));
 
     var client_early_traffic_secret: [32]u8 = undefined;
     crypto.hkdfExpandLabel(&client_early_traffic_secret, early_secret, "c e traffic", &ch_hash);
@@ -183,7 +183,7 @@ test "0-RTT keys differ from 1-RTT keys" {
     );
 
     var app_secret: [32]u8 = undefined;
-    crypto.hkdfExpandLabel(&app_secret, [_]u8{0xAA} ** 32, "c ap traffic", &ch_hash);
+    crypto.hkdfExpandLabel(&app_secret, @as([32]u8, @splat(0xAA)), "c ap traffic", &ch_hash);
     const app_keys = crypto.derivePacketKeysWithSuite(
         app_secret,
         @import("packet.zig").QUIC_VERSION_1,

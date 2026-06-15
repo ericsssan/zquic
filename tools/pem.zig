@@ -166,11 +166,11 @@ test "pem: decode Ed25519 PKCS8" {
     // Minimal PKCS#8 DER for Ed25519: the seed sits at bytes [16..48].
     // Structure: SEQUENCE { version, AlgorithmIdentifier, OCTET STRING { OCTET STRING { seed } } }
     // The pattern we search for is 0x04 0x20 <32 seed bytes>.
-    var der: [50]u8 = [_]u8{0} ** 50;
+    var der: [50]u8 = @as([50]u8, @splat(0));
     // Put the inner OCTET STRING at offset 16
     der[16] = 0x04;
     der[17] = 0x20;
-    const expected_seed = [_]u8{0xab} ** 32;
+    const expected_seed = @as([32]u8, @splat(0xab));
     @memcpy(der[18..50], &expected_seed);
 
     const seed = try pkcs8Ed25519Seed(der[0..50]);
@@ -184,15 +184,15 @@ test "pem: pkcs8Ed25519Seed finds seed at various offsets" {
     var der0: [34]u8 = undefined;
     der0[0] = 0x04;
     der0[1] = 0x20;
-    const s0 = [_]u8{0x11} ** 32;
+    const s0 = @as([32]u8, @splat(0x11));
     @memcpy(der0[2..34], &s0);
     try testing.expectEqual(s0, try pkcs8Ed25519Seed(&der0));
 
     // Seed pattern at offset 10
-    var der10: [44]u8 = [_]u8{0xff} ** 44;
+    var der10: [44]u8 = @as([44]u8, @splat(0xff));
     der10[10] = 0x04;
     der10[11] = 0x20;
-    const s10 = [_]u8{0x22} ** 32;
+    const s10 = @as([32]u8, @splat(0x22));
     @memcpy(der10[12..44], &s10);
     try testing.expectEqual(s10, try pkcs8Ed25519Seed(&der10));
 }
@@ -203,7 +203,7 @@ test "pem: no PEM marker returns error" {
 }
 
 test "pem: seed not found returns error" {
-    const der = [_]u8{0x30} ** 32; // all 0x30, no 0x04 0x20 pattern
+    const der = @as([32]u8, @splat(0x30)); // all 0x30, no 0x04 0x20 pattern
     try std.testing.expectError(error.Ed25519SeedNotFound, pkcs8Ed25519Seed(&der));
 }
 

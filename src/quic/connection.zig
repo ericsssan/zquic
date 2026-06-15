@@ -199,7 +199,7 @@ pub const Config = struct {
     /// Enable address validation with Retry tokens (RFC 9000 §8.1).
     validate_addr: bool = false,
     /// 32-byte secret for token derivation via HKDF-Expand.
-    token_secret: [32]u8 = [_]u8{0} ** 32,
+    token_secret: [32]u8 = @as([32]u8, @splat(0)),
     /// Token validity window in nanoseconds (default 5 minutes).
     token_validity_ns: i64 = 5 * 60 * std.time.ns_per_s,
     /// ALPN protocol to require. Static/caller-owned slice; "" = no ALPN check.
@@ -232,7 +232,7 @@ pub const Config = struct {
     preferred_addr_ipv4: ?[4]u8 = null,
     preferred_addr_ipv4_port: u16 = 0,
     /// IPv6 address for preferred_address transport parameter (RFC 9000 §18.2.3).
-    preferred_addr_ipv6: [16]u8 = [_]u8{0} ** 16,
+    preferred_addr_ipv6: [16]u8 = @as([16]u8, @splat(0)),
     preferred_addr_ipv6_port: u16 = 0,
     /// Preferred AEAD cipher suite. The server negotiates this when the client offers it.
     preferred_cipher: crypto.CipherSuite = .aes_128_gcm,
@@ -269,7 +269,7 @@ pub fn Connection(comptime max_streams: usize) type {
         peer_cid: ConnectionId,
         /// Client's SCID as received in the first Initial packet (0–20 bytes).
         /// RFC 9000 §7.2: server DCID in long-header packets must equal client SCID.
-        peer_scid: [20]u8 = [_]u8{0} ** 20,
+        peer_scid: [20]u8 = @as([20]u8, @splat(0)),
         peer_scid_len: u8 = 0,
         peer_addr: SocketAddr,
         /// Previous peer address (before last migration).  Packets from this
@@ -467,12 +467,12 @@ pub fn Connection(comptime max_streams: usize) type {
         /// DCID from the client's very first Initial packet (set on first receive, idle→handshake).
         /// Used for original_destination_connection_id (RFC 9000 §7.3):
         /// the server MUST always include this parameter, even without Retry.
-        first_initial_dcid: [20]u8 = [_]u8{0} ** 20,
+        first_initial_dcid: [20]u8 = @as([20]u8, @splat(0)),
         first_initial_dcid_len: u8 = 0,
 
         /// Retry token received from server (client-mode only, RFC 9000 §17.2.5).
         /// Included in subsequent Initial packets after receiving a Retry.
-        retry_token: [128]u8 = [_]u8{0} ** 128,
+        retry_token: [128]u8 = @as([128]u8, @splat(0)),
         retry_token_len: u8 = 0,
         /// Set after the client successfully processes a Version Negotiation packet.
         /// Prevents infinite VN loops: once a version switch occurs, any subsequent
@@ -589,22 +589,22 @@ pub fn Connection(comptime max_streams: usize) type {
 
             return Self{
                 .hot = .{
-                    .rx_pn = [_]u64{0} ** 3,
-                    .tx_pn = [_]u64{0} ** 3,
+                    .rx_pn = @as([3]u64, @splat(0)),
+                    .tx_pn = @as([3]u64, @splat(0)),
                     .state = .idle,
                     .epoch = 0,
                     .rx_pn_valid = .{ false, false, false },
-                    ._pad = [_]u8{0} ** 11,
+                    ._pad = @as([11]u8, @splat(0)),
                 },
                 .local_cid = local_cid,
                 .alt_local_cid = alt_local_cid,
                 .alt_local_reset_token = alt_local_reset_token,
                 .peer_cid = ConnectionId.zero,
-                .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
+                .peer_addr = .{ .v4 = .{ .addr = @as([4]u8, @splat(0)), .port = 0 } },
                 .prev_peer_addr = null,
                 .initial_keys = .{
-                    .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-                    .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+                    .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+                    .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
                 },
                 .tls_state = .{ .server = tls_server },
                 .initial_version = packet.QUIC_VERSION_1,
@@ -623,7 +623,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .cached_ack_delay_exp = 3,
                 .idle_timeout_i64 = idle_timeout_i64,
                 .sq = undefined,
-                .sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH,
+                .sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{})),
                 .sq_head = 0,
                 .sq_tail = 0,
                 .bytes_queued = 0,
@@ -649,12 +649,12 @@ pub fn Connection(comptime max_streams: usize) type {
                 .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
                 .local_max_streams_uni = @min(config.initial_max_streams_uni, @as(u64, std.math.maxInt(u62))),
                 .peer_max_stream_data_bidi_local = flow_control.DEFAULT_MAX_STREAM_DATA,
-                .peer_cid_table = [_]PeerCidEntry{.{
+                .peer_cid_table = @as([MAX_PEER_CIDS]PeerCidEntry, @splat(.{
                     .cid = .{},
                     .seq = 0,
-                    .reset_token = [_]u8{0} ** 16,
+                    .reset_token = @as([16]u8, @splat(0)),
                     .valid = false,
-                }} ** MAX_PEER_CIDS,
+                })),
                 .peer_cid_retire_prior = 0,
                 .path_validated = false,
                 .bytes_unvalidated_recv = 0,
@@ -667,15 +667,15 @@ pub fn Connection(comptime max_streams: usize) type {
                 .next_app_keys = null,
                 .cached_app_keys = null,
                 .cached_next_keys = null,
-                .next_client_secret = [_]u8{0} ** 32,
-                .next_server_secret = [_]u8{0} ** 32,
+                .next_client_secret = @as([32]u8, @splat(0)),
+                .next_server_secret = @as([32]u8, @splat(0)),
                 .current_key_generation = 0,
                 .peer_disable_migration = false,
                 .pending_handshake_done = false,
                 .pending_max_data = false,
                 .pending_reset_count = 0,
-                .unknown_versions = [_]u32{0} ** 4,
-                .unknown_version_times = [_]i64{std.math.minInt(i64)} ** 4,
+                .unknown_versions = @as([4]u32, @splat(0)),
+                .unknown_version_times = @as([4]i64, @splat(std.math.minInt(i64))),
                 .unknown_version_idx = 0,
                 .crypto_send_offset = .{ 0, 0, 0 },
                 .crypto_retx_pos = .{ 0, 0 },
@@ -693,7 +693,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .crypto_staged_count = .{ 0, 0, 0 },
                 .pending_ack = .{ false, false, false },
                 .ecn_ce_seen = .{ 0, 0, 0 },
-                .rx_pn_bitmap = [_]u64{0} ** 3,
+                .rx_pn_bitmap = @as([3]u64, @splat(0)),
             };
         }
 
@@ -738,7 +738,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Set up transport params for ClientHello.
             const scid_bytes = &local_cid.bytes;
-            var isci: [20]u8 = [_]u8{0} ** 20;
+            var isci: [20]u8 = @as([20]u8, @splat(0));
             @memcpy(isci[0..scid_bytes.len], scid_bytes);
             // Advertise per-stream receive windows matching the ring buffer size.
             // If we advertised the default 256KB but our ring buffer is 32KB, the peer
@@ -782,18 +782,18 @@ pub fn Connection(comptime max_streams: usize) type {
 
             var self = Self{
                 .hot = .{
-                    .rx_pn = [_]u64{0} ** 3,
-                    .tx_pn = [_]u64{0} ** 3,
+                    .rx_pn = @as([3]u64, @splat(0)),
+                    .tx_pn = @as([3]u64, @splat(0)),
                     .state = .handshake,
                     .epoch = 0,
                     .rx_pn_valid = .{ false, false, false },
-                    ._pad = [_]u8{0} ** 11,
+                    ._pad = @as([11]u8, @splat(0)),
                 },
                 .local_cid = local_cid,
                 .alt_local_cid = alt_local_cid,
                 .alt_local_reset_token = alt_local_reset_token,
                 .peer_cid = ConnectionId.zero,
-                .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
+                .peer_addr = .{ .v4 = .{ .addr = @as([4]u8, @splat(0)), .port = 0 } },
                 .prev_peer_addr = null,
                 .initial_keys = initial_keys,
                 .tls_state = .{ .client = tls_client },
@@ -813,7 +813,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .cached_ack_delay_exp = 3,
                 .idle_timeout_i64 = idle_timeout_i64,
                 .sq = undefined,
-                .sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH,
+                .sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{})),
                 .sq_head = 0,
                 .sq_tail = 0,
                 .bytes_queued = 0,
@@ -838,12 +838,12 @@ pub fn Connection(comptime max_streams: usize) type {
                 .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
                 .local_max_streams_uni = @min(config.initial_max_streams_uni, @as(u64, std.math.maxInt(u62))),
                 .peer_max_stream_data_bidi_local = flow_control.DEFAULT_MAX_STREAM_DATA,
-                .peer_cid_table = [_]PeerCidEntry{.{
+                .peer_cid_table = @as([MAX_PEER_CIDS]PeerCidEntry, @splat(.{
                     .cid = .{},
                     .seq = 0,
-                    .reset_token = [_]u8{0} ** 16,
+                    .reset_token = @as([16]u8, @splat(0)),
                     .valid = false,
-                }} ** MAX_PEER_CIDS,
+                })),
                 .peer_cid_retire_prior = 0,
                 .path_validated = true, // Client is not amplification-limited
                 .bytes_unvalidated_recv = 0,
@@ -856,15 +856,15 @@ pub fn Connection(comptime max_streams: usize) type {
                 .next_app_keys = null,
                 .cached_app_keys = null,
                 .cached_next_keys = null,
-                .next_client_secret = [_]u8{0} ** 32,
-                .next_server_secret = [_]u8{0} ** 32,
+                .next_client_secret = @as([32]u8, @splat(0)),
+                .next_server_secret = @as([32]u8, @splat(0)),
                 .current_key_generation = 0,
                 .peer_disable_migration = false,
                 .pending_handshake_done = false,
                 .pending_max_data = false,
                 .pending_reset_count = 0,
-                .unknown_versions = [_]u32{0} ** 4,
-                .unknown_version_times = [_]i64{std.math.minInt(i64)} ** 4,
+                .unknown_versions = @as([4]u32, @splat(0)),
+                .unknown_version_times = @as([4]i64, @splat(std.math.minInt(i64))),
                 .unknown_version_idx = 0,
                 .crypto_send_offset = .{ 0, 0, 0 },
                 .crypto_retx_pos = .{ 0, 0 },
@@ -882,7 +882,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .crypto_staged_count = .{ 0, 0, 0 },
                 .pending_ack = .{ false, false, false },
                 .ecn_ce_seen = .{ 0, 0, 0 },
-                .rx_pn_bitmap = [_]u64{0} ** 3,
+                .rx_pn_bitmap = @as([3]u64, @splat(0)),
             };
 
             // Store the DCID we're sending to (peer_scid for packet building)
@@ -2410,7 +2410,7 @@ pub fn Connection(comptime max_streams: usize) type {
                         // initial_source_connection_id MUST equal the SCID we sent in our Initial packet
                         // (RFC 9000 §7.3). Our wire SCID is ourScidBytes() = local_cid.bytes.
                         const scid_bytes = self.ourScidBytes();
-                        var isci: [20]u8 = [_]u8{0} ** 20;
+                        var isci: [20]u8 = @as([20]u8, @splat(0));
                         @memcpy(isci[0..scid_bytes.len], scid_bytes);
                         our_params.initial_source_connection_id = isci;
                         our_params.initial_source_connection_id_len = @intCast(scid_bytes.len);
@@ -2438,7 +2438,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
                         // RFC 9000 §18.2.3: advertise preferred_address if configured.
                         if (self.config.preferred_addr_ipv4) |ipv4| {
-                            var pa_cid: [20]u8 = [_]u8{0} ** 20;
+                            var pa_cid: [20]u8 = @as([20]u8, @splat(0));
                             const pa_cid_len = self.alt_local_cid.bytes.len;
                             @memcpy(pa_cid[0..pa_cid_len], &self.alt_local_cid.bytes);
                             our_params.preferred_address = transport_params.PreferredAddress{
@@ -3832,7 +3832,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Clear send queue and loss state (discard old Initial packets).
             self.sq_head = self.sq_tail;
             self.bytes_queued = 0;
-            self.sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH;
+            self.sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{}));
             self.loss.bytes_in_flight = 0;
 
             // Reset crypto send state for epoch 0.
@@ -3911,7 +3911,7 @@ pub fn Connection(comptime max_streams: usize) type {
             self.hot.tx_pn[0] = 0;
             self.sq_head = self.sq_tail;
             self.bytes_queued = 0;
-            self.sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH;
+            self.sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{}));
             self.crypto_send_offset[0] = 0;
             self.crypto_send_saved_len[0] = 0;
 
@@ -3930,7 +3930,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 else => return,
             };
             // Update the ISCI transport param to our SCID.
-            var isci: [20]u8 = [_]u8{0} ** 20;
+            var isci: [20]u8 = @as([20]u8, @splat(0));
             @memcpy(isci[0..our_scid.len], our_scid);
             fresh_tls.our_transport_params.initial_source_connection_id = isci;
             fresh_tls.our_transport_params.initial_source_connection_id_len = @intCast(our_scid.len);
@@ -4409,7 +4409,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Helper: normalize address to IPv6 for token hashing.
         fn normalizeAddressToIPv6(src: SocketAddr) [16]u8 {
-            var ipv6: [16]u8 = [_]u8{0} ** 16;
+            var ipv6: [16]u8 = @as([16]u8, @splat(0));
             switch (src) {
                 .v4 => |v4| {
                     ipv6[10] = 0xff;
@@ -4435,7 +4435,7 @@ pub fn Connection(comptime max_streams: usize) type {
             const addr_ipv6 = normalizeAddressToIPv6(src);
 
             // Build plaintext (47 bytes): odcid_len(1) + odcid(20) + addr(16) + port(2) + ts(8)
-            var plaintext: [47]u8 = [_]u8{0} ** 47;
+            var plaintext: [47]u8 = @as([47]u8, @splat(0));
             var pos: usize = 0;
 
             // Original DCID length (1 byte) + DCID bytes (padded to 20)
@@ -4534,7 +4534,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Original DCID length + bytes
             const odcid_len: u8 = if (plaintext[pos] <= 20) plaintext[pos] else return null;
             pos += 1;
-            var odcid_raw: [20]u8 = [_]u8{0} ** 20;
+            var odcid_raw: [20]u8 = @as([20]u8, @splat(0));
             @memcpy(&odcid_raw, plaintext[pos..][0..20]);
             pos += 20;
 

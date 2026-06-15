@@ -1343,7 +1343,7 @@ test "pair: Retry — server validates address, handshake completes" {
     const testing = std.testing;
     var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 1 });
 
-    const token_secret = [_]u8{0xAB} ** 32;
+    const token_secret = @as([32]u8, @splat(0xAB));
     var server = try Connection(16).accept(.{
         .validate_addr = true,
         .token_secret = token_secret,
@@ -1363,7 +1363,7 @@ test "pair: Retry — transfer completes after address validation" {
     const testing = std.testing;
     var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 2 });
 
-    const token_secret = [_]u8{0xCD} ** 32;
+    const token_secret = @as([32]u8, @splat(0xCD));
     var server = try Connection(16).accept(.{
         .validate_addr = true,
         .token_secret = token_secret,
@@ -1386,7 +1386,7 @@ test "pair: Retry under 5% loss — handshake still completes" {
     const testing = std.testing;
     var sim = NetSim.init(.{ .delay_ns = 25_000_000, .loss_pct = 5, .seed = 77 });
 
-    const token_secret = [_]u8{0xEF} ** 32;
+    const token_secret = @as([32]u8, @splat(0xEF));
     var server = try Connection(16).accept(.{
         .validate_addr = true,
         .token_secret = token_secret,
@@ -1420,7 +1420,7 @@ test "pair: VN — client discards VN containing its own version (RFC 9000 §6.2
     // Build a VN listing only v1 (same version client is using) — must be discarded.
     var vn_buf: [64]u8 = undefined;
     const client_scid = client.local_cid.bytes;
-    const fake_server_scid = [_]u8{0xAA} ** 8;
+    const fake_server_scid = @as([8]u8, @splat(0xAA));
     const vn_len = buildVnPacket(&vn_buf, &client_scid, &fake_server_scid, &[_]u32{packet_mod.QUIC_VERSION_1});
     // Deliver VN directly to client (simulates out-of-band packet from server).
     try client.receive(vn_buf[0..vn_len], CLIENT_ADDR, sim.now_ns, 0, io);
@@ -1451,7 +1451,7 @@ test "pair: VN — client switches v1→v2 when VN lists only v2" {
     // only ever sees the v2 Initial.
     var vn_buf: [64]u8 = undefined;
     const client_scid = client.local_cid.bytes;
-    const fake_server_scid = [_]u8{0xBB} ** 8;
+    const fake_server_scid = @as([8]u8, @splat(0xBB));
     const vn_len = buildVnPacket(&vn_buf, &client_scid, &fake_server_scid, &[_]u32{packet_mod.QUIC_VERSION_2});
     try client.receive(vn_buf[0..vn_len], CLIENT_ADDR, sim.now_ns, 0, io);
 

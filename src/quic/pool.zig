@@ -26,7 +26,7 @@ pub fn Pool(comptime T: type, comptime capacity: usize) type {
         free_top: usize = capacity,
 
         // Tracks which slots are currently acquired (for double-free detection).
-        in_use: [capacity]bool = [_]bool{false} ** capacity,
+        in_use: [capacity]bool = @as([capacity]bool, @splat(false)),
 
         /// Acquire a slot from the pool. Returns null when exhausted.
         pub fn acquire(self: *Self) ?*T {

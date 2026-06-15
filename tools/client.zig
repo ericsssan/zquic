@@ -46,10 +46,10 @@ const Download = struct {
     /// File handle for writing.
     file: ?std.Io.File = null,
     // H3 streaming parser state (persisted across receiveH3StreamData calls).
-    h3_hdr: [16]u8 = undefined,   // accumulate frame type+length varint bytes
-    h3_hdr_len: usize = 0,         // bytes accumulated so far (0 = waiting for next frame)
-    h3_in_data: bool = false,      // true when consuming a DATA frame body
-    h3_remaining: usize = 0,       // bytes left in current frame body (0 = reading header)
+    h3_hdr: [16]u8 = undefined, // accumulate frame type+length varint bytes
+    h3_hdr_len: usize = 0, // bytes accumulated so far (0 = waiting for next frame)
+    h3_in_data: bool = false, // true when consuming a DATA frame body
+    h3_remaining: usize = 0, // bytes left in current frame body (0 = reading header)
 };
 
 const MAX_DOWNLOADS = 2048;

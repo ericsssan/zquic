@@ -652,7 +652,7 @@ test "frame: ACK encode/parse round-trip" {
     const ack: AckFrame = .{
         .largest_acked = 10,
         .ack_delay = 0,
-        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 5 }} ++ [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 5 }} ++ @as([31]AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -731,7 +731,7 @@ test "frame: STOP_SENDING encode/parse round-trip" {
 test "frame: NEW_CONNECTION_ID encode/parse round-trip" {
     const testing = std.testing;
     var buf: [64]u8 = undefined;
-    const tok = [_]u8{0xbb} ** 16;
+    const tok = @as([16]u8, @splat(0xbb));
     var cid_bytes: [20]u8 = undefined;
     @memset(&cid_bytes, 0xaa);
     const f: Frame = .{ .new_connection_id = .{
@@ -816,7 +816,7 @@ test "frame: MAX_STREAM_DATA encode/parse round-trip" {
 test "frame: ACK with multiple ranges encode/parse round-trip" {
     const testing = std.testing;
     var buf: [128]u8 = undefined;
-    var ranges: [32]AckRange = [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges: [32]AckRange = @as([32]AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     ranges[0] = .{ .gap = 0, .ack_range = 4 }; // first range: pn 16..20
     ranges[1] = .{ .gap = 2, .ack_range = 3 }; // gap=2, second range: 4 pkts
     const ack = AckFrame{
@@ -852,7 +852,7 @@ test "frame: ACK range count boundary: 31 additional accepted, 32 rejected" {
     const testing = std.testing;
 
     // --- Boundary case: 31 additional ranges accepted (32 total, fills array exactly) ---
-    var ranges: [32]AckRange = [_]AckRange{.{ .gap = 1, .ack_range = 0 }} ** 32;
+    var ranges: [32]AckRange = @as([32]AckRange, @splat(.{ .gap = 1, .ack_range = 0 }));
     ranges[0] = .{ .gap = 0, .ack_range = 0 };
     const ack_max = AckFrame{
         .largest_acked = 100,
@@ -1218,7 +1218,7 @@ test "frame: ACK_ECN (0x03) encode/decode round-trip preserves ECN counts" {
     const ack_frame = Frame{ .ack = AckFrame{
         .largest_acked = 42,
         .ack_delay = 10,
-        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 42 }} ++ [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 42 }} ++ @as([31]AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 100,
         .ect1 = 200,
@@ -1249,7 +1249,7 @@ test "frame: ACK (0x02) without ECN has_ecn=false" {
     const ack_frame = Frame{ .ack = AckFrame{
         .largest_acked = 10,
         .ack_delay = 0,
-        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 10 }} ++ [_]AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]AckRange{.{ .gap = 0, .ack_range = 10 }} ++ @as([31]AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,

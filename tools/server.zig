@@ -43,7 +43,7 @@ const ConnSlot = struct {
     peer_addr: ?net.IpAddress = null,
     /// True when the most recent packet arrived on the CM socket.
     use_cm_sock: bool = false,
-    transfers: [MAX_TRANSFERS]FileTransfer = [_]FileTransfer{.{}} ** MAX_TRANSFERS,
+    transfers: [MAX_TRANSFERS]FileTransfer = @as([MAX_TRANSFERS]FileTransfer, @splat(.{})),
     /// Parsed requests deferred because all transfer slots were occupied.
     /// Retried at the start of each flushTransfers() pass.
     pending: [MAX_TRANSFERS]PendingTransfer = undefined,
@@ -309,7 +309,7 @@ pub fn main(init: std.process.Init) !void {
         // RFC 9000 §18.2.3: advertise preferred IPv4+IPv6 addresses for migration.
         .preferred_addr_ipv4 = if (is_cm) CM_IPV4 else null,
         .preferred_addr_ipv4_port = if (is_cm) CM_PORT else 0,
-        .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else [_]u8{0} ** 16,
+        .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else @as([16]u8, @splat(0)),
         .preferred_addr_ipv6_port = if (is_cm) CM_PORT else 0,
         .ticket_key = &ticket_key,
     };
@@ -342,7 +342,7 @@ pub fn main(init: std.process.Init) !void {
     const send_bufs: *SendBufs = &send_bufs_storage;
 
     // Connection table: array of nullable pointers (heap-allocated).
-    var conn_slots: [MAX_CONNS]?*ConnSlot = [_]?*ConnSlot{null} ** MAX_CONNS;
+    var conn_slots: [MAX_CONNS]?*ConnSlot = @as([MAX_CONNS]?*ConnSlot, @splat(null));
 
     // Stable pointer to CM socket (if active) for passing to functions.
     const cm_sock_ptr: ?*const net.Socket = if (cm_sock) |*s| s else null;

@@ -52,10 +52,10 @@ test "PMTUD: queuePmtudProbe succeeds when conditions are met" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
     // Setup 1-RTT keys (required for probing)
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Attempt to queue a probe at valid size (within MAX_PACKET_SIZE=1200)
@@ -74,9 +74,9 @@ test "PMTUD: queuePmtudProbe rejects invalid sizes" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Reject too-small size (< 1200)
@@ -95,7 +95,7 @@ test "PMTUD: queuePmtudProbe rejects when no 1-RTT keys" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     // No app_keys set
 
     // Reject because we're not in 1-RTT
@@ -109,9 +109,9 @@ test "PMTUD: queuePmtudProbe initiates and stores probe info" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate a probe at valid size
@@ -130,10 +130,10 @@ test "PMTUD: probe timeout detected at 3×PTO without ACK" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.cached_max_ack_delay_ns = 25_000_000; // 25ms
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate probe at maximum valid size (1200)
@@ -157,9 +157,9 @@ test "PMTUD: ACK detection marks probe as successful" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Manually initiate probe at valid size
@@ -172,7 +172,7 @@ test "PMTUD: ACK detection marks probe as successful" {
         .ack = .{
             .largest_acked = @intCast(probe_pn),
             .ack_delay = 0,
-            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+            .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
             .range_count = 1,
             .ect0 = 0,
             .ect1 = 0,
@@ -195,11 +195,11 @@ test "PMTUD: does not backoff on ACK with gap containing probe" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.pmtud_next_probe_ns = 0;
     conn.cached_max_ack_delay_ns = 25_000_000;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate probe at valid size
@@ -215,7 +215,7 @@ test "PMTUD: does not backoff on ACK with gap containing probe" {
         .ack = .{
             .largest_acked = @intCast(probe_pn + 1),
             .ack_delay = 0,
-            .ranges = [_]frame.AckRange{.{ .gap = 1, .ack_range = 0 }} ** 32,
+            .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 1, .ack_range = 0 })),
             .range_count = 1,
             .ect0 = 0,
             .ect1 = 0,
@@ -240,10 +240,10 @@ test "PMTUD: does not backoff on ACK with unreachable packet" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Queue a small probe manually
@@ -258,7 +258,7 @@ test "PMTUD: does not backoff on ACK with unreachable packet" {
         .ack = .{
             .largest_acked = @intCast(probe_pn + 1), // ACK packet after probe, not the probe itself
             .ack_delay = 0,
-            .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+            .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
             .range_count = 1,
             .ect0 = 0,
             .ect1 = 0,
@@ -282,7 +282,7 @@ test "PMTUD: probe disabled during handshake" {
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
     conn.pmtud_next_probe_ns = 0;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
     // No app_keys, not established
     try testing.expectEqual(.idle, conn.hot.state);
@@ -302,10 +302,10 @@ test "PMTUD: state machine: probe can only be initiated when none in flight" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate probe manually
@@ -329,10 +329,10 @@ test "PMTUD: respects 1-second retry interval after failure" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.cached_max_ack_delay_ns = 25_000_000;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Initiate and timeout probe manually
@@ -359,7 +359,7 @@ test "PMTUD: 3×PTO timeout check uses saturating multiply (no overflow panic)" 
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.cached_max_ack_delay_ns = 0;
 
     // Set RTT so ptoBase() returns a value where 3 * ptoBase overflows u64.
@@ -367,7 +367,7 @@ test "PMTUD: 3×PTO timeout check uses saturating multiply (no overflow panic)" 
     conn.loss.rtt.smoothed_rtt = std.math.maxInt(u64) / 3 + 1;
     conn.loss.rtt.rtt_var = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     try conn.queuePmtudProbe(1200);
@@ -388,9 +388,9 @@ test "PMTUD: probe packet is marked ack-eliciting" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Queue probe at realistic size (< MAX_PACKET_SIZE)
@@ -412,10 +412,10 @@ test "PMTUD: doesn't probe if already at maximum" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 65535;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     conn.tick(conn.current_time_ns);
@@ -431,10 +431,10 @@ test "PMTUD: backoff on PacketTooLarge error" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     conn.tick(conn.current_time_ns);
@@ -450,10 +450,10 @@ test "PMTUD: converges when probe size exceeds MAX_PACKET_SIZE" {
     conn.hot.state = .established;
     conn.current_time_ns = 1_000_000_000;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
     conn.pmtud_next_probe_ns = 0;
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     for (0..5) |i| {
@@ -469,9 +469,9 @@ test "PMTUD: short header padding calculation is correct" {
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.path_mtu = 1200;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     try conn.queuePmtudProbe(1200);
@@ -483,9 +483,9 @@ test "PMTUD: rejects probe size above MAX_PACKET_SIZE" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    conn.peer_cid = .{ .bytes = [_]u8{0} ** 8 };
+    conn.peer_cid = .{ .bytes = @as([8]u8, @splat(0)) };
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     try conn.queuePmtudProbe(1452);
@@ -498,7 +498,7 @@ test "token: valid token can be generated and validated" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Set token secret
-    const secret = [_]u8{0xaa} ** 32;
+    const secret = @as([32]u8, @splat(0xaa));
     conn.config.token_secret = secret;
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
@@ -521,7 +521,7 @@ test "token: expired token is rejected" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const secret = [_]u8{0xbb} ** 32;
+    const secret = @as([32]u8, @splat(0xbb));
     conn.config.token_secret = secret;
     conn.config.token_validity_ns = 60 * std.time.ns_per_s; // 60 seconds
 
@@ -541,7 +541,7 @@ test "token: future-dated token is rejected (clock skew)" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const secret = [_]u8{0xcc} ** 32;
+    const secret = @as([32]u8, @splat(0xcc));
     conn.config.token_secret = secret;
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
@@ -562,7 +562,7 @@ test "token: different source address causes validation failure" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const secret = [_]u8{0xdd} ** 32;
+    const secret = @as([32]u8, @splat(0xdd));
     conn.config.token_secret = secret;
 
     const src1: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
@@ -583,7 +583,7 @@ test "token: tampered token (corrupted AEAD tag) is rejected" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const secret = [_]u8{0xee} ** 32;
+    const secret = @as([32]u8, @splat(0xee));
     conn.config.token_secret = secret;
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
@@ -606,7 +606,7 @@ test "token: IPv6 source address validation" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const secret = [_]u8{0xff} ** 32;
+    const secret = @as([32]u8, @splat(0xff));
     conn.config.token_secret = secret;
 
     const src: SocketAddr = .{ .v6 = .{ .addr = [_]u8{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 1234 } };
@@ -629,14 +629,14 @@ test "token: truncated token is rejected" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const secret = [_]u8{0x99} ** 32;
+    const secret = @as([32]u8, @splat(0x99));
     conn.config.token_secret = secret;
 
     const src: SocketAddr = .{ .v4 = .{ .addr = [_]u8{ 192, 168, 1, 100 }, .port = 1234 } };
     const now_ns: i64 = 1_000_000_000;
 
     // Create truncated token (too short)
-    const truncated: [30]u8 = [_]u8{0} ** 30;
+    const truncated: [30]u8 = @as([30]u8, @splat(0));
 
     // Validation should fail
     const result = conn.validateToken(&truncated, src, now_ns);
@@ -787,7 +787,7 @@ test "retry: validate_addr=true, no token: retry_sent event and Retry packet que
 test "retry: validate_addr=true, valid token: original_dcid stored, handshake proceeds" {
     const testing = std.testing;
     const io = std.testing.io;
-    const secret = [_]u8{0xAB} ** 32;
+    const secret = @as([32]u8, @splat(0xAB));
     var conn = try Connection(16).accept(.{ .validate_addr = true, .token_secret = secret }, io);
 
     const dcid_bytes = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08 };
@@ -815,7 +815,7 @@ test "retry: validate_addr=true, valid token: original_dcid stored, handshake pr
 test "retry: validate_addr=true, expired token: silent drop (RFC 9000 §8.1.3)" {
     const testing = std.testing;
     const io = std.testing.io;
-    const secret = [_]u8{0xCD} ** 32;
+    const secret = @as([32]u8, @splat(0xCD));
     var conn = try Connection(16).accept(.{
         .validate_addr = true,
         .token_secret = secret,
@@ -844,7 +844,7 @@ test "retry: validate_addr=true, expired token: silent drop (RFC 9000 §8.1.3)" 
 test "retry: validate_addr=true, tampered token: silent drop (RFC 9000 §8.1.3)" {
     const testing = std.testing;
     const io = std.testing.io;
-    const secret = [_]u8{0xEF} ** 32;
+    const secret = @as([32]u8, @splat(0xEF));
     var conn = try Connection(16).accept(.{ .validate_addr = true, .token_secret = secret }, io);
 
     const dcid_bytes = [_]u8{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF };
@@ -869,7 +869,7 @@ test "retry: validate_addr=true, tampered token: silent drop (RFC 9000 §8.1.3)"
 test "retry: validate_addr=true, wrong-address token: silent drop (RFC 9000 §8.1.3)" {
     const testing = std.testing;
     const io = std.testing.io;
-    const secret = [_]u8{0x12} ** 32;
+    const secret = @as([32]u8, @splat(0x12));
     var conn = try Connection(16).accept(.{ .validate_addr = true, .token_secret = secret }, io);
 
     const dcid_bytes = [_]u8{ 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80 };

@@ -10,7 +10,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ENV ZIG_VERSION=0.16.0-dev.3006+94355f192
+ENV ZIG_VERSION=0.17.0-dev.657+2faf8debf
 
 RUN set -e; \
     ARCH=$(uname -m); \

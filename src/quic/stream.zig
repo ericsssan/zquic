@@ -714,7 +714,7 @@ pub fn StreamTable(comptime capacity: usize) type {
         const Self = @This();
         streams: [capacity]Stream = undefined,
         ids: [capacity]u62 = undefined,
-        states: [capacity]SlotState = [_]SlotState{.empty} ** capacity,
+        states: [capacity]SlotState = @as([capacity]SlotState, @splat(.empty)),
         count: usize = 0,
 
         /// Return true if slot i holds a live stream.

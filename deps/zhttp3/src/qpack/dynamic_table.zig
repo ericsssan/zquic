@@ -50,10 +50,10 @@ pub const DynamicTable = struct {
     slot_count: usize = 0,
 
     // Table state.
-    capacity: usize,      // current capacity limit (bytes)
-    max_capacity: usize,  // max allowed (SETTINGS_QPACK_MAX_TABLE_CAPACITY)
-    current_size: usize = 0,  // sum of (name_len + value_len + 32) per active entry
-    insert_count: u64 = 0,    // total entries ever inserted (absolute index of next = this)
+    capacity: usize, // current capacity limit (bytes)
+    max_capacity: usize, // max allowed (SETTINGS_QPACK_MAX_TABLE_CAPACITY)
+    current_size: usize = 0, // sum of (name_len + value_len + 32) per active entry
+    insert_count: u64 = 0, // total entries ever inserted (absolute index of next = this)
 
     pub const Slot = struct {
         name_offset: usize,
@@ -88,7 +88,7 @@ pub const DynamicTable = struct {
 
         const name_offset = self.data_len;
         @memcpy(self.data[name_offset..][0..name.len], name);
-        @memcpy(self.data[name_offset + name.len..][0..value.len], value);
+        @memcpy(self.data[name_offset + name.len ..][0..value.len], value);
         self.data_len += name.len + value.len;
 
         const slot_idx = (self.slot_head + self.slot_count) % self.slots.len;
@@ -114,7 +114,7 @@ pub const DynamicTable = struct {
         const slot = self.slots[slot_idx];
         return .{
             .name = self.data[slot.name_offset..][0..slot.name_len],
-            .value = self.data[slot.name_offset + slot.name_len..][0..slot.value_len],
+            .value = self.data[slot.name_offset + slot.name_len ..][0..slot.value_len],
         };
     }
 
@@ -135,7 +135,7 @@ pub const DynamicTable = struct {
             const slot_idx = (self.slot_head + i) % self.slots.len;
             const slot = self.slots[slot_idx];
             const n = self.data[slot.name_offset..][0..slot.name_len];
-            const v = self.data[slot.name_offset + slot.name_len..][0..slot.value_len];
+            const v = self.data[slot.name_offset + slot.name_len ..][0..slot.value_len];
             if (std.mem.eql(u8, name, n) and std.mem.eql(u8, value, v))
                 return oldest + @as(u64, i);
         }
@@ -254,8 +254,8 @@ test "entry too large returns TableFull" {
     var t = DynamicTable.init(&data, &slots, 64);
 
     // 35-byte name alone makes entry_size > 64 - ... well: 35+0+32 = 67 > 64
-    const big_name = "a" ** 33; // 33 + 0 + 32 = 65 > 64
-    try std.testing.expectError(error.TableFull, t.insert(big_name, ""));
+    const big_name: [33]u8 = @splat('a'); // 33 + 0 + 32 = 65 > 64
+    try std.testing.expectError(error.TableFull, t.insert(&big_name, ""));
 }
 
 test "multiple inserts and evictions preserve data integrity" {

@@ -61,7 +61,7 @@ pub const TestClient = struct {
         return .{
             .tls = TlsClient.init(io),
             .initial_dcid = server_dcid_bytes,
-            .server_scid = [_]u8{0} ** CID_LEN,
+            .server_scid = @as([CID_LEN]u8, @splat(0)),
             .server_scid_valid = false,
             .client_scid = client_scid,
             .initial_keys = crypto.deriveInitialKeys(&server_dcid_bytes, packet.QUIC_VERSION_1),
@@ -69,13 +69,13 @@ pub const TestClient = struct {
             .saved_initial_pt = undefined,
             .saved_initial_pt_len = 0,
             .largest_rx_pn = 0,
-            .recv_streams = [_]RecvStream{.{
+            .recv_streams = @as([MAX_STREAMS]RecvStream, @splat(.{
                 .stream_id = 0,
                 .data = undefined,
                 .len = 0,
                 .fin = false,
                 .active = false,
-            }} ** MAX_STREAMS,
+            })),
             .received_close = false,
             .close_error_code = 0,
         };
@@ -166,7 +166,7 @@ pub const TestClient = struct {
     /// Build a 1-RTT ACK packet for the given largest packet number.
     pub fn buildAck(self: *TestClient, out: []u8, largest_pn: u62) usize {
         var plaintext: [128]u8 = undefined;
-        var ranges: [32]frame.AckRange = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+        var ranges: [32]frame.AckRange = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
         ranges[0] = .{ .gap = 0, .ack_range = largest_pn };
         const pt_len = frame.encodeFrame(&plaintext, .{ .ack = .{
             .largest_acked = largest_pn,

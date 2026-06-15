@@ -198,9 +198,9 @@ fn benchShortHeaderEncode() void {
 // AEAD benchmarks
 // ---------------------------------------------------------------------------
 
-var aead_plaintext: [1200]u8 = [_]u8{0xAB} ** 1200;
+var aead_plaintext: [1200]u8 = @as([1200]u8, @splat(0xAB));
 var aead_ciphertext: [1200 + 16]u8 = undefined;
-var aead_header: [20]u8 = [_]u8{0x40} ++ [_]u8{0x01} ** 19;
+var aead_header: [20]u8 = [_]u8{0x40} ++ @as([19]u8, @splat(0x01));
 
 fn benchAeadEncrypt() void {
     const keys = getKeys();
@@ -242,7 +242,7 @@ fn benchHpApply() void {
     const keys = getKeys();
     var first_byte: u8 = 0x43; // short header
     var pn_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x2a };
-    const sample = [_]u8{0xDE} ** 16;
+    const sample = @as([16]u8, @splat(0xDE));
     crypto.applyHeaderProtection(keys.server, &first_byte, &pn_bytes, &sample);
     std.mem.doNotOptimizeAway(first_byte);
 }
@@ -251,7 +251,7 @@ fn benchHpRemove() void {
     const keys = getKeys();
     var first_byte: u8 = 0x43;
     var pn_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x2a };
-    const sample = [_]u8{0xDE} ** 16;
+    const sample = @as([16]u8, @splat(0xDE));
     // Apply then remove
     crypto.applyHeaderProtection(keys.server, &first_byte, &pn_bytes, &sample);
     _ = crypto.removeHeaderProtection(keys.server, &first_byte, &pn_bytes, &sample);
