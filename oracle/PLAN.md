@@ -21,14 +21,27 @@ impl on the wire — at interactive speed.
 
 ```
 oracle/
-  build-refs.sh     # build + cache reference binaries → oracle/.cache/bin/
+  build-refs.sh     # build + cache reference binaries + fixtures
   run.sh            # orchestrator: launch endpoints, assert, report
-  certs/            # test cert+key (generated once)
-  www/              # files served (generated; sizes per testcase)
+  refs/quicgo/      # quic-go oracle endpoint (hq-interop / HTTP-0.9)
+  refs/proxy/       # capturing + impairment UDP relay (Go)
+  certs/ www/       # cert+key, served files (generated; gitignored)
   .cache/           # built reference binaries (gitignored)
-tools/
-  netproxy.zig      # userspace UDP impairment relay (delay/loss/reorder/dup)
 ```
+
+## Validation model (this is the point)
+
+- **Data-path cases** (handshake/transfer/multiplexing): the independent impl is
+  the judge. It rejects non-conformant wire bytes/crypto/transport-params, so a
+  hash-matched transfer through quic-go is a real oracle — not self-validation.
+- **Behavioral cases** (retry, ...): a hash match does NOT prove the mechanism
+  fired. The capturing proxy classifies every packet (QUIC long-header types are
+  unmasked by header protection, so Retry/VN/0-RTT are visible without keys) and
+  the case passes only if the required class appears ON THE WIRE. Verified by a
+  falsification test: transfer-mode server transfers fine but produces no Retry →
+  the wire-check fails where hash-only would false-pass.
+- **Crypto path**: RFC 9001 Appendix A vectors as unit tests (exact bytes from the
+  spec). A.1 AES keys + A.2 AES HP + A.5 ChaCha20 packet protection.
 
 - **Endpoints over loopback UDP.** zquic server on :p, reference client → :p (or
   via the proxy). Assert: client exits 0 AND downloaded bytes hash-match the served
@@ -65,10 +78,13 @@ Each case runs: zquic-server ↔ ref-client, and ref-server ↔ zquic-client.
   + transfer, hash-verified. Validates the whole approach.
 - **Phase 1 — clean matrix.** `run.sh` orchestrator over the clean-network cases ×
   both directions × ngtcp2. `zig build oracle` wrapper.
-- **Phase 2 — impairment.** `netproxy.zig` relay; add loss/longrtt cases.
-- **Phase 3 — multi-impl + CI.** Add quiche + quic-go to build-refs and the matrix;
-  wire a fast subset into CI. Keep the full Docker matrix for the pre-release
-  11-client sweep only.
+- **Phase 2 — behavioral + impairment.** DONE for retry (wire-classified Retry);
+  proxy also injects -loss/-delayms for the loss/longrtt cases. Next behavioral
+  cases: versionnegotiation + 0-RTT (parse coalesced packets), then keyupdate +
+  ecn (need keylog-based decryption — both endpoints emit SSLKEYLOGFILE).
+- **Phase 3 — multi-impl + CI.** Add ngtcp2 (../ngtcp2, cmake+quictls) + quiche
+  (cargo) to build-refs and the matrix; wire a fast subset into CI. Keep the full
+  Docker matrix for the pre-release 11-client sweep only.
 
 ## Complementary (cheap, parallel win)
 

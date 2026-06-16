@@ -26,6 +26,14 @@ if [ ! -f "$WWW/big.bin" ]; then
   head -c 1048576 /dev/urandom > "$WWW/big.bin"
 fi
 
+# ---- capturing proxy (pure go stdlib) ---------------------------------------
+if [ ! -x "$BIN/proxy" ]; then
+  echo "==> building capturing proxy"
+  ( cd "$ORACLE/refs/proxy" && go build -o "$BIN/proxy" . )
+else
+  echo "==> proxy present (skip)"
+fi
+
 # ---- quic-go (pure go build) ------------------------------------------------
 if [ ! -x "$BIN/quicgo" ]; then
   echo "==> building quic-go oracle"
