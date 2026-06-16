@@ -2,15 +2,21 @@
 #
 # zquic oracle harness — fast, Docker-free interop against reference impls.
 #
+# SCOPE (what actually ships today): 1 reference impl (quic-go); data-path cases
+# handshake/transfer/multiplexing in BOTH directions; behavioral case `retry`
+# in the zquic-server direction only. ngtcp2/quiche, impairment, and the other
+# interop cases are not yet implemented — see PLAN.md.
+#
 # Two kinds of checks:
-#   data-path cases  (handshake/transfer/multiplexing): run BOTH directions
-#     (zquic-server <-> ref-client and ref-server <-> zquic-client) and assert
-#     downloaded bytes hash-match the served files. The independent impl is the
-#     judge — it rejects non-conformant wire bytes/crypto/params.
-#   behavioral cases (retry, ...): route through the capturing proxy and assert
-#     the protocol mechanism actually appeared ON THE WIRE (e.g. a Retry packet),
-#     not merely that the file transferred. QUIC long-header packet types are
-#     unmasked by header protection, so they're classifiable without keys.
+#   data-path: assert downloaded bytes hash-match the served files. The
+#     independent impl is the judge of wire codec / crypto / transport params.
+#     When the ref CLIENT talks to the zquic server it ALSO verifies zquic's
+#     certificate against the local CA (real TLS-auth oracle). NOTE: the reverse
+#     direction does NOT verify — zquic's own client does not validate certs, so
+#     ref-server <-> zquic-client covers wire/crypto but NOT the ref's cert.
+#   behavioral: route through the capturing proxy and assert the mechanism
+#     actually appeared ON THE WIRE (e.g. a Retry packet), not just that the file
+#     transferred.
 #
 # Usage: oracle/run.sh [-i impl] [case...]
 #
@@ -23,6 +29,7 @@ ZQUIC_CLIENT="$ROOT/zig-out/bin/client"
 CERTS="$ORACLE/certs"; WWW="$ORACLE/www"; BIN="$ORACLE/.cache/bin"; TMP="$ORACLE/.cache/run"
 PROXY="$BIN/proxy"
 PORT_BASE=4500
+CLIENT_TIMEOUT=25   # seconds; loopback handshake+1MB is <1s, so this only catches hangs
 
 declare -A CASE_PATHS=(
   [handshake]="/1.bin"
@@ -30,19 +37,39 @@ declare -A CASE_PATHS=(
   [multiplexing]="/1.bin /2.bin /3.bin /4.bin"
   [retry]="/big.bin"
 )
-# Behavioral cases: server TESTCASE -> required wire token (class the proxy must see).
-declare -A WIRE_REQUIRE=(
-  [retry]="s2c RETRY"
-)
+declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
 DATA_CASES=(handshake transfer multiplexing)
 BEHAVIORAL_CASES=(retry)
-
 IMPLS=(quicgo)
 PASS=0; FAIL=0; FAILED=()
 
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED+=("$*"); }
 
+# Kill only this harness's own binaries (full paths) — safe pre-clean + on exit.
+cleanup() {
+  for b in "$ZQUIC_SERVER" "$ZQUIC_CLIENT" "$PROXY" "$BIN"/quicgo "$BIN"/ngtcp2 "$BIN"/quiche; do
+    [ -e "$b" ] && pkill -f "$b" 2>/dev/null
+  done
+  return 0
+}
+trap cleanup EXIT
+
+# to SECS cmd... — run cmd with a hard timeout; returns 124 on timeout.
+# cmd must be a binary or a function that exec's a binary (so the polled pid IS
+# the process to kill). Output/redirection is inherited from the caller.
+to() {
+  local secs=$1; shift
+  "$@" & local pid=$! i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge "$((secs * 10))" ]; then kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+    sleep 0.1; i=$((i + 1))
+  done
+  wait "$pid"; return $?
+}
+
+# Wait until pid has bound UDP port, or it dies. (-P: numeric ports; 4500 prints
+# as the service name "ipsec-msft" otherwise.)
 wait_listen() {
   local pid=$1 port=$2 i
   for i in $(seq 1 50); do
@@ -52,6 +79,7 @@ wait_listen() {
   done
   return 1
 }
+stop() { kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
 
 assert_match() { # <dir> <path...>
   local dir=$1; shift; local p base
@@ -63,12 +91,17 @@ assert_match() { # <dir> <path...>
   done
 }
 
+# ref_client: MUST be invoked only via `to` (it exec's, replacing the subshell so
+# the timeout can kill the real process). Always verifies the zquic cert (-ca).
 ref_client() { # <impl> <port> <outdir> <path...>
   local impl=$1 port=$2 out=$3; shift 3
   local urls=() p; for p in "$@"; do urls+=("https://127.0.0.1:$port$p"); done
-  case "$impl" in quicgo) "$BIN/quicgo" client "$out" "${urls[@]}" ;; *) return 2 ;; esac
+  case "$impl" in
+    quicgo) exec "$BIN/quicgo" client -ca "$CERTS/cert.pem" "$out" "${urls[@]}" ;;
+    *) echo "unknown impl $impl" >&2; exit 2 ;;
+  esac
 }
-ref_server() { # <impl> <port> <logfile> -> pid
+ref_server() { # <impl> <port> <logfile> -> pid (binary backgrounded; pid is the binary)
   local impl=$1 port=$2 logf=$3
   case "$impl" in
     quicgo) "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" >"$logf" 2>&1 & echo $! ;;
@@ -76,42 +109,41 @@ ref_server() { # <impl> <port> <logfile> -> pid
   esac
 }
 
-# data-path, dir A: zquic server <-> ref client
-dp_zquic_server() {
+dp_zquic_server() { # zquic server <-> ref client (ref verifies zquic cert)
   local impl=$1 case=$2 port=$3 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
   local out="$d/zsrv"; rm -rf "$out"; mkdir -p "$out"
   TESTCASE="$case" CERTS="$CERTS" WWW="$WWW" PORT="$port" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
-  wait_listen "$sp" "$port" || { bad "$case [zquic-server <-> $impl-client] (no bind)"; kill "$sp" 2>/dev/null; return; }
-  local msg rc; msg="$(ref_client "$impl" "$port" "$out" $paths 2>&1)"; rc=$?
-  kill "$sp" 2>/dev/null
-  [ $rc -eq 0 ] || { bad "$case [zquic-server <-> $impl-client] (client rc=$rc: ${msg:0:50})"; return; }
-  if msg="$(assert_match "$out" $paths)"; then ok "$case [zquic-server <-> $impl-client]"; else bad "$case [zquic-server <-> $impl-client] ($msg)"; fi
+  wait_listen "$sp" "$port" || { bad "$case [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp"
+  [ $rc -eq 124 ] && { bad "$case [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "$case [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if m="$(assert_match "$out" $paths)"; then ok "$case [zquic-server <-> $impl-client | cert-verified]"; else bad "$case [zquic-server <-> $impl-client] ($m)"; fi
 }
-# data-path, dir B: ref server <-> zquic client
-dp_zquic_client() {
+dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic client limitation)
   local impl=$1 case=$2 port=$3 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
   local out="$d/zcli"; rm -rf "$out"; mkdir -p "$out"
   local sp; sp="$(ref_server "$impl" "$port" "$d/rsrv.log")"
-  wait_listen "$sp" "$port" || { bad "$case [$impl-server <-> zquic-client] (no bind)"; kill "$sp" 2>/dev/null; return; }
+  wait_listen "$sp" "$port" || { bad "$case [$impl-server <-> zquic-client] (no bind)"; stop "$sp"; return; }
   local reqs="" p; for p in $paths; do reqs="$reqs https://127.0.0.1:$port$p"; done
-  TESTCASE="$case" REQUESTS="${reqs# }" DOWNLOADS="$out" "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1; local rc=$?
-  kill "$sp" 2>/dev/null
+  to "$CLIENT_TIMEOUT" env TESTCASE="$case" REQUESTS="${reqs# }" DOWNLOADS="$out" "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1; local rc=$?
+  stop "$sp"
+  [ $rc -eq 124 ] && { bad "$case [$impl-server <-> zquic-client] (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "$case [$impl-server <-> zquic-client] (client rc=$rc)"; return; }
   local m; if m="$(assert_match "$out" $paths)"; then ok "$case [$impl-server <-> zquic-client]"; else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
 }
-
-# behavioral: zquic server <-> [proxy capture] <-> ref client; assert wire token + hash
-behavioral() {
+behavioral() { # zquic server <-> [proxy capture] <-> ref client; assert wire token + hash
   local impl=$1 case=$2 sport=$3 pport=$4 paths="${CASE_PATHS[$2]}" want="${WIRE_REQUIRE[$2]}" d="$TMP/$impl/$case"
   local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
   TESTCASE="$case" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
-  wait_listen "$sp" "$sport" || { bad "$case [wire: $want] (no server bind)"; kill "$sp" 2>/dev/null; return; }
+  wait_listen "$sp" "$sport" || { bad "$case [wire: $want] (no server bind)"; stop "$sp"; return; }
   "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
-  wait_listen "$px" "$pport" || { bad "$case [wire: $want] (no proxy bind)"; kill "$sp" "$px" 2>/dev/null; return; }
-  local msg rc; msg="$(ref_client "$impl" "$pport" "$out" $paths 2>&1)"; rc=$?
-  kill "$sp" "$px" 2>/dev/null
-  [ $rc -eq 0 ] || { bad "$case [wire: $want] (client rc=$rc: ${msg:0:40})"; return; }
-  if ! msg="$(assert_match "$out" $paths)"; then bad "$case [wire: $want] (transfer: $msg)"; return; fi
+  wait_listen "$px" "$pport" || { bad "$case [wire: $want] (no proxy bind)"; stop "$sp" "$px"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp" "$px"
+  [ $rc -eq 124 ] && { bad "$case [wire: $want] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "$case [wire: $want] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if ! m="$(assert_match "$out" $paths)"; then bad "$case [wire: $want] (transfer: $m)"; return; fi
   if grep -q "$want" "$capf" 2>/dev/null; then
     ok "$case [zquic-server <-> $impl-client | wire: $want ✓]"
   else
@@ -119,15 +151,14 @@ behavioral() {
   fi
 }
 
-IMPLS_SEL=(); CASES=()
+CASES=()
 while getopts "i:" opt; do case $opt in i) IMPLS=("$OPTARG") ;; esac; done
-shift $((OPTIND-1)); [ $# -gt 0 ] && CASES=("$@")
+shift $((OPTIND - 1)); [ $# -gt 0 ] && CASES=("$@")
 
 [ -x "$ZQUIC_SERVER" ] || { echo "build zquic: zig build"; exit 1; }
 [ -x "$PROXY" ] || { echo "missing proxy — run oracle/build-refs.sh"; exit 1; }
 for i in "${IMPLS[@]}"; do [ -x "$BIN/$i" ] || { echo "missing ref $i — run oracle/build-refs.sh"; exit 1; }; done
 
-# Select cases
 sel_data=("${DATA_CASES[@]}"); sel_beh=("${BEHAVIORAL_CASES[@]}")
 if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_beh=()
@@ -136,18 +167,19 @@ if [ ${#CASES[@]} -gt 0 ]; then
   done
 fi
 
+cleanup  # pre-clean any stragglers from a prior run
 echo "zquic oracle — impls: ${IMPLS[*]}"
 port=$PORT_BASE
 for impl in "${IMPLS[@]}"; do
   echo ""; echo "═══ oracle: $impl ═══"
   for case in "${sel_data[@]}"; do
     mkdir -p "$TMP/$impl/$case"
-    dp_zquic_server "$impl" "$case" "$port"; port=$((port+1))
-    dp_zquic_client "$impl" "$case" "$port"; port=$((port+1))
+    dp_zquic_server "$impl" "$case" "$port"; port=$((port + 1))
+    dp_zquic_client "$impl" "$case" "$port"; port=$((port + 1))
   done
   for case in "${sel_beh[@]}"; do
     mkdir -p "$TMP/$impl/$case"
-    behavioral "$impl" "$case" "$port" "$((port+1))"; port=$((port+2))
+    behavioral "$impl" "$case" "$port" "$((port + 1))"; port=$((port + 2))
   done
 done
 

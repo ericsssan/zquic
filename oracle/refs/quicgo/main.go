@@ -13,6 +13,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"flag"
 	"fmt"
 	"io"
 	"net/url"
@@ -46,10 +48,14 @@ func main() {
 }
 
 func runClient(args []string) {
-	if len(args) < 2 {
-		fatal("usage: quicgo client <outdir> <url>...")
+	fs := flag.NewFlagSet("client", flag.ExitOnError)
+	caFile := fs.String("ca", "", "PEM CA to verify the server cert; empty = skip verification")
+	_ = fs.Parse(args)
+	rest := fs.Args()
+	if len(rest) < 2 {
+		fatal("usage: quicgo client [-ca file] <outdir> <url>...")
 	}
-	outdir, urls := args[0], args[1:]
+	outdir, urls := rest[0], rest[1:]
 
 	// All requests share one connection (matches interop multiplexing tests).
 	host := ""
@@ -64,10 +70,25 @@ func runClient(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	conn, err := quic.DialAddr(ctx, host, &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{alpn},
-	}, &quic.Config{})
+	// Verify the server certificate against a CA when one is supplied — this is
+	// what makes the handshake a real oracle for zquic's TLS auth output, not
+	// just its key schedule. With no -ca, fall back to skip-verify.
+	tlsConf := &tls.Config{NextProtos: []string{alpn}}
+	if *caFile != "" {
+		pem, err := os.ReadFile(*caFile)
+		if err != nil {
+			fatal("read ca %s: %v", *caFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			fatal("no certs parsed from %s", *caFile)
+		}
+		tlsConf.RootCAs = pool
+	} else {
+		tlsConf.InsecureSkipVerify = true
+	}
+
+	conn, err := quic.DialAddr(ctx, host, tlsConf, &quic.Config{})
 	if err != nil {
 		fatal("dial %s: %v", host, err)
 	}
@@ -165,9 +186,11 @@ func serveConn(ctx context.Context, conn quic.Connection, wwwdir string) {
 			var path string
 			fmt.Sscanf(line, "GET %s", &path)
 			data, err := os.ReadFile(filepath.Join(wwwdir, filepath.Base(path)))
-			if err == nil {
-				stream.Write(data)
+			if err != nil {
+				stream.CancelWrite(1) // signal an error rather than a silent 0-byte body
+				return
 			}
+			stream.Write(data)
 			stream.Close()
 		}()
 	}

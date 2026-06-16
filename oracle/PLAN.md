@@ -8,6 +8,20 @@ cleanup) that makes a full interop run take 20-40 minutes.
 
 Target: the core oracle matrix runs in **seconds**, on every commit.
 
+## Current status (what actually ships)
+
+This document is the PLAN; ngtcp2/quiche and most cases below are the DESIGN, not
+yet implemented. Shipped today (`oracle/run.sh`, ~3s):
+
+- **1 reference impl:** quic-go. (ngtcp2 + quiche are TODO — `build-refs.sh` stubs.)
+- **Data-path cases, both directions:** handshake, transfer, multiplexing. The ref
+  client verifies zquic's cert against the local CA (real TLS-auth oracle); the
+  reverse direction does NOT (zquic's own client doesn't validate certs — disclosed).
+- **Behavioral case, server direction only:** retry (wire-classified `s2c RETRY`).
+- **Crypto:** RFC 9001 A.1/A.2/A.5 vectors as unit tests.
+- **Impairment** (`-loss`/`-delayms` in the proxy) is implemented but not yet wired
+  into any case. No loss/RTT/0-RTT/keyupdate/ecn/migration/resumption/h3 cases yet.
+
 ## Why
 
 The 60 `integration_test.zig` scenarios + `netsim` are all zquic↔zquic — fast, but
