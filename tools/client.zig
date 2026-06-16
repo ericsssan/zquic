@@ -20,6 +20,7 @@ const Conn = quic.Connection(128);
 const supported_cases = [_][]const u8{
     "handshake",
     "transfer",
+    "multiplexing",
     "multiconnect",
     "keyupdate",
     "v2",

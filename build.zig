@@ -63,6 +63,10 @@ pub fn build(b: *std.Build) void {
         .name = "server",
         .root_module = server_mod,
     });
+    // Connection is multi-MB and accept() returns it by value. Linux grows the
+    // main-thread stack at runtime, but macOS fixes it at link time, so without
+    // an explicit stack the server segfaults natively on macOS. Matches client.
+    server.stack_size = 64 * 1024 * 1024;
     b.installArtifact(server);
     const run_server = b.addRunArtifact(server);
     run_server.addPassthruArgs();
@@ -82,7 +86,7 @@ pub fn build(b: *std.Build) void {
         .name = "client",
         .root_module = client_mod,
     });
-    client.stack_size = 64 * 1024 * 1024; // Connection is ~2.2MB; Zig _start raises rlimit to accommodate
+    client.stack_size = 256 * 1024 * 1024; // Connection(128) returned by value in connect(); macOS can't grow the main stack at runtime like Linux
     b.installArtifact(client);
     const run_client = b.addRunArtifact(client);
     run_client.addPassthruArgs();
