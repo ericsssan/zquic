@@ -71,9 +71,14 @@ Then `oracle/run.sh -i <impl>`.
   `../ngtcp2` checkout against brew OpenSSL 3 + libev + libnghttp3; `build-refs.sh`
   skips it gracefully where those are absent (e.g. CI). Runs the protocol-agnostic
   cases; skips `retry` (needs the server's hq-interop retry mode).
-- quiche (cargo) — TODO.
+- **quiche** — HTTP/0.9, so a second independent impl validates zquic's `hq-interop`
+  path alongside quic-go. Optional + local: cargo-built from a sibling `../quiche`
+  checkout (`git clone --recursive`). Driven with `--wire-version 00000001` because
+  quiche's default `babababa` is a deliberate GREASE version (which zquic correctly
+  VN's). Note: quiche over **HTTP/3** currently stalls against zquic — issue #4.
 
-`oracle/run.sh` with no `-i` runs every impl that's built.
+`oracle/run.sh` with no `-i` runs every impl that's built (quic-go always; ngtcp2 /
+quiche when their sibling checkouts + deps are present).
 
 ## Known gaps (deliberate, tracked)
 

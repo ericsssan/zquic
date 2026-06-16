@@ -10,10 +10,10 @@ Target: the core oracle matrix runs in **seconds**, on every commit.
 
 ## Current status (what actually ships)
 
-Shipped today (`oracle/run.sh`) — **19/19 across two impls**:
+Shipped today (`oracle/run.sh`) — **29/29 across three impls**:
 
-- **2 reference impls:** quic-go (HTTP/0.9, CI) + ngtcp2 (HTTP/3, optional/local).
-  quiche is still TODO.
+- **3 reference impls:** quic-go (HTTP/0.9, CI), ngtcp2 (HTTP/3, optional/local),
+  quiche (HTTP/0.9, optional/local). quiche-over-HTTP/3 stalls vs zquic — issue #4.
 - **Data-path, both directions:** handshake, transfer, multiplexing. The quic-go
   client verifies zquic's cert against the local CA (real TLS-auth oracle); the
   reverse direction does NOT (zquic's own client doesn't validate certs — disclosed).

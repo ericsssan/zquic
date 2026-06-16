@@ -2,10 +2,10 @@
 #
 # zquic oracle harness — fast, Docker-free interop against reference impls.
 #
-# SCOPE: two reference impls — quic-go (HTTP/0.9, runs in CI) and ngtcp2 (HTTP/3,
-# optional/local). Cases: handshake/transfer/multiplexing both directions;
-# retry (wire-checked); handshakeloss/transferloss/longrtt (deterministic
-# impairment). See README.md / PLAN.md for the validation model and gaps.
+# SCOPE: three reference impls — quic-go (HTTP/0.9, in CI), quiche (HTTP/0.9),
+# ngtcp2 (HTTP/3); the latter two optional/local. Cases: handshake/transfer/
+# multiplexing both directions; retry (wire-checked); handshakeloss/transferloss/
+# longrtt (deterministic impairment). See README.md / PLAN.md for details.
 #
 # Two kinds of checks:
 #   data-path: assert downloaded bytes hash-match the served files. The
@@ -38,7 +38,7 @@ declare -A CASE_PATHS=(
   [retry]="/big.bin"
   [handshakeloss]="/1.bin"
   [transferloss]="/big.bin"
-  [longrtt]="/big.bin"
+  [longrtt]="/1.bin"   # high-RTT correctness, not bulk throughput — keep it small + fast
 )
 # Behavioral cases: required wire token (class the proxy capture must contain).
 declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
@@ -64,7 +64,7 @@ PROXIED_CASES=(retry handshakeloss transferloss longrtt)
 # zquic TESTCASE for (impl, case): impl protocol override > case override > name.
 ztc() { echo "${IMPL_TC[$1]:-${TC[$2]:-$2}}"; }
 skipped() { case " ${IMPL_SKIP[$1]:-} " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
-ALL_IMPLS=(quicgo ngtcp2)
+ALL_IMPLS=(quicgo ngtcp2 quiche)
 IMPLS=(); IMPL_SET=0
 PASS=0; FAIL=0; FAILED=()
 
@@ -144,6 +144,7 @@ ref_client() { # <impl> <port> <outdir> <path...>
   case "$impl" in
     quicgo) exec "$BIN/quicgo" client -ca "$CERTS/cert.pem" "$out" "${urls[@]}" ;;
     ngtcp2) exec "$BIN/ngtcp2-client" -q --download="$out" --exit-on-all-streams-close 127.0.0.1 "$port" "${urls[@]}" ;;
+    quiche) exec "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/0.9 --dump-responses "$out" "${urls[@]}" ;;
     *) echo "unknown impl $impl" >&2; exit 2 ;;
   esac
 }
@@ -152,6 +153,7 @@ impl_ok() {
   case "$1" in
     quicgo) [ -x "$BIN/quicgo" ] ;;
     ngtcp2) [ -x "$BIN/ngtcp2-client" ] && [ -x "$BIN/ngtcp2-server" ] ;;
+    quiche) [ -x "$BIN/quiche-client" ] && [ -x "$BIN/quiche-server" ] ;;
     *) return 1 ;;
   esac
 }
@@ -160,6 +162,7 @@ ref_server() { # <impl> <port> <logfile> -> pid (binary backgrounded; pid is the
   case "$impl" in
     quicgo) "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" >"$logf" 2>&1 & echo $! ;;
     ngtcp2) "$BIN/ngtcp2-server" -q --htdocs="$WWW" '*' "$port" "$CERTS/priv.key" "$CERTS/cert.pem" >"$logf" 2>&1 & echo $! ;;
+    quiche) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/0.9 >"$logf" 2>&1 & echo $! ;;
     *) return 2 ;;
   esac
 }

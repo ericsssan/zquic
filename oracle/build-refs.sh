@@ -72,7 +72,23 @@ else
   echo "==> ngtcp2 source (../ngtcp2) or cmake/brew not found — skip (HTTP/3 oracle)"
 fi
 
-# ---- quiche (cargo) ---------------------------------------------------------- TODO
+# ---- quiche (optional: HTTP/0.9 oracle; sibling ../quiche + cargo + BoringSSL) -
+QUICHE_SRC="$(cd "$ORACLE/.." && pwd)/../quiche"
+if [ -x "$BIN/quiche-client" ] && [ -x "$BIN/quiche-server" ]; then
+  echo "==> quiche oracle present (skip)"
+elif [ -d "$QUICHE_SRC" ] && command -v cargo >/dev/null 2>&1 && command -v cmake >/dev/null 2>&1; then
+  echo "==> building quiche (HTTP/0.9 oracle) — first time also builds BoringSSL"
+  if ( cd "$QUICHE_SRC/apps" && cargo build --release >/dev/null 2>&1 ); then
+    ln -sf "$QUICHE_SRC/target/release/quiche-client" "$BIN/quiche-client"
+    ln -sf "$QUICHE_SRC/target/release/quiche-server" "$BIN/quiche-server"
+    echo "==> quiche built"
+  else
+    echo "==> quiche build failed — skipping (other oracles still run)"
+  fi
+else
+  echo "==> quiche source (../quiche) or cargo/cmake not found — skip."
+  echo "    enable: git clone --recursive https://github.com/cloudflare/quiche ../quiche"
+fi
 
 echo "==> refs ready in $BIN:"
 ls -1 "$BIN"
