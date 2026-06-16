@@ -76,16 +76,37 @@ to() {
   wait "$pid"; return $?
 }
 
-# Wait until pid has bound UDP port, or it dies. (-P: numeric ports; 4500 prints
-# as the service name "ipsec-msft" otherwise.)
+# Portable SHA-256 (Linux sha256sum / macOS shasum).
+h256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a256 "$1" | awk '{print $1}'; fi
+}
+
+# Is UDP `port` bound? Portable across macOS (lsof) and Linux (ss). Ports are
+# fresh + pre-cleaned, so a port-level check is sufficient. (-P/-n: numeric;
+# 4500 prints as the service name "ipsec-msft" otherwise.)
+port_bound() {
+  local port=$2
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iUDP:"$port" 2>/dev/null | grep -q ":$port"
+  elif command -v ss >/dev/null 2>&1; then
+    ss -lun 2>/dev/null | grep -qE "[:.]$port([^0-9]|$)"
+  else
+    return 1
+  fi
+}
+
+# Wait until pid has bound UDP port, or it dies. Polls precisely for ~2s; if the
+# socket tool can't confirm but the process is alive, proceeds anyway (QUIC
+# retransmits a lost Initial, so a slightly-early client still connects).
 wait_listen() {
   local pid=$1 port=$2 i
-  for i in $(seq 1 50); do
+  for i in $(seq 1 20); do
     kill -0 "$pid" 2>/dev/null || return 1
-    lsof -nP -iUDP:"$port" -a -p "$pid" 2>/dev/null | grep -q ":$port" && return 0
+    port_bound "$pid" "$port" && return 0
     sleep 0.1
   done
-  return 1
+  kill -0 "$pid" 2>/dev/null
 }
 stop() { kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
 
@@ -94,8 +115,7 @@ assert_match() { # <dir> <path...>
   for p in "$@"; do
     base="$(basename "$p")"
     [ -f "$dir/$base" ] || { echo "missing $base"; return 1; }
-    [ "$(shasum -a256 "$WWW/$base" | awk '{print $1}')" = \
-      "$(shasum -a256 "$dir/$base" | awk '{print $1}')" ] || { echo "hash mismatch $base"; return 1; }
+    [ "$(h256 "$WWW/$base")" = "$(h256 "$dir/$base")" ] || { echo "hash mismatch $base"; return 1; }
   done
 }
 
