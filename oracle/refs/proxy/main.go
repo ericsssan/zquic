@@ -129,7 +129,6 @@ func main() {
 		must(err)
 		defer capFile.Close()
 	}
-	rng := rand.New(rand.NewSource(*seed))
 	record := func(dir string, b []byte) {
 		if capFile == nil {
 			return
@@ -140,7 +139,11 @@ func main() {
 			fmt.Fprintf(capFile, "%s %s %d\n", dir, c, len(b))
 		}
 	}
-	drop := func() bool { return *loss > 0 && rng.Intn(100) < *loss }
+	// One PRNG per direction (each driven by a single goroutine) so loss is
+	// race-free AND deterministic for a given seed — required for stable CI.
+	rngC := rand.New(rand.NewSource(*seed))
+	rngS := rand.New(rand.NewSource(*seed + 1))
+	drop := func(r *rand.Rand) bool { return *loss > 0 && r.Intn(100) < *loss }
 	fwd := func(send func([]byte), b []byte) {
 		if *delayms > 0 {
 			time.AfterFunc(time.Duration(*delayms)*time.Millisecond, func() { send(b) })
@@ -164,7 +167,7 @@ func main() {
 			}
 			pkt := append([]byte(nil), buf[:n]...)
 			record("s2c", pkt)
-			if ca := getClient(); ca != nil && !drop() {
+			if ca := getClient(); ca != nil && !drop(rngS) {
 				fwd(func(p []byte) { front.WriteTo(p, ca) }, pkt)
 			}
 		}
@@ -180,7 +183,7 @@ func main() {
 		setClient(addr)
 		pkt := append([]byte(nil), buf[:n]...)
 		record("c2s", pkt)
-		if !drop() {
+		if !drop(rngC) {
 			fwd(func(p []byte) { back.Write(p) }, pkt)
 		}
 	}

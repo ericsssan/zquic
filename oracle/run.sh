@@ -36,10 +36,18 @@ declare -A CASE_PATHS=(
   [transfer]="/big.bin"
   [multiplexing]="/1.bin /2.bin /3.bin /4.bin"
   [retry]="/big.bin"
+  [handshakeloss]="/1.bin"
+  [transferloss]="/big.bin"
 )
+# Behavioral cases: required wire token (class the proxy capture must contain).
 declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
+# Proxy impairment flags (deterministic via fixed seed) — tests loss recovery.
+declare -A IMPAIR=( [handshakeloss]="-loss 30 -seed 7" [transferloss]="-loss 6 -seed 7" )
+# zquic TESTCASE to pass to the endpoints (default = case name). Loss cases just
+# serve/fetch like transfer; the impairment is injected by the proxy.
+declare -A TC=( [handshakeloss]="transfer" [transferloss]="transfer" )
 DATA_CASES=(handshake transfer multiplexing)
-BEHAVIORAL_CASES=(retry)
+PROXIED_CASES=(retry handshakeloss transferloss)
 IMPLS=(quicgo)
 PASS=0; FAIL=0; FAILED=()
 
@@ -132,23 +140,27 @@ dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic clie
   [ $rc -eq 0 ] || { bad "$case [$impl-server <-> zquic-client] (client rc=$rc)"; return; }
   local m; if m="$(assert_match "$out" $paths)"; then ok "$case [$impl-server <-> zquic-client]"; else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
 }
-behavioral() { # zquic server <-> [proxy capture] <-> ref client; assert wire token + hash
-  local impl=$1 case=$2 sport=$3 pport=$4 paths="${CASE_PATHS[$2]}" want="${WIRE_REQUIRE[$2]}" d="$TMP/$impl/$case"
+# proxied: zquic server <-> [proxy: capture (+optional impairment)] <-> ref client.
+# Always asserts hash. If WIRE_REQUIRE[case] is set, also asserts the mechanism
+# appears on the wire. If IMPAIR[case] is set, the proxy injects loss/delay.
+proxied() {
+  local impl=$1 case=$2 sport=$3 pport=$4 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
+  local want="${WIRE_REQUIRE[$case]:-}" impair="${IMPAIR[$case]:-}" tc="${TC[$case]:-$case}"
+  local tag="$case [zquic-server <-> $impl-client${impair:+ | impair:$impair}${want:+ | wire: $want}]"
   local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
-  TESTCASE="$case" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
-  wait_listen "$sp" "$sport" || { bad "$case [wire: $want] (no server bind)"; stop "$sp"; return; }
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
-  wait_listen "$px" "$pport" || { bad "$case [wire: $want] (no proxy bind)"; stop "$sp" "$px"; return; }
+  TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
+  wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
-  [ $rc -eq 124 ] && { bad "$case [wire: $want] (TIMEOUT)"; return; }
-  [ $rc -eq 0 ] || { bad "$case [wire: $want] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
-  local m; if ! m="$(assert_match "$out" $paths)"; then bad "$case [wire: $want] (transfer: $m)"; return; fi
-  if grep -q "$want" "$capf" 2>/dev/null; then
-    ok "$case [zquic-server <-> $impl-client | wire: $want ✓]"
-  else
-    bad "$case [wire: $want] — transfer ok but mechanism NOT seen on wire"
+  [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if ! m="$(assert_match "$out" $paths)"; then bad "$tag (transfer: $m)"; return; fi
+  if [ -n "$want" ] && ! grep -q "$want" "$capf" 2>/dev/null; then
+    bad "$tag — transfer ok but mechanism NOT seen on wire"; return
   fi
+  ok "$tag${want:+ ✓}"
 }
 
 CASES=()
@@ -159,11 +171,11 @@ shift $((OPTIND - 1)); [ $# -gt 0 ] && CASES=("$@")
 [ -x "$PROXY" ] || { echo "missing proxy — run oracle/build-refs.sh"; exit 1; }
 for i in "${IMPLS[@]}"; do [ -x "$BIN/$i" ] || { echo "missing ref $i — run oracle/build-refs.sh"; exit 1; }; done
 
-sel_data=("${DATA_CASES[@]}"); sel_beh=("${BEHAVIORAL_CASES[@]}")
+sel_data=("${DATA_CASES[@]}"); sel_prox=("${PROXIED_CASES[@]}")
 if [ ${#CASES[@]} -gt 0 ]; then
-  sel_data=(); sel_beh=()
+  sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
-    [ -n "${WIRE_REQUIRE[$c]:-}" ] && sel_beh+=("$c") || sel_data+=("$c")
+    if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
 
@@ -177,9 +189,9 @@ for impl in "${IMPLS[@]}"; do
     dp_zquic_server "$impl" "$case" "$port"; port=$((port + 1))
     dp_zquic_client "$impl" "$case" "$port"; port=$((port + 1))
   done
-  for case in "${sel_beh[@]}"; do
+  for case in "${sel_prox[@]}"; do
     mkdir -p "$TMP/$impl/$case"
-    behavioral "$impl" "$case" "$port" "$((port + 1))"; port=$((port + 2))
+    proxied "$impl" "$case" "$port" "$((port + 1))"; port=$((port + 2))
   done
 done
 
