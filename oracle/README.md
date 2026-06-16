@@ -62,10 +62,21 @@ Implement two adapters in `run.sh` (`ref_client` / `ref_server`) for the new
 the timeout can kill the real process) and accept `-ca` for cert verification.
 Then `oracle/run.sh -i <impl>`.
 
+## Reference implementations
+
+- **quic-go** — HTTP/0.9 (`hq-interop`), pure `go build`, runs everywhere incl. CI.
+  The cert-verifying direction uses this.
+- **ngtcp2** — **HTTP/3** (`osslclient`/`osslserver`), so it exercises zquic's
+  H3/QPACK path (quic-go does not). Optional + local: built from a sibling
+  `../ngtcp2` checkout against brew OpenSSL 3 + libev + libnghttp3; `build-refs.sh`
+  skips it gracefully where those are absent (e.g. CI). Runs the protocol-agnostic
+  cases; skips `retry` (needs the server's hq-interop retry mode).
+- quiche (cargo) — TODO.
+
+`oracle/run.sh` with no `-i` runs every impl that's built.
+
 ## Known gaps (deliberate, tracked)
 
-- **1 reference impl (quic-go).** ngtcp2 (`../ngtcp2`, cmake+quictls) and quiche
-  (cargo) are not built yet — `build-refs.sh` has stubs.
 - **Cert verification is one-directional.** The ref client verifies zquic's
   server cert; the reverse can't, because zquic's own client doesn't validate
   certs — see issue #2.

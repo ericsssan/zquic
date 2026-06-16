@@ -42,10 +42,37 @@ else
   echo "==> quic-go oracle present (skip)"
 fi
 
-# ---- ngtcp2 (cmake + quictls) -- TODO (Phase 3) -----------------------------
-# ngtcp2 source at ../../ngtcp2; build h09client/h09server against brew quictls.
-#
-# ---- quiche (cargo) ---------------------------------------------------------- TODO (Phase 3)
+# ---- ngtcp2 (optional: HTTP/3 oracle; local source + cmake + OpenSSL 3.5+) ----
+# Builds osslclient/osslserver from a sibling ../ngtcp2 checkout against brew's
+# OpenSSL 3 (has the QUIC API), libev, and libnghttp3. Skips gracefully if the
+# source or deps are absent (e.g. CI), where the quic-go oracle still runs.
+NGTCP2_SRC="$(cd "$ORACLE/.." && pwd)/../ngtcp2"
+if [ -x "$BIN/ngtcp2-client" ] && [ -x "$BIN/ngtcp2-server" ]; then
+  echo "==> ngtcp2 oracle present (skip)"
+elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
+  SSL="$(brew --prefix openssl@3 2>/dev/null)"; EV="$(brew --prefix libev 2>/dev/null)"; H3="$(brew --prefix libnghttp3 2>/dev/null)"
+  if [ -e "$SSL/lib/libssl.dylib" ] && [ -e "$EV/lib/libev.dylib" ] && [ -e "$H3/lib/libnghttp3.dylib" ]; then
+    echo "==> building ngtcp2 (HTTP/3 oracle) — this is slow the first time"
+    if ( cd "$NGTCP2_SRC" \
+         && git submodule update --init >/dev/null 2>&1 \
+         && PKG_CONFIG_PATH="$EV/lib/pkgconfig:$H3/lib/pkgconfig:$SSL/lib/pkgconfig" \
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_OPENSSL=ON \
+              -DOPENSSL_ROOT_DIR="$SSL" -DCMAKE_PREFIX_PATH="$EV;$H3" -DENABLE_EXAMPLES=ON >/dev/null 2>&1 \
+         && cmake --build build -j4 --target osslclient osslserver >/dev/null 2>&1 ); then
+      ln -sf "$NGTCP2_SRC/build/examples/osslclient" "$BIN/ngtcp2-client"
+      ln -sf "$NGTCP2_SRC/build/examples/osslserver" "$BIN/ngtcp2-server"
+      echo "==> ngtcp2 built"
+    else
+      echo "==> ngtcp2 build failed — skipping (quic-go oracle still runs)"
+    fi
+  else
+    echo "==> ngtcp2 deps missing — skip. Install: brew install openssl@3 libev libnghttp3"
+  fi
+else
+  echo "==> ngtcp2 source (../ngtcp2) or cmake/brew not found — skip (HTTP/3 oracle)"
+fi
+
+# ---- quiche (cargo) ---------------------------------------------------------- TODO
 
 echo "==> refs ready in $BIN:"
 ls -1 "$BIN"

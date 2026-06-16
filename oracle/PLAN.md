@@ -10,17 +10,19 @@ Target: the core oracle matrix runs in **seconds**, on every commit.
 
 ## Current status (what actually ships)
 
-This document is the PLAN; ngtcp2/quiche and most cases below are the DESIGN, not
-yet implemented. Shipped today (`oracle/run.sh`, ~3s):
+Shipped today (`oracle/run.sh`) — **19/19 across two impls**:
 
-- **1 reference impl:** quic-go. (ngtcp2 + quiche are TODO — `build-refs.sh` stubs.)
-- **Data-path cases, both directions:** handshake, transfer, multiplexing. The ref
+- **2 reference impls:** quic-go (HTTP/0.9, CI) + ngtcp2 (HTTP/3, optional/local).
+  quiche is still TODO.
+- **Data-path, both directions:** handshake, transfer, multiplexing. The quic-go
   client verifies zquic's cert against the local CA (real TLS-auth oracle); the
   reverse direction does NOT (zquic's own client doesn't validate certs — disclosed).
-- **Behavioral case, server direction only:** retry (wire-classified `s2c RETRY`).
+- **Behavioral, server direction:** retry (wire-classified `s2c RETRY`).
+- **Impairment (deterministic):** handshakeloss (30%), transferloss (6%), longrtt
+  (200ms) — loss recovery + RTT, hash-verified through the proxy.
+- **HTTP/3 path:** all ngtcp2 cases run over h3, exercising zquic's H3/QPACK.
 - **Crypto:** RFC 9001 A.1/A.2/A.5 vectors as unit tests.
-- **Impairment** (`-loss`/`-delayms` in the proxy) is implemented but not yet wired
-  into any case. No loss/RTT/0-RTT/keyupdate/ecn/migration/resumption/h3 cases yet.
+- **Not yet:** 0-RTT, key update, ECN, migration, resumption wire-cases; quiche.
 
 ## Why
 
