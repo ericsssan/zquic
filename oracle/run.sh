@@ -38,16 +38,21 @@ declare -A CASE_PATHS=(
   [retry]="/big.bin"
   [handshakeloss]="/1.bin"
   [transferloss]="/big.bin"
+  [longrtt]="/big.bin"
 )
 # Behavioral cases: required wire token (class the proxy capture must contain).
 declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
-# Proxy impairment flags (deterministic via fixed seed) — tests loss recovery.
-declare -A IMPAIR=( [handshakeloss]="-loss 30 -seed 7" [transferloss]="-loss 6 -seed 7" )
-# zquic TESTCASE to pass to the endpoints (default = case name). Loss cases just
-# serve/fetch like transfer; the impairment is injected by the proxy.
-declare -A TC=( [handshakeloss]="transfer" [transferloss]="transfer" )
+# Proxy impairment flags (deterministic via fixed seed): loss recovery + high RTT.
+declare -A IMPAIR=(
+  [handshakeloss]="-loss 30 -seed 7"
+  [transferloss]="-loss 6 -seed 7"
+  [longrtt]="-delayms 100"   # 200ms RTT: exercises RTT estimation / timers / pacing
+)
+# zquic TESTCASE to pass to the endpoints (default = case name). Impaired cases
+# just serve/fetch like transfer; the impairment is injected by the proxy.
+declare -A TC=( [handshakeloss]="transfer" [transferloss]="transfer" [longrtt]="transfer" )
 DATA_CASES=(handshake transfer multiplexing)
-PROXIED_CASES=(retry handshakeloss transferloss)
+PROXIED_CASES=(retry handshakeloss transferloss longrtt)
 IMPLS=(quicgo)
 PASS=0; FAIL=0; FAILED=()
 
