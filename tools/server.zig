@@ -907,23 +907,32 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
         }
     }.do;
 
-    // Parse H3 HEADERS frame directly from ring buffer (zero copy).
-    const hdr = http3.frame.parseHeader(req_data) catch {
+    // Find the request's HEADERS frame, skipping any leading frames we must
+    // ignore: GREASE / reserved / unknown frame types (RFC 9114 §7.2.8, §9).
+    // quiche, for one, prepends GREASE frames before the request HEADERS.
+    var frame_off: usize = 0;
+    var hdr = http3.frame.parseHeader(req_data[frame_off..]) catch {
         release(st, is_inline, req_data.len);
         return;
     };
-    if (hdr.frame_type != http3.FrameType.headers) {
-        release(st, is_inline, req_data.len);
-        return;
+    while (hdr.frame_type != http3.FrameType.headers) {
+        const fend = frame_off + hdr.header_len + @as(usize, @intCast(hdr.payload_len));
+        if (fend >= req_data.len) return; // HEADERS not buffered yet — wait for more
+        frame_off = fend;
+        hdr = http3.frame.parseHeader(req_data[frame_off..]) catch {
+            release(st, is_inline, req_data.len);
+            return;
+        };
     }
-    const block_end = hdr.header_len + @as(usize, @intCast(hdr.payload_len));
+    const block_start = frame_off + hdr.header_len;
+    const block_end = block_start + @as(usize, @intCast(hdr.payload_len));
     if (block_end > req_data.len) return; // incomplete, wait for more data
 
     // QPACK decode (static-only) directly from ring buffer.
     var fields: [64]qpack.Field = undefined;
     var strings: [4096]u8 = undefined;
     const fc = qpack.decoder.decode(
-        req_data[hdr.header_len..block_end],
+        req_data[block_start..block_end],
         &fields,
         &strings,
         null,
