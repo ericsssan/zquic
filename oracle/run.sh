@@ -18,7 +18,10 @@
 #     actually appeared ON THE WIRE (e.g. a Retry packet), not just that the file
 #     transferred.
 #
-# Usage: oracle/run.sh [-i impl] [case...]
+# Usage: oracle/run.sh [-i impl] [-r impl,...] [case...]
+#   -r/--require impl[,impl]  fail (exit 3) if a named impl isn't built, instead
+#                             of silently running a smaller green matrix (#7).
+#                             Also honored via the ORACLE_REQUIRE env var.
 #
 set -u
 
@@ -247,9 +250,22 @@ vn_case() { # <trigger_impl> <sport> <pport>
   fi
 }
 
-CASES=()
-while getopts "i:" opt; do case $opt in i) IMPLS=("$OPTARG"); IMPL_SET=1 ;; esac; done
-shift $((OPTIND - 1)); [ $# -gt 0 ] && CASES=("$@")
+CASES=(); REQUIRE=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i | --impl) IMPLS=("$2"); IMPL_SET=1; shift 2 ;;
+    --impl=*) IMPLS=("${1#*=}"); IMPL_SET=1; shift ;;
+    -r | --require) IFS=', ' read -r -a REQUIRE <<<"$2"; shift 2 ;;
+    --require=*) IFS=', ' read -r -a REQUIRE <<<"${1#*=}"; shift ;;
+    --) shift; CASES+=("$@"); break ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *) CASES+=("$1"); shift ;;
+  esac
+done
+# Env fallback for required impls (lets CI forbid a silently-smaller matrix).
+if [ ${#REQUIRE[@]} -eq 0 ] && [ -n "${ORACLE_REQUIRE:-}" ]; then
+  IFS=', ' read -r -a REQUIRE <<<"$ORACLE_REQUIRE"
+fi
 
 [ -x "$ZQUIC_SERVER" ] || { echo "build zquic: zig build"; exit 1; }
 [ -x "$PROXY" ] || { echo "missing proxy — run oracle/build-refs.sh"; exit 1; }
@@ -258,6 +274,19 @@ if [ $IMPL_SET -eq 1 ]; then
 else
   for i in "${ALL_IMPLS[@]}"; do impl_ok "$i" && IMPLS+=("$i"); done
   [ ${#IMPLS[@]} -gt 0 ] || { echo "no reference impls built — run oracle/build-refs.sh"; exit 1; }
+  # Surface reduced coverage: a built-but-absent impl is easy to miss otherwise (#7).
+  absent=(); for i in "${ALL_IMPLS[@]}"; do impl_ok "$i" || absent+=("$i"); done
+  [ ${#absent[@]} -gt 0 ] && echo "note: not built, skipped: ${absent[*]} (run oracle/build-refs.sh to include)"
+fi
+# Hard-require named impls (anti silent-coverage-reduction, #7): refuse to report a
+# smaller green matrix when an impl that MUST be present is missing.
+if [ ${#REQUIRE[@]} -gt 0 ]; then
+  miss=(); for r in "${REQUIRE[@]}"; do impl_ok "$r" || miss+=("$r"); done
+  if [ ${#miss[@]} -gt 0 ]; then
+    echo "ERROR: required reference impl(s) not built: ${miss[*]}" >&2
+    echo "  must be present (oracle/build-refs.sh) — refusing a smaller green matrix." >&2
+    exit 3
+  fi
 fi
 
 sel_data=("${DATA_CASES[@]}"); sel_prox=("${PROXIED_CASES[@]}")

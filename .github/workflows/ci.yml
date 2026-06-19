@@ -64,6 +64,8 @@ jobs:
   oracle:
     name: Oracle (interop vs reference impls)
     runs-on: ubuntu-latest
+    env:
+      QUICHE_REF: "0.29.2"   # pinned for reproducible CI builds
     steps:
       - uses: actions/checkout@v4
 
@@ -77,11 +79,35 @@ jobs:
         with:
           go-version: '1.23'
 
+      - name: Ensure cmake (for quiche / BoringSSL)
+        run: cmake --version || { sudo apt-get update && sudo apt-get install -y cmake; }
+
+      # build-refs.sh looks for quiche at the repo's sibling (../quiche). Resolve
+      # that to a clean absolute path (no "..") so it's cacheable.
+      - name: Resolve quiche path
+        run: echo "QUICHE_DIR=$(cd "$GITHUB_WORKSPACE/.." && pwd)/quiche" >> "$GITHUB_ENV"
+
       - name: Build zquic (server + client)
         run: zig build
+
+      # quiche is the GREASE-frame regression guard (#4), a VN trigger, and a 2nd
+      # independent HTTP/0.9 oracle — none of which gate main without it (#6).
+      - name: Clone quiche (pinned)
+        run: git clone --depth 1 --branch "$QUICHE_REF" --recursive https://github.com/cloudflare/quiche.git "$QUICHE_DIR"
+
+      - name: Cache cargo + quiche build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.QUICHE_DIR }}/target
+          key: quiche-${{ runner.os }}-${{ env.QUICHE_REF }}
 
       - name: Build reference impls + fixtures
         run: bash oracle/build-refs.sh
 
+      # --require fails the job if quiche didn't build, instead of silently
+      # running a smaller (quic-go-only) green matrix (#7).
       - name: Run oracle matrix
-        run: bash oracle/run.sh
+        run: bash oracle/run.sh --require quicgo,quiche,quiche-h3
