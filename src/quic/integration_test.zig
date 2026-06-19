@@ -405,6 +405,23 @@ test "pair: bidirectional handshake reaches established" {
     try std.testing.expectEqual(ConnState.established, server.hot.state);
 }
 
+test "pair: handshake with verify_peer validates server CertificateVerify (#2)" {
+    const io = std.testing.io;
+    var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9100 });
+    var server = try Connection(16).accept(.{}, io);
+    server.current_time_ns = sim.now_ns;
+    // verify_peer=true: the client verifies the server's CertificateVerify
+    // signature against the leaf cert. A wrong signed-content construction
+    // (context string / transcript point) would reject the valid signature and
+    // fail the handshake, so reaching `established` proves the check is correct.
+    var client = try Connection(16).connect(.{ .verify_peer = true }, io);
+    client.current_time_ns = sim.now_ns;
+
+    const ok = try sim.runPairHandshake(&client, &server, io);
+    try std.testing.expect(ok);
+    try std.testing.expectEqual(ConnState.established, client.hot.state);
+}
+
 test "pair: client → server data transfer" {
     const io = std.testing.io;
     var sim = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9001 });

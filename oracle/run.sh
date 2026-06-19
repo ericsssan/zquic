@@ -190,11 +190,13 @@ dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic clie
   local sp; sp="$(ref_server "$impl" "$port" "$d/rsrv.log")"
   wait_listen "$sp" "$port" || { bad "$case [$impl-server <-> zquic-client] (no bind)"; stop "$sp"; return; }
   local reqs="" p; for p in $paths; do reqs="$reqs https://127.0.0.1:$port$p"; done
-  to "$CLIENT_TIMEOUT" env TESTCASE="$(ztc "$impl" "$case")" REQUESTS="${reqs# }" DOWNLOADS="$out" "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1; local rc=$?
+  # VERIFY_PEER=1: the zquic client validates the ref server's CertificateVerify
+  # against its (P-256) cert — now both directions are cert-verified (#2).
+  to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE="$(ztc "$impl" "$case")" REQUESTS="${reqs# }" DOWNLOADS="$out" "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1; local rc=$?
   stop "$sp"
   [ $rc -eq 124 ] && { bad "$case [$impl-server <-> zquic-client] (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "$case [$impl-server <-> zquic-client] (client rc=$rc)"; return; }
-  local m; if m="$(assert_match "$out" $paths)"; then ok "$case [$impl-server <-> zquic-client]"; else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
+  local m; if m="$(assert_match "$out" $paths)"; then ok "$case [$impl-server <-> zquic-client | cert-verified]"; else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
 }
 # proxied: zquic server <-> [proxy: capture (+optional impairment)] <-> ref client.
 # Always asserts hash. If WIRE_REQUIRE[case] is set, also asserts the mechanism

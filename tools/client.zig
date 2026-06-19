@@ -138,6 +138,10 @@ pub noinline fn main(init: std.process.Init) !void {
         .initial_max_streams_bidi = 1024,
         .initial_max_streams_uni = 1024,
         .advertise_v2 = std.mem.eql(u8, testcase, "v2"),
+        // Opt-in cert validation (ECDSA-P256 / Ed25519 leaf): set VERIFY_PEER to
+        // verify the server's CertificateVerify (#2). Off by default for interop
+        // against servers using unsupported signature schemes (e.g. RSA).
+        .verify_peer = init.environ_map.get("VERIFY_PEER") != null,
     };
 
     if (std.mem.eql(u8, testcase, "multiconnect")) {

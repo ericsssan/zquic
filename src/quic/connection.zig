@@ -204,6 +204,10 @@ pub const Config = struct {
     token_validity_ns: i64 = 5 * 60 * std.time.ns_per_s,
     /// ALPN protocol to require. Static/caller-owned slice; "" = no ALPN check.
     alpn: []const u8 = "",
+    /// Client: verify the server's CertificateVerify signature against the leaf
+    /// certificate (proves key possession; RFC 8446 §4.4.3). Default false for
+    /// interop without a trust store. Supports ECDSA-P256 and Ed25519 leaf keys.
+    verify_peer: bool = false,
     /// Pre-loaded DER certificate (null = use ephemeral self-signed).
     cert_der: ?[]const u8 = null,
     /// 32-byte private key material for cert_der: Ed25519 seed or P-256 scalar.
@@ -725,6 +729,7 @@ pub fn Connection(comptime max_streams: usize) type {
             client_config.is_server = false;
 
             var tls_client = tls.TlsClient.init(io);
+            tls_client.verify_peer = config.verify_peer;
 
             // Set ALPN from config
             if (config.alpn.len > 0) {

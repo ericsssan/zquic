@@ -88,9 +88,10 @@ quiche when their sibling checkouts + deps are present).
 
 ## Known gaps (deliberate, tracked)
 
-- **Cert verification is one-directional.** The ref client verifies zquic's
-  server cert; the reverse can't, because zquic's own client doesn't validate
-  certs — see issue #2.
+- **Cert verification is bidirectional** (issue #2 fixed). The ref client verifies
+  zquic's server cert, and the zquic client (VERIFY_PEER=1) verifies the ref
+  server's CertificateVerify (ECDSA-P256 / Ed25519). CA-chain / hostname
+  validation is not yet implemented.
 - **Endpoints construct `Connection` by value on the stack** (band-aided with a
   large `stack_size`) — see issue #3.
 - **Not yet covered:** 0-RTT, key update, ECN, migration, resumption, version

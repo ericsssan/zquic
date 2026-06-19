@@ -5,8 +5,9 @@
 //! EncryptedExtensions + Certificate + CertificateVerify + Finished, builds
 //! client Finished.
 //!
-//! Does NOT verify server certificate (no CA store).
-//! DOES verify server Finished (key correctness guarantee).
+//! Optionally verifies the server's CertificateVerify signature against the leaf
+//! cert when `verify_peer` is set (RFC 8446 §4.4.3; ECDSA-P256 / Ed25519). Does
+//! not yet do CA-chain / hostname validation. Always verifies server Finished.
 
 const std = @import("std");
 const crypto = @import("crypto.zig");
@@ -112,6 +113,14 @@ pub const TlsClient = struct {
     /// multiple packets.
     hs_processed_len: usize,
     crypto_bytes_total: u32,
+
+    /// When true, verify the server's CertificateVerify signature (RFC 8446
+    /// §4.4.3) against the leaf certificate's public key — proof that the peer
+    /// holds the private key for the certificate it presented. Default false for
+    /// interop (no trust store); set via Config.verify_peer.
+    verify_peer: bool = false,
+    server_leaf_der: [4096]u8 = undefined,
+    server_leaf_der_len: usize = 0,
 
     pub fn init(io: std.Io) TlsClient {
         const ecdh_kp = X25519.KeyPair.generate(io);
@@ -562,6 +571,13 @@ pub const TlsClient = struct {
             // EncryptedExtensions: extract server's transport parameters.
             if (msg_type == 8) {
                 self.parseEncryptedExtensions(data[pos + 4 .. msg_end]);
+            } else if (msg_type == 11) {
+                // Certificate: remember the leaf for CertificateVerify.
+                if (self.verify_peer) self.storeLeafCert(data[pos + 4 .. msg_end]);
+            } else if (msg_type == 15) {
+                // CertificateVerify: verify the signature over H(CH..Cert) BEFORE
+                // this message is folded into the transcript below.
+                if (self.verify_peer) try self.verifyCertVerify(data[pos + 4 .. msg_end]);
             }
 
             // Non-Finished message: add to transcript and skip
@@ -585,6 +601,67 @@ pub const TlsClient = struct {
             .client = crypto.derivePacketKeysWithSuite(self.client_app_secret, self.quic_version, self.negotiated_cipher),
             .server = crypto.derivePacketKeysWithSuite(self.server_app_secret, self.quic_version, self.negotiated_cipher),
         };
+    }
+
+    /// Store the leaf certificate DER from a TLS 1.3 Certificate message.
+    /// struct { opaque certificate_request_context<0..255>;
+    ///          CertificateEntry certificate_list<0..2^24-1>; }
+    fn storeLeafCert(self: *TlsClient, body: []const u8) void {
+        if (body.len < 1) return;
+        var p: usize = 1 + body[0]; // skip request context
+        if (p + 3 > body.len) return;
+        p += 3; // skip certificate_list length
+        if (p + 3 > body.len) return;
+        const cert_len = readU24(body[p..][0..3]);
+        p += 3;
+        if (cert_len == 0 or p + cert_len > body.len or cert_len > self.server_leaf_der.len) return;
+        @memcpy(self.server_leaf_der[0..cert_len], body[p..][0..cert_len]);
+        self.server_leaf_der_len = cert_len;
+    }
+
+    /// Verify the server's CertificateVerify (RFC 8446 §4.4.3): a signature over
+    /// the handshake transcript, made with the leaf certificate's private key.
+    /// struct { SignatureScheme algorithm; opaque signature<0..2^16-1>; }
+    fn verifyCertVerify(self: *TlsClient, body: []const u8) !void {
+        if (self.server_leaf_der_len == 0) return error.CertVerifyFailed;
+        if (body.len < 4) return error.CertVerifyFailed;
+        const scheme = (@as(u16, body[0]) << 8) | body[1];
+        const sig_len = (@as(usize, body[2]) << 8) | body[3];
+        if (4 + sig_len > body.len) return error.CertVerifyFailed;
+        const sig = body[4 .. 4 + sig_len];
+
+        // Signed content: 64 octets of 0x20, the context string, 0x00, then the
+        // transcript hash H(CH..Cert) — CertificateVerify is not yet in the hash.
+        var snap = self.transcript;
+        var th: [32]u8 = undefined;
+        snap.final(&th);
+        const ctx = "TLS 1.3, server CertificateVerify";
+        var signed: [64 + ctx.len + 1 + 32]u8 = undefined;
+        @memset(signed[0..64], 0x20);
+        @memcpy(signed[64 .. 64 + ctx.len], ctx);
+        signed[64 + ctx.len] = 0x00;
+        @memcpy(signed[64 + ctx.len + 1 ..], &th);
+
+        const cert = std.crypto.Certificate{ .buffer = self.server_leaf_der[0..self.server_leaf_der_len], .index = 0 };
+        const parsed = cert.parse() catch return error.CertVerifyFailed;
+        const pubkey = parsed.pubKey();
+
+        switch (scheme) {
+            0x0403 => { // ecdsa_secp256r1_sha256
+                const E = std.crypto.sign.ecdsa.EcdsaP256Sha256;
+                const pk = E.PublicKey.fromSec1(pubkey) catch return error.CertVerifyFailed;
+                const s = E.Signature.fromDer(sig) catch return error.CertVerifyFailed;
+                s.verify(signed[0..], pk) catch return error.CertVerifyFailed;
+            },
+            0x0807 => { // ed25519
+                const E = std.crypto.sign.Ed25519;
+                if (pubkey.len != 32 or sig.len != 64) return error.CertVerifyFailed;
+                const pk = E.PublicKey.fromBytes(pubkey[0..32].*) catch return error.CertVerifyFailed;
+                const s = E.Signature.fromBytes(sig[0..64].*);
+                s.verify(signed[0..], pk) catch return error.CertVerifyFailed;
+            },
+            else => return error.CertVerifyFailed, // unsupported signature scheme
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -887,4 +964,45 @@ test "tls_client: full key schedule matches server" {
 
 fn readU24(data: *const [3]u8) usize {
     return (@as(usize, data[0]) << 16) | (@as(usize, data[1]) << 8) | data[2];
+}
+
+test "verify_peer rejects a tampered CertificateVerify signature (#2)" {
+    var c = TlsClient.init(std.testing.io);
+    c.verify_peer = true;
+    // A real, parseable P-256 leaf certificate (CN=localhost test cert).
+    const leaf = [_]u8{
+        48,  130, 1,   161, 48,  130, 1,   71,  160, 3,   2,   1,   2,   2,   20,  92,
+        18,  84,  236, 65,  110, 53,  250, 115, 136, 9,   61,  184, 251, 68,  31,  199,
+        25,  111, 109, 48,  10,  6,   8,   42,  134, 72,  206, 61,  4,   3,   2,   48,
+        20,  49,  18,  48,  16,  6,   3,   85,  4,   3,   12,  9,   108, 111, 99,  97,
+        108, 104, 111, 115, 116, 48,  30,  23,  13,  50,  54,  48,  54,  49,  54,  49,
+        48,  51,  49,  52,  56,  90,  23,  13,  50,  56,  48,  57,  49,  56,  49,  48,
+        51,  49,  52,  56,  90,  48,  20,  49,  18,  48,  16,  6,   3,   85,  4,   3,
+        12,  9,   108, 111, 99,  97,  108, 104, 111, 115, 116, 48,  89,  48,  19,  6,
+        7,   42,  134, 72,  206, 61,  2,   1,   6,   8,   42,  134, 72,  206, 61,  3,
+        1,   7,   3,   66,  0,   4,   252, 91,  5,   151, 113, 143, 238, 3,   121, 231,
+        152, 106, 72,  70,  215, 250, 49,  96,  229, 158, 54,  106, 125, 239, 233, 225,
+        121, 36,  59,  40,  102, 95,  124, 157, 14,  228, 119, 67,  74,  244, 40,  123,
+        234, 26,  87,  217, 104, 120, 96,  227, 190, 94,  7,   2,   234, 22,  67,  209,
+        156, 85,  36,  6,   1,   41,  163, 119, 48,  117, 48,  29,  6,   3,   85,  29,
+        14,  4,   22,  4,   20,  250, 160, 162, 184, 50,  180, 152, 55,  140, 80,  9,
+        127, 47,  189, 217, 6,   2,   118, 210, 226, 48,  31,  6,   3,   85,  29,  35,
+        4,   24,  48,  22,  128, 20,  250, 160, 162, 184, 50,  180, 152, 55,  140, 80,
+        9,   127, 47,  189, 217, 6,   2,   118, 210, 226, 48,  15,  6,   3,   85,  29,
+        19,  1,   1,   255, 4,   5,   48,  3,   1,   1,   255, 48,  34,  6,   3,   85,
+        29,  17,  4,   27,  48,  25,  130, 9,   108, 111, 99,  97,  108, 104, 111, 115,
+        116, 130, 6,   115, 101, 114, 118, 101, 114, 135, 4,   127, 0,   0,   1,   48,
+        10,  6,   8,   42,  134, 72,  206, 61,  4,   3,   2,   3,   72,  0,   48,  69,
+        2,   32,  76,  25,  154, 172, 200, 252, 135, 147, 210, 63,  66,  226, 215, 68,
+        151, 181, 254, 208, 104, 86,  207, 53,  171, 148, 206, 223, 97,  209, 213, 233,
+        94,  111, 2,   33,  0,   217, 227, 26,  64,  135, 205, 198, 138, 200, 191, 4,
+        222, 47,  179, 42,  126, 110, 54,  2,   246, 11,  83,  63,  154, 52,  110, 113,
+        13,  119, 7,   113, 68,
+    };
+    @memcpy(c.server_leaf_der[0..leaf.len], &leaf);
+    c.server_leaf_der_len = leaf.len;
+    // CertificateVerify: ecdsa_secp256r1_sha256 (0x0403), an 8-byte DER ECDSA
+    // signature {r=1, s=1} — well-formed but does NOT match the cert's key.
+    const cv = [_]u8{ 0x04, 0x03, 0x00, 0x08, 0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01 };
+    try std.testing.expectError(error.CertVerifyFailed, c.verifyCertVerify(&cv));
 }
