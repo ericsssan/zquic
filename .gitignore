@@ -4,3 +4,4 @@ memory/
 certs/
 *.pem
 *.key
+*.o
