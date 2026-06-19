@@ -5,23 +5,26 @@
 # SCOPE: three reference impls — quic-go (HTTP/0.9, in CI), quiche (HTTP/0.9),
 # ngtcp2 (HTTP/3); the latter two optional/local. Cases: handshake/transfer/
 # multiplexing both directions; retry (wire-checked); handshakeloss/transferloss/
-# longrtt (deterministic impairment). See README.md / PLAN.md for details.
+# longrtt (seeded impairment). See README.md / PLAN.md for details.
 #
 # Two kinds of checks:
 #   data-path: assert downloaded bytes hash-match the served files. The
 #     independent impl is the judge of wire codec / crypto / transport params.
 #     When the ref CLIENT talks to the zquic server it ALSO verifies zquic's
-#     certificate against the local CA (real TLS-auth oracle). NOTE: the reverse
-#     direction does NOT verify — zquic's own client does not validate certs, so
-#     ref-server <-> zquic-client covers wire/crypto but NOT the ref's cert.
+#     certificate against the local CA (real TLS-auth oracle). The reverse
+#     direction also verifies: the zquic client (VERIFY_PEER=1) checks the ref
+#     server's CertificateVerify signature (#2) — both directions cert-verified.
 #   behavioral: route through the capturing proxy and assert the mechanism
 #     actually appeared ON THE WIRE (e.g. a Retry packet), not just that the file
 #     transferred.
 #
-# Usage: oracle/run.sh [-i impl] [-r impl,...] [case...]
+# Usage: oracle/run.sh [-i impl] [-r impl,...] [-n N] [case...]
 #   -r/--require impl[,impl]  fail (exit 3) if a named impl isn't built, instead
 #                             of silently running a smaller green matrix (#7).
 #                             Also honored via the ORACLE_REQUIRE env var.
+#   -n/--repeat N             run the selection N times, require all green — a
+#                             stability check for the SEEDED (not outcome-
+#                             deterministic) loss cases (#8). Also ORACLE_REPEAT.
 #
 set -u
 
@@ -45,7 +48,10 @@ declare -A CASE_PATHS=(
 )
 # Behavioral cases: required wire token (class the proxy capture must contain).
 declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
-# Proxy impairment flags (deterministic via fixed seed): loss recovery + high RTT.
+# Proxy impairment flags. SEEDED, not outcome-deterministic: the seed fixes the
+# drop sequence, but which logical packet is the Nth datagram shifts with timing,
+# so loss outcomes vary slightly run-to-run (#8). Rates carry headroom (30%/6%);
+# use `-n N` for a repeat-stability check that fails hard on latent flakiness.
 declare -A IMPAIR=(
   [handshakeloss]="-loss 30 -seed 7"
   [transferloss]="-loss 6 -seed 7"
@@ -250,13 +256,15 @@ vn_case() { # <trigger_impl> <sport> <pport>
   fi
 }
 
-CASES=(); REQUIRE=()
+CASES=(); REQUIRE=(); REPEAT=1
 while [ $# -gt 0 ]; do
   case "$1" in
     -i | --impl) IMPLS=("$2"); IMPL_SET=1; shift 2 ;;
     --impl=*) IMPLS=("${1#*=}"); IMPL_SET=1; shift ;;
     -r | --require) IFS=', ' read -r -a REQUIRE <<<"$2"; shift 2 ;;
     --require=*) IFS=', ' read -r -a REQUIRE <<<"${1#*=}"; shift ;;
+    -n | --repeat) REPEAT="$2"; shift 2 ;;
+    --repeat=*) REPEAT="${1#*=}"; shift ;;
     --) shift; CASES+=("$@"); break ;;
     -*) echo "unknown flag: $1" >&2; exit 2 ;;
     *) CASES+=("$1"); shift ;;
@@ -265,6 +273,30 @@ done
 # Env fallback for required impls (lets CI forbid a silently-smaller matrix).
 if [ ${#REQUIRE[@]} -eq 0 ] && [ -n "${ORACLE_REQUIRE:-}" ]; then
   IFS=', ' read -r -a REQUIRE <<<"$ORACLE_REQUIRE"
+fi
+# Repeat count: flag wins, else ORACLE_REPEAT env, else 1. Sanitize to an int.
+[ "$REPEAT" -eq 1 ] 2>/dev/null && [ -n "${ORACLE_REPEAT:-}" ] && REPEAT="$ORACLE_REPEAT"
+case "$REPEAT" in *[!0-9]* | '') REPEAT=1 ;; esac
+
+# Stability mode (#8): loss impairment is SEEDED, not outcome-deterministic — the
+# seed fixes the drop *sequence*, but which logical packet is the Nth datagram
+# shifts with timing (coalescing, PTO). So re-run the selection N times in fresh
+# processes and require EVERY iteration green; latent flakiness fails hard here
+# instead of surfacing as an intermittent red. Children carry ORACLE_IN_REPEAT.
+if [ "$REPEAT" -gt 1 ] && [ -z "${ORACLE_IN_REPEAT:-}" ]; then
+  FWD=()
+  [ $IMPL_SET -eq 1 ] && FWD+=(-i "${IMPLS[0]}")
+  [ ${#REQUIRE[@]} -gt 0 ] && FWD+=(-r "$(IFS=,; printf '%s' "${REQUIRE[*]}")")
+  [ ${#CASES[@]} -gt 0 ] && FWD+=(-- "${CASES[@]}")
+  green=0
+  echo "stability mode: $REPEAT iterations (all must pass)"
+  for k in $(seq 1 "$REPEAT"); do
+    echo ""; echo "━━━ iteration $k/$REPEAT ━━━"
+    if ORACLE_IN_REPEAT=1 bash "$0" "${FWD[@]}"; then green=$((green + 1)); fi
+  done
+  echo ""; echo "═════════════════════════════════"
+  echo "STABILITY: $green/$REPEAT iterations fully green"
+  [ "$green" -eq "$REPEAT" ] && exit 0 || exit 1
 fi
 
 [ -x "$ZQUIC_SERVER" ] || { echo "build zquic: zig build"; exit 1; }

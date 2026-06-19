@@ -16,9 +16,9 @@ Shipped today (`oracle/run.sh`) — **29/29 across three impls**:
   quiche (HTTP/0.9, optional/local). quiche-over-HTTP/3 stalls vs zquic — issue #4.
 - **Data-path, both directions:** handshake, transfer, multiplexing. The quic-go
   client verifies zquic's cert against the local CA (real TLS-auth oracle); the
-  reverse direction does NOT (zquic's own client doesn't validate certs — disclosed).
+  reverse direction verifies the ref server's CertificateVerify (VERIFY_PEER=1, #2).
 - **Behavioral, server direction:** retry (wire-classified `s2c RETRY`).
-- **Impairment (deterministic):** handshakeloss (30%), transferloss (6%), longrtt
+- **Impairment (seeded):** handshakeloss (30%), transferloss (6%), longrtt
   (200ms) — loss recovery + RTT, hash-verified through the proxy.
 - **HTTP/3 path:** all ngtcp2 cases run over h3, exercising zquic's H3/QPACK.
 - **Crypto:** RFC 9001 A.1/A.2/A.5 vectors as unit tests.

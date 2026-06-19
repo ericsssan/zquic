@@ -34,7 +34,7 @@ zig build test            # RFC 9001 crypto vectors live here (crypto.zig)
 | TLS auth     | (same, zquic-server direction)     | the ref client **verifies zquic's certificate** against the local CA (`cert-verified`). |
 | behavioral   | retry                              | **the wire** — the case passes only if the mechanism's packet actually appears (long-header types are unmasked by header protection, so the proxy classifies them without keys). |
 | server prop  | versionnegotiation                 | **the wire** — a client offering an unknown version (ngtcp2 `--version`, or quiche's default GREASE `babababa`) must get a `VERSION_NEGOTIATION` packet back. Wire-only (the handshake intentionally doesn't complete). |
-| loss recovery| handshakeloss, transferloss        | the data still arrives **through deterministic packet loss** (the proxy drops a seeded fraction); exercises PTO + retransmission. |
+| loss recovery| handshakeloss, transferloss        | the data still arrives **through seeded packet loss** (the proxy drops a fixed fraction; the seed fixes the drop *sequence*, not which logical packets — see #8); exercises PTO + retransmission. Use `-n N` to repeat-stress. |
 | crypto       | RFC 9001 A.1/A.2/A.5 (unit tests)  | the **RFC's exact bytes** — zero self-definition. |
 
 Each assertion is falsification-checked (e.g. a transfer-mode server produces no
@@ -49,7 +49,8 @@ In `oracle/run.sh`, add to the relevant maps:
 - Data-path case → add the name to `DATA_CASES` (runs both directions, hash-only).
 - Proxied case → add to `PROXIED_CASES` and set one or both of:
   - `WIRE_REQUIRE[name]="s2c RETRY"` — a class+direction the proxy capture must contain.
-  - `IMPAIR[name]="-loss 30 -seed 7"` — deterministic proxy impairment.
+  - `IMPAIR[name]="-loss 30 -seed 7"` — seeded proxy impairment (reproducible
+    drop sequence; outcomes still vary slightly with timing — #8).
   - `TC[name]="transfer"` — the TESTCASE zquic endpoints get (default = case name).
 
 The proxy classifies `INITIAL / 0RTT / HANDSHAKE / RETRY / VERSION_NEGOTIATION /

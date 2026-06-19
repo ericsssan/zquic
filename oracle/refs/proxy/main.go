@@ -8,7 +8,10 @@
 // Coalesced packets in one datagram are walked individually (via the long-header
 // Length field), so a 0-RTT coalesced after an Initial is still seen.
 //
-// It also optionally injects deterministic loss/delay, replacing tc-netem.
+// It also optionally injects seeded loss/delay, replacing tc-netem. The seed
+// fixes the drop *sequence* per direction, but which logical QUIC packet lands at
+// the Nth datagram still depends on endpoint timing (coalescing, PTO) — so loss
+// is reproducible-sequence, not outcome-deterministic. See harness issue #8.
 //
 //	proxy -listen :PORT -target HOST:PORT -capture FILE [-loss PCT -delayms MS -seed N]
 //
@@ -109,7 +112,7 @@ func main() {
 	capture := flag.String("capture", "", "capture file path")
 	loss := flag.Int("loss", 0, "loss percent [0..100]")
 	delayms := flag.Int("delayms", 0, "one-way delay in ms")
-	seed := flag.Int64("seed", 42, "PRNG seed for deterministic loss")
+	seed := flag.Int64("seed", 42, "PRNG seed for a reproducible loss sequence")
 	flag.Parse()
 	if *listen == "" || *target == "" {
 		fmt.Fprintln(os.Stderr, "proxy: -listen and -target required")
@@ -139,8 +142,10 @@ func main() {
 			fmt.Fprintf(capFile, "%s %s %d\n", dir, c, len(b))
 		}
 	}
-	// One PRNG per direction (each driven by a single goroutine) so loss is
-	// race-free AND deterministic for a given seed — required for stable CI.
+	// One PRNG per direction (each driven by a single goroutine) so the drop
+	// sequence is race-free AND reproducible for a given seed. (Which logical
+	// packet is the Nth datagram still varies with timing — see #8; the harness
+	// keeps loss rates with headroom and offers a repeat-stability check.)
 	rngC := rand.New(rand.NewSource(*seed))
 	rngS := rand.New(rand.NewSource(*seed + 1))
 	drop := func(r *rand.Rand) bool { return *loss > 0 && r.Intn(100) < *loss }
