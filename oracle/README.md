@@ -33,6 +33,7 @@ zig build test            # RFC 9001 crypto vectors live here (crypto.zig)
 | data-path    | handshake, transfer, multiplexing  | the **independent impl** — it rejects non-conformant wire bytes / crypto / transport params. Bytes are hash-verified end-to-end. |
 | TLS auth     | (same, zquic-server direction)     | the ref client **verifies zquic's certificate** against the local CA (`cert-verified`). |
 | behavioral   | retry                              | **the wire** — the case passes only if the mechanism's packet actually appears (long-header types are unmasked by header protection, so the proxy classifies them without keys). |
+| server prop  | versionnegotiation                 | **the wire** — a client offering an unknown version (ngtcp2 `--version`, or quiche's default GREASE `babababa`) must get a `VERSION_NEGOTIATION` packet back. Wire-only (the handshake intentionally doesn't complete). |
 | loss recovery| handshakeloss, transferloss        | the data still arrives **through deterministic packet loss** (the proxy drops a seeded fraction); exercises PTO + retransmission. |
 | crypto       | RFC 9001 A.1/A.2/A.5 (unit tests)  | the **RFC's exact bytes** — zero self-definition. |
 

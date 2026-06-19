@@ -214,6 +214,32 @@ proxied() {
   ok "$tag${want:+ ✓}"
 }
 
+# versionnegotiation (server property, not per-impl): a client offering an unknown
+# version MUST get a Version Negotiation packet (RFC 9000 §6.1). ngtcp2's --version
+# forces a greased version. Wire-only: the handshake intentionally does not complete
+# (client is pinned to the bad version), so we assert just the VN packet.
+vn_case() { # <trigger_impl> <sport> <pport>
+  local trig=$1 sport=$2 pport=$3 d="$TMP/server/versionnegotiation"; mkdir -p "$d"; local capf="$d/capture.txt"
+  TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  wait_listen "$sp" "$sport" || { bad "versionnegotiation (no server bind)"; stop "$sp"; return; }
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  wait_listen "$px" "$pport" || { bad "versionnegotiation (no proxy bind)"; stop "$sp" "$px"; return; }
+  # Each client offers an unknown version: ngtcp2 via --version, quiche via its
+  # default GREASE wire-version (babababa). Wire-only — the handshake won't complete.
+  case "$trig" in
+    ngtcp2) to 8 "$BIN/ngtcp2-client" -q --download="$d" --exit-on-all-streams-close --version=0x1a2a3a4a \
+              127.0.0.1 "$pport" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1 ;;
+    quiche) to 8 "$BIN/quiche-client" --no-verify --wire-version babababa --http-version HTTP/0.9 \
+              --dump-responses "$d" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1 ;;
+  esac
+  stop "$sp" "$px"
+  if grep -q "s2c VERSION_NEGOTIATION" "$capf" 2>/dev/null; then
+    ok "versionnegotiation [zquic server emits VN; $trig offers unknown version | wire ✓]"
+  else
+    bad "versionnegotiation — zquic did not send a VERSION_NEGOTIATION packet"
+  fi
+}
+
 CASES=()
 while getopts "i:" opt; do case $opt in i) IMPLS=("$OPTARG"); IMPL_SET=1 ;; esac; done
 shift $((OPTIND - 1)); [ $# -gt 0 ] && CASES=("$@")
@@ -231,6 +257,7 @@ sel_data=("${DATA_CASES[@]}"); sel_prox=("${PROXIED_CASES[@]}")
 if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
+    [ "$c" = versionnegotiation ] && continue # server-property case, run by vn_case below
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -252,6 +279,16 @@ for impl in "${IMPLS[@]}"; do
     proxied "$impl" "$case" "$port" "$((port + 1))"; port=$((port + 2))
   done
 done
+
+# Server-property checks (use ngtcp2's --version). On a full run, or when
+# versionnegotiation is explicitly requested.
+if [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx versionnegotiation; then
+  trig=""; impl_ok ngtcp2 && trig=ngtcp2 || { impl_ok quiche && trig=quiche; }
+  if [ -n "$trig" ]; then
+    echo ""; echo "═══ oracle: server properties ═══"
+    vn_case "$trig" "$port" "$((port + 1))"; port=$((port + 2))
+  fi
+fi
 
 echo ""; echo "─────────────────────────────────"
 echo "TOTAL: $PASS passed, $FAIL failed"
