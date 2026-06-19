@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+#
+# zquic oracle harness — fast, Docker-free interop against reference impls.
+#
+# SCOPE: three reference impls — quic-go (HTTP/0.9, in CI), quiche (HTTP/0.9),
+# ngtcp2 (HTTP/3); the latter two optional/local. Cases: handshake/transfer/
+# multiplexing both directions; retry (wire-checked); handshakeloss/transferloss/
+# longrtt (deterministic impairment). See README.md / PLAN.md for details.
+#
+# Two kinds of checks:
+#   data-path: assert downloaded bytes hash-match the served files. The
+#     independent impl is the judge of wire codec / crypto / transport params.
+#     When the ref CLIENT talks to the zquic server it ALSO verifies zquic's
+#     certificate against the local CA (real TLS-auth oracle). NOTE: the reverse
+#     direction does NOT verify — zquic's own client does not validate certs, so
+#     ref-server <-> zquic-client covers wire/crypto but NOT the ref's cert.
+#   behavioral: route through the capturing proxy and assert the mechanism
+#     actually appeared ON THE WIRE (e.g. a Retry packet), not just that the file
+#     transferred.
+#
+# Usage: oracle/run.sh [-i impl] [case...]
+#
+set -u
+
+ORACLE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(dirname "$ORACLE")"
+ZQUIC_SERVER="$ROOT/zig-out/bin/server"
+ZQUIC_CLIENT="$ROOT/zig-out/bin/client"
+CERTS="$ORACLE/certs"; WWW="$ORACLE/www"; BIN="$ORACLE/.cache/bin"; TMP="$ORACLE/.cache/run"
+PROXY="$BIN/proxy"
+PORT_BASE=4500
+CLIENT_TIMEOUT=25   # seconds; loopback handshake+1MB is <1s, so this only catches hangs
+
+declare -A CASE_PATHS=(
+  [handshake]="/1.bin"
+  [transfer]="/big.bin"
+  [multiplexing]="/1.bin /2.bin /3.bin /4.bin"
+  [retry]="/big.bin"
+  [handshakeloss]="/1.bin"
+  [transferloss]="/big.bin"
+  [longrtt]="/1.bin"   # high-RTT correctness, not bulk throughput — keep it small + fast
+)
+# Behavioral cases: required wire token (class the proxy capture must contain).
+declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
+# Proxy impairment flags (deterministic via fixed seed): loss recovery + high RTT.
+declare -A IMPAIR=(
+  [handshakeloss]="-loss 30 -seed 7"
+  [transferloss]="-loss 6 -seed 7"
+  [longrtt]="-delayms 100"   # 200ms RTT: exercises RTT estimation / timers / pacing
+)
+# zquic TESTCASE to pass to the endpoints (default = case name). Impaired cases
+# just serve/fetch like transfer; the impairment is injected by the proxy.
+declare -A TC=( [handshakeloss]="transfer" [transferloss]="transfer" [longrtt]="transfer" )
+# Per-impl protocol override: ngtcp2's example binaries are HTTP/3 only, so pair
+# them with zquic's http3 path — this exercises zquic's H3/QPACK, which the
+# quic-go (hq-interop / HTTP-0.9) cases never touch.
+declare -A IMPL_TC=( [ngtcp2]="http3" [quiche-h3]="http3" )
+# Cases an impl can't run: retry needs the server's hq-interop retry mode, which
+# can't coexist with a forced http3 protocol.
+# quiche-h3 exists to guard the H3 GREASE-frame handling (RFC 9114 §9) — quiche is
+# the only client that prepends GREASE. Its data-path cases do that; loss/RTT are
+# already covered by ngtcp2-h3, and quiche-h3 is slow under 30% loss, so skip them.
+declare -A IMPL_SKIP=( [ngtcp2]="retry" [quiche-h3]="retry handshakeloss transferloss longrtt" )
+DATA_CASES=(handshake transfer multiplexing)
+PROXIED_CASES=(retry handshakeloss transferloss longrtt)
+
+# zquic TESTCASE for (impl, case): impl protocol override > case override > name.
+ztc() { echo "${IMPL_TC[$1]:-${TC[$2]:-$2}}"; }
+skipped() { case " ${IMPL_SKIP[$1]:-} " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+ALL_IMPLS=(quicgo ngtcp2 quiche quiche-h3)
+IMPLS=(); IMPL_SET=0
+PASS=0; FAIL=0; FAILED=()
+
+ok()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
+bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED+=("$*"); }
+
+# Kill only this harness's own binaries (full paths) — safe pre-clean + on exit.
+cleanup() {
+  for b in "$ZQUIC_SERVER" "$ZQUIC_CLIENT" "$PROXY" "$BIN"/quicgo "$BIN"/ngtcp2 "$BIN"/quiche; do
+    [ -e "$b" ] && pkill -f "$b" 2>/dev/null
+  done
+  return 0
+}
+trap cleanup EXIT
+
+# to SECS cmd... — run cmd with a hard timeout; returns 124 on timeout.
+# cmd must be a binary or a function that exec's a binary (so the polled pid IS
+# the process to kill). Output/redirection is inherited from the caller.
+to() {
+  local secs=$1; shift
+  "$@" & local pid=$! i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge "$((secs * 10))" ]; then kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; return 124; fi
+    sleep 0.1; i=$((i + 1))
+  done
+  wait "$pid"; return $?
+}
+
+# Portable SHA-256 (Linux sha256sum / macOS shasum).
+h256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a256 "$1" | awk '{print $1}'; fi
+}
+
+# Is UDP `port` bound? Portable across macOS (lsof) and Linux (ss). Ports are
+# fresh + pre-cleaned, so a port-level check is sufficient. (-P/-n: numeric;
+# 4500 prints as the service name "ipsec-msft" otherwise.)
+port_bound() {
+  local port=$2
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iUDP:"$port" 2>/dev/null | grep -q ":$port"
+  elif command -v ss >/dev/null 2>&1; then
+    ss -lun 2>/dev/null | grep -qE "[:.]$port([^0-9]|$)"
+  else
+    return 1
+  fi
+}
+
+# Wait until pid has bound UDP port, or it dies. Polls precisely for ~2s; if the
+# socket tool can't confirm but the process is alive, proceeds anyway (QUIC
+# retransmits a lost Initial, so a slightly-early client still connects).
+wait_listen() {
+  local pid=$1 port=$2 i
+  for i in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || return 1
+    port_bound "$pid" "$port" && return 0
+    sleep 0.1
+  done
+  kill -0 "$pid" 2>/dev/null
+}
+stop() { kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
+
+assert_match() { # <dir> <path...>
+  local dir=$1; shift; local p base
+  for p in "$@"; do
+    base="$(basename "$p")"
+    [ -f "$dir/$base" ] || { echo "missing $base"; return 1; }
+    [ "$(h256 "$WWW/$base")" = "$(h256 "$dir/$base")" ] || { echo "hash mismatch $base"; return 1; }
+  done
+}
+
+# ref_client: MUST be invoked only via `to` (it exec's, replacing the subshell so
+# the timeout can kill the real process). Always verifies the zquic cert (-ca).
+ref_client() { # <impl> <port> <outdir> <path...>
+  local impl=$1 port=$2 out=$3; shift 3
+  local urls=() p; for p in "$@"; do urls+=("https://127.0.0.1:$port$p"); done
+  case "$impl" in
+    quicgo) exec "$BIN/quicgo" client -ca "$CERTS/cert.pem" "$out" "${urls[@]}" ;;
+    ngtcp2) exec "$BIN/ngtcp2-client" -q --download="$out" --exit-on-all-streams-close 127.0.0.1 "$port" "${urls[@]}" ;;
+    quiche) exec "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/0.9 --dump-responses "$out" "${urls[@]}" ;;
+    quiche-h3) exec "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/3 --dump-responses "$out" "${urls[@]}" ;;
+    *) echo "unknown impl $impl" >&2; exit 2 ;;
+  esac
+}
+# Are the binaries for an impl present?
+impl_ok() {
+  case "$1" in
+    quicgo) [ -x "$BIN/quicgo" ] ;;
+    ngtcp2) [ -x "$BIN/ngtcp2-client" ] && [ -x "$BIN/ngtcp2-server" ] ;;
+    quiche | quiche-h3) [ -x "$BIN/quiche-client" ] && [ -x "$BIN/quiche-server" ] ;;
+    *) return 1 ;;
+  esac
+}
+ref_server() { # <impl> <port> <logfile> -> pid (binary backgrounded; pid is the binary)
+  local impl=$1 port=$2 logf=$3
+  case "$impl" in
+    quicgo) "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" >"$logf" 2>&1 & echo $! ;;
+    ngtcp2) "$BIN/ngtcp2-server" -q --htdocs="$WWW" '*' "$port" "$CERTS/priv.key" "$CERTS/cert.pem" >"$logf" 2>&1 & echo $! ;;
+    quiche) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/0.9 >"$logf" 2>&1 & echo $! ;;
+    quiche-h3) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/3 >"$logf" 2>&1 & echo $! ;;
+    *) return 2 ;;
+  esac
+}
+
+dp_zquic_server() { # zquic server <-> ref client
+  local impl=$1 case=$2 port=$3 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
+  local cv=""; [ "$impl" = quicgo ] && cv=" | cert-verified" # only quic-go verifies the zquic cert
+  local out="$d/zsrv"; rm -rf "$out"; mkdir -p "$out"
+  TESTCASE="$(ztc "$impl" "$case")" CERTS="$CERTS" WWW="$WWW" PORT="$port" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  wait_listen "$sp" "$port" || { bad "$case [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp"
+  [ $rc -eq 124 ] && { bad "$case [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "$case [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if m="$(assert_match "$out" $paths)"; then ok "$case [zquic-server <-> $impl-client$cv]"; else bad "$case [zquic-server <-> $impl-client] ($m)"; fi
+}
+dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic client limitation)
+  local impl=$1 case=$2 port=$3 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
+  local out="$d/zcli"; rm -rf "$out"; mkdir -p "$out"
+  local sp; sp="$(ref_server "$impl" "$port" "$d/rsrv.log")"
+  wait_listen "$sp" "$port" || { bad "$case [$impl-server <-> zquic-client] (no bind)"; stop "$sp"; return; }
+  local reqs="" p; for p in $paths; do reqs="$reqs https://127.0.0.1:$port$p"; done
+  # VERIFY_PEER=1: the zquic client validates the ref server's CertificateVerify
+  # against its (P-256) cert — now both directions are cert-verified (#2).
+  to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE="$(ztc "$impl" "$case")" REQUESTS="${reqs# }" DOWNLOADS="$out" "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1; local rc=$?
+  stop "$sp"
+  [ $rc -eq 124 ] && { bad "$case [$impl-server <-> zquic-client] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "$case [$impl-server <-> zquic-client] (client rc=$rc)"; return; }
+  local m; if m="$(assert_match "$out" $paths)"; then ok "$case [$impl-server <-> zquic-client | cert-verified]"; else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
+}
+# proxied: zquic server <-> [proxy: capture (+optional impairment)] <-> ref client.
+# Always asserts hash. If WIRE_REQUIRE[case] is set, also asserts the mechanism
+# appears on the wire. If IMPAIR[case] is set, the proxy injects loss/delay.
+proxied() {
+  local impl=$1 case=$2 sport=$3 pport=$4 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
+  local want="${WIRE_REQUIRE[$case]:-}" impair="${IMPAIR[$case]:-}" tc="$(ztc "$impl" "$case")"
+  local tag="$case [zquic-server <-> $impl-client${impair:+ | impair:$impair}${want:+ | wire: $want}]"
+  local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
+  TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
+  wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp" "$px"
+  [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if ! m="$(assert_match "$out" $paths)"; then bad "$tag (transfer: $m)"; return; fi
+  if [ -n "$want" ] && ! grep -q "$want" "$capf" 2>/dev/null; then
+    bad "$tag — transfer ok but mechanism NOT seen on wire"; return
+  fi
+  ok "$tag${want:+ ✓}"
+}
+
+# versionnegotiation (server property, not per-impl): a client offering an unknown
+# version MUST get a Version Negotiation packet (RFC 9000 §6.1). ngtcp2's --version
+# forces a greased version. Wire-only: the handshake intentionally does not complete
+# (client is pinned to the bad version), so we assert just the VN packet.
+vn_case() { # <trigger_impl> <sport> <pport>
+  local trig=$1 sport=$2 pport=$3 d="$TMP/server/versionnegotiation"; mkdir -p "$d"; local capf="$d/capture.txt"
+  TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  wait_listen "$sp" "$sport" || { bad "versionnegotiation (no server bind)"; stop "$sp"; return; }
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  wait_listen "$px" "$pport" || { bad "versionnegotiation (no proxy bind)"; stop "$sp" "$px"; return; }
+  # Each client offers an unknown version: ngtcp2 via --version, quiche via its
+  # default GREASE wire-version (babababa). Wire-only — the handshake won't complete.
+  case "$trig" in
+    ngtcp2) to 8 "$BIN/ngtcp2-client" -q --download="$d" --exit-on-all-streams-close --version=0x1a2a3a4a \
+              127.0.0.1 "$pport" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1 ;;
+    quiche) to 8 "$BIN/quiche-client" --no-verify --wire-version babababa --http-version HTTP/0.9 \
+              --dump-responses "$d" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1 ;;
+  esac
+  stop "$sp" "$px"
+  if grep -q "s2c VERSION_NEGOTIATION" "$capf" 2>/dev/null; then
+    ok "versionnegotiation [zquic server emits VN; $trig offers unknown version | wire ✓]"
+  else
+    bad "versionnegotiation — zquic did not send a VERSION_NEGOTIATION packet"
+  fi
+}
+
+CASES=()
+while getopts "i:" opt; do case $opt in i) IMPLS=("$OPTARG"); IMPL_SET=1 ;; esac; done
+shift $((OPTIND - 1)); [ $# -gt 0 ] && CASES=("$@")
+
+[ -x "$ZQUIC_SERVER" ] || { echo "build zquic: zig build"; exit 1; }
+[ -x "$PROXY" ] || { echo "missing proxy — run oracle/build-refs.sh"; exit 1; }
+if [ $IMPL_SET -eq 1 ]; then
+  for i in "${IMPLS[@]}"; do impl_ok "$i" || { echo "missing ref $i — run oracle/build-refs.sh"; exit 1; }; done
+else
+  for i in "${ALL_IMPLS[@]}"; do impl_ok "$i" && IMPLS+=("$i"); done
+  [ ${#IMPLS[@]} -gt 0 ] || { echo "no reference impls built — run oracle/build-refs.sh"; exit 1; }
+fi
+
+sel_data=("${DATA_CASES[@]}"); sel_prox=("${PROXIED_CASES[@]}")
+if [ ${#CASES[@]} -gt 0 ]; then
+  sel_data=(); sel_prox=()
+  for c in "${CASES[@]}"; do
+    [ "$c" = versionnegotiation ] && continue # server-property case, run by vn_case below
+    if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
+  done
+fi
+
+cleanup  # pre-clean any stragglers from a prior run
+echo "zquic oracle — impls: ${IMPLS[*]}"
+port=$PORT_BASE
+for impl in "${IMPLS[@]}"; do
+  echo ""; echo "═══ oracle: $impl ═══"
+  for case in "${sel_data[@]}"; do
+    skipped "$impl" "$case" && continue
+    mkdir -p "$TMP/$impl/$case"
+    dp_zquic_server "$impl" "$case" "$port"; port=$((port + 1))
+    dp_zquic_client "$impl" "$case" "$port"; port=$((port + 1))
+  done
+  for case in "${sel_prox[@]}"; do
+    skipped "$impl" "$case" && continue
+    mkdir -p "$TMP/$impl/$case"
+    proxied "$impl" "$case" "$port" "$((port + 1))"; port=$((port + 2))
+  done
+done
+
+# Server-property checks (use ngtcp2's --version). On a full run, or when
+# versionnegotiation is explicitly requested.
+if [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx versionnegotiation; then
+  trig=""; impl_ok ngtcp2 && trig=ngtcp2 || { impl_ok quiche && trig=quiche; }
+  if [ -n "$trig" ]; then
+    echo ""; echo "═══ oracle: server properties ═══"
+    vn_case "$trig" "$port" "$((port + 1))"; port=$((port + 2))
+  fi
+fi
+
+echo ""; echo "─────────────────────────────────"
+echo "TOTAL: $PASS passed, $FAIL failed"
+[ $FAIL -gt 0 ] && { printf '  - %s\n' "${FAILED[@]}"; exit 1; }
+exit 0

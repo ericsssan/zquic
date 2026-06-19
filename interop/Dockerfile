@@ -9,7 +9,7 @@ FROM debian:bookworm-slim AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends wget xz-utils ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ENV ZIG_VERSION=0.16.0-dev.2676+4e2cec265
+ENV ZIG_VERSION=0.17.0-dev.657+2faf8debf
 
 # Auto-detect architecture and download appropriate Zig binary
 RUN set -e; \
@@ -35,6 +35,8 @@ RUN set -e; \
 ENV PATH="/zig:${PATH}"
 
 WORKDIR /build
+# Cache-bust arg must be declared after FROM to invalidate COPY + RUN steps.
+ARG CACHEBUST=1
 COPY . .
 
 RUN set -e; \
@@ -50,6 +52,7 @@ LABEL org.opencontainers.image.title="zquic-interop" \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=builder /build/zig-out/bin/server /server
+COPY --from=builder /build/zig-out/bin/client /client
 COPY interop/run_endpoint.sh /run_endpoint.sh
 
 RUN chmod +x /run_endpoint.sh && mkdir -p /logs /certs

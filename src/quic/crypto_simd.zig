@@ -51,13 +51,13 @@ pub const CachedKeyCtx = union(quic_crypto.CipherSuite) {
     chacha20_poly1305: ChaChaCached,
 
     pub const AesCached = struct {
-        enc: @TypeOf(Aes128.initEnc([_]u8{0} ** 16)),
+        enc: @TypeOf(Aes128.initEnc(@as([16]u8, @splat(0)))),
         hash_key: [16]u8,
 
         pub fn initFromKey(key: [16]u8) AesCached {
             const enc = Aes128.initEnc(key);
             var h: [16]u8 = undefined;
-            enc.encrypt(&h, &([_]u8{0} ** 16));
+            enc.encrypt(&h, &(@as([16]u8, @splat(0))));
             return .{ .enc = enc, .hash_key = h };
         }
     };
@@ -340,7 +340,7 @@ test "CachedAesCtx round-trip with known vector" {
 }
 
 test "batchHpMask produces same result as single hpMask" {
-    const key = [_]u8{0x42} ** 16;
+    const key = @as([16]u8, @splat(0x42));
     const ctx = CachedAesCtx.initFromKey(key);
     const aes = Aes128.initEnc(key);
 
@@ -368,8 +368,8 @@ test "batchHpMask produces same result as single hpMask" {
 }
 
 test "multiDecryptGcm matches std Aes128Gcm" {
-    const key = [_]u8{0xAB} ** 16;
-    const nonce = [_]u8{0xCD} ** 12;
+    const key = @as([16]u8, @splat(0xAB));
+    const nonce = @as([12]u8, @splat(0xCD));
     const aad = [_]u8{ 0x01, 0x02, 0x03, 0x04 };
     const plaintext = "Hello, QUIC zero-copy world!";
 
@@ -390,7 +390,7 @@ test "multiDecryptGcm matches std Aes128Gcm" {
 }
 
 test "multiDecryptGcm 4-wide matches std" {
-    const key = [_]u8{0x55} ** 16;
+    const key = @as([16]u8, @splat(0x55));
     const ctx = CachedAesCtx.initFromKey(key);
 
     // Create 4 different messages, encrypt each with std
@@ -407,7 +407,7 @@ test "multiDecryptGcm 4-wide matches std" {
     var aad_slices: [4][]const u8 = undefined;
 
     for (0..4) |i| {
-        nonces[i] = [_]u8{@intCast(i)} ** 12;
+        nonces[i] = @as([12]u8, @splat(@intCast(i)));
         aad_bufs[i] = .{ @intCast(i), 0, 0, 0 };
         aad_slices[i] = &aad_bufs[i];
 
@@ -425,7 +425,7 @@ test "multiDecryptGcm 4-wide matches std" {
     }
 
     // Decrypt all 4 with multi-buffer
-    var results: [4]DecryptStatus = .{.pending} ** 4;
+    var results: [4]DecryptStatus = @splat(.pending);
     multiDecryptGcm(4, ctx, nonces, aad_slices, payload_slices, &results);
 
     for (0..4) |i| {
@@ -435,9 +435,9 @@ test "multiDecryptGcm 4-wide matches std" {
 }
 
 test "multiDecryptGcm detects tampered ciphertext" {
-    const key = [_]u8{0x77} ** 16;
+    const key = @as([16]u8, @splat(0x77));
     const ctx = CachedAesCtx.initFromKey(key);
-    const nonce = [_]u8{0x88} ** 12;
+    const nonce = @as([12]u8, @splat(0x88));
     const aad = [_]u8{0};
     const msg = "tamper test";
 

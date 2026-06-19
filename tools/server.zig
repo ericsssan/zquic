@@ -43,7 +43,7 @@ const ConnSlot = struct {
     peer_addr: ?net.IpAddress = null,
     /// True when the most recent packet arrived on the CM socket.
     use_cm_sock: bool = false,
-    transfers: [MAX_TRANSFERS]FileTransfer = [_]FileTransfer{.{}} ** MAX_TRANSFERS,
+    transfers: [MAX_TRANSFERS]FileTransfer = @as([MAX_TRANSFERS]FileTransfer, @splat(.{})),
     /// Parsed requests deferred because all transfer slots were occupied.
     /// Retried at the start of each flushTransfers() pass.
     pending: [MAX_TRANSFERS]PendingTransfer = undefined,
@@ -132,9 +132,8 @@ fn allocateSlot(slots: *[MAX_CONNS]?*ConnSlot, config: quic.Config, io: std.Io) 
         if (s_opt.* == null) {
             const slot = try page_allocator.create(ConnSlot);
             errdefer page_allocator.destroy(slot);
-            slot.* = .{
-                .conn = try Conn.accept(config, io),
-            };
+            slot.* = .{ .conn = undefined };
+            try slot.conn.acceptInto(config, io); // init in place — no stack temp (#3)
             s_opt.* = slot;
             return slot;
         }
@@ -309,7 +308,7 @@ pub fn main(init: std.process.Init) !void {
         // RFC 9000 §18.2.3: advertise preferred IPv4+IPv6 addresses for migration.
         .preferred_addr_ipv4 = if (is_cm) CM_IPV4 else null,
         .preferred_addr_ipv4_port = if (is_cm) CM_PORT else 0,
-        .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else [_]u8{0} ** 16,
+        .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else @as([16]u8, @splat(0)),
         .preferred_addr_ipv6_port = if (is_cm) CM_PORT else 0,
         .ticket_key = &ticket_key,
     };
@@ -342,7 +341,7 @@ pub fn main(init: std.process.Init) !void {
     const send_bufs: *SendBufs = &send_bufs_storage;
 
     // Connection table: array of nullable pointers (heap-allocated).
-    var conn_slots: [MAX_CONNS]?*ConnSlot = [_]?*ConnSlot{null} ** MAX_CONNS;
+    var conn_slots: [MAX_CONNS]?*ConnSlot = @as([MAX_CONNS]?*ConnSlot, @splat(null));
 
     // Stable pointer to CM socket (if active) for passing to functions.
     const cm_sock_ptr: ?*const net.Socket = if (cm_sock) |*s| s else null;
@@ -907,23 +906,32 @@ fn startTransferH3(slot: *ConnSlot, stream_id: u62, www: []const u8, io: std.Io)
         }
     }.do;
 
-    // Parse H3 HEADERS frame directly from ring buffer (zero copy).
-    const hdr = http3.frame.parseHeader(req_data) catch {
+    // Find the request's HEADERS frame, skipping any leading frames we must
+    // ignore: GREASE / reserved / unknown frame types (RFC 9114 §7.2.8, §9).
+    // quiche, for one, prepends GREASE frames before the request HEADERS.
+    var frame_off: usize = 0;
+    var hdr = http3.frame.parseHeader(req_data[frame_off..]) catch {
         release(st, is_inline, req_data.len);
         return;
     };
-    if (hdr.frame_type != http3.FrameType.headers) {
-        release(st, is_inline, req_data.len);
-        return;
+    while (hdr.frame_type != http3.FrameType.headers) {
+        const fend = frame_off + hdr.header_len + @as(usize, @intCast(hdr.payload_len));
+        if (fend >= req_data.len) return; // HEADERS not buffered yet — wait for more
+        frame_off = fend;
+        hdr = http3.frame.parseHeader(req_data[frame_off..]) catch {
+            release(st, is_inline, req_data.len);
+            return;
+        };
     }
-    const block_end = hdr.header_len + @as(usize, @intCast(hdr.payload_len));
+    const block_start = frame_off + hdr.header_len;
+    const block_end = block_start + @as(usize, @intCast(hdr.payload_len));
     if (block_end > req_data.len) return; // incomplete, wait for more data
 
     // QPACK decode (static-only) directly from ring buffer.
     var fields: [64]qpack.Field = undefined;
     var strings: [4096]u8 = undefined;
     const fc = qpack.decoder.decode(
-        req_data[hdr.header_len..block_end],
+        req_data[block_start..block_end],
         &fields,
         &strings,
         null,
@@ -1032,7 +1040,7 @@ fn configureEcn(sock: *const net.Socket) !void {
     // Enable ECT(0) marking on outgoing IPv4 packets: IP_TOS with ECT(0)=0x02
     // ECT(0) = 0b0000 0010 in DSCP/ECN bits (RFC 3168)
     const tos_value: c_int = 0x02; // ECT(0)
-    var tos_bytes = std.mem.asBytes(&tos_value);
+    const tos_bytes = std.mem.asBytes(&tos_value);
     const tos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_TOS, tos_bytes.ptr, @sizeOf(c_int));
     if (tos_result < 0) {
         const err = @as(i32, @intCast(-tos_result));
@@ -1041,7 +1049,7 @@ fn configureEcn(sock: *const net.Socket) !void {
 
     // Enable receiving IPv4 ECN bits: IP_RECVTOS
     const recvtos_value: c_int = 1;
-    var recvtos_bytes = std.mem.asBytes(&recvtos_value);
+    const recvtos_bytes = std.mem.asBytes(&recvtos_value);
     const recvtos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_RECVTOS, recvtos_bytes.ptr, @sizeOf(c_int));
     if (recvtos_result < 0) {
         const err = @as(i32, @intCast(-recvtos_result));
@@ -1050,7 +1058,7 @@ fn configureEcn(sock: *const net.Socket) !void {
 
     // Enable ECT(0) marking on outgoing IPv6 packets: IPV6_TCLASS
     const tclass_value: c_int = 0x02; // ECT(0)
-    var tclass_bytes = std.mem.asBytes(&tclass_value);
+    const tclass_bytes = std.mem.asBytes(&tclass_value);
     const tclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_TCLASS, tclass_bytes.ptr, @sizeOf(c_int));
     if (tclass_result < 0) {
         const err = @as(i32, @intCast(-tclass_result));
@@ -1059,7 +1067,7 @@ fn configureEcn(sock: *const net.Socket) !void {
 
     // Enable receiving IPv6 ECN bits: IPV6_RECVTCLASS
     const recvtclass_value: c_int = 1;
-    var recvtclass_bytes = std.mem.asBytes(&recvtclass_value);
+    const recvtclass_bytes = std.mem.asBytes(&recvtclass_value);
     const recvtclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_RECVTCLASS, recvtclass_bytes.ptr, @sizeOf(c_int));
     if (recvtclass_result < 0) {
         const err = @as(i32, @intCast(-recvtclass_result));
@@ -1112,7 +1120,7 @@ fn computeTimeout(deadline: ?i64) std.Io.Timeout {
 /// with all generations up to current. Called immediately after key rotation
 /// to ensure Wireshark can decrypt packets before connection closes.
 fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
-    const tls = &conn.tls_state;
+    const tls = &conn.tls_state.server;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
@@ -1145,7 +1153,7 @@ fn updateKeyLog(conn: *const Conn, io: std.Io, _: u32) void {
 /// (the path the interop runner expects for server logs).
 /// Writes initial secrets at handshake, then appends rotated secrets dynamically.
 fn writeKeyLog(conn: *const Conn, io: std.Io) void {
-    const tls = &conn.tls_state;
+    const tls = &conn.tls_state.server;
     const random_hex = std.fmt.bytesToHex(tls.client_random, .lower);
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;

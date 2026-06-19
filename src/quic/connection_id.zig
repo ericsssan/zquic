@@ -8,9 +8,9 @@ const std = @import("std");
 pub const len: usize = 8;
 
 pub const ConnectionId = struct {
-    bytes: [len]u8 = [_]u8{0} ** len,
+    bytes: [len]u8 = @as([len]u8, @splat(0)),
 
-    pub const zero: ConnectionId = .{ .bytes = [_]u8{0} ** len };
+    pub const zero: ConnectionId = .{ .bytes = @as([len]u8, @splat(0)) };
 
     /// Generate a random CID tagged with `thread_id` in the first byte.
     /// Uses `io.random` for cryptographically strong randomness.

@@ -222,7 +222,7 @@ test "connection: processAck uses packet epoch not connection epoch" {
     const ack = frame.AckFrame{
         .largest_acked = 1,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 1 }} ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -612,7 +612,7 @@ test "close: closing state discards incoming packets (returns early)" {
     conn.current_time_ns = 0;
 
     // Feed a dummy packet — should not panic and connection stays closing.
-    var dummy = [_]u8{0x00} ** 10;
+    var dummy = @as([10]u8, @splat(0x00));
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
     conn.receive(&dummy, src, 0, 0, io) catch {};
     try testing.expectEqual(ConnState.closing, conn.hot.state);
@@ -626,7 +626,7 @@ test "close: receive refreshes idle_deadline on active connection" {
     conn.idle_deadline_ns = 500;
 
     // Feed a (malformed but non-empty) packet at time 1000.
-    var dummy = [_]u8{0x00} ** 5;
+    var dummy = @as([5]u8, @splat(0x00));
     const src: SocketAddr = .{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 9000 } };
     conn.receive(&dummy, src, 1_000_000_000, 0, io) catch {};
 
@@ -780,7 +780,7 @@ test "security: processAck malformed ack_range returns InvalidFrame" {
         .largest_acked = 2,
         .ack_delay = 0,
         .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 10 }} // 10 > largest_acked=2
-        ++ [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 31,
+        ++ @as([31]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -799,7 +799,7 @@ test "security: processAck malformed gap returns InvalidFrame" {
 
     // Two ranges: first [10..10], gap=100 (too large), second [0..0].
     // After first range: low=10, high=10.  gap=100 >= low=10 → underflow guard.
-    var ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32;
+    var ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 }));
     ranges[0] = .{ .gap = 0, .ack_range = 0 }; // first range: [10..10]
     ranges[1] = .{ .gap = 100, .ack_range = 0 }; // gap 100 >= low 10 → underflow
     const ack = frame.AckFrame{
@@ -983,7 +983,7 @@ test "loss: multi-packet loss triggers single congestion event" {
     const ack = frame.AckFrame{
         .largest_acked = 10,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -1173,7 +1173,7 @@ test "connection: Version Negotiation DCID echoes full client SCID (RFC 9000 §6
 
     // Build a raw long-header packet with an unknown version and a 12-byte SCID.
     const unknown_version: u32 = 0xDEADBEEF;
-    const client_dcid = [_]u8{0x11} ** 8;
+    const client_dcid = @as([8]u8, @splat(0x11));
     const client_scid = [_]u8{ 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06 }; // 12 bytes
     var raw: [64]u8 = undefined;
     var pos: usize = 0;
@@ -1222,8 +1222,8 @@ test "connection: deinit zeroes all key material" {
 
     // Populate key fields with non-zero values.
     const dummy_keys = tls.AppKeys{
-        .client = .{ .key = [_]u8{0xAB} ** 32, .iv = [_]u8{0xCD} ** 12, .hp = [_]u8{0xEF} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0xAB} ** 32, .iv = [_]u8{0xCD} ** 12, .hp = [_]u8{0xEF} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0xAB)), .iv = @as([12]u8, @splat(0xCD)), .hp = @as([32]u8, @splat(0xEF)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0xAB)), .iv = @as([12]u8, @splat(0xCD)), .hp = @as([32]u8, @splat(0xEF)), .suite = .aes_128_gcm },
     };
     conn.app_keys = dummy_keys;
     conn.next_app_keys = dummy_keys;
@@ -1239,8 +1239,8 @@ test "connection: deinit zeroes all key material" {
     try testing.expectEqual(@as(?tls.AppKeys, null), conn.next_app_keys);
     try testing.expectEqual(@as(?tls.HandshakeKeys, null), conn.hs_keys);
     // next_client_secret and next_server_secret must be zero.
-    try testing.expectEqual([_]u8{0} ** 32, conn.next_client_secret);
-    try testing.expectEqual([_]u8{0} ** 32, conn.next_server_secret);
+    try testing.expectEqual(@as([32]u8, @splat(0)), conn.next_client_secret);
+    try testing.expectEqual(@as([32]u8, @splat(0)), conn.next_server_secret);
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,7 +1256,7 @@ test "connection: alt_local_cid is distinct from primary local_cid" {
     const conn = try Connection(16).accept(.{}, io);
 
     // The alt CID must not be all-zero (it's randomly generated).
-    try testing.expect(!std.mem.eql(u8, &conn.alt_local_cid.bytes, &[_]u8{0} ** 8));
+    try testing.expect(!std.mem.eql(u8, &conn.alt_local_cid.bytes, &@as([8]u8, @splat(0))));
     // The two CIDs must differ so tshark session tracking benefits from the extra CID.
     try testing.expect(!std.mem.eql(u8, &conn.local_cid.bytes, &conn.alt_local_cid.bytes));
 }

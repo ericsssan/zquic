@@ -17,9 +17,9 @@ const Conn = Connection(16);
 fn setupEstablished(conn: *Conn) void {
     conn.hot.state = .established;
     const k = crypto.PacketKeys{
-        .key = [_]u8{0x01} ** 32,
-        .iv = [_]u8{0x02} ** 12,
-        .hp = [_]u8{0x03} ** 32,
+        .key = @as([32]u8, @splat(0x01)),
+        .iv = @as([12]u8, @splat(0x02)),
+        .hp = @as([32]u8, @splat(0x03)),
         .suite = .aes_128_gcm,
     };
     conn.app_keys = tls_mod.AppKeys{ .client = k, .server = k };
@@ -89,7 +89,7 @@ test "sent table: different epochs use different indices — no cross-epoch evic
 test "sent table: same-epoch never collides for pn < region size" {
     const MAX_SENT = loss_recovery_mod.MAX_SENT;
     for (0..3) |epoch| {
-        var seen = [_]bool{false} ** MAX_SENT;
+        var seen = @as([MAX_SENT]bool, @splat(false));
         for (0..loss_recovery_mod.SentPacketTable.EPOCH_SIZES[epoch]) |pn| {
             const idx = loss_recovery_mod.SentPacketTable.slotIndex(@intCast(pn), @intCast(epoch));
             if (seen[idx]) return error.TestUnexpectedResult;
@@ -172,7 +172,7 @@ test "time-loss alarm fires for STREAM pkn with sub-threshold gap" {
         fi.count = 0;
         _ = conn.sendShortHeaderPacket(n, fi, false) catch {};
     }
-    conn.streamSend(0, &([_]u8{0xFF} ** 200), true) catch return error.TestUnexpectedResult;
+    conn.streamSend(0, &(@as([200]u8, @splat(0xFF))), true) catch return error.TestUnexpectedResult;
     conn.queuePing() catch {};
     conn.queuePing() catch {};
 
@@ -219,7 +219,7 @@ test "full retransmission lifecycle: loss → retransmit → PTO → re-probe" {
         fi.count = 0;
         _ = conn.sendShortHeaderPacket(n, fi, false) catch {};
     }
-    conn.streamSend(0, &([_]u8{0xFF} ** 200), true) catch return error.TestUnexpectedResult;
+    conn.streamSend(0, &(@as([200]u8, @splat(0xFF))), true) catch return error.TestUnexpectedResult;
     conn.queuePing() catch {};
     conn.queuePing() catch {};
 
@@ -264,11 +264,11 @@ test "PTO skips Initial retransmit when hs_keys exist to preserve budget for Han
     conn.bytes_unvalidated_recv = 1200;
     conn.bytes_unvalidated_sent = 3400; // only 200 bytes remaining
 
-    const initial_data = [_]u8{0xAA} ** 90;
+    const initial_data = @as([90]u8, @splat(0xAA));
     conn.crypto_send_saved_len[0] = initial_data.len;
     @memcpy(conn.crypto_send_saved[0][0..initial_data.len], &initial_data);
 
-    const hs_data = [_]u8{0xBB} ** 693;
+    const hs_data = @as([693]u8, @splat(0xBB));
     conn.crypto_send_saved_len[1] = hs_data.len;
     @memcpy(conn.crypto_send_saved[1][0..hs_data.len], &hs_data);
 
@@ -297,7 +297,7 @@ test "zombie connection: pkts_recv == 0 after failed receive" {
     try testing.expect(conn.hot.state == .idle);
 
     const dummy_addr = conn_mod.SocketAddr{ .v4 = .{ .addr = .{ 127, 0, 0, 1 }, .port = 443 } };
-    var bad_data = [_]u8{0xC0} ++ [_]u8{0} ** 99;
+    var bad_data = [_]u8{0xC0} ++ @as([99]u8, @splat(0));
     conn.receive(&bad_data, dummy_addr, 1_000_000_000, 0, io) catch {};
 
     try testing.expectEqual(@as(u64, 0), conn.pkts_recv);
@@ -339,7 +339,7 @@ test "processLostFrames retransmits STREAM directly when send queue has space" {
     setupEstablished(&conn);
     conn.current_time_ns = 1_000_000_000;
 
-    conn.streamSend(0, &([_]u8{0xAA} ** 100), true) catch return error.TestUnexpectedResult;
+    conn.streamSend(0, &(@as([100]u8, @splat(0xAA))), true) catch return error.TestUnexpectedResult;
     var buf: [1500]u8 = undefined;
     while (conn.send(&buf, 0) > 0) {}
 
@@ -380,7 +380,7 @@ test "pending stream retransmit arms PTO when drained via tick" {
     conn.stream_pending_retx_count = 1;
     const st = conn.streams.getOrCreate(0) orelse return error.TestUnexpectedResult;
     st.send_max = 1_000_000;
-    _ = st.bufferSendData(&([_]u8{0xBB} ** 50));
+    _ = st.bufferSendData(&(@as([50]u8, @splat(0xBB))));
 
     conn.pto_deadline_ns = null;
     conn.pmtud_next_probe_ns = t0 + 999_000_000_000;
@@ -404,7 +404,7 @@ test "processShortHeaderPacket silently drops when app_keys is null" {
     var fake_short: [64]u8 = undefined;
     @memset(&fake_short, 0);
     fake_short[0] = 0x40;
-    const consumed = conn.processShortHeaderPacket(&fake_short) catch 0;
+    const consumed = conn.processShortHeaderPacket(&fake_short, io) catch 0;
     try testing.expectEqual(@as(usize, 0), consumed);
 }
 

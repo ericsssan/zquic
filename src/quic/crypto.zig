@@ -120,9 +120,9 @@ pub fn derivePacketKeys(secret: [32]u8, version: u32) PacketKeys {
 /// Derive key/iv/hp for a specific cipher suite.
 pub fn derivePacketKeysWithSuite(secret: [32]u8, version: u32, suite: CipherSuite) PacketKeys {
     var keys: PacketKeys = .{
-        .key = [_]u8{0} ** 32,
+        .key = @as([32]u8, @splat(0)),
         .iv = undefined,
-        .hp = [_]u8{0} ** 32,
+        .hp = @as([32]u8, @splat(0)),
         .suite = suite,
     };
     const is_v2 = version == packet.QUIC_VERSION_2;
@@ -371,7 +371,7 @@ fn hpMask(keys: PacketKeys, sample: *const [16]u8) [5]u8 {
             const counter = std.mem.readInt(u32, sample[0..4], .little);
             const nonce = sample[4..16].*;
             var mask: [5]u8 = undefined;
-            const zeros = [_]u8{0} ** 5;
+            const zeros = @as([5]u8, @splat(0));
             ChaCha20IETF.xor(&mask, &zeros, counter, keys.hp, nonce);
             return mask;
         },
@@ -470,6 +470,93 @@ test "crypto: RFC 9001 A — server key/iv/hp" {
     try testing.expectEqualSlices(u8, &expected_hp, keys.server.hp[0..16]);
 }
 
+test "crypto: RFC 9001 A.2 — AES header protection (client Initial)" {
+    const testing = std.testing;
+    const ck = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1).client;
+    // RFC 9001 A.2: 16-byte sample taken from the protected payload.
+    const sample = [_]u8{
+        0xd1, 0xb1, 0xc9, 0x8d, 0xd7, 0x68, 0x9f, 0xb8,
+        0xec, 0x11, 0xd2, 0x42, 0xb1, 0x23, 0xdc, 0x9b,
+    };
+    // Unprotected: long header, 4-byte PN encoding (0xc3), packet number 2.
+    var first_byte: u8 = 0xc3;
+    var pn_bytes = [_]u8{ 0x00, 0x00, 0x00, 0x02 };
+    applyHeaderProtection(ck, &first_byte, &pn_bytes, &sample);
+    // RFC 9001 A.2 protected header = c0...449e 7b9aec34.
+    try testing.expectEqual(@as(u8, 0xc0), first_byte);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x7b, 0x9a, 0xec, 0x34 }, &pn_bytes);
+}
+
+// RFC 9001 A.5 application traffic secret for the ChaCha20-Poly1305 example.
+const a5_secret = [_]u8{
+    0x9a, 0xc3, 0x12, 0xa7, 0xf8, 0x77, 0x46, 0x8e,
+    0xbe, 0x69, 0x42, 0x27, 0x48, 0xad, 0x00, 0xa1,
+    0x54, 0x43, 0xf1, 0x82, 0x03, 0xa0, 0x7d, 0x60,
+    0x60, 0xf6, 0x88, 0xf3, 0x0f, 0x21, 0x63, 0x2b,
+};
+const a5_key = [_]u8{
+    0xc6, 0xd9, 0x8f, 0xf3, 0x44, 0x1c, 0x3f, 0xe1,
+    0xb2, 0x18, 0x20, 0x94, 0xf6, 0x9c, 0xaa, 0x2e,
+    0xd4, 0xb7, 0x16, 0xb6, 0x54, 0x88, 0x96, 0x0a,
+    0x7a, 0x98, 0x49, 0x79, 0xfb, 0x23, 0xe1, 0xc8,
+};
+const a5_iv = [_]u8{ 0xe0, 0x45, 0x9b, 0x34, 0x74, 0xbd, 0xd0, 0xe4, 0x4a, 0x41, 0xc1, 0x44 };
+const a5_hp = [_]u8{
+    0x25, 0xa2, 0x82, 0xb9, 0xe8, 0x2f, 0x06, 0xf2,
+    0x1f, 0x48, 0x89, 0x17, 0xa4, 0xfc, 0x8f, 0x1b,
+    0x73, 0x57, 0x36, 0x85, 0x60, 0x85, 0x97, 0xd0,
+    0xef, 0xcb, 0x07, 0x6b, 0x0a, 0xb7, 0xa7, 0xa4,
+};
+
+test "crypto: RFC 9001 A.5 — ChaCha20 key/iv/hp from secret" {
+    const testing = std.testing;
+    const keys = derivePacketKeysWithSuite(a5_secret, packet.QUIC_VERSION_1, .chacha20_poly1305);
+    try testing.expectEqualSlices(u8, &a5_key, &keys.key);
+    try testing.expectEqualSlices(u8, &a5_iv, &keys.iv);
+    try testing.expectEqualSlices(u8, &a5_hp, &keys.hp);
+}
+
+test "crypto: RFC 9001 A.5 — ChaCha20 short-header packet protection" {
+    const testing = std.testing;
+    const keys = PacketKeys{ .key = a5_key, .iv = a5_iv, .hp = a5_hp, .suite = .chacha20_poly1305 };
+
+    // Short header, 3-byte PN encoding; packet number 654360564; PING frame.
+    const pn: u64 = 654360564;
+    const header = [_]u8{ 0x42, 0x00, 0xbf, 0xf4 }; // unprotected header (AEAD AAD)
+    const plaintext = [_]u8{0x01};
+
+    // AEAD: ciphertext+tag must match RFC A.5 exactly.
+    var ct: [plaintext.len + 16]u8 = undefined;
+    encryptPayload(keys, pn, &header, &plaintext, &ct);
+    const expected_ct = [_]u8{
+        0x65, 0x5e, 0x5c, 0xd5, 0x5c, 0x41, 0xf6, 0x90,
+        0x80, 0x57, 0x5d, 0x79, 0x99, 0xc2, 0x5a, 0x5b,
+        0xfb,
+    };
+    try testing.expectEqualSlices(u8, &expected_ct, &ct);
+
+    // Header protection: sample starts at PN_offset+4. PN is 3 bytes, so skip 1
+    // ciphertext byte. sample = ct[1..17].
+    var first_byte: u8 = header[0];
+    var pn_bytes = [_]u8{ header[1], header[2], header[3] };
+    const sample: [16]u8 = ct[1..17].*;
+    applyHeaderProtection(keys, &first_byte, &pn_bytes, &sample);
+    try testing.expectEqual(@as(u8, 0x4c), first_byte);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0xfe, 0x41, 0x89 }, &pn_bytes);
+
+    // Full protected packet == RFC A.5 (21 bytes).
+    var pkt: [21]u8 = undefined;
+    pkt[0] = first_byte;
+    @memcpy(pkt[1..4], &pn_bytes);
+    @memcpy(pkt[4..21], &ct);
+    const expected_pkt = [_]u8{
+        0x4c, 0xfe, 0x41, 0x89, 0x65, 0x5e, 0x5c, 0xd5,
+        0x5c, 0x41, 0xf6, 0x90, 0x80, 0x57, 0x5d, 0x79,
+        0x99, 0xc2, 0x5a, 0x5b, 0xfb,
+    };
+    try testing.expectEqualSlices(u8, &expected_pkt, &pkt);
+}
+
 test "crypto: encrypt-decrypt round-trip" {
     const testing = std.testing;
     const keys = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1);
@@ -489,7 +576,7 @@ test "crypto: encrypt-decrypt round-trip" {
 
 test "crypto: decryptPayload short buffer (< tag_length) returns TooShort" {
     const ck = deriveInitialKeys(&test_dcid, packet.QUIC_VERSION_1).client;
-    const short: [15]u8 = .{0} ** 15; // one byte short of the 16-byte tag
+    const short: [15]u8 = @splat(0); // one byte short of the 16-byte tag
     var out: [0]u8 = .{};
     try std.testing.expectError(error.TooShort, decryptPayload(ck, 0, &.{}, &short, &out));
 }
@@ -512,9 +599,9 @@ test "crypto: decryptPayload with corrupted authentication tag returns error" {
 }
 
 test "crypto: applyHeaderProtection is self-inverse (XOR involution)" {
-    var hp32: [32]u8 = [_]u8{0} ** 32;
+    var hp32: [32]u8 = @as([32]u8, @splat(0));
     @memcpy(hp32[0..16], &[_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 });
-    const keys = PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = hp32, .suite = .aes_128_gcm };
+    const keys = PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = hp32, .suite = .aes_128_gcm };
     // Use a non-zero sample to get a non-trivial mask
     const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
     var first_byte: u8 = 0xC3; // long header (bit 7 = 1)
@@ -534,10 +621,10 @@ test "crypto: applyHeaderProtection is self-inverse (XOR involution)" {
 
 test "crypto: removeHeaderProtection handles all pn_len values (1-4)" {
     const testing = std.testing;
-    var hp32: [32]u8 = [_]u8{0} ** 32;
+    var hp32: [32]u8 = @as([32]u8, @splat(0));
     const hp16 = [_]u8{ 0x9f, 0x50, 0x44, 0x9e, 0x04, 0xa0, 0xe8, 0x10, 0x28, 0x3a, 0x1e, 0x99, 0x33, 0xad, 0xed, 0xd2 };
     @memcpy(hp32[0..16], &hp16);
-    const keys = PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = hp32, .suite = .aes_128_gcm };
+    const keys = PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = hp32, .suite = .aes_128_gcm };
     const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
 
     // Compute actual mask using AES
@@ -738,7 +825,7 @@ test "crypto: RFC 9369 — v2 client key/iv/hp derived correctly" {
 
 test "crypto: ChaCha20-Poly1305 encrypt-decrypt round-trip" {
     const testing = std.testing;
-    const secret = [_]u8{0x42} ** 32;
+    const secret = @as([32]u8, @splat(0x42));
     const keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .chacha20_poly1305);
     try testing.expectEqual(CipherSuite.chacha20_poly1305, keys.suite);
 
@@ -756,7 +843,7 @@ test "crypto: ChaCha20-Poly1305 encrypt-decrypt round-trip" {
 
 test "crypto: ChaCha20-Poly1305 header protection round-trip" {
     const testing = std.testing;
-    const secret = [_]u8{0x42} ** 32;
+    const secret = @as([32]u8, @splat(0x42));
     const keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .chacha20_poly1305);
 
     const sample = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
@@ -777,7 +864,7 @@ test "crypto: ChaCha20-Poly1305 header protection round-trip" {
 
 test "crypto: ChaCha20 keys differ from AES keys for same secret" {
     const testing = std.testing;
-    const secret = [_]u8{0x42} ** 32;
+    const secret = @as([32]u8, @splat(0x42));
     const aes_keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .aes_128_gcm);
     const cc_keys = derivePacketKeysWithSuite(secret, packet.QUIC_VERSION_1, .chacha20_poly1305);
     // Suite must be recorded correctly.

@@ -23,7 +23,7 @@ pub fn main() void {
     std.debug.print("\n", .{});
 
     // Initialize base secret (simulating TLS handshake derived secret)
-    const base_secret = [_]u8{0xaa} ** 32;
+    const base_secret = @as([32]u8, @splat(0xaa));
     const version = packet.QUIC_VERSION_1;
 
     // GENERATION 0: Initial application secret

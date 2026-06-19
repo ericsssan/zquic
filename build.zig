@@ -63,11 +63,36 @@ pub fn build(b: *std.Build) void {
         .name = "server",
         .root_module = server_mod,
     });
+    // The Connection is heap-constructed via acceptInto/connectInto (#3), so the
+    // by-value return temporary is gone. ReleaseSafe (what interop uses) needs no
+    // large stack. Debug doesn't elide the Self struct-literal materialization, so
+    // keep modest headroom for native Debug runs (was 256 MB before the fix).
+    server.stack_size = 16 * 1024 * 1024;
     b.installArtifact(server);
     const run_server = b.addRunArtifact(server);
-    if (b.args) |args| run_server.addArgs(args);
+    run_server.addPassthruArgs();
     const server_step = b.step("run-server", "Run interop server (default port 4433)");
     server_step.dependOn(&run_server.step);
+
+    // Interop client
+    const client_mod = b.createModule(.{
+        .root_source_file = b.path("tools/client.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    client_mod.addImport("zquic", zquic_mod);
+    client_mod.addImport("http3", http3_mod);
+    client_mod.addImport("qpack", qpack_mod);
+    const client = b.addExecutable(.{
+        .name = "client",
+        .root_module = client_mod,
+    });
+    client.stack_size = 16 * 1024 * 1024; // see server.stack_size note (#3)
+    b.installArtifact(client);
+    const run_client = b.addRunArtifact(client);
+    run_client.addPassthruArgs();
+    const client_step = b.step("run-client", "Run interop client");
+    client_step.dependOn(&run_client.step);
 
     // Key rotation verification tool
     const verify_mod = b.createModule(.{
@@ -85,6 +110,41 @@ pub fn build(b: *std.Build) void {
     const verify_step = b.step("verify-key-rotation", "Run key rotation verification");
     verify_step.dependOn(&run_verify.step);
 
+    // Throughput benchmark
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    bench_mod.addImport("zquic", zquic_mod);
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    bench.stack_size = 64 * 1024 * 1024; // Connection(16) is ~2.2MB
+    b.installArtifact(bench);
+    const run_bench = b.addRunArtifact(bench);
+    const bench_step = b.step("bench", "Run throughput benchmark");
+    bench_step.dependOn(&run_bench.step);
+
+    // Micro-benchmarks (macOS only — uses mach_absolute_time)
+    if (target.result.os.tag == .macos) {
+        const microbench_mod = b.createModule(.{
+            .root_source_file = b.path("tools/microbench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        });
+        microbench_mod.addImport("zquic", zquic_mod);
+        const microbench = b.addExecutable(.{
+            .name = "microbench",
+            .root_module = microbench_mod,
+        });
+        b.installArtifact(microbench);
+        const run_microbench = b.addRunArtifact(microbench);
+        const microbench_step = b.step("microbench", "Run micro-benchmarks");
+        microbench_step.dependOn(&run_microbench.step);
+    }
+
     // Per-module unit tests
     const test_step = b.step("test", "Run unit tests");
     const test_files = [_][]const u8{
@@ -99,6 +159,7 @@ pub fn build(b: *std.Build) void {
         "src/quic/congestion/cubic.zig",
         "src/quic/congestion/bbr.zig",
         "src/quic/congestion/common.zig",
+        "src/quic/congestion/cc_test_harness.zig",
         "src/quic/transport_params.zig",
         "src/quic/loss_recovery.zig",
         "src/quic/tls.zig",
@@ -111,6 +172,10 @@ pub fn build(b: *std.Build) void {
         "src/quic/connection_test_handshakecorruption.zig",
         "src/quic/fuzz.zig",
         "src/quic/connection_test_resumption.zig",
+        "src/quic/tls_client.zig",
+        "src/quic/test_harness.zig",
+        "src/quic/netsim.zig",
+        "src/quic/integration_test.zig",
         "tools/pem.zig",
     };
 

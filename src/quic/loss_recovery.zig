@@ -50,7 +50,7 @@ pub const FrameInfo = union(enum) {
 };
 
 pub const SentFrameInfo = struct {
-    frames: [MAX_FRAMES_PER_PACKET]FrameInfo = .{.none} ** MAX_FRAMES_PER_PACKET,
+    frames: [MAX_FRAMES_PER_PACKET]FrameInfo = @splat(.none),
     count: u8 = 0,
 };
 
@@ -427,7 +427,7 @@ pub const LossRecovery = struct {
             .rtt = .{},
             .sent = SentPacketTable.init(),
             .bytes_in_flight = 0,
-            .largest_acked = [_]u64{0} ** 3,
+            .largest_acked = @as([3]u64, @splat(0)),
             .last_ack_eliciting_ns = null,
             .pto_count = 0,
             .delivery = .{},

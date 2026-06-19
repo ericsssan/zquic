@@ -36,6 +36,23 @@ SKIP_BUILD=false
 SKIP_CLONE=false
 CLIENTS="all"  # Default: run all clients
 
+# Use the quic-interop-runner venv if it exists (has all deps + Python 3.10+),
+# otherwise fall back to any system Python 3.10+.
+if [ -x "$INTEROP_DIR/.venv/bin/python3" ]; then
+    _TMPBIN="$(mktemp -d)"
+    ln -s "$INTEROP_DIR/.venv/bin/python3" "$_TMPBIN/python3"
+    export PATH="$_TMPBIN:$PATH"
+else
+    for _py in python3.13 python3.12 python3.11 python3.10; do
+        if command -v "$_py" &>/dev/null && "$_py" -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" 2>/dev/null; then
+            _TMPBIN="$(mktemp -d)"
+            ln -s "$(command -v "$_py")" "$_TMPBIN/python3"
+            export PATH="$_TMPBIN:$PATH"
+            break
+        fi
+    done
+fi
+
 print_header() {
     echo -e "${BLUE}${BOLD}═══════════════════════════════════════════════════════════════════${NC}"
     echo -e "${BLUE}${BOLD}    ZQUIC COMPREHENSIVE INTEROPERABILITY TEST AUTOMATION${NC}"

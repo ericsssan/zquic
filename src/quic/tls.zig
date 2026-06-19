@@ -18,6 +18,9 @@ const std = @import("std");
 const crypto = @import("crypto.zig");
 const packet_mod = @import("packet.zig");
 const transport_params = @import("transport_params.zig");
+const tls_client = @import("tls_client.zig");
+pub const TlsClient = tls_client.TlsClient;
+pub const SessionTicket = tls_client.SessionTicket;
 const HkdfSha256 = std.crypto.kdf.hkdf.HkdfSha256;
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -99,6 +102,97 @@ pub const TlsState = enum(u8) {
     error_state,
 };
 
+// ---------------------------------------------------------------------------
+// TlsRole — tagged union for server/client TLS state machines
+// ---------------------------------------------------------------------------
+
+pub const TlsRole = union(enum) {
+    server: TlsServer,
+    client: TlsClient,
+
+    pub fn processCrypto(self: *TlsRole, data: []const u8, out: []u8, io: std.Io) !usize {
+        switch (self.*) {
+            inline else => |*s| return s.processCrypto(data, out, io),
+        }
+    }
+
+    pub fn isComplete(self: *const TlsRole) bool {
+        switch (self.*) {
+            inline else => |*s| return s.isComplete(),
+        }
+    }
+
+    pub fn deinit(self: *TlsRole) void {
+        switch (self.*) {
+            inline else => |*s| s.deinit(),
+        }
+    }
+
+    pub fn peerTransportParams(self: *const TlsRole) transport_params.TransportParams {
+        switch (self.*) {
+            inline else => |*s| return s.peerTransportParams(),
+        }
+    }
+
+    // -- Common field accessors via inline switch --
+
+    pub fn handshakeKeys(self: *const TlsRole) HandshakeKeys {
+        switch (self.*) {
+            inline else => |*s| return s.handshake_keys,
+        }
+    }
+
+    pub fn appKeys(self: *const TlsRole) AppKeys {
+        switch (self.*) {
+            inline else => |*s| return s.app_keys,
+        }
+    }
+
+    pub fn clientAppSecret(self: *const TlsRole) [32]u8 {
+        switch (self.*) {
+            inline else => |*s| return s.client_app_secret,
+        }
+    }
+
+    pub fn serverAppSecret(self: *const TlsRole) [32]u8 {
+        switch (self.*) {
+            inline else => |*s| return s.server_app_secret,
+        }
+    }
+
+    pub fn negotiatedCipher(self: *const TlsRole) crypto.CipherSuite {
+        switch (self.*) {
+            inline else => |*s| return s.negotiated_cipher,
+        }
+    }
+
+    pub fn getQuicVersion(self: *const TlsRole) u32 {
+        switch (self.*) {
+            inline else => |*s| return s.quic_version,
+        }
+    }
+
+    pub fn setQuicVersion(self: *TlsRole, version: u32) void {
+        switch (self.*) {
+            inline else => |*s| s.quic_version = version,
+        }
+    }
+
+    pub fn setOurTransportParams(self: *TlsRole, params: transport_params.TransportParams) void {
+        switch (self.*) {
+            inline else => |*s| s.our_transport_params = params,
+        }
+    }
+
+    /// Returns true if the TLS state machine is waiting for the first message (server: ClientHello, client: idle).
+    pub fn isInitial(self: *const TlsRole) bool {
+        return switch (self.*) {
+            .server => |s| s.state == .wait_client_hello,
+            .client => |s| s.state == .idle,
+        };
+    }
+};
+
 /// Parsed ClientHello data (what we need from it).
 const ClientHelloData = struct {
     random: [32]u8,
@@ -109,16 +203,16 @@ const ClientHelloData = struct {
     client_p256_pub: [65]u8,
     has_p256: bool,
     peer_transport_params: transport_params.TransportParams,
-    alpn_names: [4][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 4,
-    alpn_lens: [4]u8 = [_]u8{0} ** 4,
+    alpn_names: [4][32]u8 = @splat(@splat(0)),
+    alpn_lens: [4]u8 = @as([4]u8, @splat(0)),
     alpn_count: u8 = 0,
     has_aes_128_gcm: bool = false,
     has_chacha20_poly1305: bool = false,
 
     // PSK / session resumption fields
-    psk_identity: [128]u8 = [_]u8{0} ** 128,
+    psk_identity: [128]u8 = @as([128]u8, @splat(0)),
     psk_identity_len: u16 = 0,
-    psk_binder: [32]u8 = [_]u8{0} ** 32,
+    psk_binder: [32]u8 = @as([32]u8, @splat(0)),
     has_psk: bool = false,
     has_psk_dhe_ke: bool = false,
     psk_obfuscated_age: u32 = 0,
@@ -187,9 +281,9 @@ pub const TlsServer = struct {
 
     // ALPN negotiation (RFC 7301 / TLS ext 0x0010).
     // required_alpn_len == 0 means no ALPN check.
-    required_alpn: [32]u8 = [_]u8{0} ** 32,
+    required_alpn: [32]u8 = @as([32]u8, @splat(0)),
     required_alpn_len: u8 = 0,
-    negotiated_alpn: [32]u8 = [_]u8{0} ** 32,
+    negotiated_alpn: [32]u8 = @as([32]u8, @splat(0)),
     negotiated_alpn_len: u8 = 0,
 
     // Cipher suite negotiation. Server prefers AES by default.
@@ -198,9 +292,9 @@ pub const TlsServer = struct {
     negotiated_cipher: crypto.CipherSuite = .aes_128_gcm,
 
     // Session resumption / 0-RTT fields
-    resumption_master_secret: [32]u8 = [_]u8{0} ** 32,
-    early_secret: [32]u8 = [_]u8{0} ** 32,
-    client_early_traffic_secret: [32]u8 = [_]u8{0} ** 32,
+    resumption_master_secret: [32]u8 = @as([32]u8, @splat(0)),
+    early_secret: [32]u8 = @as([32]u8, @splat(0)),
+    client_early_traffic_secret: [32]u8 = @as([32]u8, @splat(0)),
     is_psk_handshake: bool = false,
     accept_early_data: bool = false,
     ticket_key: ?*const [32]u8 = null,
@@ -231,15 +325,15 @@ pub const TlsServer = struct {
             .cert_buf = undefined,
             .cert_len = 0,
             .transcript = Sha256.init(.{}),
-            .handshake_secret = [_]u8{0} ** 32,
-            .master_secret = [_]u8{0} ** 32,
+            .handshake_secret = @as([32]u8, @splat(0)),
+            .master_secret = @as([32]u8, @splat(0)),
             .handshake_keys = undefined,
             .app_keys = undefined,
-            .client_hs_secret = [_]u8{0} ** 32,
-            .server_hs_secret = [_]u8{0} ** 32,
-            .client_app_secret = [_]u8{0} ** 32,
-            .server_app_secret = [_]u8{0} ** 32,
-            .client_random = [_]u8{0} ** 32,
+            .client_hs_secret = @as([32]u8, @splat(0)),
+            .server_hs_secret = @as([32]u8, @splat(0)),
+            .client_app_secret = @as([32]u8, @splat(0)),
+            .server_app_secret = @as([32]u8, @splat(0)),
+            .client_random = @as([32]u8, @splat(0)),
             .peer_params = .{},
             .read_buf = undefined,
             .read_len = 0,
@@ -248,7 +342,7 @@ pub const TlsServer = struct {
 
         self.cert_len = buildCertificate(
             sign_kp.public_key.bytes,
-            &[_]u8{0} ** 64, // placeholder — will be re-signed below
+            &@as([64]u8, @splat(0)), // placeholder — will be re-signed below
             self.cert_buf[0..],
         );
         // Sign the actual TBSCertificate and rebuild
@@ -288,15 +382,15 @@ pub const TlsServer = struct {
             .cert_buf = undefined,
             .cert_len = cert_der.len,
             .transcript = Sha256.init(.{}),
-            .handshake_secret = [_]u8{0} ** 32,
-            .master_secret = [_]u8{0} ** 32,
+            .handshake_secret = @as([32]u8, @splat(0)),
+            .master_secret = @as([32]u8, @splat(0)),
             .handshake_keys = undefined,
             .app_keys = undefined,
-            .client_hs_secret = [_]u8{0} ** 32,
-            .server_hs_secret = [_]u8{0} ** 32,
-            .client_app_secret = [_]u8{0} ** 32,
-            .server_app_secret = [_]u8{0} ** 32,
-            .client_random = [_]u8{0} ** 32,
+            .client_hs_secret = @as([32]u8, @splat(0)),
+            .server_hs_secret = @as([32]u8, @splat(0)),
+            .client_app_secret = @as([32]u8, @splat(0)),
+            .server_app_secret = @as([32]u8, @splat(0)),
+            .client_random = @as([32]u8, @splat(0)),
             .peer_params = .{},
             .read_buf = undefined,
             .read_len = 0,
@@ -464,7 +558,7 @@ pub const TlsServer = struct {
 
                 if (cipher_ok and alpn_ok and age_ok) {
                     // Compute early_secret from PSK for binder validation
-                    const zero32 = [_]u8{0} ** 32;
+                    const zero32 = @as([32]u8, @splat(0));
                     const psk_early_secret = HkdfSha256.extract(&zero32, &ticket_data.psk);
 
                     // Validate binder (RFC 8446 §4.2.11.2):
@@ -573,6 +667,17 @@ pub const TlsServer = struct {
         //   H(CH || SH || EE || Cert || CertVerify || ServerFinished)).
         self.transcript.update(out[sf_start..pos]);
 
+        // RFC 9001 §4.1.2: Derive app keys now so the server can send 1-RTT packets
+        // before receiving the client Finished. The app traffic secrets use the
+        // transcript through ServerFinished only (RFC 8446 §7.1), which is exactly
+        // what self.transcript holds at this point.
+        {
+            var app_transcript = self.transcript;
+            var app_th: [32]u8 = undefined;
+            app_transcript.final(&app_th);
+            self.deriveAppKeys(&app_th);
+        }
+
         self.state = .wait_client_finished;
         return pos;
     }
@@ -584,7 +689,7 @@ pub const TlsServer = struct {
         //   Handshake Secret = HKDF-Extract(DHE, Derive-Secret(ES, "derived", ""))
         //   Master Secret = HKDF-Extract(0, Derive-Secret(HS, "derived", ""))
 
-        const zero32 = [_]u8{0} ** 32;
+        const zero32 = @as([32]u8, @splat(0));
 
         // Early Secret: with PSK or zero for full handshake
         const early_secret = if (psk) |p|
@@ -977,11 +1082,11 @@ pub fn parseClientHello(data: []const u8) !ClientHelloData {
 
     var ch: ClientHelloData = .{
         .random = data[pos..][0..32].*,
-        .legacy_session_id = [_]u8{0} ** 32,
+        .legacy_session_id = @as([32]u8, @splat(0)),
         .session_id_len = 0,
-        .client_x25519_pub = [_]u8{0} ** 32,
+        .client_x25519_pub = @as([32]u8, @splat(0)),
         .has_x25519 = false,
-        .client_p256_pub = [_]u8{0} ** 65,
+        .client_p256_pub = @as([65]u8, @splat(0)),
         .has_p256 = false,
         .peer_transport_params = .{},
     };
@@ -1426,7 +1531,7 @@ pub fn decryptTicket(ticket_key: *const [32]u8, ticket: []const u8) ?TicketData 
     var td: TicketData = .{
         .psk = plaintext[0..32].*,
         .cipher = undefined,
-        .alpn = [_]u8{0} ** 32,
+        .alpn = @as([32]u8, @splat(0)),
         .alpn_len = 0,
         .timestamp = 0,
     };
@@ -1452,8 +1557,8 @@ pub fn decryptTicket(ticket_key: *const [32]u8, ticket: []const u8) ?TicketData 
 // ---------------------------------------------------------------------------
 test "tls: certificate builds to expected size" {
     const testing = std.testing;
-    const pub_key = [_]u8{0x42} ** 32;
-    const sig = [_]u8{0xab} ** 64;
+    const pub_key = @as([32]u8, @splat(0x42));
+    const sig = @as([64]u8, @splat(0xab));
     var buf: [320]u8 = undefined;
     const len = buildCertificate(pub_key, &sig, &buf);
     // Should be around 211 bytes (may vary slightly by DER length encoding)
@@ -1471,7 +1576,7 @@ test "tls: key schedule derived step uses SHA256 of empty string (RFC 8448 §3)"
     //
     // This test verifies that we use SHA256("") (not "") as the context for the "derived" step.
     const testing = std.testing;
-    const zero32 = [_]u8{0} ** 32;
+    const zero32 = @as([32]u8, @splat(0));
 
     // Verify Early Secret matches RFC 8448
     const early_secret = HkdfSha256.extract(&zero32, &zero32);
@@ -1499,7 +1604,7 @@ test "tls: key schedule produces handshake keys" {
     const io = std.testing.io;
     var server = try TlsServer.init(io);
     // Run the key schedule with a known shared secret
-    const shared_secret = [_]u8{0x11} ** 32;
+    const shared_secret = @as([32]u8, @splat(0x11));
     try server.runKeySchedule(shared_secret, null);
 
     // Verify handshake keys are non-zero
@@ -1602,7 +1707,7 @@ test "tls: transcript is non-empty after ClientHello processing" {
     server_with_ch.transcript.update(&fake_ch);
 
     // Run key schedule on both
-    const shared = [_]u8{0x77} ** 32;
+    const shared = @as([32]u8, @splat(0x77));
     try server_with_ch.runKeySchedule(shared, null);
     try server_empty.runKeySchedule(shared, null);
 
@@ -1613,7 +1718,7 @@ test "tls: transcript is non-empty after ClientHello processing" {
 test "tls: Finished message builds correctly" {
     const testing = std.testing;
     var buf: [40]u8 = undefined;
-    const vd = [_]u8{0xcc} ** 32;
+    const vd = @as([32]u8, @splat(0xcc));
     const n = buildFinishedMessage(&buf, &vd);
     try testing.expectEqual(@as(usize, 36), n);
     try testing.expectEqual(@as(u8, HS_FINISHED), buf[0]);
@@ -1625,7 +1730,7 @@ test "tls: deinit zeros all secret fields" {
     var server = try TlsServer.init(io);
 
     // Run key schedule to populate secrets with non-zero values
-    const shared_secret = [_]u8{0x11} ** 32;
+    const shared_secret = @as([32]u8, @splat(0x11));
     try server.runKeySchedule(shared_secret, null);
 
     // Verify at least one secret field is non-zero before deinit
@@ -1641,13 +1746,13 @@ test "tls: deinit zeros all secret fields" {
     server.deinit();
 
     // All secret fields must be zeroed after deinit
-    try std.testing.expectEqual([_]u8{0} ** 32, server.handshake_secret);
-    try std.testing.expectEqual([_]u8{0} ** 32, server.master_secret);
-    try std.testing.expectEqual([_]u8{0} ** 32, server.client_hs_secret);
-    try std.testing.expectEqual([_]u8{0} ** 32, server.server_hs_secret);
-    try std.testing.expectEqual([_]u8{0} ** 32, server.client_app_secret);
-    try std.testing.expectEqual([_]u8{0} ** 32, server.server_app_secret);
-    try std.testing.expectEqual([_]u8{0} ** 32, server.ecdh_kp.secret_key);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.handshake_secret);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.master_secret);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.client_hs_secret);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.server_hs_secret);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.client_app_secret);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.server_app_secret);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.ecdh_kp.secret_key);
 }
 
 test "tls: cumulative CRYPTO cap rejects data exceeding 64KB total" {
@@ -1716,7 +1821,7 @@ test "tls: ALPN: EncryptedExtensions omits ALPN when empty" {
 test "tls: ALPN: no required_alpn skips check entirely" {
     // A server with required_alpn_len == 0 should accept any ClientHello regardless of ALPN.
     const io = std.testing.io;
-    var server = try TlsServer.init(io);
+    const server = try TlsServer.init(io);
     // Default: required_alpn_len is 0; negotiated_alpn_len stays 0.
     try std.testing.expectEqual(@as(u8, 0), server.required_alpn_len);
     try std.testing.expectEqual(@as(u8, 0), server.negotiated_alpn_len);
@@ -1744,12 +1849,12 @@ test "tls: ALPN: matching protocol selected" {
     // It's easier to test the ALPN negotiation path by directly manipulating
     // ClientHelloData and running the matching logic in isolation.
     var ch: ClientHelloData = .{
-        .random = [_]u8{0} ** 32,
-        .legacy_session_id = [_]u8{0} ** 32,
+        .random = @as([32]u8, @splat(0)),
+        .legacy_session_id = @as([32]u8, @splat(0)),
         .session_id_len = 0,
-        .client_x25519_pub = [_]u8{0} ** 32,
+        .client_x25519_pub = @as([32]u8, @splat(0)),
         .has_x25519 = true,
-        .client_p256_pub = [_]u8{0} ** 65,
+        .client_p256_pub = @as([65]u8, @splat(0)),
         .has_p256 = false,
         .peer_transport_params = .{},
         .has_aes_128_gcm = true,
@@ -1794,12 +1899,12 @@ test "tls: ALPN: mismatch returns AlpnMismatch" {
 
     // Directly populate a ClientHelloData with only "h3" and verify mismatch.
     var ch: ClientHelloData = .{
-        .random = [_]u8{0} ** 32,
-        .legacy_session_id = [_]u8{0} ** 32,
+        .random = @as([32]u8, @splat(0)),
+        .legacy_session_id = @as([32]u8, @splat(0)),
         .session_id_len = 0,
-        .client_x25519_pub = [_]u8{0x42} ** 32, // non-zero key share
+        .client_x25519_pub = @as([32]u8, @splat(0x42)), // non-zero key share
         .has_x25519 = true,
-        .client_p256_pub = [_]u8{0} ** 65,
+        .client_p256_pub = @as([65]u8, @splat(0)),
         .has_p256 = false,
         .peer_transport_params = .{},
         .has_aes_128_gcm = true,
@@ -1824,7 +1929,7 @@ test "tls: P-256 initFromCert stores p256 key variant" {
     var base = try TlsServer.init(io);
     const cert_der = base.cert_buf[0..base.cert_len];
     // Private scalar = 1 is the smallest valid P-256 scalar.
-    var seed: [32]u8 = [_]u8{0} ** 32;
+    var seed: [32]u8 = @as([32]u8, @splat(0));
     seed[31] = 1;
     const server = try TlsServer.initFromCert(cert_der, seed, .p256, io);
     try std.testing.expect(server.sign_key == .p256);
@@ -1834,12 +1939,12 @@ test "tls: P-256 buildCertificateVerify produces DER ECDSA signature" {
     const io = std.testing.io;
     var base = try TlsServer.init(io);
     const cert_der = base.cert_buf[0..base.cert_len];
-    var seed: [32]u8 = [_]u8{0} ** 32;
+    var seed: [32]u8 = @as([32]u8, @splat(0));
     seed[31] = 1;
     var server = try TlsServer.initFromCert(cert_der, seed, .p256, io);
 
     var out: [512]u8 = undefined;
-    const transcript_hash = [_]u8{0xab} ** 32;
+    const transcript_hash = @as([32]u8, @splat(0xab));
     const n = try server.buildCertificateVerify(&out, &transcript_hash);
 
     // HandshakeType = 15 (CertificateVerify)
@@ -1874,12 +1979,12 @@ test "tls: full handshake roundtrip: client Finished verifies correctly" {
     // Using all-0x42 as the client's ephemeral public key (for testing only — not a valid point
     // but X25519.scalarmult will not reject it; the shared secret will be a known garbage value).
     var ch: ClientHelloData = .{
-        .random = [_]u8{0x11} ** 32,
-        .legacy_session_id = [_]u8{0} ** 32,
+        .random = @as([32]u8, @splat(0x11)),
+        .legacy_session_id = @as([32]u8, @splat(0)),
         .session_id_len = 0,
-        .client_x25519_pub = [_]u8{0x42} ** 32,
+        .client_x25519_pub = @as([32]u8, @splat(0x42)),
         .has_x25519 = true,
-        .client_p256_pub = [_]u8{0} ** 65,
+        .client_p256_pub = @as([65]u8, @splat(0)),
         .has_p256 = false,
         .peer_transport_params = .{},
         .has_aes_128_gcm = true,
@@ -1929,11 +2034,11 @@ test "tls: P-256 deinit zeros secret key bytes" {
     const io = std.testing.io;
     var base = try TlsServer.init(io);
     const cert_der = base.cert_buf[0..base.cert_len];
-    var seed: [32]u8 = [_]u8{0} ** 32;
+    var seed: [32]u8 = @as([32]u8, @splat(0));
     seed[31] = 1;
     var server = try TlsServer.initFromCert(cert_der, seed, .p256, io);
     server.deinit();
-    try std.testing.expectEqual([_]u8{0} ** 32, server.sign_key.p256.secret_key.bytes);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), server.sign_key.p256.secret_key.bytes);
 }
 
 test "security: CRYPTO read_buf is zeroed after ClientHello processing" {
@@ -1979,10 +2084,10 @@ test "tls: P-256 ECDH: server accepts P-256-only client and produces handshake k
 
     // Build ClientHelloData with only P-256 key share (no X25519)
     const ch: ClientHelloData = .{
-        .random = [_]u8{0x33} ** 32,
-        .legacy_session_id = [_]u8{0} ** 32,
+        .random = @as([32]u8, @splat(0x33)),
+        .legacy_session_id = @as([32]u8, @splat(0)),
         .session_id_len = 0,
-        .client_x25519_pub = [_]u8{0} ** 32,
+        .client_x25519_pub = @as([32]u8, @splat(0)),
         .has_x25519 = false,
         .client_p256_pub = client_pub,
         .has_p256 = true,
@@ -2000,7 +2105,7 @@ test "tls: P-256 ECDH: server accepts P-256-only client and produces handshake k
     // ServerHello starts with HS_SERVER_HELLO (0x02)
     try std.testing.expectEqual(@as(u8, HS_SERVER_HELLO), out[0]);
     // Handshake keys are non-zero (key schedule ran)
-    const zero32 = [_]u8{0} ** 32;
+    const zero32 = @as([32]u8, @splat(0));
     try std.testing.expect(!std.mem.eql(u8, &server.handshake_keys.server.key, &zero32));
 }
 
@@ -2089,12 +2194,12 @@ test "tls: no key share returns NoSupportedKeyShare" {
     const io = std.testing.io;
     var server = try TlsServer.init(io);
     const ch: ClientHelloData = .{
-        .random = [_]u8{0} ** 32,
-        .legacy_session_id = [_]u8{0} ** 32,
+        .random = @as([32]u8, @splat(0)),
+        .legacy_session_id = @as([32]u8, @splat(0)),
         .session_id_len = 0,
-        .client_x25519_pub = [_]u8{0} ** 32,
+        .client_x25519_pub = @as([32]u8, @splat(0)),
         .has_x25519 = false,
-        .client_p256_pub = [_]u8{0} ** 65,
+        .client_p256_pub = @as([65]u8, @splat(0)),
         .has_p256 = false,
         .peer_transport_params = .{},
         .has_aes_128_gcm = true,

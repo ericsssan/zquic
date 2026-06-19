@@ -26,7 +26,7 @@ zig build                       # build server binary
 zig build -Dcongestion=cubic    # build with CUBIC
 ```
 
-Requires Zig 0.16.0-dev or later.
+Requires Zig 0.17.0-dev.657+2faf8debf or later.
 
 ## Interop Results
 

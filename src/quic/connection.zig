@@ -199,11 +199,15 @@ pub const Config = struct {
     /// Enable address validation with Retry tokens (RFC 9000 §8.1).
     validate_addr: bool = false,
     /// 32-byte secret for token derivation via HKDF-Expand.
-    token_secret: [32]u8 = [_]u8{0} ** 32,
+    token_secret: [32]u8 = @as([32]u8, @splat(0)),
     /// Token validity window in nanoseconds (default 5 minutes).
     token_validity_ns: i64 = 5 * 60 * std.time.ns_per_s,
     /// ALPN protocol to require. Static/caller-owned slice; "" = no ALPN check.
     alpn: []const u8 = "",
+    /// Client: verify the server's CertificateVerify signature against the leaf
+    /// certificate (proves key possession; RFC 8446 §4.4.3). Default false for
+    /// interop without a trust store. Supports ECDSA-P256 and Ed25519 leaf keys.
+    verify_peer: bool = false,
     /// Pre-loaded DER certificate (null = use ephemeral self-signed).
     cert_der: ?[]const u8 = null,
     /// 32-byte private key material for cert_der: Ed25519 seed or P-256 scalar.
@@ -217,6 +221,11 @@ pub const Config = struct {
     /// Initial QUIC version (0x00000001 = v1, 0x6b3343cf = v2).
     /// Overridden by client's version in first Initial packet.
     initial_quic_version: u32 = packet.QUIC_VERSION_1,
+    /// Session ticket from a previous connection for PSK resumption.
+    session_ticket: ?tls.SessionTicket = null,
+    /// Advertise QUIC v2 support in version_information (RFC 9369).
+    /// When true, the server may negotiate to v2 via compatible version negotiation.
+    advertise_v2: bool = false,
     /// Maximum number of client-initiated bidirectional streams to advertise.
     initial_max_streams_bidi: u64 = 100,
     /// Maximum number of client-initiated unidirectional streams to advertise.
@@ -227,7 +236,7 @@ pub const Config = struct {
     preferred_addr_ipv4: ?[4]u8 = null,
     preferred_addr_ipv4_port: u16 = 0,
     /// IPv6 address for preferred_address transport parameter (RFC 9000 §18.2.3).
-    preferred_addr_ipv6: [16]u8 = [_]u8{0} ** 16,
+    preferred_addr_ipv6: [16]u8 = @as([16]u8, @splat(0)),
     preferred_addr_ipv6_port: u16 = 0,
     /// Preferred AEAD cipher suite. The server negotiates this when the client offers it.
     preferred_cipher: crypto.CipherSuite = .aes_128_gcm,
@@ -264,7 +273,7 @@ pub fn Connection(comptime max_streams: usize) type {
         peer_cid: ConnectionId,
         /// Client's SCID as received in the first Initial packet (0–20 bytes).
         /// RFC 9000 §7.2: server DCID in long-header packets must equal client SCID.
-        peer_scid: [20]u8 = [_]u8{0} ** 20,
+        peer_scid: [20]u8 = @as([20]u8, @splat(0)),
         peer_scid_len: u8 = 0,
         peer_addr: SocketAddr,
         /// Previous peer address (before last migration).  Packets from this
@@ -274,7 +283,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
         // Crypto
         initial_keys: crypto.InitialKeys,
-        tls_state: tls.TlsServer,
+        tls_state: tls.TlsRole,
         /// Initial QUIC version from client's first Initial packet.
         /// Used for encoding Initial response packets (always matches client's version).
         initial_version: u32,
@@ -462,8 +471,17 @@ pub fn Connection(comptime max_streams: usize) type {
         /// DCID from the client's very first Initial packet (set on first receive, idle→handshake).
         /// Used for original_destination_connection_id (RFC 9000 §7.3):
         /// the server MUST always include this parameter, even without Retry.
-        first_initial_dcid: [20]u8 = [_]u8{0} ** 20,
+        first_initial_dcid: [20]u8 = @as([20]u8, @splat(0)),
         first_initial_dcid_len: u8 = 0,
+
+        /// Retry token received from server (client-mode only, RFC 9000 §17.2.5).
+        /// Included in subsequent Initial packets after receiving a Retry.
+        retry_token: [128]u8 = @as([128]u8, @splat(0)),
+        retry_token_len: u8 = 0,
+        /// Set after the client successfully processes a Version Negotiation packet.
+        /// Prevents infinite VN loops: once a version switch occurs, any subsequent
+        /// VN is ignored.
+        vn_handled: bool = false,
 
         /// Alternative local CID advertised to peer via NEW_CONNECTION_ID (sequence=1).
         /// Helps tshark track 1-RTT packets when the primary CID appears in client
@@ -547,7 +565,18 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Create a server-side connection.  Call `receive()` with the first
         /// datagram to start the handshake.
+        /// Create a server-side connection by value. Convenience wrapper for
+        /// small Connection(N) (e.g. tests); large N should use `acceptInto` to
+        /// avoid a multi-MB stack temporary for the return value (issue #3).
         pub fn accept(config: Config, io: std.Io) !Self {
+            var self: Self = undefined;
+            try self.acceptInto(config, io);
+            return self;
+        }
+
+        /// Initialize a server-side connection in place (constructs directly into
+        /// `self`, so there is no by-value return temporary on the stack).
+        pub fn acceptInto(self: *Self, config: Config, io: std.Io) !void {
             var tls_server = if (config.cert_der) |der|
                 try tls.TlsServer.initFromCert(der, config.cert_seed.?, config.cert_key_algorithm, io)
             else
@@ -573,26 +602,26 @@ pub fn Connection(comptime max_streams: usize) type {
             else
                 0;
 
-            return Self{
+            self.* = Self{
                 .hot = .{
-                    .rx_pn = [_]u64{0} ** 3,
-                    .tx_pn = [_]u64{0} ** 3,
+                    .rx_pn = @as([3]u64, @splat(0)),
+                    .tx_pn = @as([3]u64, @splat(0)),
                     .state = .idle,
                     .epoch = 0,
                     .rx_pn_valid = .{ false, false, false },
-                    ._pad = [_]u8{0} ** 11,
+                    ._pad = @as([11]u8, @splat(0)),
                 },
                 .local_cid = local_cid,
                 .alt_local_cid = alt_local_cid,
                 .alt_local_reset_token = alt_local_reset_token,
                 .peer_cid = ConnectionId.zero,
-                .peer_addr = .{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } },
+                .peer_addr = .{ .v4 = .{ .addr = @as([4]u8, @splat(0)), .port = 0 } },
                 .prev_peer_addr = null,
                 .initial_keys = .{
-                    .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-                    .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+                    .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+                    .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
                 },
-                .tls_state = tls_server,
+                .tls_state = .{ .server = tls_server },
                 .initial_version = packet.QUIC_VERSION_1,
                 .quic_version = packet.QUIC_VERSION_1,
                 .hs_keys = null,
@@ -609,7 +638,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .cached_ack_delay_exp = 3,
                 .idle_timeout_i64 = idle_timeout_i64,
                 .sq = undefined,
-                .sq_meta = [_]SendMeta{.{}} ** SEND_QUEUE_DEPTH,
+                .sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{})),
                 .sq_head = 0,
                 .sq_tail = 0,
                 .bytes_queued = 0,
@@ -635,12 +664,12 @@ pub fn Connection(comptime max_streams: usize) type {
                 .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
                 .local_max_streams_uni = @min(config.initial_max_streams_uni, @as(u64, std.math.maxInt(u62))),
                 .peer_max_stream_data_bidi_local = flow_control.DEFAULT_MAX_STREAM_DATA,
-                .peer_cid_table = [_]PeerCidEntry{.{
+                .peer_cid_table = @as([MAX_PEER_CIDS]PeerCidEntry, @splat(.{
                     .cid = .{},
                     .seq = 0,
-                    .reset_token = [_]u8{0} ** 16,
+                    .reset_token = @as([16]u8, @splat(0)),
                     .valid = false,
-                }} ** MAX_PEER_CIDS,
+                })),
                 .peer_cid_retire_prior = 0,
                 .path_validated = false,
                 .bytes_unvalidated_recv = 0,
@@ -653,15 +682,15 @@ pub fn Connection(comptime max_streams: usize) type {
                 .next_app_keys = null,
                 .cached_app_keys = null,
                 .cached_next_keys = null,
-                .next_client_secret = [_]u8{0} ** 32,
-                .next_server_secret = [_]u8{0} ** 32,
+                .next_client_secret = @as([32]u8, @splat(0)),
+                .next_server_secret = @as([32]u8, @splat(0)),
                 .current_key_generation = 0,
                 .peer_disable_migration = false,
                 .pending_handshake_done = false,
                 .pending_max_data = false,
                 .pending_reset_count = 0,
-                .unknown_versions = [_]u32{0} ** 4,
-                .unknown_version_times = [_]i64{std.math.minInt(i64)} ** 4,
+                .unknown_versions = @as([4]u32, @splat(0)),
+                .unknown_version_times = @as([4]i64, @splat(std.math.minInt(i64))),
                 .unknown_version_idx = 0,
                 .crypto_send_offset = .{ 0, 0, 0 },
                 .crypto_retx_pos = .{ 0, 0 },
@@ -679,8 +708,231 @@ pub fn Connection(comptime max_streams: usize) type {
                 .crypto_staged_count = .{ 0, 0, 0 },
                 .pending_ack = .{ false, false, false },
                 .ecn_ce_seen = .{ 0, 0, 0 },
-                .rx_pn_bitmap = [_]u64{0} ** 3,
+                .rx_pn_bitmap = @as([3]u64, @splat(0)),
             };
+        }
+
+        /// Create a client-mode Connection and initiate the QUIC handshake.
+        /// Derives initial keys from `server_dcid` (or a random one) and queues a
+        /// ClientHello in an Initial packet, ready to be sent via `send()`.
+        /// Create a client-side connection by value. Convenience wrapper; large
+        /// Connection(N) should use `connectInto` to avoid a stack temporary (#3).
+        pub fn connect(config: Config, io: std.Io) !Self {
+            var self: Self = undefined;
+            try self.connectInto(config, io);
+            return self;
+        }
+
+        /// Initialize a client-side connection in place (no by-value return).
+        pub fn connectInto(self: *Self, config: Config, io: std.Io) !void {
+            var client_config = config;
+            client_config.is_server = false;
+
+            var tls_client = tls.TlsClient.init(io);
+            tls_client.verify_peer = config.verify_peer;
+
+            // Set ALPN from config
+            if (config.alpn.len > 0) {
+                const n = @min(config.alpn.len, @as(usize, 32));
+                @memcpy(tls_client.alpn[0..n], config.alpn[0..n]);
+                tls_client.alpn_len = @intCast(n);
+            }
+
+            // Set session ticket for PSK resumption
+            if (config.session_ticket) |ticket| {
+                tls_client.setTicket(ticket);
+            }
+
+            const local_cid = ConnectionId.generate(0, io);
+            const alt_local_cid = ConnectionId.generate(0, io);
+            var alt_local_reset_token: [16]u8 = undefined;
+            io.random(&alt_local_reset_token);
+            const idle_timeout_i64: i64 = if (config.idle_timeout_ns > 0)
+                @intCast(@min(config.idle_timeout_ns, @as(u64, std.math.maxInt(i64))))
+            else
+                0;
+
+            // Generate a random DCID to use in the Initial (RFC 9000 §7.2).
+            // This becomes the server's initial_destination_connection_id.
+            var initial_dcid: [cid_mod.len]u8 = undefined;
+            io.random(&initial_dcid);
+
+            // Derive initial keys from the DCID we'll send (client-generated).
+            const initial_version = config.initial_quic_version;
+            const initial_keys = crypto.deriveInitialKeys(&initial_dcid, initial_version);
+
+            // Set up transport params for ClientHello.
+            const scid_bytes = &local_cid.bytes;
+            var isci: [20]u8 = @as([20]u8, @splat(0));
+            @memcpy(isci[0..scid_bytes.len], scid_bytes);
+            // Advertise per-stream receive windows matching the ring buffer size.
+            // If we advertised the default 256KB but our ring buffer is 32KB, the peer
+            // would legitimately send 256KB before any MAX_STREAM_DATA updates, overflowing
+            // the buffer (BufferFull). The sliding-window flow control then grows the
+            // window incrementally as the application reads.
+            const stream_buf: u64 = @import("stream.zig").STREAM_BUF_SIZE;
+            var our_params = transport_params.TransportParams{
+                .initial_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
+                .initial_max_streams_uni = @min(config.initial_max_streams_uni, @as(u64, std.math.maxInt(u62))),
+                .initial_source_connection_id = isci,
+                .initial_source_connection_id_len = @intCast(scid_bytes.len),
+                .initial_max_stream_data_bidi_local = stream_buf,
+                .initial_max_stream_data_bidi_remote = stream_buf,
+                .initial_max_stream_data_uni = stream_buf,
+            };
+            // RFC 9369: version_information — advertise supported versions for negotiation.
+            {
+                var vi: [20]u8 = undefined;
+                std.mem.writeInt(u32, vi[0..4], initial_version, .big);
+                std.mem.writeInt(u32, vi[4..8], packet.QUIC_VERSION_1, .big);
+                if (config.advertise_v2) {
+                    std.mem.writeInt(u32, vi[8..12], packet.QUIC_VERSION_2, .big);
+                    our_params.version_information = vi;
+                    our_params.version_information_len = 12;
+                } else {
+                    our_params.version_information = vi;
+                    our_params.version_information_len = 8;
+                }
+            }
+            tls_client.our_transport_params = our_params;
+
+            // Build ClientHello via processCrypto (data is ignored in idle state).
+            var ch_buf: [32768]u8 = undefined;
+            const ch_len = try tls_client.processCrypto(&.{}, &ch_buf, io);
+
+            // Snapshot real time so idle/PTO timers start from the correct epoch.
+            // Without this, reserveSendSlot sets idle_deadline_ns = 0 + 30s (1970),
+            // which fires immediately when the caller later assigns the real time.
+            const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+
+            self.* = Self{
+                .hot = .{
+                    .rx_pn = @as([3]u64, @splat(0)),
+                    .tx_pn = @as([3]u64, @splat(0)),
+                    .state = .handshake,
+                    .epoch = 0,
+                    .rx_pn_valid = .{ false, false, false },
+                    ._pad = @as([11]u8, @splat(0)),
+                },
+                .local_cid = local_cid,
+                .alt_local_cid = alt_local_cid,
+                .alt_local_reset_token = alt_local_reset_token,
+                .peer_cid = ConnectionId.zero,
+                .peer_addr = .{ .v4 = .{ .addr = @as([4]u8, @splat(0)), .port = 0 } },
+                .prev_peer_addr = null,
+                .initial_keys = initial_keys,
+                .tls_state = .{ .client = tls_client },
+                .initial_version = initial_version,
+                .quic_version = initial_version,
+                .hs_keys = null,
+                .app_keys = null,
+                .streams = .{},
+                .conn_flow = flow_control.FlowController.init(
+                    config.initial_max_data,
+                    config.initial_max_data,
+                ),
+                .congestion = cc_mod.CongestionControl.init(),
+                .loss = loss_recovery_mod.LossRecovery.init(),
+                .current_time_ns = now_ns,
+                .cached_max_ack_delay_ns = 25_000_000,
+                .cached_ack_delay_exp = 3,
+                .idle_timeout_i64 = idle_timeout_i64,
+                .sq = undefined,
+                .sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{})),
+                .sq_head = 0,
+                .sq_tail = 0,
+                .bytes_queued = 0,
+                .idle_deadline_ns = null,
+                .pto_deadline_ns = null,
+                .drain_deadline_ns = null,
+                .time_loss_alarm_ns = null,
+                .bytes_sent = 0,
+                .bytes_recv = 0,
+                .pkts_sent = 0,
+                .pkts_recv = 0,
+                .config = client_config,
+                .events = .{},
+                .closing_frame_buf = undefined,
+                .closing_frame_len = 0,
+                .pkt_scratch = undefined,
+                .enc_scratch = undefined,
+                .inline_borrow_stream = null,
+                .idle_ping_count = 0,
+                .peer_max_streams_bidi = 0,
+                .peer_max_streams_uni = 0,
+                .local_max_streams_bidi = @min(config.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62))),
+                .local_max_streams_uni = @min(config.initial_max_streams_uni, @as(u64, std.math.maxInt(u62))),
+                .peer_max_stream_data_bidi_local = flow_control.DEFAULT_MAX_STREAM_DATA,
+                .peer_cid_table = @as([MAX_PEER_CIDS]PeerCidEntry, @splat(.{
+                    .cid = .{},
+                    .seq = 0,
+                    .reset_token = @as([16]u8, @splat(0)),
+                    .valid = false,
+                })),
+                .peer_cid_retire_prior = 0,
+                .path_validated = true, // Client is not amplification-limited
+                .bytes_unvalidated_recv = 0,
+                .bytes_unvalidated_sent = 0,
+                .ecn_ect0_recv = .{ 0, 0, 0 },
+                .ecn_ce_recv = .{ 0, 0, 0 },
+                .pending_path_challenge = null,
+                .key_update_pending = false,
+                .current_key_phase = false,
+                .next_app_keys = null,
+                .cached_app_keys = null,
+                .cached_next_keys = null,
+                .next_client_secret = @as([32]u8, @splat(0)),
+                .next_server_secret = @as([32]u8, @splat(0)),
+                .current_key_generation = 0,
+                .peer_disable_migration = false,
+                .pending_handshake_done = false,
+                .pending_max_data = false,
+                .pending_reset_count = 0,
+                .unknown_versions = @as([4]u32, @splat(0)),
+                .unknown_version_times = @as([4]i64, @splat(std.math.minInt(i64))),
+                .unknown_version_idx = 0,
+                .crypto_send_offset = .{ 0, 0, 0 },
+                .crypto_retx_pos = .{ 0, 0 },
+                .crypto_send_saved = @import("std").mem.zeroes([2][32768]u8),
+                .crypto_send_saved_len = .{ 0, 0 },
+                .tls_pending_hs = std.mem.zeroes([32768]u8),
+                .tls_pending_hs_len = 0,
+                .tls_pending_hs_offset = 0,
+                .stream_pending_retx = undefined,
+                .stream_pending_retx_count = 0,
+                .crypto_pending_retx = undefined,
+                .crypto_pending_retx_count = 0,
+                .crypto_recv_offset = .{ 0, 0, 0 },
+                .crypto_staged = @import("std").mem.zeroes([3][CRYPTO_STAGE_DEPTH]CryptoStagedFrag),
+                .crypto_staged_count = .{ 0, 0, 0 },
+                .pending_ack = .{ false, false, false },
+                .ecn_ce_seen = .{ 0, 0, 0 },
+                .rx_pn_bitmap = @as([3]u64, @splat(0)),
+            };
+
+            // Store the DCID we're sending to (peer_scid for packet building)
+            @memcpy(self.peer_scid[0..cid_mod.len], &initial_dcid);
+            self.peer_scid_len = cid_mod.len;
+            // Also store in first_initial_dcid for key derivation in retransmits
+            @memcpy(self.first_initial_dcid[0..cid_mod.len], &initial_dcid);
+            self.first_initial_dcid_len = cid_mod.len;
+
+            // Queue the ClientHello as an Initial CRYPTO frame.
+            try self.queueTlsOutput(ch_buf[0..ch_len]);
+
+            // If PSK was offered, set 0-RTT keys for early data sending.
+            if (tls_client.early_keys) |ek| {
+                self.zero_rtt_keys = ek;
+                // Pre-populate the peer stream limit from the remembered transport
+                // parameters so the client can open streams as 0-RTT early data
+                // (RFC 9000 §7.4.1: 0-RTT uses params from the prior session).
+                if (config.session_ticket) |st| {
+                    if (st.max_streams_bidi > 0) {
+                        const bidi_limit = @min(st.max_streams_bidi, @as(u64, std.math.maxInt(u62)));
+                        self.peer_max_streams_bidi = @intCast(bidi_limit);
+                    }
+                }
+            }
         }
 
         // -----------------------------------------------------------------------
@@ -778,9 +1030,12 @@ pub fn Connection(comptime max_streams: usize) type {
             // in the left-node trace, breaking decryption.  Holding the ACK means
             // it will be included (along with ServerHello) on the next datagram.
             if (self.pending_ack[0]) {
-                if (self.hs_keys != null) {
+                if (self.hs_keys != null and self.hot.state != .established) {
                     self.pending_ack[0] = false;
                     self.sendEncryptedAck(0) catch {};
+                } else if (self.hot.state == .established) {
+                    // Initial keys already zeroed; drop the pending ACK.
+                    self.pending_ack[0] = false;
                 }
             }
             if (self.pending_ack[1]) {
@@ -830,7 +1085,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 return 0;
             }
             const mask = SEND_QUEUE_DEPTH - 1;
-            var meta = self.sq_meta[self.sq_head & mask];
+            const meta = self.sq_meta[self.sq_head & mask];
             // Pacing gate: refill tokens and check if we can send.
             // Bypass pacing when nothing is in flight — there is no congestion
             // to pace for, and blocking here creates a death spiral where the
@@ -986,7 +1241,6 @@ pub fn Connection(comptime max_streams: usize) type {
                             // retransmit previously-sent CRYPTO data as probe packets (RFC 9002 §6.2.4).
                             // Prioritize Handshake over Initial: once we have HS keys, the client
                             // must have processed our Initial, so retransmitting Initial wastes budget.
-                            const sent_before = self.bytes_unvalidated_sent;
                             self.flushPendingHsCrypto();
                             // Retransmit CRYPTO data as PTO probes (RFC 9002 §6.2.4).
                             // Once we have Handshake keys, the client has already processed
@@ -1004,19 +1258,17 @@ pub fn Connection(comptime max_streams: usize) type {
                                 self.retransmitCryptoSaved(0);
                             }
                             self.retransmitCryptoSaved(1);
-                            const no_progress = self.bytes_unvalidated_sent == sent_before;
-                            if (no_progress and !self.path_validated and self.bytes_unvalidated_recv > 0) {
-                                // Amplification-limited: can't send anything. Schedule PTO
-                                // from current time to prevent the deadline-in-the-past flooding
-                                // bug (last_ack_eliciting_ns doesn't advance when no ack-eliciting
-                                // packets are sent, causing ptoDeadline() to return a past time).
+                            // Schedule next PTO from current time with exponential backoff.
+                            // We can't use ptoDeadline() here because last_ack_eliciting_ns
+                            // hasn't been updated yet (the retransmit is queued but not yet
+                            // sent via drainSend).  Computing from current_time_ns avoids
+                            // deadline-in-the-past stalls.
+                            {
                                 const pto_base = self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns);
                                 const shift: u6 = @intCast(@min(self.loss.pto_count, 5));
                                 const backoff: u64 = pto_base *| (@as(u64, 1) << shift);
                                 const max_i64: u64 = @as(u64, std.math.maxInt(i64));
                                 self.pto_deadline_ns = self.current_time_ns +| @as(i64, @intCast(@min(backoff, max_i64)));
-                            } else {
-                                self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
                             }
                         }
                     }
@@ -1136,7 +1388,7 @@ pub fn Connection(comptime max_streams: usize) type {
             }
             // Check buffer capacity before any mutation so the operation is all-or-nothing.
             if (st.sendBufferFree() < data.len) return error.BufferFull;
-            if (self.hot.state != .established) return error.StreamNotWritable;
+            if (self.hot.state != .established and self.zero_rtt_keys == null) return error.StreamNotWritable;
             // Congestion window gate for new sends only (RFC 9002 §7).
             // Retransmissions (processLostFrames) bypass this check so loss recovery
             // is never blocked by a temporarily-reduced cwnd after a loss event.
@@ -1147,6 +1399,41 @@ pub fn Connection(comptime max_streams: usize) type {
             // Clear app-limited flag: we are actively sending.
             self.loss.delivery.app_limited = false;
             try self.queueStreamData(stream_id, data, fin);
+        }
+
+        /// Read received data from a stream into `out`. Returns the number of bytes read.
+        /// Handles both inline-borrowed data (zero-copy from recv buffer) and ring buffer.
+        /// Advances the stream's flow control window so the peer can send more.
+        pub fn streamRecv(self: *Self, stream_id: u62, out: []u8) usize {
+            const st = self.streams.get(stream_id) orelse return 0;
+
+            // First drain any inline-borrowed data by flushing to ring buffer
+            if (st.inline_recv != null) {
+                st.flushInline();
+            }
+
+            // Read from ring buffer (updates flow control window)
+            return st.read(out);
+        }
+
+        /// Returns true if the given stream has data available to read.
+        pub fn streamReadable(self: *Self, stream_id: u62) bool {
+            const st = self.streams.get(stream_id) orelse return false;
+            return st.isReadable();
+        }
+
+        /// Returns true if the stream has received FIN and all data has been delivered.
+        pub fn streamFinished(self: *Self, stream_id: u62) bool {
+            const st = self.streams.get(stream_id) orelse return false;
+            return st.state == .half_closed_remote or st.state == .closed;
+        }
+
+        /// Returns the stored session ticket (if server sent NewSessionTicket).
+        pub fn getSessionTicket(self: *const Self) ?tls.SessionTicket {
+            return switch (self.tls_state) {
+                .client => |*c| c.getTicket(),
+                .server => null,
+            };
         }
 
         /// Initiate a connection close.  Transitions to closing, queues a CONNECTION_CLOSE,
@@ -1214,6 +1501,43 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         // -----------------------------------------------------------------------
+        // Key direction helpers (server: RX=client, TX=server; client: reversed)
+        // -----------------------------------------------------------------------
+
+        inline fn rxInitialKeys(self: *const Self) crypto.PacketKeys {
+            return if (self.config.is_server) self.initial_keys.client else self.initial_keys.server;
+        }
+
+        inline fn txInitialKeys(self: *const Self) crypto.PacketKeys {
+            return if (self.config.is_server) self.initial_keys.server else self.initial_keys.client;
+        }
+
+        inline fn rxHsKeys(self: *const Self) ?crypto.PacketKeys {
+            const ks = self.hs_keys orelse return null;
+            return if (self.config.is_server) ks.client else ks.server;
+        }
+
+        inline fn txHsKeys(self: *const Self) ?crypto.PacketKeys {
+            const ks = self.hs_keys orelse return null;
+            return if (self.config.is_server) ks.server else ks.client;
+        }
+
+        inline fn rxAppKeys(self: *const Self) ?crypto.PacketKeys {
+            const ks = self.app_keys orelse return null;
+            return if (self.config.is_server) ks.client else ks.server;
+        }
+
+        inline fn txAppKeys(self: *const Self) ?crypto.PacketKeys {
+            const ks = self.app_keys orelse return null;
+            return if (self.config.is_server) ks.server else ks.client;
+        }
+
+        inline fn rxNextAppKeys(self: *const Self) ?crypto.PacketKeys {
+            const ks = self.next_app_keys orelse return null;
+            return if (self.config.is_server) ks.client else ks.server;
+        }
+
+        // -----------------------------------------------------------------------
         // Internal packet processing
         // -----------------------------------------------------------------------
 
@@ -1245,7 +1569,7 @@ pub fn Connection(comptime max_streams: usize) type {
             if (packet.isLongHeader(data[0])) {
                 return self.processLongHeaderPacket(data, src, io);
             } else {
-                return self.processShortHeaderPacket(data);
+                return self.processShortHeaderPacket(data, io);
             }
         }
 
@@ -1260,8 +1584,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 // v1 and v2 can negotiate together. Client chooses version by sending with that version.
                 // Server must respond with matching version (initial keys are version-specific).
                 if (self.hot.state == .idle) {
+                    // VN packets (ver=0) must never be processed as regular packets.
+                    // RFC 9000 §6.1: A server MUST NOT send VN in response to another VN.
+                    if (ver == 0) return data.len;
                     // Check if version is supported (v1 or v2).
-                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2 and ver != 0) {
+                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2) {
                         // Unsupported version; send Version Negotiation.
                         if (!self.shouldThrottleVersionNeg(ver)) {
                             self.sendVersionNeg(data) catch {};
@@ -1278,14 +1605,22 @@ pub fn Connection(comptime max_streams: usize) type {
                     // be updated by the TLS layer if compatible version negotiation negotiates a
                     // different version via version_information transport parameter.
                 } else {
+                    // RFC 9000 §6: Version Negotiation packet (ver=0).
+                    // Servers MUST NOT respond to VN packets; clients handle them during handshake.
+                    if (ver == 0) {
+                        if (!self.config.is_server and self.hot.state == .handshake and !self.vn_handled) {
+                            self.handleVersionNegotiation(data, io) catch {};
+                        }
+                        return data.len;
+                    }
                     // RFC 9369: During handshake, allow version changes for compatible version negotiation.
                     // Only reject version mismatches after the handshake is complete (connection established).
-                    if (self.hot.state == .established and ver != self.quic_version and ver != 0) {
+                    if (self.hot.state == .established and ver != self.quic_version) {
                         return data.len; // Silently drop mismatched version during 1-RTT
                     }
                     // During handshake, reject packets with unsupported versions (not v1 or v2).
                     // This prevents garbage packets with random version bytes from corrupting handshake.
-                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2 and ver != 0) {
+                    if (ver != packet.QUIC_VERSION_1 and ver != packet.QUIC_VERSION_2) {
                         return data.len; // Silently drop unsupported version during handshake
                     }
                 }
@@ -1360,19 +1695,34 @@ pub fn Connection(comptime max_streams: usize) type {
                 // conn.quic_version into TLS before processCrypto, allowing TLS to upgrade it
                 // via version_information. conn.quic_version then adopts TLS's result.
             } else if (raw_pkt_type == .initial and self.hot.state != .idle and ver != self.initial_version) {
-                // RFC 9369: Compatible version negotiation with Retry.
-                // Client may retry with a different version (e.g., after Retry response).
-                // Re-derive initial keys with the new version to allow decryption.
+                // RFC 9369: Compatible version negotiation — server selected a different version.
+                // Re-derive initial keys using the ORIGINAL client DCID (not the server's DCID
+                // in this packet). Both endpoints derive initial keys from the client's first
+                // Initial DCID; only the version-specific salt changes.
                 self.initial_version = ver;
-                self.initial_keys = crypto.deriveInitialKeys(raw_dcid, ver);
+                self.quic_version = ver;
+                const odcid = self.first_initial_dcid[0..self.first_initial_dcid_len];
+                self.initial_keys = crypto.deriveInitialKeys(odcid, ver);
+                // Update TLS quic_version BEFORE ServerHello processing so handshake keys
+                // are derived with the correct version-specific labels (e.g., "quicv2 key").
+                switch (self.tls_state) {
+                    .client => |*c| c.quic_version = ver,
+                    else => {},
+                }
             }
 
             // Select the header-protection key for this packet type.
             const hp_keys: crypto.PacketKeys = switch (raw_pkt_type) {
-                .initial => self.initial_keys.client,
-                .handshake => if (self.hs_keys) |hk| hk.client else return data.len,
+                .initial => self.rxInitialKeys(),
+                .handshake => self.rxHsKeys() orelse return data.len,
                 .zero_rtt => if (self.zero_rtt_keys) |zk| zk else return data.len,
-                else => return data.len, // Retry: can't process
+                else => {
+                    // Retry packet: client-mode only.
+                    if (raw_pkt_type == .retry and !self.config.is_server) {
+                        self.handleRetry(data, ver, io) catch {};
+                    }
+                    return data.len;
+                },
             };
 
             // Compute offset of the packet-number field; validate buffer has space for HP sample.
@@ -1418,7 +1768,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     }
 
                     // Decrypt the Initial packet.
-                    const keys = self.initial_keys.client;
+                    const keys = self.rxInitialKeys();
                     const pn = packet.decodePacketNumber(
                         self.hot.rx_pn[0],
                         hdr.packet_number,
@@ -1469,6 +1819,23 @@ pub fn Connection(comptime max_streams: usize) type {
                         }
                     }
 
+                    // Client mode: extract server's SCID from first server Initial.
+                    // RFC 9000 §7.2: client switches DCID to server's SCID after first Initial.
+                    if (!self.config.is_server and std.mem.eql(u8, &self.peer_cid.bytes, &ConnectionId.zero.bytes)) {
+                        if (data.len >= 6 + raw_dcid_len + 1) {
+                            const raw_scid_len = data[6 + raw_dcid_len];
+                            if (raw_scid_len <= 20 and data.len >= 6 + raw_dcid_len + 1 + raw_scid_len) {
+                                if (raw_scid_len > 0) @memcpy(self.peer_scid[0..raw_scid_len], data[6 + raw_dcid_len + 1 ..][0..raw_scid_len]);
+                                self.peer_scid_len = @intCast(raw_scid_len);
+                                const copy_len = @min(raw_scid_len, cid_mod.len);
+                                var pc: ConnectionId = .{};
+                                if (copy_len > 0) @memcpy(pc.bytes[0..copy_len], data[6 + raw_dcid_len + 1 ..][0..copy_len]);
+                                self.peer_cid = pc;
+                            }
+                        }
+                        self.peer_addr = src;
+                    }
+
                     self.markPnReceived(0, pn);
                     self.bytes_recv += result.consumed;
                     self.pkts_recv += 1;
@@ -1480,8 +1847,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 },
                 .handshake => {
                     // Handshake packet: use handshake keys.
-                    if (self.hs_keys == null) return result.consumed;
-                    const keys = self.hs_keys.?.client;
+                    const keys = self.rxHsKeys() orelse return result.consumed;
                     const pn = packet.decodePacketNumber(
                         self.hot.rx_pn[1],
                         hdr.packet_number,
@@ -1644,8 +2010,24 @@ pub fn Connection(comptime max_streams: usize) type {
             return count;
         }
 
-        pub fn processShortHeaderPacket(self: *Self, data: []u8) !usize {
-            if (self.app_keys == null) return 0;
+        pub fn processShortHeaderPacket(self: *Self, data: []u8, io: ?std.Io) !usize {
+            if (self.app_keys == null) {
+                // RFC 9001 §4.1.2: Server MAY consider handshake confirmed when it
+                // receives a valid 1-RTT packet. If TLS has derived app_keys but is
+                // still waiting for client Finished (wait_client_finished state), we
+                // can confirm early. completeHandshake() is idempotent — the normal
+                // Finished path is harmless if it fires afterwards.
+                if (self.config.is_server and self.hot.state == .handshake) {
+                    const can_early_confirm = switch (self.tls_state) {
+                        .server => |*s| s.state == .wait_client_finished,
+                        else => false,
+                    };
+                    if (can_early_confirm) {
+                        self.completeHandshake() catch {};
+                    }
+                }
+                if (self.app_keys == null) return 0;
+            }
 
             // Reject packets larger than MAX_PACKET_SIZE (RFC 9000 compliance).
             if (data.len > MAX_PACKET_SIZE) return 0;
@@ -1658,7 +2040,7 @@ pub fn Connection(comptime max_streams: usize) type {
             if (pn_off + 4 + 16 > data.len) {
                 return 0;
             }
-            _ = crypto.removeHeaderProtection(self.app_keys.?.client, &data[0], data[pn_off..][0..4], data[pn_off + 4 ..][0..16]);
+            _ = crypto.removeHeaderProtection(self.rxAppKeys().?, &data[0], data[pn_off..][0..4], data[pn_off + 4 ..][0..16]);
 
             const result = try packet.parseShortHeader(data, our_scid_len);
             const hdr = result.header;
@@ -1689,9 +2071,9 @@ pub fn Connection(comptime max_streams: usize) type {
             if (hdr.key_phase != self.current_key_phase) {
                 // Peer initiated key update. Try next-generation keys first.
                 var decrypted_with_next = false;
-                if (self.next_app_keys) |nk| {
-                    const ctx = self.cached_next_keys orelse crypto_simd.CachedKeyCtx.init(nk.client);
-                    const nonce = crypto.buildNonce(nk.client.iv, pn);
+                if (self.rxNextAppKeys()) |rx_next| {
+                    const ctx = self.cached_next_keys orelse crypto_simd.CachedKeyCtx.init(rx_next);
+                    const nonce = crypto.buildNonce(rx_next.iv, pn);
                     if (crypto_simd.decryptCached(ctx, nonce, aad, payload)) |_| {
                         decrypted_with_next = true;
                     } else |_| {}
@@ -1701,8 +2083,9 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.key_update_pending = false;
                 } else {
                     // Fallback: current keys (handles reordering during key transition).
-                    const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(self.app_keys.?.client);
-                    const nonce = crypto.buildNonce(self.app_keys.?.client.iv, pn);
+                    const rx_keys = self.rxAppKeys().?;
+                    const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(rx_keys);
+                    const nonce = crypto.buildNonce(rx_keys.iv, pn);
                     _ = crypto_simd.decryptCached(ctx, nonce, aad, payload) catch {
                         if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                             self.hot.state = .closed;
@@ -1713,8 +2096,9 @@ pub fn Connection(comptime max_streams: usize) type {
                 }
             } else {
                 // Same phase — HOT PATH. Cached key schedule, no branch on cipher suite.
-                const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(self.app_keys.?.client);
-                const nonce = crypto.buildNonce(self.app_keys.?.client.iv, pn);
+                const rx_keys = self.rxAppKeys().?;
+                const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(rx_keys);
+                const nonce = crypto.buildNonce(rx_keys.iv, pn);
                 _ = crypto_simd.decryptCached(ctx, nonce, aad, payload) catch {
                     if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                         self.hot.state = .closed;
@@ -1730,7 +2114,7 @@ pub fn Connection(comptime max_streams: usize) type {
             self.bytes_recv += data.len;
             self.pkts_recv += 1;
             // Process frames from in-place decrypted plaintext (zero copy).
-            self.processFrames(data[payload_start..][0..pt_len], 2, null) catch |err| {
+            self.processFrames(data[payload_start..][0..pt_len], 2, io) catch |err| {
                 const code: u62 = switch (err) {
                     error.FlowControlViolation => 0x03,
                     error.StreamLimitError => 0x04,
@@ -1861,8 +2245,12 @@ pub fn Connection(comptime max_streams: usize) type {
                         // RFC 9000 §19.20: HANDSHAKE_DONE is only sent by the server.
                         // A server-role endpoint must never receive it.
                         if (self.config.is_server) return error.ProtocolViolation;
-                        self.hot.state = .established;
-                        self.events.push(.connected);
+                        // Client may already be in .established from TLS completion;
+                        // only push .connected if not already established.
+                        if (self.hot.state != .established) {
+                            self.hot.state = .established;
+                            self.events.push(.connected);
+                        }
                     },
                     .connection_close => |cc| {
                         if (self.hot.state != .closing and
@@ -2034,92 +2422,95 @@ pub fn Connection(comptime max_streams: usize) type {
         fn deliverCryptoChunk(self: *Self, epoch: u8, data: []const u8, io: std.Io) !void {
             self.crypto_recv_offset[epoch] += data.len;
 
-            // Before processing ClientHello, configure transport parameters for EncryptedExtensions.
-            if (self.tls_state.state == .wait_client_hello) {
-                var our_params = transport_params.TransportParams{
-                    .initial_max_streams_bidi = self.local_max_streams_bidi,
-                    .initial_max_streams_uni = self.local_max_streams_uni,
-                };
-                // initial_source_connection_id MUST equal the SCID we sent in our Initial packet
-                // (RFC 9000 §7.3). Our wire SCID is ourScidBytes() = local_cid.bytes.
-                const scid_bytes = self.ourScidBytes();
-                var isci: [20]u8 = [_]u8{0} ** 20;
-                @memcpy(isci[0..scid_bytes.len], scid_bytes);
-                our_params.initial_source_connection_id = isci;
-                our_params.initial_source_connection_id_len = @intCast(scid_bytes.len);
-                if (self.original_dcid) |dcid| {
-                    our_params.original_destination_connection_id = dcid;
-                    our_params.original_destination_connection_id_len = self.original_dcid_len;
-                    if (self.retry_scid) |scid| {
-                        our_params.retry_source_connection_id = scid;
+            // Server-specific: configure transport parameters before processing ClientHello.
+            switch (self.tls_state) {
+                .server => |*s| {
+                    if (s.state == .wait_client_hello) {
+                        var our_params = transport_params.TransportParams{
+                            .initial_max_streams_bidi = self.local_max_streams_bidi,
+                            .initial_max_streams_uni = self.local_max_streams_uni,
+                        };
+                        // initial_source_connection_id MUST equal the SCID we sent in our Initial packet
+                        // (RFC 9000 §7.3). Our wire SCID is ourScidBytes() = local_cid.bytes.
+                        const scid_bytes = self.ourScidBytes();
+                        var isci: [20]u8 = @as([20]u8, @splat(0));
+                        @memcpy(isci[0..scid_bytes.len], scid_bytes);
+                        our_params.initial_source_connection_id = isci;
+                        our_params.initial_source_connection_id_len = @intCast(scid_bytes.len);
+                        if (self.original_dcid) |dcid| {
+                            our_params.original_destination_connection_id = dcid;
+                            our_params.original_destination_connection_id_len = self.original_dcid_len;
+                            if (self.retry_scid) |scid| {
+                                our_params.retry_source_connection_id = scid;
+                            }
+                        } else if (self.first_initial_dcid_len > 0) {
+                            our_params.original_destination_connection_id = self.first_initial_dcid;
+                            our_params.original_destination_connection_id_len = self.first_initial_dcid_len;
+                        }
+
+                        // RFC 9369: version_information - advertise supported versions
+                        if (self.config.initial_quic_version == packet.QUIC_VERSION_2) {
+                            var vi: [20]u8 = undefined;
+                            std.mem.writeInt(u32, vi[0..4], packet.QUIC_VERSION_2, .big);
+                            std.mem.writeInt(u32, vi[4..8], packet.QUIC_VERSION_1, .big);
+                            our_params.version_information = vi;
+                            our_params.version_information_len = 8;
+                        } else {
+                            our_params.version_information = null;
+                        }
+
+                        // RFC 9000 §18.2.3: advertise preferred_address if configured.
+                        if (self.config.preferred_addr_ipv4) |ipv4| {
+                            var pa_cid: [20]u8 = @as([20]u8, @splat(0));
+                            const pa_cid_len = self.alt_local_cid.bytes.len;
+                            @memcpy(pa_cid[0..pa_cid_len], &self.alt_local_cid.bytes);
+                            our_params.preferred_address = transport_params.PreferredAddress{
+                                .ipv4_addr = ipv4,
+                                .ipv4_port = self.config.preferred_addr_ipv4_port,
+                                .ipv6_addr = self.config.preferred_addr_ipv6,
+                                .ipv6_port = self.config.preferred_addr_ipv6_port,
+                                .cid = pa_cid,
+                                .cid_len = @intCast(pa_cid_len),
+                                .reset_token = self.alt_local_reset_token,
+                            };
+                        }
+
+                        s.our_transport_params = our_params;
+                        // Push client's Initial version into TLS as baseline BEFORE processing ClientHello.
+                        // TLS may upgrade it to server_configured_version via version_information (RFC 9369).
+                        s.quic_version = self.quic_version;
+                        s.current_time_ns = self.current_time_ns;
                     }
-                } else if (self.first_initial_dcid_len > 0) {
-                    our_params.original_destination_connection_id = self.first_initial_dcid;
-                    our_params.original_destination_connection_id_len = self.first_initial_dcid_len;
-                }
-
-                // RFC 9369: version_information - advertise supported versions
-                // Server always supports V1, optionally V2 if configured
-                if (self.config.initial_quic_version == packet.QUIC_VERSION_2) {
-                    // Server supports both V1 and V2: advertise in version_information
-                    // List chosen version (V2) first, then alternatives
-                    var vi: [20]u8 = undefined;
-                    std.mem.writeInt(u32, vi[0..4], packet.QUIC_VERSION_2, .big);
-                    std.mem.writeInt(u32, vi[4..8], packet.QUIC_VERSION_1, .big);
-                    our_params.version_information = vi;
-                    our_params.version_information_len = 8; // 2 versions * 4 bytes each
-                } else {
-                    // Server only supports V1 (default)
-                    // RFC 9369 requires version_information for servers supporting V2.
-                    // V1-only servers can omit it.
-                    our_params.version_information = null;
-                }
-
-                // RFC 9000 §18.2.3: advertise preferred_address if configured.
-                // Advertise both IPv4 and IPv6 preferred addresses so that the client
-                // can migrate to whichever address family it is not currently using.
-                if (self.config.preferred_addr_ipv4) |ipv4| {
-                    var pa_cid: [20]u8 = [_]u8{0} ** 20;
-                    const pa_cid_len = self.alt_local_cid.bytes.len;
-                    @memcpy(pa_cid[0..pa_cid_len], &self.alt_local_cid.bytes);
-                    our_params.preferred_address = transport_params.PreferredAddress{
-                        .ipv4_addr = ipv4,
-                        .ipv4_port = self.config.preferred_addr_ipv4_port,
-                        .ipv6_addr = self.config.preferred_addr_ipv6,
-                        .ipv6_port = self.config.preferred_addr_ipv6_port,
-                        .cid = pa_cid,
-                        .cid_len = @intCast(pa_cid_len),
-                        .reset_token = self.alt_local_reset_token,
-                    };
-                }
-
-                self.tls_state.our_transport_params = our_params;
-            }
-
-            // Push client's Initial version into TLS as baseline BEFORE processing ClientHello.
-            // TLS may upgrade it to server_configured_version via version_information (RFC 9369).
-            // Guard ensures this only fires on ClientHello call, not again on ClientFinished.
-            if (self.tls_state.state == .wait_client_hello) {
-                self.tls_state.quic_version = self.quic_version;
-                self.tls_state.current_time_ns = self.current_time_ns;
+                },
+                .client => |*c| {
+                    // Push connection's QUIC version into TLS so key derivation uses it.
+                    // The TLS client defaults to V1; for V2 handshakes we must set it
+                    // before processCrypto derives handshake keys from ServerHello.
+                    c.quic_version = self.quic_version;
+                },
             }
 
             var out_buf: [32768]u8 = undefined;
             const out_len = try self.tls_state.processCrypto(data, &out_buf, io);
 
-            if (self.hs_keys == null and self.tls_state.state != .wait_client_hello) {
+            if (self.hs_keys == null and !self.tls_state.isInitial()) {
                 // Adopt whatever version TLS negotiated (V1 unchanged, or V2 if version_info matched).
-                self.quic_version = self.tls_state.quic_version;
-                self.hs_keys = self.tls_state.handshake_keys;
+                self.quic_version = self.tls_state.getQuicVersion();
+                self.hs_keys = self.tls_state.handshakeKeys();
 
-                // If TLS accepted 0-RTT, derive 0-RTT decryption keys from client_early_traffic_secret.
-                if (self.tls_state.accept_early_data) {
-                    self.zero_rtt_keys = crypto.derivePacketKeysWithSuite(
-                        self.tls_state.client_early_traffic_secret,
-                        self.quic_version,
-                        self.tls_state.negotiated_cipher,
-                    );
-                    self.accepting_early_data = true;
+                // Server-only: if TLS accepted 0-RTT, derive 0-RTT decryption keys.
+                switch (self.tls_state) {
+                    .server => |*s| {
+                        if (s.accept_early_data) {
+                            self.zero_rtt_keys = crypto.derivePacketKeysWithSuite(
+                                s.client_early_traffic_secret,
+                                self.quic_version,
+                                s.negotiated_cipher,
+                            );
+                            self.accepting_early_data = true;
+                        }
+                    },
+                    .client => {},
                 }
             }
 
@@ -2128,56 +2519,68 @@ pub fn Connection(comptime max_streams: usize) type {
             }
 
             if (self.tls_state.isComplete()) {
-                self.app_keys = self.tls_state.app_keys;
-                // Cache key schedule for the hot path (both AES and ChaCha20).
-                self.cached_app_keys = crypto_simd.CachedKeyCtx.init(self.tls_state.app_keys.client);
-                self.hot.state = .established;
-                // Defense-in-depth: zero initial keys after transition to 1-RTT (no longer needed)
-                std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.InitialKeys)]u8, @ptrCast(&self.initial_keys)));
-                // Discard any queued CRYPTO retransmits — they used handshake-epoch keys that
-                // the peer will discard once 1-RTT keys are established (RFC 9001 §4.9).
-                // Keeping them would cause stale CRYPTO sends on every tick and block the PTO
-                // handler from sending PING probes or stream retransmits post-handshake.
-                self.crypto_pending_retx_count = 0;
-                self.path_validated = true;
-                self.events.push(.connected);
+                try self.completeHandshake();
+            }
+        }
 
-                self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.client_app_secret, self.quic_version);
-                self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.server_app_secret, self.quic_version);
-                self.next_app_keys = tls.AppKeys{
-                    .client = crypto.derivePacketKeysWithSuite(self.next_client_secret, self.quic_version, self.tls_state.negotiated_cipher),
-                    .server = crypto.derivePacketKeysWithSuite(self.next_server_secret, self.quic_version, self.tls_state.negotiated_cipher),
-                };
-                // RFC 9001 §6.1: header protection key does not change with key updates.
-                // Override the derived hp fields with the gen-0 hp from the active keys.
-                if (self.app_keys) |cur| {
-                    self.next_app_keys.?.client.hp = cur.client.hp;
-                    self.next_app_keys.?.server.hp = cur.server.hp;
-                }
-                // Cache next-gen key schedule for fast key-update decrypt.
-                self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.next_app_keys.?.client);
+        /// Finalize the handshake: set app_keys, transition to established, derive
+        /// key-update material, read peer transport params, and queue HANDSHAKE_DONE.
+        /// Idempotent: if already established, returns immediately (prevents double-call
+        /// when RFC 9001 §4.1.2 early-confirm via 1-RTT races the normal Finished path).
+        fn completeHandshake(self: *Self) !void {
+            if (self.hot.state == .established) return;
+            const app_keys = self.tls_state.appKeys();
+            self.app_keys = app_keys;
+            // Cache key schedule for the hot path (both AES and ChaCha20).
+            const rx_app = if (self.config.is_server) app_keys.client else app_keys.server;
+            self.cached_app_keys = crypto_simd.CachedKeyCtx.init(rx_app);
+            self.hot.state = .established;
+            // Defense-in-depth: zero initial keys after transition to 1-RTT (no longer needed)
+            std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.InitialKeys)]u8, @ptrCast(&self.initial_keys)));
+            // Discard any queued CRYPTO retransmits — they used handshake-epoch keys that
+            // the peer will discard once 1-RTT keys are established (RFC 9001 §4.9).
+            self.crypto_pending_retx_count = 0;
+            self.path_validated = true;
+            self.events.push(.connected);
 
-                const params = self.tls_state.peerTransportParams();
-                self.conn_flow.updateSendMax(params.initial_max_data);
-                self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
-                self.cached_ack_delay_exp = @intCast(@min(params.ack_delay_exponent, 20));
-                self.peer_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
+            const cipher = self.tls_state.negotiatedCipher();
+            self.next_client_secret = crypto.deriveNextAppSecret(self.tls_state.clientAppSecret(), self.quic_version);
+            self.next_server_secret = crypto.deriveNextAppSecret(self.tls_state.serverAppSecret(), self.quic_version);
+            self.next_app_keys = tls.AppKeys{
+                .client = crypto.derivePacketKeysWithSuite(self.next_client_secret, self.quic_version, cipher),
+                .server = crypto.derivePacketKeysWithSuite(self.next_server_secret, self.quic_version, cipher),
+            };
+            // RFC 9001 §6.1: header protection key does not change with key updates.
+            if (self.app_keys) |cur| {
+                self.next_app_keys.?.client.hp = cur.client.hp;
+                self.next_app_keys.?.server.hp = cur.server.hp;
+            }
+            // Cache next-gen key schedule for fast key-update decrypt.
+            self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.rxNextAppKeys().?);
 
-                const bidi_limit = @min(params.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62)));
-                const uni_limit = @min(params.initial_max_streams_uni, @as(u64, std.math.maxInt(u62)));
-                self.peer_max_streams_bidi = @intCast(bidi_limit);
-                self.peer_max_streams_uni = @intCast(uni_limit);
+            const params = self.tls_state.peerTransportParams();
+            self.conn_flow.updateSendMax(params.initial_max_data);
+            self.cached_max_ack_delay_ns = params.max_ack_delay_ms * 1_000_000;
+            self.cached_ack_delay_exp = @intCast(@min(params.ack_delay_exponent, 20));
+            self.peer_max_stream_data_bidi_local = params.initial_max_stream_data_bidi_local;
 
-                self.peer_disable_migration = params.disable_active_migration;
+            const bidi_limit = @min(params.initial_max_streams_bidi, @as(u64, std.math.maxInt(u62)));
+            const uni_limit = @min(params.initial_max_streams_uni, @as(u64, std.math.maxInt(u62)));
+            self.peer_max_streams_bidi = @intCast(bidi_limit);
+            self.peer_max_streams_uni = @intCast(uni_limit);
 
-                // 0-RTT acceptance phase is over once handshake completes.
-                self.accepting_early_data = false;
+            self.peer_disable_migration = params.disable_active_migration;
 
-                // Schedule NewSessionTicket if ticket_key is configured.
-                if (self.config.ticket_key != null) {
-                    self.pending_new_session_ticket = true;
-                }
+            // 0-RTT acceptance phase is over once handshake completes.
+            self.accepting_early_data = false;
 
+            // Server-only: schedule NewSessionTicket if ticket_key is configured.
+            if (self.config.is_server and self.config.ticket_key != null) {
+                self.pending_new_session_ticket = true;
+            }
+
+            // Server sends HANDSHAKE_DONE; client does not.
+            if (self.config.is_server) {
                 try self.queueHandshakeDone();
             }
         }
@@ -2186,8 +2589,18 @@ pub fn Connection(comptime max_streams: usize) type {
             // RFC 9000 §12.4: STREAM frames are only valid in 1-RTT (established) state.
             // Exception: allow STREAM in handshake state when accepting 0-RTT data.
             if (self.hot.state != .established and !self.accepting_early_data) return error.ProtocolViolation;
-            // Server must only receive client-initiated streams (bit 0 = 0).
-            if (f.stream_id & 1 != 0) return error.StreamStateError;
+            // Validate stream direction: each endpoint must only receive STREAM frames
+            // on peer-initiated streams (or bidi streams opened by either side).
+            if (self.config.is_server) {
+                // Server only receives on client-initiated streams (even IDs).
+                if (f.stream_id & 1 != 0) return error.StreamStateError;
+            } else {
+                // Client can receive on server-initiated streams (odd IDs) and
+                // client-initiated bidirectional streams (ID & 3 == 0). Only
+                // client-initiated unidirectional streams (ID & 3 == 2) are
+                // send-only — the server must not send STREAM frames on them.
+                if (f.stream_id & 3 == 2) return error.StreamStateError;
+            }
             // RFC 9000 §4.6: reject streams that exceed the advertised stream limit.
             const stream_num = f.stream_id >> 2;
             if ((f.stream_id >> 1) & 1 == 0) {
@@ -2231,6 +2644,16 @@ pub fn Connection(comptime max_streams: usize) type {
                 st.gap_list.fill(f.offset, f.data.len);
             } else {
                 // Slow path: out-of-order, FIN, or inline already active → ring buffer.
+                // If this stream has a pending inline borrow, flush it to the ring buffer
+                // first.  Otherwise recv_buf.wp is behind recv_offset and writeAt/wp-advance
+                // in receiveData will leave a gap of uninitialised bytes in the ring buffer
+                // (the inline data that was never copied).
+                if (st.inline_recv != null) {
+                    st.flushInline();
+                    if (self.inline_borrow_stream) |ibs| {
+                        if (ibs == f.stream_id) self.inline_borrow_stream = null;
+                    }
+                }
                 try st.receiveData(f.offset, f.data, f.fin);
                 self.conn_flow.onReceived(fc_delta);
                 if (new_end > old_hwm) st.highest_recv_offset = new_end;
@@ -2650,21 +3073,22 @@ pub fn Connection(comptime max_streams: usize) type {
 
         fn sendCryptoChunkEpoch0(self: *Self, chunk: []const u8, offset: u62, fpos: usize) !void {
             const packet_version = self.quic_version;
-            const ik = if (packet_version == packet.QUIC_VERSION_2)
-                crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
-            else
-                self.initial_keys.server;
+            const ik = if (packet_version == packet.QUIC_VERSION_2) blk: {
+                const derived = crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2);
+                break :blk if (self.config.is_server) derived.server else derived.client;
+            } else self.txInitialKeys();
             const pn = self.hot.tx_pn[0];
             self.hot.tx_pn[0] += 1;
             const ct_len = fpos + 16;
             const slot_buf = try self.reserveSendSlot(ct_len + 30);
+            const retry_token_slice = self.retry_token[0..self.retry_token_len];
             const hdr_len = packet.encodeLongHeader(
                 slot_buf,
                 .initial,
                 packet_version,
                 self.peer_scid[0..self.peer_scid_len],
                 self.ourScidBytes(),
-                &.{},
+                retry_token_slice,
                 @intCast(pn),
                 ct_len,
             );
@@ -2682,7 +3106,7 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         fn sendCryptoChunkEpoch1(self: *Self, chunk: []const u8, offset: u62, fpos: usize) !void {
-            const hk = self.hs_keys orelse return error.NoHandshakeKeys;
+            const hk = self.txHsKeys() orelse return error.NoHandshakeKeys;
             const pn = self.hot.tx_pn[1];
             self.hot.tx_pn[1] += 1;
             const ct_len = fpos + 16;
@@ -2701,8 +3125,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.hot.tx_pn[1] -= 1;
                 return error.PacketTooLarge;
             }
-            crypto.encryptPayload(hk.server, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(hk.server, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+            crypto.encryptPayload(hk, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(hk, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
             self.commitSendSlot(hdr_len + ct_len);
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(offset), .len = @intCast(chunk.len) } };
@@ -2750,9 +3174,9 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         /// Send an encrypted ACK frame for the given epoch.
-        /// epoch 0 = Initial (long header, initial_keys.server)
-        /// epoch 1 = Handshake (long header, hs_keys.?.server)
-        /// epoch 2 = 1-RTT (short header, app_keys.?.server)
+        /// epoch 0 = Initial (long header, TX initial keys)
+        /// epoch 1 = Handshake (long header, TX handshake keys)
+        /// epoch 2 = 1-RTT (short header, TX app keys)
         /// ACK frames are not ack-eliciting (RFC 9002 §2), so ack_eliciting=false.
         pub fn sendEncryptedAck(self: *Self, epoch: u8) !void {
             // RFC 9000 §13.2: only send ACKs if we've actually received packets in this epoch.
@@ -2790,10 +3214,10 @@ pub fn Connection(comptime max_streams: usize) type {
                     // RFC 9369: If configured for V2, respond with V2 Initial and V2 keys.
                     // Re-derive V2 keys if needed; otherwise use V1 keys derived earlier.
                     const packet_version = self.quic_version; // V2 if configured, V1 otherwise
-                    const ik = if (packet_version == packet.QUIC_VERSION_2)
-                        crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
-                    else
-                        self.initial_keys.server;
+                    const ik = if (packet_version == packet.QUIC_VERSION_2) blk: {
+                        const derived = crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2);
+                        break :blk if (self.config.is_server) derived.server else derived.client;
+                    } else self.txInitialKeys();
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
@@ -2803,7 +3227,7 @@ pub fn Connection(comptime max_streams: usize) type {
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
-                        &.{},
+                        self.retry_token[0..self.retry_token_len],
                         @intCast(pn),
                         ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
                     );
@@ -2817,8 +3241,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 },
                 1 => {
                     // Handshake packet: Long Header, handshake keys
-                    if (self.hs_keys == null) return;
-                    const hk = self.hs_keys.?.server;
+                    const hk = self.txHsKeys() orelse return;
                     const pn = self.hot.tx_pn[1];
                     self.hot.tx_pn[1] += 1;
                     const ct_len = fpos + 16;
@@ -2882,8 +3305,9 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.hot.tx_pn[2] -= 1;
                 return error.PacketTooLarge;
             }
-            crypto.encryptPayload(ak.server, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..plaintext_len], slot_buf[hdr_len..][0..ct_len]);
-            crypto.applyHeaderProtection(ak.server, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+            const tx_keys = if (self.config.is_server) ak.server else ak.client;
+            crypto.encryptPayload(tx_keys, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..plaintext_len], slot_buf[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(tx_keys, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
             const out_len = hdr_len + ct_len;
             self.commitSendSlot(out_len);
 
@@ -2946,8 +3370,13 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Build and send a NewSessionTicket in a 1-RTT CRYPTO frame (post-handshake).
         fn sendNewSessionTicket(self: *Self) !void {
             var nst_buf: [512]u8 = undefined;
-            self.tls_state.current_time_ns = self.current_time_ns;
-            const nst_len = self.tls_state.buildNewSessionTicket(&nst_buf);
+            const nst_len = switch (self.tls_state) {
+                .server => |*s| blk: {
+                    s.current_time_ns = self.current_time_ns;
+                    break :blk s.buildNewSessionTicket(&nst_buf);
+                },
+                .client => return, // client never sends NST
+            };
             if (nst_len == 0) return;
 
             const tls_offset = self.crypto_send_offset[2];
@@ -2986,12 +3415,18 @@ pub fn Connection(comptime max_streams: usize) type {
         pub fn queueTlsOutput(self: *Self, tls_data: []const u8) !void {
             if (tls_data.len == 0) return;
 
-            // RFC 9001 §4.1.3: ServerHello MUST be sent in an Initial CRYPTO frame;
-            // EncryptedExtensions through Finished MUST be in Handshake CRYPTO frames.
-            //
-            // Split point: end of the first TLS handshake message (ServerHello).
-            // TLS handshake message format: type(1) || length(3) || body(length).
+            // RFC 9001 §4.1.3: epoch routing for TLS output.
+            // Server: ServerHello → Initial, EE+Cert+CV+Finished → Handshake.
+            // Client: ClientHello → Initial, ClientFinished → Handshake.
             const sh_end: usize = blk: {
+                if (!self.config.is_server) {
+                    // Client mode: ClientHello (0x01) → Initial, Finished (0x14) → Handshake.
+                    if (tls_data.len >= 1 and tls_data[0] == 0x14) {
+                        break :blk 0; // All data goes to Handshake epoch
+                    }
+                    break :blk tls_data.len; // All data goes to Initial epoch (ClientHello)
+                }
+                // Server mode: split at ServerHello boundary.
                 if (tls_data.len >= 4 and tls_data[0] == 0x02) { // SERVER_HELLO
                     const body_len: usize =
                         (@as(usize, tls_data[1]) << 16) |
@@ -3082,22 +3517,21 @@ pub fn Connection(comptime max_streams: usize) type {
 
             switch (epoch) {
                 0 => {
-                    const packet_version = self.quic_version; // V2 if configured, V1 otherwise
-                    const ik = if (packet_version == packet.QUIC_VERSION_2)
-                        crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
-                    else
-                        self.initial_keys.server;
+                    const packet_version = self.quic_version;
+                    const ik = if (packet_version == packet.QUIC_VERSION_2) blk: {
+                        const derived = crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2);
+                        break :blk if (self.config.is_server) derived.server else derived.client;
+                    } else self.txInitialKeys();
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
-                    // RFC 9369: If configured for V2, respond with V2 Initial and V2 keys.
                     const hdr_len = packet.encodeLongHeader(
                         &self.enc_scratch,
                         .initial,
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
-                        &.{},
+                        self.retry_token[0..self.retry_token_len],
                         @intCast(pn),
                         ct_len,
                     );
@@ -3122,7 +3556,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.storeSendMeta(pn, 0, hdr_len + ct_len, true, fi);
                 },
                 1 => {
-                    const hk = self.hs_keys.?.server;
+                    const hk = self.txHsKeys() orelse return error.NoHandshakeKeys;
                     const pn = self.hot.tx_pn[1];
                     self.hot.tx_pn[1] += 1;
                     const ct_len = fpos + 16;
@@ -3218,11 +3652,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 fpos += frame.encodeFrame(self.pkt_scratch[fpos..], crypto_frame_val);
 
                 if (epoch == 0) {
-                    const packet_version = self.quic_version; // V2 if configured, V1 otherwise
-                    const ik = if (packet_version == packet.QUIC_VERSION_2)
-                        crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2).server
-                    else
-                        self.initial_keys.server;
+                    const packet_version = self.quic_version;
+                    const ik = if (packet_version == packet.QUIC_VERSION_2) blk: {
+                        const derived = crypto.deriveInitialKeys(self.first_initial_dcid[0..self.first_initial_dcid_len], packet.QUIC_VERSION_2);
+                        break :blk if (self.config.is_server) derived.server else derived.client;
+                    } else self.txInitialKeys();
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
@@ -3232,7 +3666,7 @@ pub fn Connection(comptime max_streams: usize) type {
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
                         self.ourScidBytes(),
-                        &.{},
+                        self.retry_token[0..self.retry_token_len],
                         @intCast(pn),
                         ct_len,
                     );
@@ -3369,6 +3803,168 @@ pub fn Connection(comptime max_streams: usize) type {
             try self.enqueueSend(vn_buf[0..vn_n]);
         }
 
+        /// Handle a Retry packet received by the client (RFC 9000 §17.2.5).
+        /// Verifies the integrity tag, updates the DCID, stores the token, resets TLS,
+        /// and re-queues the ClientHello with the token included in the next Initial.
+        fn handleRetry(self: *Self, data: []const u8, ver: u32, io: std.Io) !void {
+            // Only clients handle Retry, only during handshake, and only once.
+            if (self.config.is_server) return;
+            if (self.hot.state != .handshake) return;
+            if (self.retry_token_len > 0) return; // already processed a Retry
+
+            // Parse Retry structure:
+            //   first(1) + ver(4) + dcid_len(1) + dcid + scid_len(1) + scid + token + tag(16)
+            if (data.len < 7 + 16) return;
+            const raw_dcid_len = data[5];
+            if (data.len < @as(usize, 6) + raw_dcid_len + 1 + 16) return;
+            const raw_scid_len = data[6 + raw_dcid_len];
+            const scid_start = 7 + raw_dcid_len;
+            if (data.len < scid_start + raw_scid_len + 16) return;
+            const scid = data[scid_start..][0..raw_scid_len];
+            const token_start = scid_start + raw_scid_len;
+            if (data.len < token_start + 16) return;
+            const token_end = data.len - 16;
+            const token = data[token_start..token_end];
+            const tag: *const [16]u8 = data[token_end..][0..16];
+
+            // Verify Retry Integrity Tag against original DCID.
+            const odcid = self.first_initial_dcid[0..self.first_initial_dcid_len];
+            if (!packet.verifyRetryIntegrity(data[0..token_end], odcid, tag, ver)) return;
+
+            // Store Retry token (capped at 128 bytes).
+            const store_len = @min(token.len, @as(usize, 128));
+            @memcpy(self.retry_token[0..store_len], token[0..store_len]);
+            self.retry_token_len = @intCast(store_len);
+
+            // Update DCID to Retry's SCID.
+            const new_len = @min(raw_scid_len, @as(u8, 20));
+            @memcpy(self.peer_scid[0..new_len], scid[0..new_len]);
+            self.peer_scid_len = new_len;
+            @memcpy(self.first_initial_dcid[0..new_len], scid[0..new_len]);
+            self.first_initial_dcid_len = new_len;
+
+            // Re-derive initial keys from the new DCID.
+            self.initial_keys = crypto.deriveInitialKeys(scid[0..new_len], ver);
+
+            // Continue Initial packet number counter from current value.
+            // RFC 9000 §17.2.5 says the client restarts the connection attempt, but
+            // major implementations (ngtcp2, quic-go) keep the PN monotonically
+            // increasing — which also satisfies the interop runner's trace check
+            // that post-Retry PN > pre-Retry PN.
+
+            // Clear send queue and loss state (discard old Initial packets).
+            self.sq_head = self.sq_tail;
+            self.bytes_queued = 0;
+            self.sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{}));
+            self.loss.bytes_in_flight = 0;
+
+            // Reset crypto send state for epoch 0.
+            self.crypto_send_offset[0] = 0;
+            self.crypto_send_saved_len[0] = 0;
+
+            // Reset TLS client and re-build ClientHello.
+            var fresh_tls = tls.TlsClient.init(io);
+            if (self.config.alpn.len > 0) {
+                const n = @min(self.config.alpn.len, @as(usize, 32));
+                @memcpy(fresh_tls.alpn[0..n], self.config.alpn[0..n]);
+                fresh_tls.alpn_len = @intCast(n);
+            }
+            if (self.config.session_ticket) |ticket| {
+                fresh_tls.setTicket(ticket);
+            }
+            // Preserve transport params from the original TLS client.
+            fresh_tls.our_transport_params = switch (self.tls_state) {
+                .client => |*c| c.our_transport_params,
+                else => return,
+            };
+            self.tls_state = .{ .client = fresh_tls };
+
+            var ch_buf: [32768]u8 = undefined;
+            const ch_len = try self.tls_state.client.processCrypto(&.{}, &ch_buf, io);
+            try self.queueTlsOutput(ch_buf[0..ch_len]);
+        }
+
+        /// Process an incoming Version Negotiation packet (RFC 9000 §6.2).
+        /// Only called on client-mode connections during the handshake, and only once
+        /// (vn_handled prevents infinite version-switching loops).
+        fn handleVersionNegotiation(self: *Self, data: []const u8, io: std.Io) !void {
+            // VN format: first(1) + ver=0(4) + dcid_len(1) + dcid + scid_len(1) + scid + versions(n×4)
+            if (data.len < 7) return;
+            const dcid_len = data[5];
+            if (data.len < @as(usize, 6) + dcid_len + 1) return;
+            const dcid = data[6..][0..dcid_len];
+            const scid_len_pos: usize = 6 + dcid_len;
+            const scid_len = data[scid_len_pos];
+            const versions_start: usize = scid_len_pos + 1 + scid_len;
+            if (versions_start > data.len) return;
+            const versions_data = data[versions_start..];
+            if (versions_data.len < 4 or versions_data.len % 4 != 0) return;
+
+            // RFC 9000 §6.2: DCID in VN must match our SCID (prevents off-path spoofing).
+            const our_scid = self.ourScidBytes();
+            if (!std.mem.eql(u8, dcid, our_scid)) return;
+
+            // Scan the supported versions list.
+            // RFC 9000 §6.2: MUST discard VN if it contains the version we already sent.
+            // Also find the first version we support other than our current one.
+            var chosen: ?u32 = null;
+            var i: usize = 0;
+            while (i + 4 <= versions_data.len) : (i += 4) {
+                const v = std.mem.readInt(u32, versions_data[i..][0..4], .big);
+                if (v == self.initial_version) return; // MUST discard
+                if (chosen == null and (v == packet.QUIC_VERSION_1 or v == packet.QUIC_VERSION_2)) {
+                    chosen = v;
+                }
+            }
+            const new_ver = chosen orelse return; // no supported version found — give up
+
+            // Switch to new_ver: re-derive initial keys with a new random DCID.
+            self.vn_handled = true;
+            var new_dcid: [cid_mod.len]u8 = undefined;
+            io.random(&new_dcid);
+            self.initial_keys = crypto.deriveInitialKeys(&new_dcid, new_ver);
+            self.initial_version = new_ver;
+            self.quic_version = new_ver;
+            @memcpy(self.peer_scid[0..cid_mod.len], &new_dcid);
+            self.peer_scid_len = cid_mod.len;
+            @memcpy(self.first_initial_dcid[0..cid_mod.len], &new_dcid);
+            self.first_initial_dcid_len = cid_mod.len;
+
+            // Reset packet number and send queue.
+            self.hot.tx_pn[0] = 0;
+            self.sq_head = self.sq_tail;
+            self.bytes_queued = 0;
+            self.sq_meta = @as([SEND_QUEUE_DEPTH]SendMeta, @splat(.{}));
+            self.crypto_send_offset[0] = 0;
+            self.crypto_send_saved_len[0] = 0;
+
+            // Re-build fresh TLS client for the new version.
+            var fresh_tls = tls.TlsClient.init(io);
+            if (self.config.alpn.len > 0) {
+                const n = @min(self.config.alpn.len, @as(usize, 32));
+                @memcpy(fresh_tls.alpn[0..n], self.config.alpn[0..n]);
+                fresh_tls.alpn_len = @intCast(n);
+            }
+            if (self.config.session_ticket) |ticket| {
+                fresh_tls.setTicket(ticket);
+            }
+            fresh_tls.our_transport_params = switch (self.tls_state) {
+                .client => |*c| c.our_transport_params,
+                else => return,
+            };
+            // Update the ISCI transport param to our SCID.
+            var isci: [20]u8 = @as([20]u8, @splat(0));
+            @memcpy(isci[0..our_scid.len], our_scid);
+            fresh_tls.our_transport_params.initial_source_connection_id = isci;
+            fresh_tls.our_transport_params.initial_source_connection_id_len = @intCast(our_scid.len);
+            self.tls_state = .{ .client = fresh_tls };
+
+            // Re-build and queue a new ClientHello.
+            var ch_buf: [32768]u8 = undefined;
+            const ch_len = try self.tls_state.client.processCrypto(&.{}, &ch_buf, io);
+            try self.queueTlsOutput(ch_buf[0..ch_len]);
+        }
+
         /// Build and enqueue a Retry packet (RFC 9000 §8.1).
         /// Generates a fresh address-validation token, picks a new SCID, and pushes
         /// `retry_sent` so the caller knows to drain and discard this connection.
@@ -3403,14 +3999,60 @@ pub fn Connection(comptime max_streams: usize) type {
             _ = try self.sendShortHeaderPacket(fpos, fi, true);
         }
 
+        /// Build a 0-RTT long header packet containing a STREAM frame.
+        fn encryptAndEnqueueZeroRttStreamFrame(self: *Self, id: u62, offset: u62, data: []const u8, fin: bool, zk: crypto.PacketKeys) !void {
+            self.idle_ping_count = 0;
+            var fpos: usize = 0;
+            fpos += frame.encodeFrame(self.pkt_scratch[fpos..], .{ .stream = .{
+                .stream_id = id,
+                .offset = offset,
+                .fin = fin,
+                .data = data,
+            } });
+            const pn = self.hot.tx_pn[2]; // 0-RTT shares the 1-RTT PN space (epoch 2)
+            self.hot.tx_pn[2] += 1;
+            const ct_len = fpos + 16;
+            const slot_buf = try self.reserveSendSlot(ct_len + 30);
+            const hdr_len = packet.encodeLongHeader(
+                slot_buf,
+                .zero_rtt,
+                self.quic_version,
+                self.peer_scid[0..self.peer_scid_len],
+                self.ourScidBytes(),
+                &.{},
+                @intCast(pn),
+                ct_len,
+            );
+            if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) {
+                self.hot.tx_pn[2] -= 1;
+                return error.PacketTooLarge;
+            }
+            crypto.encryptPayload(zk, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+            crypto.applyHeaderProtection(zk, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+            self.commitSendSlot(hdr_len + ct_len);
+            var fi = loss_recovery_mod.SentFrameInfo{};
+            fi.frames[0] = .{ .stream = .{
+                .stream_id = id,
+                .offset = offset,
+                .len = @intCast(@min(data.len, 0xffff)),
+                .fin = fin,
+            } };
+            fi.count = 1;
+            self.storeSendMeta(pn, 2, hdr_len + ct_len, true, fi);
+        }
+
         fn queueStreamData(self: *Self, id: u62, data: []const u8, fin: bool) !void {
-            if (self.app_keys == null) return;
+            if (self.app_keys == null and self.zero_rtt_keys == null) return;
 
             const st = self.streams.getOrCreate(id) orelse return;
             const offset: u62 = @intCast(st.send_offset);
             // Enqueue the packet first; if the send queue is full this returns an error
             // and no state is changed (send_buf and send_offset remain unmodified).
-            try self.encryptAndEnqueueStreamFrame(id, offset, data, fin);
+            if (self.app_keys != null) {
+                try self.encryptAndEnqueueStreamFrame(id, offset, data, fin);
+            } else if (self.zero_rtt_keys) |zk| {
+                try self.encryptAndEnqueueZeroRttStreamFrame(id, offset, data, fin, zk);
+            } else return;
             // Only after the packet is successfully queued: buffer for retransmission
             // and advance the send offset.
             _ = st.bufferSendData(data);
@@ -3694,9 +4336,10 @@ pub fn Connection(comptime max_streams: usize) type {
 
             self.next_client_secret = new_client;
             self.next_server_secret = new_server;
+            const cipher = self.tls_state.negotiatedCipher();
             self.next_app_keys = tls.AppKeys{
-                .client = crypto.derivePacketKeysWithSuite(self.next_client_secret, self.quic_version, self.tls_state.negotiated_cipher),
-                .server = crypto.derivePacketKeysWithSuite(self.next_server_secret, self.quic_version, self.tls_state.negotiated_cipher),
+                .client = crypto.derivePacketKeysWithSuite(self.next_client_secret, self.quic_version, cipher),
+                .server = crypto.derivePacketKeysWithSuite(self.next_server_secret, self.quic_version, cipher),
             };
             // RFC 9001 §6.1: header protection key does not change with key updates.
             if (self.app_keys) |cur| {
@@ -3704,7 +4347,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.next_app_keys.?.server.hp = cur.server.hp;
             }
             // Cache rotated key schedule.
-            self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.next_app_keys.?.client);
+            self.cached_next_keys = crypto_simd.CachedKeyCtx.init(self.rxNextAppKeys().?);
         }
 
         /// Initiate a locally-triggered key update (RFC 9001 §6).
@@ -3720,8 +4363,8 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Derive client and server secrets for a given generation (0=initial, 1+=rotations).
         /// Used for SSLKEYLOG to track all key generations.
         pub fn deriveSecretsForGeneration(self: *const Self, generation: u32) struct { client: [32]u8, server: [32]u8 } {
-            var client = self.tls_state.client_app_secret;
-            var server = self.tls_state.server_app_secret;
+            var client = self.tls_state.clientAppSecret();
+            var server = self.tls_state.serverAppSecret();
             for (0..generation) |_| {
                 client = crypto.deriveNextAppSecret(client, self.quic_version);
                 server = crypto.deriveNextAppSecret(server, self.quic_version);
@@ -3789,7 +4432,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Helper: normalize address to IPv6 for token hashing.
         fn normalizeAddressToIPv6(src: SocketAddr) [16]u8 {
-            var ipv6: [16]u8 = [_]u8{0} ** 16;
+            var ipv6: [16]u8 = @as([16]u8, @splat(0));
             switch (src) {
                 .v4 => |v4| {
                     ipv6[10] = 0xff;
@@ -3815,7 +4458,7 @@ pub fn Connection(comptime max_streams: usize) type {
             const addr_ipv6 = normalizeAddressToIPv6(src);
 
             // Build plaintext (47 bytes): odcid_len(1) + odcid(20) + addr(16) + port(2) + ts(8)
-            var plaintext: [47]u8 = [_]u8{0} ** 47;
+            var plaintext: [47]u8 = @as([47]u8, @splat(0));
             var pos: usize = 0;
 
             // Original DCID length (1 byte) + DCID bytes (padded to 20)
@@ -3914,7 +4557,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // Original DCID length + bytes
             const odcid_len: u8 = if (plaintext[pos] <= 20) plaintext[pos] else return null;
             pos += 1;
-            var odcid_raw: [20]u8 = [_]u8{0} ** 20;
+            var odcid_raw: [20]u8 = @as([20]u8, @splat(0));
             @memcpy(&odcid_raw, plaintext[pos..][0..20]);
             pos += 20;
 

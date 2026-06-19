@@ -55,14 +55,17 @@ pub fn Router(comptime routes: anytype) type {
 
     // Find a seed that produces zero collisions.
     comptime var seed: u64 = 0x811c9dc5; // FNV offset basis
-    comptime var table: [table_size]?Entry = [_]?Entry{null} ** table_size;
+    comptime var table: [table_size]?Entry = @as([table_size]?Entry, @splat(null));
     comptime found: {
         while (true) : (seed +%= 1) {
-            var t: [table_size]?Entry = [_]?Entry{null} ** table_size;
+            var t: [table_size]?Entry = @as([table_size]?Entry, @splat(null));
             var ok = true;
             for (0..num_routes) |i| {
                 const slot = fnv1a(seed, keys[i]) & (table_size - 1);
-                if (t[slot] != null) { ok = false; break; }
+                if (t[slot] != null) {
+                    ok = false;
+                    break;
+                }
                 t[slot] = .{ .key = keys[i], .handler = handlers_arr[i] };
             }
             if (ok) {
@@ -133,9 +136,9 @@ fn postHandler(req: *const Request, res: *Response) void {
 }
 
 const TestRouter = Router(.{
-    .{ "GET",  "/hello",   helloHandler },
-    .{ "GET",  "/echo",    echoHandler  },
-    .{ "POST", "/submit",  postHandler  },
+    .{ "GET", "/hello", helloHandler },
+    .{ "GET", "/echo", echoHandler },
+    .{ "POST", "/submit", postHandler },
 });
 
 test "Router: known GET route dispatches correctly" {

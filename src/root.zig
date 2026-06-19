@@ -39,6 +39,11 @@ pub const SocketAddr = @import("quic/connection.zig").SocketAddr;
 pub const ConnectionId = @import("quic/connection_id.zig").ConnectionId;
 pub const PacketKeys = @import("quic/crypto.zig").PacketKeys;
 
+// Test framework modules (used by tools/bench.zig)
+pub const tls_client = @import("quic/tls_client.zig");
+pub const test_harness = @import("quic/test_harness.zig");
+pub const netsim = @import("quic/netsim.zig");
+
 test {
     // Pull in all module tests via a recursive comptime import.
     const std = @import("std");

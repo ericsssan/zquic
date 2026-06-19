@@ -457,15 +457,15 @@ test "EncryptJob round-trip with known keys" {
     // Create a simple encrypt job and verify it produces valid output
     var job = EncryptJob{};
     job.keys = crypto.PacketKeys{
-        .key = [_]u8{0x01} ** 32,
-        .iv = [_]u8{0x02} ** 12,
-        .hp = [_]u8{0x03} ** 32,
+        .key = @as([32]u8, @splat(0x01)),
+        .iv = @as([12]u8, @splat(0x02)),
+        .hp = @as([32]u8, @splat(0x03)),
         .suite = .aes_128_gcm,
     };
     job.pn = 42;
 
     // Build a simple short header
-    const hdr = packet.encodeShortHeader(&job.header, &([_]u8{0xAA} ** 8), 42, false);
+    const hdr = packet.encodeShortHeader(&job.header, &(@as([8]u8, @splat(0xAA))), 42, false);
     job.header_len = @intCast(hdr);
 
     // Simple plaintext (PING frame)

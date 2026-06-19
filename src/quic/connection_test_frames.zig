@@ -29,20 +29,23 @@ test "connection: tick clears shouldSendMaxStreamData after stream read" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    // Create a stream and simulate the application reading data (grows recv_max)
+    // Create a stream and simulate reading enough data to trigger MAX_STREAM_DATA
+    // (threshold = 25% of buffer size = STREAM_BUF_SIZE / 4)
     const st = conn.streams.getOrCreate(0).?;
-    try st.receiveData(0, "hello world", false);
-    var read_buf: [16]u8 = undefined;
+    const quarter = @import("stream.zig").STREAM_BUF_SIZE / 4;
+    var big_data: [quarter]u8 = undefined;
+    @memset(&big_data, 0x42);
+    try st.receiveData(0, &big_data, false);
+    var read_buf: [quarter]u8 = undefined;
     _ = st.read(&read_buf);
-    // recv_max has grown beyond last_sent_max_stream_data
     try testing.expect(st.shouldSendMaxStreamData());
 
     // Simulate established state with dummy app_keys (keys don't need to be valid
     // for decryption here; we only check that the watermark is cleared and a packet queued).
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
     };
     const sq_before = conn.sq_tail;
     conn.tick(1_000_000);
@@ -81,7 +84,7 @@ test "connection: persistent congestion collapses cwnd to 2*MSS" {
     const ack = frame.AckFrame{
         .largest_acked = 8,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -142,7 +145,7 @@ test "security: amplification limit blocks excessive sends" {
     conn.bytes_unvalidated_recv = 100;
 
     // First 300 bytes should be allowed (3 × 100).
-    const pkt = [_]u8{0x01} ** 100;
+    const pkt = @as([100]u8, @splat(0x01));
     try conn.enqueueSend(&pkt);
     try conn.enqueueSend(&pkt);
     try conn.enqueueSend(&pkt);
@@ -160,7 +163,7 @@ test "security: amplification limit lifted after path_validated" {
     conn.path_validated = true; // validated → no limit
 
     // Even though budget is tiny, sends are allowed once validated.
-    try conn.enqueueSend(&[_]u8{0x01} ** 100);
+    try conn.enqueueSend(&@as([100]u8, @splat(0x01)));
     // Verify the send queue actually accepted the bytes.
     var out: [MAX_PACKET_SIZE]u8 = undefined;
     try testing.expect(conn.send(&out, 0) > 0);
@@ -202,7 +205,7 @@ test "security: ACK frame in epoch 0 is allowed" {
     const ack_frame_data: frame.Frame = .{ .ack = .{
         .largest_acked = 0,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -320,9 +323,8 @@ test "perf: flushPendingMaxStreamData not called when not established" {
     var conn = try Connection(16).accept(.{}, io);
 
     const st = conn.streams.getOrCreate(0).?;
-    try st.receiveData(0, "hello world", false);
-    var buf: [16]u8 = undefined;
-    _ = st.read(&buf);
+    // Force shouldSendMaxStreamData by setting last_sent below recv_max by >= threshold
+    st.last_sent_max_stream_data = 0;
     try testing.expect(st.shouldSendMaxStreamData());
 
     // tick() in idle state must NOT clear the flag (no flush).
@@ -341,7 +343,7 @@ test "connection: ACK with max ack_delay does not overflow" {
     const ack_frm = frame.Frame{ .ack = .{
         .largest_acked = 0,
         .ack_delay = std.math.maxInt(u62),
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -468,14 +470,14 @@ test "security: shouldThrottleVersionNeg round-robin eviction after 4 versions" 
 test "connection: current_key_phase defaults false" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection(16).accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.current_key_phase);
 }
 
 test "connection: key_update_pending defaults false" {
     const testing = std.testing;
     const io = std.testing.io;
-    var conn = try Connection(16).accept(.{}, io);
+    const conn = try Connection(16).accept(.{}, io);
     try testing.expect(!conn.key_update_pending);
 }
 
@@ -489,10 +491,10 @@ test "connection: initiateKeyUpdate errors when not established" {
 test "connection: initiateKeyUpdate errors when key_update_pending" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
-    conn.next_client_secret = [_]u8{0x33} ** 32;
-    conn.next_server_secret = [_]u8{0x44} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(0x33));
+    conn.next_server_secret = @as([32]u8, @splat(0x44));
     conn.next_app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.key_update_pending = true;
     try std.testing.expectError(error.KeyUpdatePending, conn.initiateKeyUpdate());
@@ -502,10 +504,10 @@ test "connection: initiateKeyUpdate flips key_phase and sets pending" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
-    conn.next_client_secret = [_]u8{0x55} ** 32;
-    conn.next_server_secret = [_]u8{0x66} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(0x55));
+    conn.next_server_secret = @as([32]u8, @splat(0x66));
     conn.next_app_keys = tls.AppKeys{ .client = k, .server = k };
 
     try testing.expect(!conn.current_key_phase);
@@ -518,8 +520,8 @@ test "connection: rotateKeys advances next-generation secrets" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
-    const secret = [_]u8{0x77} ** 32;
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
+    const secret = @as([32]u8, @splat(0x77));
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.next_client_secret = secret;
     conn.next_server_secret = secret;
@@ -540,10 +542,10 @@ test "connection: ACK generation after key update" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Setup: establish connection with initial keys
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
-    conn.next_client_secret = [_]u8{0x55} ** 32;
-    conn.next_server_secret = [_]u8{0x66} ** 32;
+    conn.next_client_secret = @as([32]u8, @splat(0x55));
+    conn.next_server_secret = @as([32]u8, @splat(0x66));
     conn.next_app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.hot.state = .established;
 
@@ -587,7 +589,7 @@ test "connection: same address no migration" {
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     // peer_addr initialised to 0.0.0.0:0; receive from the same address.
-    const src = SocketAddr{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } };
+    const src = SocketAddr{ .v4 = .{ .addr = @as([4]u8, @splat(0)), .port = 0 } };
     try conn.receive(&[_]u8{}, src, 0, 0, io);
     // No migration event must have been pushed.
     try testing.expect(conn.pollEvent() == null);
@@ -652,7 +654,7 @@ test "connection: peer_disable_migration suppresses migration" {
     const new_src = SocketAddr{ .v4 = .{ .addr = [4]u8{ 192, 168, 0, 1 }, .port = 8080 } };
     try conn.receive(&[_]u8{}, new_src, 0, 0, io);
     // peer_addr must NOT be updated when migration is disabled.
-    const original = SocketAddr{ .v4 = .{ .addr = [_]u8{0} ** 4, .port = 0 } };
+    const original = SocketAddr{ .v4 = .{ .addr = @as([4]u8, @splat(0)), .port = 0 } };
     try testing.expect(conn.peer_addr.eql(original));
     // No migration event.
     try testing.expect(conn.pollEvent() == null);
@@ -717,7 +719,7 @@ test "connection: sendEncryptedAck for 1-RTT epoch produces short header" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.markPnReceived(2, 3);
 
@@ -770,7 +772,7 @@ test "connection: ACK frame does NOT set pending_ack" {
     const ack_f: frame.Frame = .{ .ack = .{
         .largest_acked = 0,
         .ack_delay = 0,
-        .ranges = [_]frame.AckRange{.{ .gap = 0, .ack_range = 0 }} ** 32,
+        .ranges = @as([32]frame.AckRange, @splat(.{ .gap = 0, .ack_range = 0 })),
         .range_count = 1,
         .ect0 = 0,
         .ect1 = 0,
@@ -794,7 +796,7 @@ test "connection: receive() flushes deferred ACK after ack-eliciting packet" {
     conn.hot.state = .handshake; // past idle so Initial packets are processed
     conn.peer_cid = conn.local_cid;
     // hs_keys must be non-null so epoch-0 ACK is not suppressed.
-    const hs_secret = [_]u8{0xab} ** 32;
+    const hs_secret = @as([32]u8, @splat(0xab));
     conn.hs_keys = tls.HandshakeKeys{
         .client = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
         .server = crypto.derivePacketKeys(hs_secret, packet.QUIC_VERSION_1),
@@ -950,7 +952,7 @@ test "connection: CRYPTO duplicate frame is silently ignored" {
     // Pretend we already processed 10 bytes.
     conn.crypto_recv_offset[0] = 10;
 
-    const data = [_]u8{0x42} ** 10;
+    const data = @as([10]u8, @splat(0x42));
     // Frame at offset 0 with 10 bytes → end = 10 = expected → pure duplicate.
     const f: frame.CryptoFrame = .{ .offset = 0, .data = &data };
     // Must return without error (or any TLS error is irrelevant — offset guard fires first).
@@ -966,7 +968,7 @@ test "connection: CRYPTO gap is staged, offset does not advance" {
     var conn = try Connection(16).accept(.{}, io);
     conn.crypto_recv_offset[0] = 0;
 
-    const data = [_]u8{0x55} ** 5;
+    const data = @as([5]u8, @splat(0x55));
     // Frame at offset 100 when expected is 0 — gap: should be staged, not an error.
     const f: frame.CryptoFrame = .{ .offset = 100, .data = &data };
     try conn.processCryptoFrame(f, 0, io);
@@ -983,7 +985,7 @@ test "connection: CRYPTO partial overlap trims leading bytes" {
     var conn = try Connection(16).accept(.{}, io);
     conn.crypto_recv_offset[0] = 10;
 
-    const data = [_]u8{0x99} ** 5;
+    const data = @as([5]u8, @splat(0x99));
     const f: frame.CryptoFrame = .{ .offset = 8, .data = &data };
     conn.processCryptoFrame(f, 0, io) catch {};
 
@@ -997,7 +999,7 @@ test "connection: tick batches MAX_DATA and MAX_STREAM_DATA in one packet" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     // Set up pending MAX_DATA.
@@ -1022,7 +1024,7 @@ test "connection: flushControlFrames is no-op when nothing pending" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
 
     const sq_before = conn.sq_tail;
@@ -1035,7 +1037,7 @@ test "connection: coalesced packet tracked by loss recovery" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.pending_max_data = true;
 
@@ -1202,7 +1204,7 @@ test "connection: enqueueSend refreshes idle deadline" {
     conn.idle_timeout_i64 = 30_000_000_000; // 30s
     conn.idle_deadline_ns = 1; // stale deadline from before
 
-    const k = crypto.PacketKeys{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm };
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
     conn.app_keys = tls.AppKeys{ .client = k, .server = k };
     conn.queuePing() catch {};
 
@@ -1218,7 +1220,7 @@ test "connection: stateless reset closes connection when token matches" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Install a known reset token in the peer CID table.
-    const token = [_]u8{0xde} ** 16;
+    const token = @as([16]u8, @splat(0xde));
     conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
 
     // Build a minimal fake "packet" of ≥21 bytes whose last 16 bytes are the token.
@@ -1235,7 +1237,7 @@ test "connection: stateless reset ignores short packet" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const token = [_]u8{0xab} ** 16;
+    const token = @as([16]u8, @splat(0xab));
     conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
 
     var short_pkt: [20]u8 = undefined;
@@ -1249,7 +1251,7 @@ test "connection: stateless reset ignores non-matching token" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const token = [_]u8{0xcd} ** 16;
+    const token = @as([16]u8, @splat(0xcd));
     conn.peer_cid_table[0] = .{ .cid = .{}, .seq = 0, .reset_token = token, .valid = true };
 
     var pkt: [32]u8 = undefined;
@@ -1365,7 +1367,7 @@ test "connection: RESET_STREAM charges gap bytes to connection flow control (RFC
     conn.peer_max_stream_data_bidi_local = stream_mod.STREAM_BUF_SIZE;
 
     // Create stream 0 and receive 100 bytes (charges 100 to conn_flow.recv_total).
-    const data = [_]u8{'x'} ** 100;
+    const data = @as([100]u8, @splat('x'));
     var data_buf: [200]u8 = undefined;
     const dn = frame.encodeFrame(&data_buf, .{ .stream = .{
         .stream_id = 0,
@@ -1402,9 +1404,9 @@ test "connection: 1-RTT malformed frame closes connection with FRAME_ENCODING_ER
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
-    const app_key = [_]u8{0xAA} ** 32;
-    const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 32;
+    const app_key = @as([32]u8, @splat(0xAA));
+    const app_iv = @as([12]u8, @splat(0xBB));
+    const app_hp = @as([32]u8, @splat(0xCC));
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
         .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
@@ -1445,9 +1447,9 @@ test "connection: 1-RTT protocol violation closes connection, not silently ignor
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
     // Establish state with 1-RTT keys.
-    const app_key = [_]u8{0xAA} ** 32;
-    const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 32;
+    const app_key = @as([32]u8, @splat(0xAA));
+    const app_iv = @as([12]u8, @splat(0xBB));
+    const app_hp = @as([32]u8, @splat(0xCC));
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
         .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
@@ -1497,7 +1499,7 @@ test "flow control: retransmitted STREAM data does not re-charge connection wind
     conn.hot.state = .established;
     conn.peer_max_stream_data_bidi_local = stream_mod.STREAM_BUF_SIZE;
 
-    const data = [_]u8{'x'} ** 100;
+    const data = @as([100]u8, @splat('x'));
     var buf: [200]u8 = undefined;
 
     // First delivery: 100 bytes at offset 0.
@@ -1524,7 +1526,7 @@ test "flow control: out-of-order STREAM data charges HWM delta, not frame bytes"
 
     // Artificially grow stream recv_max so it doesn't block the high-offset frame.
     // First, create the stream with enough receive room.
-    const data = [_]u8{'x'} ** 100;
+    const data = @as([100]u8, @splat('x'));
     var buf: [512]u8 = undefined;
 
     // Frame at offset=200 (out of order): HWM goes 0→300, charge 300.
@@ -1547,7 +1549,7 @@ test "flow control: RESET_STREAM uses highest_recv_offset for gap charge" {
     conn.hot.state = .established;
     conn.peer_max_stream_data_bidi_local = stream_mod.STREAM_BUF_SIZE;
 
-    const data = [_]u8{'x'} ** 100;
+    const data = @as([100]u8, @splat('x'));
     var buf: [512]u8 = undefined;
 
     // Data at offset=200 (out of order): HWM=300, recv_offset=0 (no contiguous data yet).
@@ -1575,8 +1577,8 @@ test "flow control: pending_max_streams_bidi preserved when packet full" {
     var conn = try Connection(16).accept(.{}, io);
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
-        .client = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
-        .server = .{ .key = [_]u8{0} ** 32, .iv = [_]u8{0} ** 12, .hp = [_]u8{0} ** 32, .suite = .aes_128_gcm },
+        .client = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
+        .server = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm },
     };
     // Fill pkt_scratch to the budget limit by setting pending_max_data at max value
     // so MAX_DATA alone exhausts the frame budget, leaving no room for MAX_STREAMS.
@@ -1607,9 +1609,9 @@ test "connection: server-initiated stream ID in STREAM frame closes with STREAM_
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
 
-    const app_key = [_]u8{0xAA} ** 32;
-    const app_iv = [_]u8{0xBB} ** 12;
-    const app_hp = [_]u8{0xCC} ** 32;
+    const app_key = @as([32]u8, @splat(0xAA));
+    const app_iv = @as([12]u8, @splat(0xBB));
+    const app_hp = @as([32]u8, @splat(0xCC));
     conn.hot.state = .established;
     conn.app_keys = tls.AppKeys{
         .client = .{ .key = app_key, .iv = app_iv, .hp = app_hp, .suite = .aes_128_gcm },
@@ -1653,7 +1655,7 @@ test "NEW_CONNECTION_ID: retired seq is silently dropped" {
         .retire_prior_to = 6,
         .cid_len = 8,
         .cid = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
     try testing.expectEqual(@as(u62, 6), conn.peer_cid_retire_prior);
 
@@ -1663,7 +1665,7 @@ test "NEW_CONNECTION_ID: retired seq is silently dropped" {
         .retire_prior_to = 0,
         .cid_len = 8,
         .cid = [_]u8{ 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-        .stateless_reset_token = [_]u8{0} ** 16,
+        .stateless_reset_token = @as([16]u8, @splat(0)),
     });
     // seq=10 CID in slot 0, seq=5 was dropped → slot 1 must be invalid.
     try testing.expectEqual(@as(u62, 10), conn.peer_cid_table[0].seq);

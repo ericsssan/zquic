@@ -347,17 +347,30 @@ pub const Stream = struct {
     /// Consume inline-borrowed data and update flow control.
     pub fn consumeInline(self: *Stream) void {
         if (self.inline_recv) |data| {
-            self.recv_max = self.recv_buf.rp + data.len + STREAM_BUF_SIZE;
+            const new_max = self.recv_buf.rp + data.len + STREAM_BUF_SIZE;
+            if (new_max > self.recv_max) self.recv_max = new_max;
             self.inline_recv = null;
         }
     }
 
     /// Flush inline borrow to ring buffer (safety net: called at start of
     /// next receive() before the recv buffer is overwritten).
+    /// Also advances recv_buf.wp for any out-of-order data (written via writeAt)
+    /// that is now contiguous after the inline range was filled.
     pub fn flushInline(self: *Stream) void {
         if (self.inline_recv) |data| {
             _ = self.recv_buf.write(data);
             self.inline_recv = null;
+            // The inline fast path advanced recv_offset and filled the gap list,
+            // but didn't advance recv_buf.wp for previously writeAt'd data that
+            // is now contiguous.  Sync wp to the contiguous frontier.
+            const new_frontier = self.gap_list.contiguousFrom(self.recv_offset);
+            if (new_frontier > self.recv_offset) {
+                const advance: usize = @intCast(new_frontier - self.recv_offset);
+                self.recv_buf.wp += advance;
+                self.recv_offset = new_frontier;
+            }
+            self.checkFinTransition();
         }
     }
 
@@ -467,7 +480,10 @@ pub const Stream = struct {
         if (n > 0) {
             // recv_buf.rp is the total bytes consumed (monotonically increasing).
             // New recv_max = consumed_so_far + STREAM_BUF_SIZE.
-            self.recv_max = self.recv_buf.rp + STREAM_BUF_SIZE;
+            // Use @max to ensure recv_max is monotonically non-decreasing — the caller
+            // may have initialized recv_max to a larger value (e.g., from transport params).
+            const new_max = self.recv_buf.rp + STREAM_BUF_SIZE;
+            if (new_max > self.recv_max) self.recv_max = new_max;
         }
         return n;
     }
@@ -478,14 +494,17 @@ pub const Stream = struct {
     pub fn consumeRecv(self: *Stream, n: usize) void {
         self.recv_buf.consume(n);
         if (n > 0) {
-            self.recv_max = self.recv_buf.rp + STREAM_BUF_SIZE;
+            const new_max = self.recv_buf.rp + STREAM_BUF_SIZE;
+            if (new_max > self.recv_max) self.recv_max = new_max;
         }
     }
 
-    /// True when recv_max has grown beyond what we last advertised to the peer.
-    /// The connection layer should send a MAX_STREAM_DATA frame when this returns true.
+    /// True when recv_max has grown significantly beyond what we last advertised.
+    /// Uses a 25% threshold to avoid sending MAX_STREAM_DATA for tiny reads
+    /// (RFC 9000 §4.2: implementations SHOULD use a threshold).
     pub fn shouldSendMaxStreamData(self: *const Stream) bool {
-        return self.recv_max > self.last_sent_max_stream_data;
+        if (self.recv_max <= self.last_sent_max_stream_data) return false;
+        return self.recv_max - self.last_sent_max_stream_data >= STREAM_BUF_SIZE / 4;
     }
 
     /// Record that we sent `bytes` (advances send_offset).
@@ -695,7 +714,7 @@ pub fn StreamTable(comptime capacity: usize) type {
         const Self = @This();
         streams: [capacity]Stream = undefined,
         ids: [capacity]u62 = undefined,
-        states: [capacity]SlotState = [_]SlotState{.empty} ** capacity,
+        states: [capacity]SlotState = @as([capacity]SlotState, @splat(.empty)),
         count: usize = 0,
 
         /// Return true if slot i holds a live stream.
@@ -1341,14 +1360,22 @@ test "stream: shouldSendMaxStreamData false initially" {
     try testing.expect(!s.shouldSendMaxStreamData());
 }
 
-test "stream: shouldSendMaxStreamData true after read advances recv_max" {
+test "stream: shouldSendMaxStreamData true after reading 25%+ of buffer" {
     const testing = std.testing;
     var s = Stream.init(0);
-    // Receive some data then read it — recv_max grows
+    // Small reads below threshold should NOT trigger MAX_STREAM_DATA
     try s.receiveData(0, "hello world", false);
     var buf: [16]u8 = undefined;
     _ = s.read(&buf);
-    // recv_max = recv_buf.rp + STREAM_BUF_SIZE = 11 + 4096 > 4096 = last_sent
+    try testing.expect(!s.shouldSendMaxStreamData()); // 11 bytes < 25% of buffer
+
+    // Reading >= 25% of buffer SHOULD trigger it
+    const quarter = STREAM_BUF_SIZE / 4;
+    var big_data: [quarter]u8 = undefined;
+    @memset(&big_data, 0x42);
+    try s.receiveData(11, &big_data, false);
+    var big_buf: [quarter]u8 = undefined;
+    _ = s.read(&big_buf);
     try testing.expect(s.shouldSendMaxStreamData());
     // After acknowledging the new max, flag clears
     s.last_sent_max_stream_data = s.recv_max;

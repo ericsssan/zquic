@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: 0.16.0-dev.2676+4e2cec265
+  ZIG_VERSION: 0.17.0-dev.657+2faf8debf
 
 jobs:
   test:
@@ -60,3 +60,28 @@ jobs:
 
       - name: Cross-compile
         run: zig build -Dtarget=${{ matrix.target }}
+
+  oracle:
+    name: Oracle (interop vs reference impls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build zquic (server + client)
+        run: zig build
+
+      - name: Build reference impls + fixtures
+        run: bash oracle/build-refs.sh
+
+      - name: Run oracle matrix
+        run: bash oracle/run.sh

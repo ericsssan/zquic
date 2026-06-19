@@ -463,7 +463,7 @@ Build + functional test (Docker on Mac — io_uring works in Linux VM)
 Benchmark (Linux server)
 ```
 
-Zig version: 0.16.0-dev.2637+6a9510c0e (master via zigup)
+Zig version: 0.17.0-dev.657+2faf8debf (master via zigup)
 
 ---
 

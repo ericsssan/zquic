@@ -26,7 +26,7 @@ const Slot = struct {
 };
 
 pub const KvStore = struct {
-    slots: [MAX_ENTRIES]Slot = [_]Slot{.{}} ** MAX_ENTRIES,
+    slots: [MAX_ENTRIES]Slot = @as([MAX_ENTRIES]Slot, @splat(.{})),
 
     pub fn get(self: *const KvStore, key: []const u8) ?[]const u8 {
         for (&self.slots) |*s| {
@@ -165,7 +165,11 @@ test "kvGet: missing key param returns 400" {
     const std_ = @import("std");
     resetStore();
     var req: Request = .{
-        .method = "GET", .path = "/v1/get", .query = "", .headers = .{}, .body = "",
+        .method = "GET",
+        .path = "/v1/get",
+        .query = "",
+        .headers = .{},
+        .body = "",
     };
     var res: Response = .{};
     kvGet(&req, &res);
@@ -176,7 +180,11 @@ test "kvGet: not-found key returns 404" {
     const std_ = @import("std");
     resetStore();
     var req: Request = .{
-        .method = "GET", .path = "/v1/get", .query = "key=missing", .headers = .{}, .body = "",
+        .method = "GET",
+        .path = "/v1/get",
+        .query = "key=missing",
+        .headers = .{},
+        .body = "",
     };
     var res: Response = .{};
     kvGet(&req, &res);
@@ -188,14 +196,22 @@ test "kvSet then kvGet round-trip" {
     resetStore();
 
     var set_req: Request = .{
-        .method = "POST", .path = "/v1/set", .query = "", .headers = .{}, .body = "greeting=hello",
+        .method = "POST",
+        .path = "/v1/set",
+        .query = "",
+        .headers = .{},
+        .body = "greeting=hello",
     };
     var set_res: Response = .{};
     kvSet(&set_req, &set_res);
     try std_.testing.expectEqual(@as(u16, 204), set_res.status);
 
     var get_req: Request = .{
-        .method = "GET", .path = "/v1/get", .query = "key=greeting", .headers = .{}, .body = "",
+        .method = "GET",
+        .path = "/v1/get",
+        .query = "key=greeting",
+        .headers = .{},
+        .body = "",
     };
     var get_res: Response = .{};
     kvGet(&get_req, &get_res);
@@ -207,7 +223,11 @@ test "kvSet: invalid body returns 400" {
     const std_ = @import("std");
     resetStore();
     var req: Request = .{
-        .method = "POST", .path = "/v1/set", .query = "", .headers = .{}, .body = "no-equals-sign",
+        .method = "POST",
+        .path = "/v1/set",
+        .query = "",
+        .headers = .{},
+        .body = "no-equals-sign",
     };
     var res: Response = .{};
     kvSet(&req, &res);
@@ -218,7 +238,11 @@ test "kvSet: empty key returns 400" {
     const std_ = @import("std");
     resetStore();
     var req: Request = .{
-        .method = "POST", .path = "/v1/set", .query = "", .headers = .{}, .body = "=value",
+        .method = "POST",
+        .path = "/v1/set",
+        .query = "",
+        .headers = .{},
+        .body = "=value",
     };
     var res: Response = .{};
     kvSet(&req, &res);
