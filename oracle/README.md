@@ -36,10 +36,16 @@ zig build test            # RFC 9001 crypto vectors live here (crypto.zig)
 | server prop  | versionnegotiation                 | **the wire** — a client offering an unknown version (ngtcp2 `--version`, or quiche's default GREASE `babababa`) must get a `VERSION_NEGOTIATION` packet back. Wire-only (the handshake intentionally doesn't complete). |
 | loss recovery| handshakeloss, transferloss        | the data still arrives **through seeded packet loss** (the proxy drops a fixed fraction; the seed fixes the drop *sequence*, not which logical packets — see #8); exercises PTO + retransmission. Use `-n N` to repeat-stress. |
 | crypto       | RFC 9001 A.1/A.2/A.5 (unit tests)  | the **RFC's exact bytes** — zero self-definition. |
+| self-test    | (meta) wire_has, assert_match      | **the harness itself** — each assertion is run against a known negative (a corrupted/missing file, a transfer capture with no Retry/VN) and must reject it, so a refactor can't silently turn a check into a no-op (#9). Runs on every full run and via `--self-test`. |
 
 Each assertion is falsification-checked (e.g. a transfer-mode server produces no
 Retry → the retry wire-check fails; 95% loss → the transfer fails). "It passed"
-means the specific thing was verified, not just "the file moved."
+means the specific thing was verified, not just "the file moved." Those
+falsification checks are no longer manual — they run as a standing **self-test**
+(`oracle/run.sh --self-test`, also appended to every full run): the meta-tests
+assert that `assert_match` rejects a corrupted/missing file and that the wire-check
+finds no Retry/VN in a normal transfer, so the suite can't degrade into a
+confidently-green no-op (#9).
 
 ## Adding a test case
 

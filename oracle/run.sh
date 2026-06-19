@@ -25,6 +25,9 @@
 #   -n/--repeat N             run the selection N times, require all green — a
 #                             stability check for the SEEDED (not outcome-
 #                             deterministic) loss cases (#8). Also ORACLE_REPEAT.
+#   --self-test               run only the meta-tests: prove the harness's own
+#                             assertions still reject their negatives (#9). Also
+#                             runs automatically at the end of every full run.
 #
 set -u
 
@@ -139,6 +142,11 @@ wait_listen() {
 }
 stop() { kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
 
+# wire_has TOKEN CAPFILE — true if the proxy capture contains a class+direction
+# token (e.g. "s2c RETRY"). The single chokepoint for every behavioral wire-check,
+# so the self-test (#9) can prove it still discriminates present from absent.
+wire_has() { grep -q "$1" "$2" 2>/dev/null; }
+
 assert_match() { # <dir> <path...>
   local dir=$1; shift; local p base
   for p in "$@"; do
@@ -224,7 +232,7 @@ proxied() {
   [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
   local m; if ! m="$(assert_match "$out" $paths)"; then bad "$tag (transfer: $m)"; return; fi
-  if [ -n "$want" ] && ! grep -q "$want" "$capf" 2>/dev/null; then
+  if [ -n "$want" ] && ! wire_has "$want" "$capf"; then
     bad "$tag — transfer ok but mechanism NOT seen on wire"; return
   fi
   ok "$tag${want:+ ✓}"
@@ -249,14 +257,52 @@ vn_case() { # <trigger_impl> <sport> <pport>
               --dump-responses "$d" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1 ;;
   esac
   stop "$sp" "$px"
-  if grep -q "s2c VERSION_NEGOTIATION" "$capf" 2>/dev/null; then
+  if wire_has "s2c VERSION_NEGOTIATION" "$capf"; then
     ok "versionnegotiation [zquic server emits VN; $trig offers unknown version | wire ✓]"
   else
     bad "versionnegotiation — zquic did not send a VERSION_NEGOTIATION packet"
   fi
 }
 
-CASES=(); REQUIRE=(); REPEAT=1
+# self_test (#9): prove the harness's OWN assertions still reject the negative case
+# — otherwise a refactor could turn assert_match / the wire-checks into no-ops that
+# pass everything green. Each check below FAILS the run if an assertion stops
+# discriminating. Runs on every full run and via `--self-test`.
+self_test() {
+  echo ""; echo "═══ self-test: the harness's own assertions ═══"
+  local d="$TMP/selftest"; rm -rf "$d"; mkdir -p "$d/match" "$d/out"
+
+  # (a) wire_has — must find a present token and miss an absent one.
+  printf 'c2s INITIAL 1200\ns2c HANDSHAKE 1000\nc2s SHORT 80\n' >"$d/syn.cap"
+  if wire_has "s2c HANDSHAKE" "$d/syn.cap"; then ok "meta: wire_has finds a present token"; else bad "meta: wire_has missed a present token (no-op!)"; fi
+  if wire_has "s2c RETRY" "$d/syn.cap"; then bad "meta: wire_has matched an ABSENT token (no-op!)"; else ok "meta: wire_has rejects an absent token"; fi
+
+  # (b) assert_match — accept a correct copy, reject a corrupted + a missing file.
+  cp "$WWW/1.bin" "$d/match/1.bin"
+  if assert_match "$d/match" "/1.bin" >/dev/null 2>&1; then ok "meta: assert_match accepts a correct file"; else bad "meta: assert_match rejected a correct file"; fi
+  head -c 65536 /dev/zero >"$d/match/1.bin"
+  if assert_match "$d/match" "/1.bin" >/dev/null 2>&1; then bad "meta: assert_match accepted a CORRUPTED file (no-op!)"; else ok "meta: assert_match rejects a corrupted file"; fi
+  rm -f "$d/match/1.bin"
+  if assert_match "$d/match" "/1.bin" >/dev/null 2>&1; then bad "meta: assert_match accepted a MISSING file (no-op!)"; else ok "meta: assert_match rejects a missing file"; fi
+
+  # (c) Falsification on a REAL capture: a normal v1 transfer must classify packets
+  #     yet contain NEITHER behavioral token, so the retry/VN wire-checks correctly
+  #     FAIL here — the exact false-pass the README claims is guarded against.
+  local sti=quicgo; impl_ok quicgo || sti="${IMPLS[0]}"
+  local sport=$port pport=$((port + 1)); port=$((port + 2)); local capf="$d/transfer.cap"
+  TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  if ! wait_listen "$sp" "$sport"; then bad "meta: self-test server bind"; stop "$sp"; return; fi
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  if ! wait_listen "$px" "$pport"; then bad "meta: self-test proxy bind"; stop "$sp" "$px"; return; fi
+  to "$CLIENT_TIMEOUT" ref_client "$sti" "$pport" "$d/out" /1.bin >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp" "$px"
+  if [ $rc -ne 0 ]; then bad "meta: self-test transfer failed (rc=$rc) — capture unverifiable"; return; fi
+  if wire_has " INITIAL " "$capf" && wire_has " HANDSHAKE " "$capf"; then ok "meta: classifier emits INITIAL+HANDSHAKE on a normal transfer"; else bad "meta: classifier emitted no handshake classes (capture broken)"; fi
+  if wire_has "s2c RETRY" "$capf"; then bad "meta: RETRY seen in a non-retry transfer (false-pass risk)"; else ok "meta: retry wire-check fails on a transfer capture (falsification)"; fi
+  if wire_has "s2c VERSION_NEGOTIATION" "$capf"; then bad "meta: VN seen in a v1 handshake (false-pass risk)"; else ok "meta: VN wire-check fails on a v1 capture (falsification)"; fi
+}
+
+CASES=(); REQUIRE=(); REPEAT=1; SELFTEST=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -i | --impl) IMPLS=("$2"); IMPL_SET=1; shift 2 ;;
@@ -265,6 +311,7 @@ while [ $# -gt 0 ]; do
     --require=*) IFS=', ' read -r -a REQUIRE <<<"${1#*=}"; shift ;;
     -n | --repeat) REPEAT="$2"; shift 2 ;;
     --repeat=*) REPEAT="${1#*=}"; shift ;;
+    --self-test) SELFTEST=1; shift ;;
     --) shift; CASES+=("$@"); break ;;
     -*) echo "unknown flag: $1" >&2; exit 2 ;;
     *) CASES+=("$1"); shift ;;
@@ -321,6 +368,16 @@ if [ ${#REQUIRE[@]} -gt 0 ]; then
   fi
 fi
 
+# --self-test (#9): run only the meta-tests (assertions reject their negatives) + exit.
+if [ "$SELFTEST" -eq 1 ]; then
+  cleanup; port=$PORT_BASE
+  self_test
+  echo ""; echo "─────────────────────────────────"
+  echo "TOTAL: $PASS passed, $FAIL failed"
+  [ $FAIL -gt 0 ] && { printf '  - %s\n' "${FAILED[@]}"; exit 1; }
+  exit 0
+fi
+
 sel_data=("${DATA_CASES[@]}"); sel_prox=("${PROXIED_CASES[@]}")
 if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
@@ -357,6 +414,10 @@ if [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx versionnegot
     vn_case "$trig" "$port" "$((port + 1))"; port=$((port + 2))
   fi
 fi
+
+# Meta-tests on every full run: guarantee the harness's assertions still
+# discriminate pass from fail (#9) — they can't silently become no-ops.
+[ ${#CASES[@]} -eq 0 ] && self_test
 
 echo ""; echo "─────────────────────────────────"
 echo "TOTAL: $PASS passed, $FAIL failed"
