@@ -561,7 +561,18 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Create a server-side connection.  Call `receive()` with the first
         /// datagram to start the handshake.
+        /// Create a server-side connection by value. Convenience wrapper for
+        /// small Connection(N) (e.g. tests); large N should use `acceptInto` to
+        /// avoid a multi-MB stack temporary for the return value (issue #3).
         pub fn accept(config: Config, io: std.Io) !Self {
+            var self: Self = undefined;
+            try self.acceptInto(config, io);
+            return self;
+        }
+
+        /// Initialize a server-side connection in place (constructs directly into
+        /// `self`, so there is no by-value return temporary on the stack).
+        pub fn acceptInto(self: *Self, config: Config, io: std.Io) !void {
             var tls_server = if (config.cert_der) |der|
                 try tls.TlsServer.initFromCert(der, config.cert_seed.?, config.cert_key_algorithm, io)
             else
@@ -587,7 +598,7 @@ pub fn Connection(comptime max_streams: usize) type {
             else
                 0;
 
-            return Self{
+            self.* = Self{
                 .hot = .{
                     .rx_pn = @as([3]u64, @splat(0)),
                     .tx_pn = @as([3]u64, @splat(0)),
@@ -700,7 +711,16 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Create a client-mode Connection and initiate the QUIC handshake.
         /// Derives initial keys from `server_dcid` (or a random one) and queues a
         /// ClientHello in an Initial packet, ready to be sent via `send()`.
+        /// Create a client-side connection by value. Convenience wrapper; large
+        /// Connection(N) should use `connectInto` to avoid a stack temporary (#3).
         pub fn connect(config: Config, io: std.Io) !Self {
+            var self: Self = undefined;
+            try self.connectInto(config, io);
+            return self;
+        }
+
+        /// Initialize a client-side connection in place (no by-value return).
+        pub fn connectInto(self: *Self, config: Config, io: std.Io) !void {
             var client_config = config;
             client_config.is_server = false;
 
@@ -780,7 +800,7 @@ pub fn Connection(comptime max_streams: usize) type {
             // which fires immediately when the caller later assigns the real time.
             const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
 
-            var self = Self{
+            self.* = Self{
                 .hot = .{
                     .rx_pn = @as([3]u64, @splat(0)),
                     .tx_pn = @as([3]u64, @splat(0)),
@@ -908,8 +928,6 @@ pub fn Connection(comptime max_streams: usize) type {
                     }
                 }
             }
-
-            return self;
         }
 
         // -----------------------------------------------------------------------

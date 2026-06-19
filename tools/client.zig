@@ -186,7 +186,7 @@ fn runConnection(
 ) !?quic.tls.SessionTicket {
     const conn_ptr = try page_allocator.create(Conn);
     defer page_allocator.destroy(conn_ptr);
-    conn_ptr.* = try Conn.connect(config, io);
+    try conn_ptr.connectInto(config, io); // init in place — no stack temp (#3)
     const conn = conn_ptr;
 
     const init_now: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);

@@ -132,9 +132,8 @@ fn allocateSlot(slots: *[MAX_CONNS]?*ConnSlot, config: quic.Config, io: std.Io) 
         if (s_opt.* == null) {
             const slot = try page_allocator.create(ConnSlot);
             errdefer page_allocator.destroy(slot);
-            slot.* = .{
-                .conn = try Conn.accept(config, io),
-            };
+            slot.* = .{ .conn = undefined };
+            try slot.conn.acceptInto(config, io); // init in place — no stack temp (#3)
             s_opt.* = slot;
             return slot;
         }
