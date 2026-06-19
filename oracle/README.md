@@ -76,7 +76,12 @@ Then `oracle/run.sh -i <impl>`.
   path alongside quic-go. Optional + local: cargo-built from a sibling `../quiche`
   checkout (`git clone --recursive`). Driven with `--wire-version 00000001` because
   quiche's default `babababa` is a deliberate GREASE version (which zquic correctly
-  VN's). Note: quiche over **HTTP/3** currently stalls against zquic — issue #4.
+  VN's).
+- **quiche-h3** — the same quiche binary over HTTP/3. quiche is the only client that
+  prepends GREASE frames before the request HEADERS (RFC 9114 §9), so this guards
+  zquic's h3 frame handling. (It found issue #4 — zquic dropped requests that didn't
+  start with HEADERS — now fixed.) Scoped to data-path cases (loss/RTT are covered
+  by ngtcp2-h3).
 
 `oracle/run.sh` with no `-i` runs every impl that's built (quic-go always; ngtcp2 /
 quiche when their sibling checkouts + deps are present).

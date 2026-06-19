@@ -54,17 +54,20 @@ declare -A TC=( [handshakeloss]="transfer" [transferloss]="transfer" [longrtt]="
 # Per-impl protocol override: ngtcp2's example binaries are HTTP/3 only, so pair
 # them with zquic's http3 path — this exercises zquic's H3/QPACK, which the
 # quic-go (hq-interop / HTTP-0.9) cases never touch.
-declare -A IMPL_TC=( [ngtcp2]="http3" )
+declare -A IMPL_TC=( [ngtcp2]="http3" [quiche-h3]="http3" )
 # Cases an impl can't run: retry needs the server's hq-interop retry mode, which
-# can't coexist with ngtcp2's forced http3 protocol.
-declare -A IMPL_SKIP=( [ngtcp2]="retry" )
+# can't coexist with a forced http3 protocol.
+# quiche-h3 exists to guard the H3 GREASE-frame handling (RFC 9114 §9) — quiche is
+# the only client that prepends GREASE. Its data-path cases do that; loss/RTT are
+# already covered by ngtcp2-h3, and quiche-h3 is slow under 30% loss, so skip them.
+declare -A IMPL_SKIP=( [ngtcp2]="retry" [quiche-h3]="retry handshakeloss transferloss longrtt" )
 DATA_CASES=(handshake transfer multiplexing)
 PROXIED_CASES=(retry handshakeloss transferloss longrtt)
 
 # zquic TESTCASE for (impl, case): impl protocol override > case override > name.
 ztc() { echo "${IMPL_TC[$1]:-${TC[$2]:-$2}}"; }
 skipped() { case " ${IMPL_SKIP[$1]:-} " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
-ALL_IMPLS=(quicgo ngtcp2 quiche)
+ALL_IMPLS=(quicgo ngtcp2 quiche quiche-h3)
 IMPLS=(); IMPL_SET=0
 PASS=0; FAIL=0; FAILED=()
 
@@ -145,6 +148,7 @@ ref_client() { # <impl> <port> <outdir> <path...>
     quicgo) exec "$BIN/quicgo" client -ca "$CERTS/cert.pem" "$out" "${urls[@]}" ;;
     ngtcp2) exec "$BIN/ngtcp2-client" -q --download="$out" --exit-on-all-streams-close 127.0.0.1 "$port" "${urls[@]}" ;;
     quiche) exec "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/0.9 --dump-responses "$out" "${urls[@]}" ;;
+    quiche-h3) exec "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/3 --dump-responses "$out" "${urls[@]}" ;;
     *) echo "unknown impl $impl" >&2; exit 2 ;;
   esac
 }
@@ -153,7 +157,7 @@ impl_ok() {
   case "$1" in
     quicgo) [ -x "$BIN/quicgo" ] ;;
     ngtcp2) [ -x "$BIN/ngtcp2-client" ] && [ -x "$BIN/ngtcp2-server" ] ;;
-    quiche) [ -x "$BIN/quiche-client" ] && [ -x "$BIN/quiche-server" ] ;;
+    quiche | quiche-h3) [ -x "$BIN/quiche-client" ] && [ -x "$BIN/quiche-server" ] ;;
     *) return 1 ;;
   esac
 }
@@ -163,6 +167,7 @@ ref_server() { # <impl> <port> <logfile> -> pid (binary backgrounded; pid is the
     quicgo) "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" >"$logf" 2>&1 & echo $! ;;
     ngtcp2) "$BIN/ngtcp2-server" -q --htdocs="$WWW" '*' "$port" "$CERTS/priv.key" "$CERTS/cert.pem" >"$logf" 2>&1 & echo $! ;;
     quiche) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/0.9 >"$logf" 2>&1 & echo $! ;;
+    quiche-h3) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/3 >"$logf" 2>&1 & echo $! ;;
     *) return 2 ;;
   esac
 }
