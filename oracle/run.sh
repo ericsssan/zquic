@@ -737,13 +737,14 @@ if [ "$_any_svr" -eq 1 ]; then
   fi
 
   # zerortt: 0-RTT packets must appear on the wire (c2s 0RTT in proxy capture).
-  # Only quicgo-server issues 0-RTT-capable session tickets to the zquic client;
-  # quiche-server does not provide early_data in its tickets, so c2s 0RTT is never
-  # seen on wire against quiche. Fall back to quiche only when quicgo is absent.
+  # Requires quicgo-server: only quicgo issues early_data-capable session tickets
+  # to the zquic client. quiche-server does not, so using it as a fallback would
+  # always produce FAIL — skipped entirely when quicgo is not built.
   if _want_svr zerortt; then
     [ -x "$ZQUIC_CLIENT" ] || bad "zerortt: $ZQUIC_CLIENT missing — run: zig build"
-    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
-    [ -n "$trig" ] && { zerortt_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+    if impl_ok quicgo; then
+      zerortt_case quicgo "$port" "$((port + 1))"; port=$((port + 2))
+    fi
   fi
 
   # multiconnect: server handles N sequential connections (data-path); client opens
