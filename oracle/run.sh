@@ -244,7 +244,11 @@ dp_zquic_server() { # zquic server <-> ref client
   stop "$sp"
   [ $rc -eq 124 ] && { bad "$case [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "$case [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
-  local m; if m="$(assert_match "$out" $paths)"; then ok "$case [zquic-server <-> $impl-client$cv]"; else bad "$case [zquic-server <-> $impl-client] ($m)"; fi
+  local m kphs_chk=1
+  [ "$case" = keyupdate ] && ! grep -q "\[KPHS\]" "$d/zsrv.log" && kphs_chk=0
+  if m="$(assert_match "$out" $paths)"; then
+    if [ "$kphs_chk" -eq 0 ]; then bad "$case [zquic-server <-> $impl-client] (no key phase rotation in server log)"; else ok "$case [zquic-server <-> $impl-client$cv]"; fi
+  else bad "$case [zquic-server <-> $impl-client] ($m)"; fi
 }
 dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic client limitation)
   local impl=$1 case=$2 port=$3 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
@@ -259,7 +263,11 @@ dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic clie
   stop "$sp"
   [ $rc -eq 124 ] && { bad "$case [$impl-server <-> zquic-client] (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "$case [$impl-server <-> zquic-client] (client rc=$rc)"; return; }
-  local m; if m="$(assert_match "$out" $paths)"; then ok "$case [$impl-server <-> zquic-client | cert-verified]"; else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
+  local m kphs_chk=1
+  [ "$case" = keyupdate ] && ! grep -q "\[KPHS\]" "$d/zcli.log" && kphs_chk=0
+  if m="$(assert_match "$out" $paths)"; then
+    if [ "$kphs_chk" -eq 0 ]; then bad "$case [$impl-server <-> zquic-client] (no key phase rotation in client log)"; else ok "$case [$impl-server <-> zquic-client | cert-verified]"; fi
+  else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
 }
 # proxied: zquic server <-> [proxy: capture (+optional impairment)] <-> ref client.
 # Always asserts hash. If WIRE_REQUIRE[case] is set, also asserts the mechanism
@@ -661,6 +669,7 @@ self_test() {
   if wire_has "s2c RETRY" "$capf"; then bad "meta: RETRY seen in a non-retry transfer (false-pass risk)"; else ok "meta: retry wire-check fails on a transfer capture (falsification)"; fi
   if wire_has "s2c VERSION_NEGOTIATION" "$capf"; then bad "meta: VN seen in a v1 handshake (false-pass risk)"; else ok "meta: VN wire-check fails on a v1 capture (falsification)"; fi
   if wire_has "c2s 0RTT" "$capf"; then bad "meta: 0RTT seen in a plain transfer (false-pass risk)"; else ok "meta: zerortt wire-check fails on a plain transfer (falsification)"; fi
+  if grep -q "\[KPHS\]" "$d/zsrv.log"; then bad "meta: [KPHS] seen in a plain transfer (keyupdate wire-check false-pass risk)"; else ok "meta: keyupdate log-check fails on plain transfer (falsification)"; fi
 }
 
 CASES=(); REQUIRE=(); REPEAT=1; SELFTEST=0

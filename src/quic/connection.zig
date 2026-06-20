@@ -4471,6 +4471,7 @@ pub fn Connection(comptime max_streams: usize) type {
             self.current_key_phase = !self.current_key_phase;
             self.current_key_generation += 1;
             self.key_update_pending = false;
+            std.debug.print("[KPHS] key phase rotated to {d}\n", .{@intFromBool(self.current_key_phase)});
 
             // Derive next-next generation from the (now-current) secrets.
             const new_client = crypto.deriveNextAppSecret(self.next_client_secret, self.quic_version);
