@@ -425,29 +425,31 @@ zerortt_case() { # <impl> <sport> <pport>
 }
 
 # resumption_case: verify TLS 1.3 session ticket resumption (PSK, no early data).
-# Server direction: zquic server issues a ticket on conn1; quicgo -resumption makes
-# conn2 with the same session cache → PSK in ClientHello → abbreviated handshake.
-# Client direction: zquic client (TESTCASE=resumption) makes conn1 (warms ticket)
-# then conn2 (PSK resume) against the quicgo ref server.
-# Both directions assert hash match on both files (conn1 + conn2 output).
+# Server direction: zquic server issues a ticket; quicgo -resumption makes two
+# sequential connections and asserts DidResume on conn2. Only runs when impl=quicgo
+# (the -resumption flag is specific to the quicgo oracle binary; no quiche equiv).
+# Client direction: zquic client (TESTCASE=resumption) + ref server — runs for any
+# impl, giving a second independent check of zquic's PSK handling (#23).
 resumption_case() { # <impl> <srv_port> <cli_port>
   local impl=$1 sport=$2 cport=$3
   local paths="/1.bin /big.bin"
 
-  # Server direction: zquic server + quicgo -resumption
-  local d="$TMP/server/resumption"; rm -rf "$d/out"; mkdir -p "$d/out"
-  TESTCASE=resumption CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
-  _HARNESS_PIDS+=("$sp")
-  wait_listen "$sp" "$sport" || { bad "resumption [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
-  to "$CLIENT_TIMEOUT" "$BIN/quicgo" client -ca "$CERTS/cert.pem" -resumption "$d/out" \
-    "https://127.0.0.1:$sport/1.bin" "https://127.0.0.1:$sport/big.bin" >"$d/cli.log" 2>&1; local rc=$?
-  stop "$sp"
-  [ $rc -eq 124 ] && { bad "resumption [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
-  [ $rc -eq 0 ] || { bad "resumption [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
-  local m; if m="$(assert_match "$d/out" $paths)"; then
-    ok "resumption [zquic-server <-> $impl-client | PSK session ticket]"
-  else
-    bad "resumption [zquic-server <-> $impl-client] ($m)"
+  # Server direction: only quicgo has the -resumption flag; skip for other impls.
+  if [ "$impl" = quicgo ]; then
+    local d="$TMP/server/resumption"; rm -rf "$d/out"; mkdir -p "$d/out"
+    TESTCASE=resumption CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+    _HARNESS_PIDS+=("$sp")
+    wait_listen "$sp" "$sport" || { bad "resumption [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
+    to "$CLIENT_TIMEOUT" "$BIN/quicgo" client -ca "$CERTS/cert.pem" -resumption "$d/out" \
+      "https://127.0.0.1:$sport/1.bin" "https://127.0.0.1:$sport/big.bin" >"$d/cli.log" 2>&1; local rc=$?
+    stop "$sp"
+    [ $rc -eq 124 ] && { bad "resumption [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
+    [ $rc -eq 0 ] || { bad "resumption [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+    local m; if m="$(assert_match "$d/out" $paths)"; then
+      ok "resumption [zquic-server <-> $impl-client | PSK session ticket]"
+    else
+      bad "resumption [zquic-server <-> $impl-client] ($m)"
+    fi
   fi
 
   # Client direction: zquic client (TESTCASE=resumption) + ref server
@@ -724,14 +726,20 @@ if [ "$_any_svr" -eq 1 ]; then
   fi
 
   # resumption: session ticket issued on conn1; conn2 resumes with PSK (no early data).
-  # Both directions: zquic server + quicgo -resumption; zquic client + quicgo server.
+  # Server direction uses quicgo -resumption (only impl with that flag). Client
+  # direction runs against each available impl for independent PSK coverage (#23).
   if _want_svr resumption; then
     [ -x "$ZQUIC_CLIENT" ] || bad "resumption: $ZQUIC_CLIENT missing — run: zig build"
-    trig=""; impl_ok quicgo && trig=quicgo
-    [ -n "$trig" ] && { resumption_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+    for trig in quicgo quiche; do
+      impl_ok "$trig" || continue
+      resumption_case "$trig" "$port" "$((port + 1))"; port=$((port + 2))
+    done
   fi
 
   # zerortt: 0-RTT packets must appear on the wire (c2s 0RTT in proxy capture).
+  # Only quicgo-server issues 0-RTT-capable session tickets to the zquic client;
+  # quiche-server does not provide early_data in its tickets, so c2s 0RTT is never
+  # seen on wire against quiche. Fall back to quiche only when quicgo is absent.
   if _want_svr zerortt; then
     [ -x "$ZQUIC_CLIENT" ] || bad "zerortt: $ZQUIC_CLIENT missing — run: zig build"
     trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
