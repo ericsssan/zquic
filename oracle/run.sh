@@ -86,11 +86,17 @@ PASS=0; FAIL=0; FAILED=()
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED+=("$*"); }
 
-# Kill only this harness's own binaries (full paths) — safe pre-clean + on exit.
+# PIDs of every process this oracle run has backgrounded. cleanup() kills by
+# exact PID rather than pkill -f (which matches any process carrying the binary
+# path in its argv, including a concurrent oracle run or a CI wrapper script).
+_HARNESS_PIDS=()
+
 cleanup() {
-  for b in "$ZQUIC_SERVER" "$ZQUIC_CLIENT" "$PROXY" "$BIN"/quicgo "$BIN"/ngtcp2 "$BIN"/quiche; do
-    [ -e "$b" ] && pkill -f "$b" 2>/dev/null
+  local pid
+  for pid in "${_HARNESS_PIDS[@]+"${_HARNESS_PIDS[@]}"}"; do
+    kill "$pid" 2>/dev/null
   done
+  wait "${_HARNESS_PIDS[@]+"${_HARNESS_PIDS[@]}"}" 2>/dev/null
   return 0
 }
 trap cleanup EXIT
@@ -128,9 +134,8 @@ port_bound() {
   fi
 }
 
-# Wait until pid has bound UDP port, or it dies. Polls precisely for ~2s; if the
-# socket tool can't confirm but the process is alive, proceeds anyway (QUIC
-# retransmits a lost Initial, so a slightly-early client still connects).
+# Wait until pid has bound UDP port, or it dies. Requires lsof/ss (checked at
+# startup); the process-alive fallthrough at the end is a safety net only.
 wait_listen() {
   local pid=$1 port=$2 i
   for i in $(seq 1 20); do
@@ -178,15 +183,16 @@ impl_ok() {
     *) return 1 ;;
   esac
 }
-ref_server() { # <impl> <port> <logfile> -> pid (binary backgrounded; pid is the binary)
+ref_server() { # <impl> <port> <logfile> — starts server, sets _LAST_SERVER_PID
   local impl=$1 port=$2 logf=$3
   case "$impl" in
-    quicgo) "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" >"$logf" 2>&1 & echo $! ;;
-    ngtcp2) "$BIN/ngtcp2-server" -q --htdocs="$WWW" '*' "$port" "$CERTS/priv.key" "$CERTS/cert.pem" >"$logf" 2>&1 & echo $! ;;
-    quiche) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/0.9 >"$logf" 2>&1 & echo $! ;;
-    quiche-h3) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/3 >"$logf" 2>&1 & echo $! ;;
+    quicgo)    "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" >"$logf" 2>&1 & _LAST_SERVER_PID=$! ;;
+    ngtcp2)    "$BIN/ngtcp2-server" -q --htdocs="$WWW" '*' "$port" "$CERTS/priv.key" "$CERTS/cert.pem" >"$logf" 2>&1 & _LAST_SERVER_PID=$! ;;
+    quiche)    "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/0.9 >"$logf" 2>&1 & _LAST_SERVER_PID=$! ;;
+    quiche-h3) "$BIN/quiche-server" --listen "127.0.0.1:$port" --cert "$CERTS/cert.pem" --key "$CERTS/priv.key" --root "$WWW" --http-version HTTP/3 >"$logf" 2>&1 & _LAST_SERVER_PID=$! ;;
     *) return 2 ;;
   esac
+  _HARNESS_PIDS+=("$_LAST_SERVER_PID")
 }
 
 dp_zquic_server() { # zquic server <-> ref client
@@ -194,6 +200,7 @@ dp_zquic_server() { # zquic server <-> ref client
   local cv=""; [ "$impl" = quicgo ] && cv=" | cert-verified" # only quic-go verifies the zquic cert
   local out="$d/zsrv"; rm -rf "$out"; mkdir -p "$out"
   TESTCASE="$(ztc "$impl" "$case")" CERTS="$CERTS" WWW="$WWW" PORT="$port" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$port" || { bad "$case [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
   to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp"
@@ -204,7 +211,8 @@ dp_zquic_server() { # zquic server <-> ref client
 dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic client limitation)
   local impl=$1 case=$2 port=$3 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
   local out="$d/zcli"; rm -rf "$out"; mkdir -p "$out"
-  local sp; sp="$(ref_server "$impl" "$port" "$d/rsrv.log")"
+  ref_server "$impl" "$port" "$d/rsrv.log" || { bad "$case [$impl-server <-> zquic-client] (no bind)"; return; }
+  local sp=$_LAST_SERVER_PID
   wait_listen "$sp" "$port" || { bad "$case [$impl-server <-> zquic-client] (no bind)"; stop "$sp"; return; }
   local reqs="" p; for p in $paths; do reqs="$reqs https://127.0.0.1:$port$p"; done
   # VERIFY_PEER=1: the zquic client validates the ref server's CertificateVerify
@@ -224,8 +232,10 @@ proxied() {
   local tag="$case [zquic-server <-> $impl-client${impair:+ | impair:$impair}${want:+ | wire: $want}]"
   local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
   TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
   "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
@@ -245,8 +255,10 @@ proxied() {
 vn_case() { # <trigger_impl> <sport> <pport>
   local trig=$1 sport=$2 pport=$3 d="$TMP/server/versionnegotiation"; mkdir -p "$d"; local capf="$d/capture.txt"
   TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "versionnegotiation (no server bind)"; stop "$sp"; return; }
   "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "versionnegotiation (no proxy bind)"; stop "$sp" "$px"; return; }
   # Each client offers an unknown version: ngtcp2 via --version, quiche via its
   # default GREASE wire-version (babababa). Wire-only — the handshake won't complete.
@@ -291,8 +303,10 @@ self_test() {
   local sti=quicgo; impl_ok quicgo || sti="${IMPLS[0]}"
   local sport=$port pport=$((port + 1)); port=$((port + 2)); local capf="$d/transfer.cap"
   TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
   if ! wait_listen "$sp" "$sport"; then bad "meta: self-test server bind"; stop "$sp"; return; fi
   "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
   if ! wait_listen "$px" "$pport"; then bad "meta: self-test proxy bind"; stop "$sp" "$px"; return; fi
   to "$CLIENT_TIMEOUT" ref_client "$sti" "$pport" "$d/out" /1.bin >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
@@ -348,6 +362,11 @@ fi
 
 [ -x "$ZQUIC_SERVER" ] || { echo "build zquic: zig build"; exit 1; }
 [ -x "$PROXY" ] || { echo "missing proxy — run oracle/build-refs.sh"; exit 1; }
+# Require a socket inspection tool. Without one, wait_listen can only confirm
+# the process is alive, not that it has bound the port — a timing race that
+# QUIC Initial retransmission usually masks but isn't guaranteed to.
+command -v lsof >/dev/null 2>&1 || command -v ss >/dev/null 2>&1 || \
+  { echo "oracle: lsof (macOS) or ss (Linux iproute2) required for port-bind checks" >&2; exit 1; }
 if [ $IMPL_SET -eq 1 ]; then
   for i in "${IMPLS[@]}"; do impl_ok "$i" || { echo "missing ref $i — run oracle/build-refs.sh"; exit 1; }; done
 else
