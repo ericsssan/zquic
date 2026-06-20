@@ -561,6 +561,56 @@ statelessreset_case() { # <impl> <port>
   fi
 }
 
+# statelessreset_client_case: zquic CLIENT must detect a stateless reset from
+# a quicgo server that restarted with the same RESET_KEY (#42).
+# Flow:
+#   1. Start quicgo server with RESET_KEY=K (deterministic tokens via HMAC-SHA256).
+#   2. Start zquic client requesting /big.bin (keeps it alive during transfer).
+#   3. Allow time for handshake to complete (quicgo sends NEW_CONNECTION_ID + tokens).
+#   4. Kill quicgo and immediately restart with same RESET_KEY at same port.
+#   5. Client sends a SHORT packet; new server doesn't know the conn → stateless reset.
+#   6. Reset token = HMAC(K, client_dcid)[:16] matches zquic's peer_cid_table entry.
+#   7. Client logs [SRST] stateless reset received.
+statelessreset_client_case() { # <port>
+  local port=$1
+  local d="$TMP/client/statelessreset_cli"
+  local key="deadbeefcafebabedeadbeefcafebabe0102030405060708090a0b0c0d0e0f10"
+  rm -rf "$d/out"; mkdir -p "$d/out"
+
+  # Phase 1: start quicgo server with RESET_KEY + zquic client (big.bin, stays alive)
+  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" \
+    >"$d/qgsrv1.log" 2>&1 & local sp1=$!
+  _HARNESS_PIDS+=("$sp1")
+  wait_listen "$sp1" "$port" || { bad "statelessreset-client (phase 1: no quicgo bind)"; stop "$sp1"; return; }
+
+  # Start client in background; big.bin takes a few seconds → still alive mid-transfer.
+  to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=transfer \
+    REQUESTS="https://127.0.0.1:$port/big.bin" DOWNLOADS="$d/out" \
+    "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1 & local cp=$!
+  _HARNESS_PIDS+=("$cp")
+
+  # Allow handshake to complete so quicgo sends NEW_CONNECTION_ID with reset tokens.
+  sleep 0.4
+  # Kill the original quicgo (state loss simulated).
+  stop "$sp1"
+
+  # Phase 2: restart quicgo with same RESET_KEY at same port.
+  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" \
+    >"$d/qgsrv2.log" 2>&1 & local sp2=$!
+  _HARNESS_PIDS+=("$sp2")
+  wait_listen "$sp2" "$port" || { stop "$cp"; bad "statelessreset-client (phase 2: no quicgo bind)"; stop "$sp2"; return; }
+
+  # Wait for the client to receive the stateless reset and exit (or time out).
+  wait "$cp" 2>/dev/null || true
+  stop "$sp2"
+
+  if grep -q '\[SRST\] stateless reset received' "$d/zcli.log" 2>/dev/null; then
+    ok "statelessreset-client [quicgo-server restart → zquic-client detects [SRST]]"
+  else
+    bad "statelessreset-client (no [SRST] in client log — stateless reset not detected)"
+  fi
+}
+
 # idle_timeout_case: server with IDLE_TIMEOUT=3 must emit [IDLE] after 4s of
 # silence. Wire proof: server log contains "[IDLE] connection timed out".
 # A second transfer after the idle wait succeeds — proving the server is alive
@@ -766,7 +816,7 @@ if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
     # Standalone cases run outside the per-impl loop (server properties / behavioral).
-    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration|idletimeout|statelessreset) continue ;; esac
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration|idletimeout|statelessreset|statelessresetclient) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -794,7 +844,7 @@ done
 # explicitly. Each function picks the best available impl for its needs.
 _want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
 _any_svr=0
-for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration idletimeout statelessreset; do
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration idletimeout statelessreset statelessresetclient; do
   _want_svr "$_sc" && _any_svr=1 && break
 done
 
@@ -875,6 +925,14 @@ if [ "$_any_svr" -eq 1 ]; then
   if _want_svr statelessreset; then
     trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
     [ -n "$trig" ] && { statelessreset_case "$trig" "$port"; port=$((port + 1)); }
+  fi
+
+  # statelessreset-client: zquic client must detect a stateless reset from a
+  # quicgo server that restarted with the same RESET_KEY (RFC 9000 §10.3, #42).
+  # Requires zquic client binary and quicgo (which supports StatelessResetKey).
+  if _want_svr statelessresetclient; then
+    [ -x "$ZQUIC_CLIENT" ] || bad "statelessreset-client: $ZQUIC_CLIENT missing — run: zig build"
+    impl_ok quicgo && { statelessreset_client_case "$port"; port=$((port + 1)); }
   fi
 fi
 

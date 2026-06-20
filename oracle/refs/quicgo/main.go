@@ -14,9 +14,11 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -214,12 +216,44 @@ func runServer(args []string) {
 	if err != nil {
 		fatal("load cert: %v", err)
 	}
-	ln, err := quic.ListenAddr(addr, &tls.Config{
+	tlsConf := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{alpn},
-	}, &quic.Config{})
-	if err != nil {
-		fatal("listen %s: %v", addr, err)
+	}
+	quicConf := &quic.Config{}
+
+	// RESET_KEY (64 hex chars = 32 bytes): configure stateless reset via Transport (#42).
+	// When set, a new server instance with the same key can issue stateless resets for
+	// connections it doesn't recognise — allows oracle to test client-side detection.
+	var ln *quic.Listener
+	if keyHex := os.Getenv("RESET_KEY"); len(keyHex) == 64 {
+		keyBytes, hexErr := hex.DecodeString(keyHex)
+		if hexErr == nil {
+			var k quic.StatelessResetKey
+			copy(k[:], keyBytes)
+			udpAddr, resolveErr := net.ResolveUDPAddr("udp", addr)
+			if resolveErr != nil {
+				fatal("resolve %s: %v", addr, resolveErr)
+			}
+			conn, listenErr := net.ListenUDP("udp", udpAddr)
+			if listenErr != nil {
+				fatal("listen %s: %v", addr, listenErr)
+			}
+			tr := &quic.Transport{Conn: conn, StatelessResetKey: &k}
+			var trErr error
+			ln, trErr = tr.Listen(tlsConf, quicConf)
+			if trErr != nil {
+				fatal("listen %s: %v", addr, trErr)
+			}
+			fmt.Printf("[RST_KEY] stateless reset key configured\n")
+		}
+	}
+	if ln == nil {
+		var listenErr error
+		ln, listenErr = quic.ListenAddr(addr, tlsConf, quicConf)
+		if listenErr != nil {
+			fatal("listen %s: %v", addr, listenErr)
+		}
 	}
 	fmt.Printf("quicgo server listening on %s\n", addr)
 

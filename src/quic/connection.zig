@@ -2187,6 +2187,7 @@ pub fn Connection(comptime max_streams: usize) type {
                         if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                             self.hot.state = .closed;
                             self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                            std.debug.print("[SRST] stateless reset received\n", .{});
                         }
                         return data.len;
                     };
@@ -2200,6 +2201,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                         self.hot.state = .closed;
                         self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                        std.debug.print("[SRST] stateless reset received\n", .{});
                     }
                     return data.len;
                 };
