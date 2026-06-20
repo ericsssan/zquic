@@ -91,13 +91,18 @@ declare -A IMPL_TC=( [ngtcp2]="http3" [quiche-h3]="http3" )
 # quiche-h3 exists to guard the H3 GREASE-frame handling (RFC 9114 §9) — quiche is
 # the only client that prepends GREASE. Its data-path cases do that; loss/RTT are
 # already covered by ngtcp2-h3, and quiche-h3 is slow under 30% loss, so skip them.
-declare -A IMPL_SKIP=( [ngtcp2]="retry ecn keyupdate" [quiche]="keyupdate" [quiche-h3]="retry handshakeloss transferloss longrtt ecn keyupdate" )
+declare -A IMPL_SKIP=( [ngtcp2]="retry ecn keyupdate" [quiche-h3]="retry handshakeloss transferloss longrtt ecn keyupdate" )
+# Cases to skip only in the dp_zquic_client direction (ref server + zquic client).
+# quiche-server drops streams after a Key Phase bit flip, but quiche-client handles
+# server-initiated key updates correctly — so only the client direction is skipped (#22).
+declare -A SKIP_CLIENT=( [quiche]="keyupdate" )
 DATA_CASES=(handshake transfer multiplexing ecn keyupdate)
 PROXIED_CASES=(retry handshakeloss transferloss longrtt handshakecorruption transfercorruption)
 
 # zquic TESTCASE for (impl, case): impl protocol override > case override > name.
 ztc() { echo "${IMPL_TC[$1]:-${TC[$2]:-$2}}"; }
-skipped() { case " ${IMPL_SKIP[$1]:-} " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+skipped()     { case " ${IMPL_SKIP[$1]:-}   " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+skip_client() { case " ${SKIP_CLIENT[$1]:-} " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
 ALL_IMPLS=(quicgo ngtcp2 quiche quiche-h3)
 IMPLS=(); IMPL_SET=0
 PASS=0; FAIL=0; FAILED=()
@@ -675,7 +680,7 @@ for impl in "${IMPLS[@]}"; do
     skipped "$impl" "$case" && continue
     mkdir -p "$TMP/$impl/$case"
     dp_zquic_server "$impl" "$case" "$port"; port=$((port + 1))
-    dp_zquic_client "$impl" "$case" "$port"; port=$((port + 1))
+    skip_client "$impl" "$case" || { dp_zquic_client "$impl" "$case" "$port"; port=$((port + 1)); }
   done
   for case in "${sel_prox[@]}"; do
     skipped "$impl" "$case" && continue
