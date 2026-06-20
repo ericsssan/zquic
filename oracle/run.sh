@@ -50,6 +50,8 @@ declare -A CASE_PATHS=(
   [longrtt]="/1.bin"   # high-RTT correctness, not bulk throughput — keep it small + fast
   [handshakecorruption]="/1.bin"
   [transfercorruption]="/big.bin"
+  [ecn]="/big.bin"         # meaningful: server TESTCASE=ecn enables ECN socket options
+  [keyupdate]="/big.bin"   # meaningful (client dir): zquic client calls initiateKeyUpdate()
 )
 # Behavioral cases: required wire token (class the proxy capture must contain).
 declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
@@ -77,8 +79,8 @@ declare -A IMPL_TC=( [ngtcp2]="http3" [quiche-h3]="http3" )
 # quiche-h3 exists to guard the H3 GREASE-frame handling (RFC 9114 §9) — quiche is
 # the only client that prepends GREASE. Its data-path cases do that; loss/RTT are
 # already covered by ngtcp2-h3, and quiche-h3 is slow under 30% loss, so skip them.
-declare -A IMPL_SKIP=( [ngtcp2]="retry" [quiche-h3]="retry handshakeloss transferloss longrtt" )
-DATA_CASES=(handshake transfer multiplexing)
+declare -A IMPL_SKIP=( [ngtcp2]="retry ecn keyupdate" [quiche]="keyupdate" [quiche-h3]="retry handshakeloss transferloss longrtt ecn keyupdate" )
+DATA_CASES=(handshake transfer multiplexing ecn keyupdate)
 PROXIED_CASES=(retry handshakeloss transferloss longrtt handshakecorruption transfercorruption)
 
 # zquic TESTCASE for (impl, case): impl protocol override > case override > name.
@@ -379,6 +381,50 @@ zerortt_case() { # <impl> <sport> <pport>
   fi
 }
 
+# multiconnect_case: verify zquic handles multiple independent connections.
+# Server direction: N sequential ref-client calls, each its own connection, to one
+# zquic server — exercises per-connection state teardown and re-init.
+# Client direction: zquic client (TESTCASE=multiconnect) opens one connection per
+# file URL — exercises the client's per-request connection path.
+multiconnect_case() { # <impl> <srv_port> <cli_port>
+  local impl=$1 sport=$2 cport=$3
+  local paths="/1.bin /big.bin"
+
+  # Server direction: sequential connections from ref client.
+  local d="$TMP/server/multiconnect"; rm -rf "$d/out"; mkdir -p "$d/out"
+  TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$sport" || { bad "multiconnect [zquic-server <-> $impl-client×2] (no bind)"; stop "$sp"; return; }
+  local mok=1 p
+  for p in $paths; do
+    to "$CLIENT_TIMEOUT" ref_client "$impl" "$sport" "$d/out" "$p" >"$d/cli${p//\//_}.log" 2>&1 || { mok=0; break; }
+  done
+  stop "$sp"
+  if [ "$mok" -ne 1 ]; then bad "multiconnect [zquic-server <-> $impl-client×2] (connection failed)"; return; fi
+  local m; if m="$(assert_match "$d/out" $paths)"; then
+    ok "multiconnect [zquic-server <-> $impl-client×2 | N sequential connections]"
+  else
+    bad "multiconnect [zquic-server <-> $impl-client×2] ($m)"
+  fi
+
+  # Client direction: zquic client opens one connection per file.
+  local d2="$TMP/$impl/multiconnect_cli"; rm -rf "$d2/out"; mkdir -p "$d2/out"
+  ref_server "$impl" "$cport" "$d2/rsrv.log" || { bad "multiconnect [$impl-server <-> zquic-client×2] (no server cmd)"; return; }
+  local sp2=$_LAST_SERVER_PID
+  wait_listen "$sp2" "$cport" || { bad "multiconnect [$impl-server <-> zquic-client×2] (no bind)"; stop "$sp2"; return; }
+  local reqs="" pp; for pp in $paths; do reqs="$reqs https://127.0.0.1:$cport$pp"; done
+  to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=multiconnect REQUESTS="${reqs# }" DOWNLOADS="$d2/out" \
+    "$ZQUIC_CLIENT" >"$d2/zcli.log" 2>&1; local rc=$?
+  stop "$sp2"
+  [ $rc -eq 124 ] && { bad "multiconnect [$impl-server <-> zquic-client×2] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "multiconnect [$impl-server <-> zquic-client×2] (client rc=$rc)"; return; }
+  local m; if m="$(assert_match "$d2/out" $paths)"; then
+    ok "multiconnect [$impl-server <-> zquic-client×2 | cert-verified]"
+  else
+    bad "multiconnect [$impl-server <-> zquic-client×2] ($m)"
+  fi
+}
+
 # self_test (#9): prove the harness's OWN assertions still reject the negative case
 # — otherwise a refactor could turn assert_match / the wire-checks into no-ops that
 # pass everything green. Each check below FAILS the run if an assertion stops
@@ -507,7 +553,7 @@ if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
     # Standalone cases run outside the per-impl loop (server properties / behavioral).
-    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt) continue ;; esac
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|multiconnect) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -534,7 +580,7 @@ done
 # explicitly. Each function picks the best available impl for its needs.
 _want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
 _any_svr=0
-for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt; do
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt multiconnect; do
   _want_svr "$_sc" && _any_svr=1 && break
 done
 
@@ -569,6 +615,14 @@ if [ "$_any_svr" -eq 1 ]; then
     [ -x "$ZQUIC_CLIENT" ] || bad "zerortt: $ZQUIC_CLIENT missing — run: zig build"
     trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
     [ -n "$trig" ] && { zerortt_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+  fi
+
+  # multiconnect: server handles N sequential connections (data-path); client opens
+  # one connection per file (TESTCASE=multiconnect). No proxy needed — data-path only.
+  if _want_svr multiconnect; then
+    [ -x "$ZQUIC_CLIENT" ] || bad "multiconnect: $ZQUIC_CLIENT missing — run: zig build"
+    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { multiconnect_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
   fi
 fi
 
