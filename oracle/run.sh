@@ -381,6 +381,29 @@ zerortt_case() { # <impl> <sport> <pport>
   fi
 }
 
+# connectionmigration_case: server advertises a preferred_address (RFC 9000 §9.6);
+# ref client migrates to it mid-transfer and the bulk download still completes.
+# Server direction only — zquic client does not yet follow preferred_address.
+# Two ports: handshake_port (initial connection) + migrate_port (preferred_address).
+connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
+  local impl=$1 hport=$2 mport=$3 d="$TMP/server/connectionmigration"
+  rm -rf "$d/out"; mkdir -p "$d/out"
+  CM_ADDR4=127.0.0.1 CM_PORT="$mport" TESTCASE=connectionmigration \
+    CERTS="$CERTS" WWW="$WWW" PORT="$hport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$hport" || { bad "connectionmigration (no server bind on $hport)"; stop "$sp"; return; }
+  wait_listen "$sp" "$mport" || { bad "connectionmigration (no CM socket bind on $mport)"; stop "$sp"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$hport" "$d/out" /big.bin >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp"
+  [ $rc -eq 124 ] && { bad "connectionmigration (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "connectionmigration (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if m="$(assert_match "$d/out" "/big.bin")"; then
+    ok "connectionmigration [zquic-server → $impl preferred_addr 127.0.0.1:$mport]"
+  else
+    bad "connectionmigration ($m)"
+  fi
+}
+
 # multiconnect_case: verify zquic handles multiple independent connections.
 # Server direction: N sequential ref-client calls, each its own connection, to one
 # zquic server — exercises per-connection state teardown and re-init.
@@ -553,7 +576,7 @@ if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
     # Standalone cases run outside the per-impl loop (server properties / behavioral).
-    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|multiconnect) continue ;; esac
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|multiconnect|connectionmigration) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -580,7 +603,7 @@ done
 # explicitly. Each function picks the best available impl for its needs.
 _want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
 _any_svr=0
-for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt multiconnect; do
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt multiconnect connectionmigration; do
   _want_svr "$_sc" && _any_svr=1 && break
 done
 
@@ -623,6 +646,14 @@ if [ "$_any_svr" -eq 1 ]; then
     [ -x "$ZQUIC_CLIENT" ] || bad "multiconnect: $ZQUIC_CLIENT missing — run: zig build"
     trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
     [ -n "$trig" ] && { multiconnect_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+  fi
+
+  # connectionmigration: server advertises preferred_address; ref client migrates to it
+  # mid-transfer and the download must still complete. Two ports: handshake + migrate.
+  # quic-go follows preferred_address by default; no extra client flags needed.
+  if _want_svr connectionmigration; then
+    trig=""; impl_ok quicgo && trig=quicgo
+    [ -n "$trig" ] && { connectionmigration_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
   fi
 fi
 

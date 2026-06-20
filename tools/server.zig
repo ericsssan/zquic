@@ -69,14 +69,27 @@ var g_is_h3: bool = false;
 var g_keylog_buf: [65536]u8 = undefined;
 var g_keylog_len: usize = 0;
 
-// IPv4/IPv6 addresses for preferred_address in connectionmigration test (interop runner addresses).
+// IPv4/IPv6 addresses for preferred_address in connectionmigration test.
+// Defaults are the Docker interop runner addresses; override with CM_ADDR4 / CM_PORT env vars
+// (e.g. CM_ADDR4=127.0.0.1 CM_PORT=4434 for the loopback oracle).
 // server4:  193.167.100.100  (0xc1, 0xa7, 0x64, 0x64)
 // server6:  fd00:cafe:cafe:0100::100
-const CM_IPV4: [4]u8 = .{ 193, 167, 100, 100 };
+const CM_IPV4_DEFAULT: [4]u8 = .{ 193, 167, 100, 100 };
 const CM_IPV6: [16]u8 = .{ 0xfd, 0x00, 0xca, 0xfe, 0xca, 0xfe, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00 };
-// Port for preferred_address in connectionmigration (different from initial port 443).
-// Both neqo and lsquic use 4433; the server must bind an additional socket on this port.
-const CM_PORT: u16 = 4433;
+const CM_PORT_DEFAULT: u16 = 4433;
+
+fn parseIPv4(s: []const u8) ![4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (it.next()) |part| {
+        if (i >= 4) return error.InvalidAddress;
+        out[i] = try std.fmt.parseInt(u8, part, 10);
+        i += 1;
+    }
+    if (i != 4) return error.InvalidAddress;
+    return out;
+}
 
 /// State for one in-progress file transfer.
 const FileTransfer = struct {
@@ -286,6 +299,14 @@ pub fn main(init: std.process.Init) !void {
 
     g_is_h3 = std.mem.eql(u8, testcase, "http3");
     const is_cm = std.mem.eql(u8, testcase, "connectionmigration");
+    const cm_addr4: [4]u8 = blk: {
+        const s = init.environ_map.get("CM_ADDR4") orelse break :blk CM_IPV4_DEFAULT;
+        break :blk parseIPv4(s) catch CM_IPV4_DEFAULT;
+    };
+    const cm_port: u16 = blk: {
+        const s = init.environ_map.get("CM_PORT") orelse break :blk CM_PORT_DEFAULT;
+        break :blk std.fmt.parseInt(u16, s, 10) catch CM_PORT_DEFAULT;
+    };
 
     // Generate a random ticket encryption key for session resumption / 0-RTT.
     var ticket_key: [32]u8 = undefined;
@@ -306,10 +327,10 @@ pub fn main(init: std.process.Init) !void {
         .initial_max_streams_bidi = 64, // Match MAX_TRANSFERS; grows as streams close
         .initial_max_streams_uni = 100,
         // RFC 9000 §18.2.3: advertise preferred IPv4+IPv6 addresses for migration.
-        .preferred_addr_ipv4 = if (is_cm) CM_IPV4 else null,
-        .preferred_addr_ipv4_port = if (is_cm) CM_PORT else 0,
+        .preferred_addr_ipv4 = if (is_cm) cm_addr4 else null,
+        .preferred_addr_ipv4_port = if (is_cm) cm_port else 0,
         .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else @as([16]u8, @splat(0)),
-        .preferred_addr_ipv6_port = if (is_cm) CM_PORT else 0,
+        .preferred_addr_ipv6_port = if (is_cm) cm_port else 0,
         .ticket_key = &ticket_key,
     };
 
@@ -319,11 +340,11 @@ pub fn main(init: std.process.Init) !void {
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
 
-    // For connectionmigration: bind a second socket on CM_PORT (4433) so the server
+    // For connectionmigration: bind a second socket on cm_port so the server
     // can receive packets after the client migrates to the preferred_address.
     var cm_sock: ?net.Socket = null;
     if (is_cm) {
-        const cm_bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(CM_PORT) };
+        const cm_bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(cm_port) };
         cm_sock = try net.IpAddress.bind(&cm_bind_addr, io, .{ .mode = .dgram });
     }
     defer if (cm_sock) |s| s.close(io);
