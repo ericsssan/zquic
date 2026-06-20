@@ -339,6 +339,7 @@ amplimit_case() { # <impl> <sport> <pport>
   stop "$sp" "$px"
   [ $rc -eq 124 ] && { bad "amplificationlimit (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "amplificationlimit (client rc=$rc)"; return; }
+  local m; if ! m="$(assert_match "$d/out" "/1.bin")"; then bad "amplificationlimit [$impl] (data: $m)"; return; fi
   # Count DGRAM bytes per direction before the first c2s HANDSHAKE (= address
   # validation event per RFC 9001 §4.1.2). Assert s2c ≤ 3× c2s.
   local msg; msg=$(awk '
@@ -374,6 +375,7 @@ zerortt_case() { # <impl> <sport> <pport>
   stop "$sp" "$px"
   [ $rc -eq 124 ] && { bad "zerortt [zquic-client <-> $impl-server] (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "zerortt [zquic-client <-> $impl-server] (client rc=$rc)"; return; }
+  local m; if ! m="$(assert_match "$d/out" "/1.bin")"; then bad "zerortt [zquic-client <-> $impl-server] (data: $m)"; return; fi
   if wire_has "c2s 0RTT" "$capf"; then
     ok "zerortt [zquic-client <-> $impl-server | wire: c2s 0RTT ✓]"
   else
