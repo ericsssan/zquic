@@ -245,6 +245,10 @@ pub const Config = struct {
     /// 32-byte key for session ticket encryption (enables resumption/0-RTT).
     /// When null, session tickets are not issued.
     ticket_key: ?*const [32]u8 = null,
+    /// 32-byte key for deterministic stateless reset token derivation via
+    /// HMAC-SHA256(key, cid)[:16] (RFC 9000 §10.3.1). When null, tokens are
+    /// random (per-connection, no stateless reset after state loss).
+    reset_key: ?[32]u8 = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -608,7 +612,15 @@ pub fn Connection(comptime max_streams: usize) type {
             const local_cid = ConnectionId.generate(0, io);
             const alt_local_cid = ConnectionId.generate(0, io);
             var alt_local_reset_token: [16]u8 = undefined;
-            io.random(&alt_local_reset_token);
+            if (config.reset_key) |key| {
+                // Derive token deterministically: HMAC-SHA256(key, cid)[:16].
+                // This allows stateless reset after state loss (RFC 9000 §10.3.1).
+                var hmac_out: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+                std.crypto.auth.hmac.sha2.HmacSha256.create(&hmac_out, &alt_local_cid.bytes, &key);
+                @memcpy(&alt_local_reset_token, hmac_out[0..16]);
+            } else {
+                io.random(&alt_local_reset_token);
+            }
             const idle_timeout_i64: i64 = if (config.idle_timeout_ns > 0)
                 @intCast(@min(config.idle_timeout_ns, @as(u64, std.math.maxInt(i64))))
             else
@@ -760,7 +772,13 @@ pub fn Connection(comptime max_streams: usize) type {
             const local_cid = ConnectionId.generate(0, io);
             const alt_local_cid = ConnectionId.generate(0, io);
             var alt_local_reset_token: [16]u8 = undefined;
-            io.random(&alt_local_reset_token);
+            if (config.reset_key) |key| {
+                var hmac_out: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+                std.crypto.auth.hmac.sha2.HmacSha256.create(&hmac_out, &alt_local_cid.bytes, &key);
+                @memcpy(&alt_local_reset_token, hmac_out[0..16]);
+            } else {
+                io.random(&alt_local_reset_token);
+            }
             const idle_timeout_i64: i64 = if (config.idle_timeout_ns > 0)
                 @intCast(@min(config.idle_timeout_ns, @as(u64, std.math.maxInt(i64))))
             else
@@ -2216,6 +2234,16 @@ pub fn Connection(comptime max_streams: usize) type {
             return self.checkStatelessResetToken(raw_packet[raw_packet.len - 16 ..][0..16]);
         }
 
+        /// Derive a stateless reset token for `cid_bytes` using config.reset_key.
+        /// Returns null when reset_key is not configured.
+        /// Used by the server to generate a stateless reset for an unknown CID.
+        pub fn deriveResetToken(self: *const Self, cid_bytes: []const u8) ?[16]u8 {
+            const key = self.config.reset_key orelse return null;
+            var hmac_out: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&hmac_out, cid_bytes, &key);
+            return hmac_out[0..16].*;
+        }
+
         /// Check a pre-saved 16-byte token against known peer stateless reset tokens.
         /// Used by in-place decrypt path where the original packet tail may be
         /// overwritten by AEAD — caller saves the token before decryption.
@@ -2536,6 +2564,17 @@ pub fn Connection(comptime max_streams: usize) type {
                             our_params.version_information_len = 8;
                         } else {
                             our_params.version_information = null;
+                        }
+
+                        // RFC 9000 §18.2 (0x02): advertise stateless_reset_token for the
+                        // initial connection ID when using deterministic token derivation.
+                        // The client stores this so it can detect a stateless reset later.
+                        if (self.config.reset_key) |key| {
+                            var tok: [16]u8 = undefined;
+                            var hmac_out: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+                            std.crypto.auth.hmac.sha2.HmacSha256.create(&hmac_out, &self.local_cid.bytes, &key);
+                            @memcpy(&tok, hmac_out[0..16]);
+                            our_params.stateless_reset_token = tok;
                         }
 
                         // RFC 9000 §18.2.3: advertise preferred_address if configured.

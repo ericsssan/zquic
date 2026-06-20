@@ -312,6 +312,13 @@ pub fn main(init: std.process.Init) !void {
         const secs = std.fmt.parseInt(u64, s, 10) catch break :blk 30_000_000_000;
         break :blk secs * 1_000_000_000;
     };
+    const reset_key: ?[32]u8 = blk: {
+        const s = init.environ_map.get("RESET_KEY") orelse break :blk null;
+        if (s.len != 64) break :blk null;
+        var key: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&key, s) catch break :blk null;
+        break :blk key;
+    };
 
     // Generate a random ticket encryption key for session resumption / 0-RTT.
     var ticket_key: [32]u8 = undefined;
@@ -338,6 +345,7 @@ pub fn main(init: std.process.Init) !void {
         .preferred_addr_ipv6_port = if (is_cm) cm_port else 0,
         .ticket_key = &ticket_key,
         .idle_timeout_ns = idle_timeout_ns,
+        .reset_key = reset_key,
     };
 
     // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6
@@ -502,7 +510,30 @@ fn processPacket(
         }
     }
 
-    if (slot == null) return;
+    if (slot == null) {
+        // Unknown connection: if SHORT header and reset_key is set, send a
+        // stateless reset (RFC 9000 §10.3). The reset token is derived as
+        // HMAC-SHA256(reset_key, dcid)[:16] — reproducible across restarts.
+        if (data.len > 0 and data[0] & 0x80 == 0 and config.reset_key != null) {
+            if (dcid) |d| {
+                if (d.len > 0) {
+                    const key = config.reset_key.?;
+                    var hmac_out: [std.crypto.auth.hmac.sha2.HmacSha256.mac_length]u8 = undefined;
+                    std.crypto.auth.hmac.sha2.HmacSha256.create(&hmac_out, &d, &key);
+                    // Stateless reset: ≥21 bytes, first byte has fixed-bit (0x40) set
+                    // and the packet-type bits cleared, last 16 bytes = token.
+                    var srst: [32]u8 = undefined;
+                    io.random(&srst);
+                    srst[0] = (srst[0] | 0x40) & 0x7f; // fixed bit=1, long-header bit=0
+                    @memcpy(srst[16..32], hmac_out[0..16]);
+                    var msg = [1]net.OutgoingMessage{.{ .address = &from, .data_ptr = &srst, .data_len = srst.len }};
+                    sock.sendMany(io, &msg, .{}) catch {};
+                    std.debug.print("[SRST] stateless reset sent for unknown CID\n", .{});
+                }
+            }
+        }
+        return;
+    }
 
     const s = slot.?;
     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);

@@ -500,6 +500,53 @@ connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
   ok "connectionmigration [zquic-server → $impl preferred_addr 127.0.0.1:$mport]"
 }
 
+# statelessreset_case: server with a known RESET_KEY must emit [SRST] when it
+# receives a SHORT packet for an unknown DCID (RFC 9000 §10.3).
+# Wire proof: server log contains "[SRST] stateless reset sent".
+# Flow:
+#   1. Start server with RESET_KEY=K (deterministic tokens via HMAC-SHA256).
+#   2. Client connects and completes a transfer (server assigns a connection ID).
+#   3. Capture the server's log SCID entry (not needed — we inject a random
+#      SHORT packet; server must respond to ANY unknown SHORT when key is set).
+#   4. Stop server, restart fresh (state lost) with same RESET_KEY.
+#   5. Send a crafted SHORT packet (random DCID) via netcat/socat.
+#   6. Server generates HMAC(key, dcid) → sends stateless reset → logs [SRST].
+statelessreset_case() { # <impl> <port>
+  local impl=$1 port=$2
+  local d="$TMP/server/statelessreset"
+  local key="deadbeefcafebabedeadbeefcafebabe0102030405060708090a0b0c0d0e0f10"
+  rm -rf "$d/out"; mkdir -p "$d/out"
+
+  # Phase 1: establish a connection so we know the server works.
+  RESET_KEY="$key" TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$port" \
+    "$ZQUIC_SERVER" >"$d/zsrv1.log" 2>&1 & local sp1=$!
+  _HARNESS_PIDS+=("$sp1")
+  wait_listen "$sp1" "$port" || { bad "statelessreset (no server bind phase 1)"; stop "$sp1"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$d/out" /1.bin >"$d/cli.log" 2>&1
+  local rc=$?
+  stop "$sp1"
+  [ $rc -eq 0 ] || { bad "statelessreset (phase 1 transfer failed rc=$rc)"; return; }
+
+  # Phase 2: restart server (state lost) with same RESET_KEY. Send a crafted
+  # SHORT packet with a random unknown DCID. Server must send [SRST].
+  RESET_KEY="$key" TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$port" \
+    "$ZQUIC_SERVER" >"$d/zsrv2.log" 2>&1 & local sp2=$!
+  _HARNESS_PIDS+=("$sp2")
+  wait_listen "$sp2" "$port" || { bad "statelessreset (no server bind phase 2)"; stop "$sp2"; return; }
+  # Craft a 32-byte SHORT packet: first byte has fixed bit=1, long-header bit=0.
+  # Remaining bytes are random. The last 16 bytes do NOT match a valid token
+  # (random dcid), so AEAD will fail and the server will generate [SRST].
+  printf '\x41\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e' | \
+    nc -u -q1 127.0.0.1 "$port" >/dev/null 2>&1 || true
+  sleep 1
+  stop "$sp2"
+  if grep -q '\[SRST\] stateless reset sent' "$d/zsrv2.log" 2>/dev/null; then
+    ok "statelessreset [zquic-server sends [SRST] for unknown SHORT CID]"
+  else
+    bad "statelessreset (no [SRST] in server log — stateless reset not sent)"
+  fi
+}
+
 # idle_timeout_case: server with IDLE_TIMEOUT=3 must emit [IDLE] after 4s of
 # silence. Wire proof: server log contains "[IDLE] connection timed out".
 # A second transfer after the idle wait succeeds — proving the server is alive
@@ -704,7 +751,7 @@ if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
     # Standalone cases run outside the per-impl loop (server properties / behavioral).
-    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration|idletimeout) continue ;; esac
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration|idletimeout|statelessreset) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -732,7 +779,7 @@ done
 # explicitly. Each function picks the best available impl for its needs.
 _want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
 _any_svr=0
-for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration idletimeout; do
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration idletimeout statelessreset; do
   _want_svr "$_sc" && _any_svr=1 && break
 done
 
@@ -806,6 +853,13 @@ if [ "$_any_svr" -eq 1 ]; then
   if _want_svr idletimeout; then
     trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
     [ -n "$trig" ] && { idle_timeout_case "$trig" "$port"; port=$((port + 1)); }
+  fi
+
+  # statelessreset: server with RESET_KEY must send [SRST] for unknown SHORT
+  # packet after state loss (RFC 9000 §10.3). Uses nc to inject a raw UDP packet.
+  if _want_svr statelessreset; then
+    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { statelessreset_case "$trig" "$port"; port=$((port + 1)); }
   fi
 fi
 
