@@ -42,17 +42,20 @@ else
   echo "==> quic-go oracle present (skip)"
 fi
 
-# ---- ngtcp2 (optional: HTTP/3 oracle; local source + cmake + OpenSSL 3.5+) ----
-# Builds osslclient/osslserver from a sibling ../ngtcp2 checkout against brew's
-# OpenSSL 3 (has the QUIC API), libev, and libnghttp3. Skips gracefully if the
-# source or deps are absent (e.g. CI), where the quic-go oracle still runs.
+# ---- ngtcp2 (optional: HTTP/3 oracle; local source + cmake) --------------------
+# Two build paths — same source, different TLS backends:
+#   macOS: OpenSSL 3 QUIC API via brew (osslclient / osslserver)
+#   Linux: GnuTLS QUIC API via apt  (gtlsclient  / gtlsserver)
+# In both cases the result is symlinked to $BIN/ngtcp2-{client,server} (#29).
+# Deps are installed by the caller (workflow / developer); this script just builds.
 NGTCP2_SRC="$(cd "$ORACLE/.." && pwd)/../ngtcp2"
 if [ -x "$BIN/ngtcp2-client" ] && [ -x "$BIN/ngtcp2-server" ]; then
   echo "==> ngtcp2 oracle present (skip)"
 elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && command -v brew >/dev/null 2>&1; then
+  # macOS: OpenSSL 3 has the QUIC transport API (brew install openssl@3 libev libnghttp3)
   SSL="$(brew --prefix openssl@3 2>/dev/null)"; EV="$(brew --prefix libev 2>/dev/null)"; H3="$(brew --prefix libnghttp3 2>/dev/null)"
   if [ -e "$SSL/lib/libssl.dylib" ] && [ -e "$EV/lib/libev.dylib" ] && [ -e "$H3/lib/libnghttp3.dylib" ]; then
-    echo "==> building ngtcp2 (HTTP/3 oracle) — this is slow the first time"
+    echo "==> building ngtcp2 (HTTP/3 oracle, macOS/OpenSSL) — this is slow the first time"
     if ( cd "$NGTCP2_SRC" \
          && git submodule update --init >/dev/null 2>&1 \
          && PKG_CONFIG_PATH="$EV/lib/pkgconfig:$H3/lib/pkgconfig:$SSL/lib/pkgconfig" \
@@ -61,15 +64,31 @@ elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && command -v brew
          && cmake --build build -j4 --target osslclient osslserver >/dev/null 2>&1 ); then
       ln -sf "$NGTCP2_SRC/build/examples/osslclient" "$BIN/ngtcp2-client"
       ln -sf "$NGTCP2_SRC/build/examples/osslserver" "$BIN/ngtcp2-server"
-      echo "==> ngtcp2 built"
+      echo "==> ngtcp2 built (macOS/OpenSSL)"
     else
       echo "==> ngtcp2 build failed — skipping (quic-go oracle still runs)"
     fi
   else
     echo "==> ngtcp2 deps missing — skip. Install: brew install openssl@3 libev libnghttp3"
   fi
+elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
+  # Linux: GnuTLS 3.7+ has QUIC transport support (apt-get install libgnutls28-dev libev-dev libnghttp3-dev)
+  echo "==> building ngtcp2 (HTTP/3 oracle, Linux/GnuTLS) — this is slow the first time"
+  if ( cd "$NGTCP2_SRC" \
+       && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_GNUTLS=ON -DENABLE_EXAMPLES=ON >/dev/null 2>&1 \
+       && cmake --build build -j"$(nproc)" --target gtlsclient gtlsserver >/dev/null 2>&1 ); then
+    ln -sf "$NGTCP2_SRC/build/examples/gtlsclient" "$BIN/ngtcp2-client"
+    ln -sf "$NGTCP2_SRC/build/examples/gtlsserver" "$BIN/ngtcp2-server"
+    echo "==> ngtcp2 built (Linux/GnuTLS)"
+  else
+    echo "==> ngtcp2 build failed — skipping (quic-go oracle still runs)"
+    echo "    ensure deps: sudo apt-get install libgnutls28-dev libev-dev libnghttp3-dev"
+  fi
 else
-  echo "==> ngtcp2 source (../ngtcp2) or cmake/brew not found — skip (HTTP/3 oracle)"
+  echo "==> ngtcp2 source (../ngtcp2) or cmake not found — skip (HTTP/3 oracle)"
+  echo "    macOS: brew install openssl@3 libev libnghttp3"
+  echo "    Linux: git clone ../ngtcp2 + apt-get install libgnutls28-dev libev-dev libnghttp3-dev"
 fi
 
 # ---- quiche (optional: HTTP/0.9 oracle; sibling ../quiche + cargo + BoringSSL) -

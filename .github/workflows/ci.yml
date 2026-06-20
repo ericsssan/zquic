@@ -66,6 +66,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       QUICHE_REF: "0.29.2"   # pinned for reproducible CI builds
+      NGTCP2_REF: "v1.9.0"   # pinned; build-refs.sh uses GnuTLS on Linux (#29)
     steps:
       - uses: actions/checkout@v4
 
@@ -87,6 +88,9 @@ jobs:
       - name: Resolve quiche path
         run: echo "QUICHE_DIR=$(cd "$GITHUB_WORKSPACE/.." && pwd)/quiche" >> "$GITHUB_ENV"
 
+      - name: Resolve ngtcp2 path
+        run: echo "NGTCP2_DIR=$(cd "$GITHUB_WORKSPACE/.." && pwd)/ngtcp2" >> "$GITHUB_ENV"
+
       - name: Build zquic (server + client)
         run: zig build
 
@@ -103,6 +107,21 @@ jobs:
             ~/.cargo/git
             ${{ env.QUICHE_DIR }}/target
           key: quiche-${{ runner.os }}-${{ env.QUICHE_REF }}
+
+      # ngtcp2 exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3). Built with
+      # GnuTLS on Linux (GnuTLS 3.7+ has the QUIC transport API; Ubuntu's OpenSSL
+      # 3.0 does not). The clone + cache mirror the quiche pattern above (#29, #31).
+      - name: Install ngtcp2 deps (GnuTLS + libev + nghttp3)
+        run: sudo apt-get update -qq && sudo apt-get install -y libgnutls28-dev libev-dev libnghttp3-dev
+
+      - name: Clone ngtcp2 (pinned)
+        run: git clone --depth 1 --branch "$NGTCP2_REF" https://github.com/ngtcp2/ngtcp2.git "$NGTCP2_DIR"
+
+      - name: Cache ngtcp2 build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.NGTCP2_DIR }}/build
+          key: ngtcp2-${{ runner.os }}-${{ env.NGTCP2_REF }}
 
       - name: Build reference impls + fixtures
         run: bash oracle/build-refs.sh

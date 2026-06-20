@@ -29,6 +29,11 @@
 #                             assertions still reject their negatives (#9). Also
 #                             runs automatically at the end of every full run.
 #
+if (( BASH_VERSINFO[0] < 4 )); then
+  echo "oracle/run.sh requires bash 4+ (found ${BASH_VERSION})." >&2
+  echo "On macOS: brew install bash  (then use /opt/homebrew/bin/bash oracle/run.sh)" >&2
+  exit 1
+fi
 set -u
 
 ORACLE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,6 +70,13 @@ declare -A IMPAIR=(
   [longrtt]="-delayms 100"   # 200ms RTT: exercises RTT estimation / timers / pacing
   [handshakecorruption]="-corrupt 5 -seed 42"   # 5% bit-flip; AEAD drops → retransmit
   [transfercorruption]="-corrupt 2 -seed 42"    # 2% on big.bin (5% cascades on 1MB)
+)
+# Per-case timeout overrides (seconds). Loss cases need extra headroom: 30% loss
+# with exponential PTO backoff can cascade to ~12s worst-case on a quiet machine
+# and ~20s under 5% CI CPU contention, leaving almost no margin at 25s (#36).
+declare -A CASE_TIMEOUT=(
+  [handshakeloss]=45
+  [transferloss]=45
 )
 # zquic TESTCASE to pass to the endpoints (default = case name). Impaired cases
 # just serve/fetch like transfer; the impairment is injected by the proxy.
@@ -127,30 +139,30 @@ h256() {
   else shasum -a256 "$1" | awk '{print $1}'; fi
 }
 
-# Is UDP `port` bound? Portable across macOS (lsof) and Linux (ss). Ports are
-# fresh + pre-cleaned, so a port-level check is sufficient. (-P/-n: numeric;
-# 4500 prints as the service name "ipsec-msft" otherwise.)
+# Is UDP `port` bound? Uses lsof on macOS (works without root) and ss on Linux
+# (reads kernel netlink directly; lsof on Linux may silently return empty for
+# UDP sockets without elevated permissions — #39). Ports are fresh + pre-cleaned,
+# so a port-level check is sufficient. (-P/-n: numeric; 4500 prints as the
+# service name "ipsec-msft" otherwise.)
 port_bound() {
   local port=$2
-  if command -v lsof >/dev/null 2>&1; then
-    lsof -nP -iUDP:"$port" 2>/dev/null | grep -q ":$port"
-  elif command -v ss >/dev/null 2>&1; then
-    ss -lun 2>/dev/null | grep -qE "[:.]$port([^0-9]|$)"
-  else
-    return 1
-  fi
+  case "$(uname -s)" in
+    Darwin) lsof -nP -iUDP:"$port" 2>/dev/null | grep -q ":$port" ;;
+    *)      ss -lun 2>/dev/null | grep -qE "[:.]$port([^0-9]|$)" ;;
+  esac
 }
 
 # Wait until pid has bound UDP port, or it dies. Requires lsof/ss (checked at
-# startup); the process-alive fallthrough at the end is a safety net only.
+# startup). Returns 1 if the port is not bound within 5 seconds — a live-but-
+# unbound process is not ready (#33).
 wait_listen() {
   local pid=$1 port=$2 i
-  for i in $(seq 1 20); do
+  for i in $(seq 1 50); do
     kill -0 "$pid" 2>/dev/null || return 1
     port_bound "$pid" "$port" && return 0
     sleep 0.1
   done
-  kill -0 "$pid" 2>/dev/null
+  return 1
 }
 stop() { kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
 
@@ -159,12 +171,26 @@ stop() { kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
 # so the self-test (#9) can prove it still discriminates present from absent.
 wire_has() { grep -q "$1" "$2" 2>/dev/null; }
 
+# dump_capture CAPFILE — print a sorted class summary after a wire_has failure
+# so a developer can see what the proxy DID capture without reading the file (#34).
+dump_capture() {
+  local f=$1 lines=0
+  [ -f "$f" ] && lines=$(wc -l <"$f" 2>/dev/null)
+  echo "  capture ($f, ${lines} lines):"
+  if [ "${lines:-0}" -eq 0 ]; then
+    echo "    (empty — proxy may not have received any packets)"
+  else
+    sort "$f" 2>/dev/null | uniq -c | sort -rn | head -10 | sed 's/^/    /'
+  fi
+}
+
 assert_match() { # <dir> <path...>
-  local dir=$1; shift; local p base
+  local dir=$1; shift; local p base want got
   for p in "$@"; do
     base="$(basename "$p")"
-    [ -f "$dir/$base" ] || { echo "missing $base"; return 1; }
-    [ "$(h256 "$WWW/$base")" = "$(h256 "$dir/$base")" ] || { echo "hash mismatch $base"; return 1; }
+    [ -f "$dir/$base" ] || { echo "missing $base (looked in $dir)"; return 1; }
+    want=$(h256 "$WWW/$base"); got=$(h256 "$dir/$base")
+    [ "$want" = "$got" ] || { echo "hash mismatch $base: want $want got $got"; return 1; }
   done
 }
 
@@ -236,6 +262,7 @@ dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic clie
 proxied() {
   local impl=$1 case=$2 sport=$3 pport=$4 paths="${CASE_PATHS[$2]}" d="$TMP/$impl/$case"
   local want="${WIRE_REQUIRE[$case]:-}" impair="${IMPAIR[$case]:-}" tc="$(ztc "$impl" "$case")"
+  local ct="${CASE_TIMEOUT[$case]:-$CLIENT_TIMEOUT}"
   local tag="$case [zquic-server <-> $impl-client${impair:+ | impair:$impair}${want:+ | wire: $want}]"
   local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
   TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
@@ -244,13 +271,15 @@ proxied() {
   "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
-  to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
+  to "$ct" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
   [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; echo "[HSDONE loss=$(grep -c 'HSDONE.*loss' "$d/zsrv.log" 2>/dev/null) retx=$(grep -c 'HSDONE.*queue' "$d/zsrv.log" 2>/dev/null)]"; echo "[AUTH]"; grep 'AUTH\]' "$d/zsrv.log" 2>/dev/null | head -3; echo "[PTO]"; grep 'PTO\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[STREAM]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | head -5; echo "[STREAM last]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[ACKR]"; grep 'ACKR\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null; echo "[cli]"; cat "$d/cli.log" 2>/dev/null; echo "[proxy drop]"; grep -i 'drop\|loss\|discard' "$d/proxy.log" 2>/dev/null | tail -5; echo "[cap $(wc -l <"$d/capture.txt" 2>/dev/null)]"; sort "$d/capture.txt" 2>/dev/null | uniq -c | sort -rn | head -10; echo "[cap tail]"; tail -20 "$d/capture.txt" 2>/dev/null; return; }
   [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
   local m; if ! m="$(assert_match "$out" $paths)"; then bad "$tag (transfer: $m)"; return; fi
   if [ -n "$want" ] && ! wire_has "$want" "$capf"; then
-    bad "$tag — transfer ok but mechanism NOT seen on wire"; return
+    bad "$tag — transfer ok but '$want' NOT seen on wire"
+    dump_capture "$capf"
+    return
   fi
   ok "$tag${want:+ ✓}"
 }
@@ -280,6 +309,7 @@ vn_case() { # <trigger_impl> <sport> <pport>
     ok "versionnegotiation [zquic server emits VN; $trig offers unknown version | wire ✓]"
   else
     bad "versionnegotiation — zquic did not send a VERSION_NEGOTIATION packet"
+    dump_capture "$capf"
   fi
 }
 
@@ -380,6 +410,7 @@ zerortt_case() { # <impl> <sport> <pport>
     ok "zerortt [zquic-client <-> $impl-server | wire: c2s 0RTT ✓]"
   else
     bad "zerortt [zquic-client <-> $impl-server] — transfer ok but 0RTT NOT seen on wire"
+    dump_capture "$capf"
   fi
 }
 
@@ -582,11 +613,13 @@ fi
 
 [ -x "$ZQUIC_SERVER" ] || { echo "build zquic: zig build"; exit 1; }
 [ -x "$PROXY" ] || { echo "missing proxy — run oracle/build-refs.sh"; exit 1; }
-# Require a socket inspection tool. Without one, wait_listen can only confirm
-# the process is alive, not that it has bound the port — a timing race that
-# QUIC Initial retransmission usually masks but isn't guaranteed to.
-command -v lsof >/dev/null 2>&1 || command -v ss >/dev/null 2>&1 || \
-  { echo "oracle: lsof (macOS) or ss (Linux iproute2) required for port-bind checks" >&2; exit 1; }
+# Require the platform-appropriate socket inspection tool (#39).
+case "$(uname -s)" in
+  Darwin) command -v lsof >/dev/null 2>&1 || \
+            { echo "oracle: lsof required on macOS for port-bind checks" >&2; exit 1; } ;;
+  *)      command -v ss >/dev/null 2>&1 || \
+            { echo "oracle: ss (iproute2) required on Linux for port-bind checks" >&2; exit 1; } ;;
+esac
 if [ $IMPL_SET -eq 1 ]; then
   for i in "${IMPLS[@]}"; do impl_ok "$i" || { echo "missing ref $i — run oracle/build-refs.sh"; exit 1; }; done
 else
@@ -629,6 +662,7 @@ fi
 
 cleanup  # pre-clean any stragglers from a prior run
 echo "zquic oracle — impls: ${IMPLS[*]}"
+echo "logs:  $TMP"
 port=$PORT_BASE
 for impl in "${IMPLS[@]}"; do
   echo ""; echo "═══ oracle: $impl ═══"
