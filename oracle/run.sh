@@ -383,6 +383,50 @@ zerortt_case() { # <impl> <sport> <pport>
   fi
 }
 
+# resumption_case: verify TLS 1.3 session ticket resumption (PSK, no early data).
+# Server direction: zquic server issues a ticket on conn1; quicgo -resumption makes
+# conn2 with the same session cache → PSK in ClientHello → abbreviated handshake.
+# Client direction: zquic client (TESTCASE=resumption) makes conn1 (warms ticket)
+# then conn2 (PSK resume) against the quicgo ref server.
+# Both directions assert hash match on both files (conn1 + conn2 output).
+resumption_case() { # <impl> <srv_port> <cli_port>
+  local impl=$1 sport=$2 cport=$3
+  local paths="/1.bin /big.bin"
+
+  # Server direction: zquic server + quicgo -resumption
+  local d="$TMP/server/resumption"; rm -rf "$d/out"; mkdir -p "$d/out"
+  TESTCASE=resumption CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$sport" || { bad "resumption [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
+  to "$CLIENT_TIMEOUT" "$BIN/quicgo" client -ca "$CERTS/cert.pem" -resumption "$d/out" \
+    "https://127.0.0.1:$sport/1.bin" "https://127.0.0.1:$sport/big.bin" >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp"
+  [ $rc -eq 124 ] && { bad "resumption [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "resumption [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if m="$(assert_match "$d/out" $paths)"; then
+    ok "resumption [zquic-server <-> $impl-client | PSK session ticket]"
+  else
+    bad "resumption [zquic-server <-> $impl-client] ($m)"
+  fi
+
+  # Client direction: zquic client (TESTCASE=resumption) + ref server
+  local d2="$TMP/$impl/resumption_cli"; rm -rf "$d2/out"; mkdir -p "$d2/out"
+  ref_server "$impl" "$cport" "$d2/rsrv.log" || { bad "resumption [$impl-server <-> zquic-client] (no server cmd)"; return; }
+  local sp2=$_LAST_SERVER_PID
+  wait_listen "$sp2" "$cport" || { bad "resumption [$impl-server <-> zquic-client] (no bind)"; stop "$sp2"; return; }
+  local reqs="https://127.0.0.1:$cport/1.bin https://127.0.0.1:$cport/big.bin"
+  to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=resumption REQUESTS="$reqs" DOWNLOADS="$d2/out" \
+    "$ZQUIC_CLIENT" >"$d2/zcli.log" 2>&1; local rc=$?
+  stop "$sp2"
+  [ $rc -eq 124 ] && { bad "resumption [$impl-server <-> zquic-client] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "resumption [$impl-server <-> zquic-client] (client rc=$rc)"; return; }
+  local m; if m="$(assert_match "$d2/out" $paths)"; then
+    ok "resumption [$impl-server <-> zquic-client | cert-verified]"
+  else
+    bad "resumption [$impl-server <-> zquic-client] ($m)"
+  fi
+}
+
 # connectionmigration_case: server advertises a preferred_address (RFC 9000 §9.6);
 # ref client migrates to it mid-transfer and the bulk download still completes.
 # Server direction only — zquic client does not yet follow preferred_address.
@@ -578,7 +622,7 @@ if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
     # Standalone cases run outside the per-impl loop (server properties / behavioral).
-    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|multiconnect|connectionmigration) continue ;; esac
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -605,7 +649,7 @@ done
 # explicitly. Each function picks the best available impl for its needs.
 _want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
 _any_svr=0
-for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt multiconnect connectionmigration; do
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration; do
   _want_svr "$_sc" && _any_svr=1 && break
 done
 
@@ -633,6 +677,14 @@ if [ "$_any_svr" -eq 1 ]; then
   if _want_svr amplificationlimit; then
     trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
     [ -n "$trig" ] && { amplimit_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+  fi
+
+  # resumption: session ticket issued on conn1; conn2 resumes with PSK (no early data).
+  # Both directions: zquic server + quicgo -resumption; zquic client + quicgo server.
+  if _want_svr resumption; then
+    [ -x "$ZQUIC_CLIENT" ] || bad "resumption: $ZQUIC_CLIENT missing — run: zig build"
+    trig=""; impl_ok quicgo && trig=quicgo
+    [ -n "$trig" ] && { resumption_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
   fi
 
   # zerortt: 0-RTT packets must appear on the wire (c2s 0RTT in proxy capture).

@@ -51,10 +51,11 @@ func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	caFile := fs.String("ca", "", "PEM CA to verify the server cert; empty = skip verification")
 	useV2 := fs.Bool("v2", false, "use QUIC v2 (RFC 9369) instead of v1")
+	useResumption := fs.Bool("resumption", false, "make two sequential connections; second resumes with session ticket (PSK)")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if len(rest) < 2 {
-		fatal("usage: quicgo client [-ca file] [-v2] <outdir> <url>...")
+		fatal("usage: quicgo client [-ca file] [-v2] [-resumption] <outdir> <url>...")
 	}
 	outdir, urls := rest[0], rest[1:]
 
@@ -89,10 +90,58 @@ func runClient(args []string) {
 		tlsConf.InsecureSkipVerify = true
 	}
 
+	// Session cache shared across connections — enables ticket resumption on
+	// the second DialAddr call without any extra client-side bookkeeping.
+	tlsConf.ClientSessionCache = tls.NewLRUClientSessionCache(4)
+
 	quicConf := &quic.Config{}
 	if *useV2 {
 		quicConf.Versions = []quic.Version{quic.Version2}
 	}
+
+	if *useResumption {
+		// Connection 1: download first URL, let the NST arrive and be cached.
+		if len(urls) < 2 {
+			fatal("resumption requires at least 2 URLs")
+		}
+		conn1, err := quic.DialAddr(ctx, host, tlsConf, quicConf)
+		if err != nil {
+			fatal("dial %s (conn1): %v", host, err)
+		}
+		if err := fetch(ctx, conn1, urls[0], outdir); err != nil {
+			fatal("conn1: %v", err)
+		}
+		conn1.CloseWithError(0, "done")
+
+		// Connection 2: same tlsConf → session cache hit → PSK resumption.
+		conn2, err := quic.DialAddr(ctx, host, tlsConf, quicConf)
+		if err != nil {
+			fatal("dial %s (conn2): %v", host, err)
+		}
+		defer conn2.CloseWithError(0, "done")
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var firstErr error
+		for _, u := range urls[1:] {
+			wg.Add(1)
+			go func(u string) {
+				defer wg.Done()
+				if err := fetch(ctx, conn2, u, outdir); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+				}
+			}(u)
+		}
+		wg.Wait()
+		if firstErr != nil {
+			fatal("%v", firstErr)
+		}
+		return
+	}
+
 	conn, err := quic.DialAddr(ctx, host, tlsConf, quicConf)
 	if err != nil {
 		fatal("dial %s: %v", host, err)
