@@ -13,12 +13,17 @@
 // the Nth datagram still depends on endpoint timing (coalescing, PTO) — so loss
 // is reproducible-sequence, not outcome-deterministic. See harness issue #8.
 //
-//	proxy -listen :PORT -target HOST:PORT -capture FILE [-loss PCT -corrupt PCT -delayms MS -seed N]
+//	proxy -listen :PORT -target HOST:PORT -capture FILE [-loss PCT -corrupt PCT -delayms MS -seed N] [-ecn]
 //
 // Capture: one line PER DATAGRAM ("c2s DGRAM N") for byte-counting, followed
 // by one line per QUIC packet within that datagram ("c2s CLASS N"). CLASS is
 // from classifyAll. The DGRAM line lets byte-count checks (e.g. amplificationlimit)
 // avoid double-counting coalesced packets. Recorded before any simulated drop/corrupt.
+//
+// When -ecn is set (Linux only): enables IP_RECVTOS on the back socket so that
+// the IP TOS byte (containing ECN bits) of server→proxy packets is read via CMSG.
+// ECN-marked packet counts are appended to the capture file as "s2c ECT0 N" etc.
+// This proves server-sent packets carry ECN markings on the wire (#41).
 //
 // Limitation: tracks a single client flow (last sender address wins) — multi-
 // connection cases (resumption/multiconnect) are out of scope.
@@ -31,7 +36,9 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"runtime"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -125,6 +132,7 @@ func main() {
 	corrupt := flag.Int("corrupt", 0, "corrupt percent [0..100]: bit-flip one byte in that fraction of forwarded packets (skips header type byte; AEAD detects corruption)")
 	delayms := flag.Int("delayms", 0, "one-way delay in ms")
 	seed := flag.Int64("seed", 42, "PRNG seed for a reproducible loss sequence")
+	ecnFlag := flag.Bool("ecn", false, "read IP ECN bits from s2c packets via IP_RECVTOS CMSG (Linux only) and append counts to capture file (#41)")
 	flag.Parse()
 	if *listen == "" || *target == "" {
 		fmt.Fprintln(os.Stderr, "proxy: -listen and -target required")
@@ -192,14 +200,58 @@ func main() {
 	getClient := func() net.Addr { mu.Lock(); defer mu.Unlock(); return clientAddr }
 	setClient := func(a net.Addr) { mu.Lock(); clientAddr = a; mu.Unlock() }
 
+	// -ecn: enable IP_RECVTOS on back socket so the IP TOS byte (ECN bits) of
+	// server-sent packets is delivered as CMSG in ReadMsgUDP (#41, Linux only).
+	useECN := *ecnFlag && runtime.GOOS == "linux"
+	if useECN {
+		if rc, e := back.SyscallConn(); e == nil {
+			rc.Control(func(fd uintptr) { // IP_RECVTOS = 13 on Linux
+				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 0xd, 1)
+			})
+		}
+	}
+
 	// Server replies (back) -> client (front).
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 65535)
+		// ECN codepoint counts for server→proxy direction (#41).
+		// Index = ECN bits (0=Not-ECT, 1=ECT(1), 2=ECT(0), 3=CE) from IP TOS.
+		var ecnCounts [4]uint64
+		defer func() {
+			if !useECN || capFile == nil {
+				return
+			}
+			labels := [4]string{"NOT_ECT", "ECT1", "ECT0", "CE"}
+			capMu.Lock()
+			for i, cnt := range ecnCounts {
+				if cnt > 0 {
+					fmt.Fprintf(capFile, "s2c %s %d\n", labels[i], cnt)
+				}
+			}
+			capMu.Unlock()
+		}()
+		var oob [64]byte
 		for {
-			n, err := back.Read(buf)
+			var n int
+			var err error
+			if useECN {
+				var oobn int
+				n, oobn, _, _, err = back.ReadMsgUDP(buf, oob[:])
+				if err == nil && oobn > 0 {
+					// Parse CMSG for IP_TOS (level=IPPROTO_IP=0, type=IP_TOS=1).
+					msgs, _ := syscall.ParseSocketControlMessage(oob[:oobn])
+					for _, m := range msgs {
+						if m.Header.Level == syscall.IPPROTO_IP && m.Header.Type == 1 && len(m.Data) > 0 {
+							ecnCounts[m.Data[0]&0x03]++
+						}
+					}
+				}
+			} else {
+				n, err = back.Read(buf)
+			}
 			if err != nil {
 				return
 			}

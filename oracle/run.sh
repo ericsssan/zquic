@@ -59,17 +59,17 @@ declare -A CASE_PATHS=(
   [keyupdate]="/big.bin"   # meaningful (client dir): zquic client calls initiateKeyUpdate()
 )
 # Behavioral cases: required wire token (class the proxy capture must contain).
-declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
-# Proxy impairment flags. SEEDED, not outcome-deterministic: the seed fixes the
-# drop sequence, but which logical packet is the Nth datagram shifts with timing,
-# so loss outcomes vary slightly run-to-run (#8). Rates carry headroom (30%/6%);
-# use `-n N` for a repeat-stability check that fails hard on latent flakiness.
+declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" [ecn]="s2c ECT0" )
+# Proxy impairment / extra flags. SEEDED for loss cases (not outcome-deterministic:
+# the seed fixes the drop sequence, but which logical packet is the Nth datagram
+# shifts with timing — #8). Rates carry headroom; use `-n N` for repeat-stability.
 declare -A IMPAIR=(
   [handshakeloss]="-loss 30 -seed 7"
   [transferloss]="-loss 6 -seed 7"
   [longrtt]="-delayms 100"   # 200ms RTT: exercises RTT estimation / timers / pacing
   [handshakecorruption]="-corrupt 5 -seed 42"   # 5% bit-flip; AEAD drops → retransmit
   [transfercorruption]="-corrupt 2 -seed 42"    # 2% on big.bin (5% cascades on 1MB)
+  [ecn]="-ecn"               # proxy reads IP_RECVTOS CMSG; logs s2c ECT0 count (#41)
 )
 # Per-case timeout overrides (seconds). Loss cases need extra headroom: 30% loss
 # with exponential PTO backoff can cascade to ~12s worst-case on a quiet machine
@@ -96,8 +96,9 @@ declare -A IMPL_SKIP=( [ngtcp2]="retry ecn keyupdate" [quiche-h3]="retry handsha
 # quiche-server drops streams after a Key Phase bit flip, but quiche-client handles
 # server-initiated key updates correctly — so only the client direction is skipped (#22).
 declare -A SKIP_CLIENT=( [quiche]="keyupdate" )
-DATA_CASES=(handshake transfer multiplexing ecn keyupdate)
-PROXIED_CASES=(retry handshakeloss transferloss longrtt handshakecorruption transfercorruption)
+DATA_CASES=(handshake transfer multiplexing keyupdate)
+# ecn moved to PROXIED_CASES: server-direction only via proxy with -ecn (#41 wire-proof).
+PROXIED_CASES=(retry handshakeloss transferloss longrtt handshakecorruption transfercorruption ecn)
 
 # zquic TESTCASE for (impl, case): impl protocol override > case override > name.
 ztc() { echo "${IMPL_TC[$1]:-${TC[$2]:-$2}}"; }
@@ -289,6 +290,11 @@ proxied() {
   [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; echo "[HSDONE loss=$(grep -c 'HSDONE.*loss' "$d/zsrv.log" 2>/dev/null) retx=$(grep -c 'HSDONE.*queue' "$d/zsrv.log" 2>/dev/null)]"; echo "[AUTH]"; grep 'AUTH\]' "$d/zsrv.log" 2>/dev/null | head -3; echo "[PTO]"; grep 'PTO\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[STREAM]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | head -5; echo "[STREAM last]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[ACKR]"; grep 'ACKR\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null; echo "[cli]"; cat "$d/cli.log" 2>/dev/null; echo "[proxy drop]"; grep -i 'drop\|loss\|discard' "$d/proxy.log" 2>/dev/null | tail -5; echo "[cap $(wc -l <"$d/capture.txt" 2>/dev/null)]"; sort "$d/capture.txt" 2>/dev/null | uniq -c | sort -rn | head -10; echo "[cap tail]"; tail -20 "$d/capture.txt" 2>/dev/null; return; }
   [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
   local m; if ! m="$(assert_match "$out" $paths)"; then bad "$tag (transfer: $m)"; return; fi
+  # ECN wire-proof requires Linux: IP_RECVTOS CMSG is not reliably populated on macOS loopback (#41).
+  if [ -n "$want" ] && echo "$want" | grep -q "ECT\|^CE" && [ "$(uname -s)" != "Linux" ]; then
+    ok "$tag (ECN wire-proof skipped on $(uname -s))"
+    return
+  fi
   if [ -n "$want" ] && ! wire_has "$want" "$capf"; then
     bad "$tag — transfer ok but '$want' NOT seen on wire"
     dump_capture "$capf"
