@@ -42,7 +42,7 @@ ZQUIC_SERVER="$ROOT/zig-out/bin/server"
 ZQUIC_CLIENT="$ROOT/zig-out/bin/client"
 CERTS="$ORACLE/certs"; WWW="$ORACLE/www"; BIN="$ORACLE/.cache/bin"; TMP="$ORACLE/.cache/run"
 PROXY="$BIN/proxy"
-PORT_BASE=4500
+PORT_BASE=59200  # RFC 6335 dynamic/private range; avoids IANA-registered 4500 (ipsec-msft)
 CLIENT_TIMEOUT=25   # seconds; loopback handshake+1MB is <1s, so this only catches hangs
 
 declare -A CASE_PATHS=(
