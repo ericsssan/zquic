@@ -1,0 +1,43 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '0 2 * * 1'  # weekly, Monday 02:00 UTC
+  workflow_dispatch:      # manual trigger
+
+env:
+  ZIG_VERSION: 0.17.0-dev.657+2faf8debf
+
+jobs:
+  fuzz:
+    name: Fuzz targets (10 min)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # Run coverage-guided fuzzing for 10 minutes.  `timeout` exits 124 when it
+      # kills the process (no crash found — normal for a clean fuzz run).  Any
+      # other non-zero exit means the fuzzer found a crash and we fail the job.
+      - name: Fuzz (10 minutes)
+        run: |
+          timeout 600 zig build fuzz --fuzz; status=$?
+          if [ "$status" -eq 124 ]; then
+            echo "Fuzzing ran 10 minutes without finding a crash."
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ github.run_id }}
+          path: |
+            .zig-cache/**/crashes/
+            .zig-cache/**/corpus/
+          if-no-files-found: ignore

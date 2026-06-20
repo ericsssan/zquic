@@ -206,4 +206,19 @@ pub fn build(b: *std.Build) void {
     const server_test = b.addTest(.{ .root_module = server_test_mod });
     server_test.stack_size = 64 * 1024 * 1024;
     test_step.dependOn(&b.addRunArtifact(server_test).step);
+
+    // `zig build fuzz` — smoke-run fuzz targets (one shot per target, same as
+    // the copy already inside `test`).  Add `--fuzz` to engage coverage-guided
+    // continuous fuzzing: `zig build fuzz --fuzz`.  Building only fuzz.zig
+    // avoids recompiling the full test suite in CI fuzz jobs (#47).
+    const fuzz_step = b.step("fuzz", "Run fuzz targets (add --fuzz for coverage-guided mode)");
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/quic/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_mod.addImport("build_options", build_options_mod);
+    const fuzz_exe = b.addTest(.{ .root_module = fuzz_mod });
+    fuzz_exe.stack_size = 64 * 1024 * 1024;
+    fuzz_step.dependOn(&b.addRunArtifact(fuzz_exe).step);
 }
