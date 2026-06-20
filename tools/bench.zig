@@ -65,7 +65,26 @@ const scenarios = [_]Scenario{
     .{ .name = "256KB bidi, 50ms RTT", .data_bytes = 256 * 1024, .rtt_ms = 50, .kind = .bidi },
 };
 
-pub fn main() !void {
+// One measured scenario for JSON output (--json flag).
+const JsonScenario = struct {
+    name: []const u8,
+    goodput_kbps: f64,
+    goodput_stdev_kbps: f64,
+    handshake_us: f64,
+};
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    // Parse --json flag: emit machine-readable JSON to stdout in addition to
+    // the human-readable table on stderr (useful for CI regression tracking).
+    _ = init.environ;
+    var emit_json = false;
+    for (init.args.vector[1..]) |arg| {
+        if (std.mem.eql(u8, std.mem.span(arg), "--json")) emit_json = true;
+    }
+
+    var json_buf: std.ArrayList(JsonScenario) = .empty;
+    defer json_buf.deinit(std.heap.page_allocator);
+
     std.debug.print("\n=== zquic throughput benchmark ({} iterations/scenario) ===\n\n", .{ITERATIONS});
 
     // Handshake-only section
@@ -88,6 +107,12 @@ pub fn main() !void {
             const med = median(hs_samples[0..ok_count]);
             const sd = stdev(hs_samples[0..ok_count]);
             std.debug.print("{s:<40} {d:>12.0} {d:>12.1}\n", .{ s.name, med, sd });
+            if (emit_json) try json_buf.append(std.heap.page_allocator, .{
+                .name = s.name,
+                .goodput_kbps = 0,
+                .goodput_stdev_kbps = 0,
+                .handshake_us = med,
+            });
         } else {
             std.debug.print("{s:<40} FAILED\n", .{s.name});
         }
@@ -124,11 +149,35 @@ pub fn main() !void {
                 gp_sd,
                 hs_med,
             });
+            if (emit_json) try json_buf.append(std.heap.page_allocator, .{
+                .name = s.name,
+                .goodput_kbps = gp_med,
+                .goodput_stdev_kbps = gp_sd,
+                .handshake_us = hs_med,
+            });
         } else {
             std.debug.print("{s:<40} FAILED\n", .{s.name});
         }
     }
     std.debug.print("\n", .{});
+
+    if (emit_json) {
+        const io = getIo();
+        const stdout = std.Io.File.stdout();
+        var json_line: std.ArrayList(u8) = .empty;
+        defer json_line.deinit(std.heap.page_allocator);
+        try json_line.appendSlice(std.heap.page_allocator, "{\"scenarios\":{");
+        for (json_buf.items, 0..) |r, idx| {
+            if (idx > 0) try json_line.append(std.heap.page_allocator, ',');
+            try json_line.print(
+                std.heap.page_allocator,
+                "\"{s}\":{{\"goodput_kbps\":{d:.1},\"goodput_stdev_kbps\":{d:.1},\"handshake_us\":{d:.0}}}",
+                .{ r.name, r.goodput_kbps, r.goodput_stdev_kbps, r.handshake_us },
+            );
+        }
+        try json_line.appendSlice(std.heap.page_allocator, "}}\n");
+        try stdout.writeStreamingAll(io, json_line.items);
+    }
 }
 
 const BenchResult = struct {

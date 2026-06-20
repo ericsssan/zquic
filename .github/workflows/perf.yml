@@ -1,0 +1,77 @@
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.17.0-dev.657+2faf8debf
+
+jobs:
+  bench:
+    name: Goodput regression check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build
+
+      - name: Run bench
+        run: zig-out/bin/bench --json > bench-result.json
+
+      # On main-branch pushes, archive the result as the new baseline.
+      - name: Upload bench artifact (main baseline)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-main
+          path: bench-result.json
+          retention-days: 90
+
+      # On PRs, download the latest main baseline and compare.
+      - name: Download main baseline (PR only)
+        if: github.event_name == 'pull_request'
+        id: download_baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id=$(gh run list \
+            --branch main \
+            --workflow perf.yml \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // ""')
+          if [ -z "$run_id" ]; then
+            echo "No main baseline found — skipping regression check"
+            echo "has_baseline=false" >> "$GITHUB_OUTPUT"
+          else
+            gh run download "$run_id" --name bench-main --dir bench-baseline/ \
+              && echo "has_baseline=true" >> "$GITHUB_OUTPUT" \
+              || { echo "Download failed — skipping regression check"; echo "has_baseline=false" >> "$GITHUB_OUTPUT"; }
+          fi
+
+      - name: Compare against baseline (PR only)
+        if: github.event_name == 'pull_request' && steps.download_baseline.outputs.has_baseline == 'true'
+        run: python3 scripts/bench_compare.py bench-baseline/bench-result.json bench-result.json
+
+      # Always upload the PR result as an artifact for manual inspection.
+      - name: Upload bench artifact (PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-pr-${{ github.event.pull_request.number }}
+          path: bench-result.json
+          retention-days: 30
