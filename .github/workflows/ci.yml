@@ -107,7 +107,9 @@ jobs:
       - name: Build reference impls + fixtures
         run: bash oracle/build-refs.sh
 
-      # --require fails the job if quiche didn't build, instead of silently
-      # running a smaller (quic-go-only) green matrix (#7).
+      # --require fails the job if any impl didn't build, instead of silently
+      # running a smaller green matrix (#7). ngtcp2 is the only impl that
+      # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
+      # would silently drop 11 H3 test runs (#16).
       - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,quiche,quiche-h3
+        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
