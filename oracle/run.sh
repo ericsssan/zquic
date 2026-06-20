@@ -500,6 +500,36 @@ connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
   ok "connectionmigration [zquic-server → $impl preferred_addr 127.0.0.1:$mport]"
 }
 
+# idle_timeout_case: server with IDLE_TIMEOUT=3 must emit [IDLE] after 4s of
+# silence. Wire proof: server log contains "[IDLE] connection timed out".
+# A second transfer after the idle wait succeeds — proving the server is alive
+# and freed the slot, and can accept new connections after idle cleanup.
+idle_timeout_case() { # <impl> <port>
+  local impl=$1 port=$2 d="$TMP/server/idletimeout"
+  rm -rf "$d/out" "$d/out2"; mkdir -p "$d/out" "$d/out2"
+  IDLE_TIMEOUT=3 TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$port" \
+    "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$port" || { bad "idletimeout (no server bind)"; stop "$sp"; return; }
+  # First transfer — establishes a connection; idle timer starts when client exits.
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$d/out" /1.bin >"$d/cli.log" 2>&1
+  local rc=$?
+  [ $rc -eq 0 ] || { bad "idletimeout (first transfer failed rc=$rc)"; stop "$sp"; return; }
+  # Wait for idle timeout (3s) + margin.
+  sleep 4
+  # Second transfer — new QUIC connection; proves server is alive after cleanup.
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$d/out2" /2.bin >"$d/cli2.log" 2>&1
+  rc=$?
+  stop "$sp"
+  [ $rc -eq 0 ] || { bad "idletimeout (second transfer failed rc=$rc — server died or slot not freed)"; return; }
+  # Wire proof: server must have logged the idle timeout event.
+  if ! grep -q '\[IDLE\] connection timed out' "$d/zsrv.log" 2>/dev/null; then
+    bad "idletimeout (no [IDLE] in server log — idle timeout did not fire or was not logged)"
+    return
+  fi
+  ok "idletimeout [zquic-server 3s idle → [IDLE] + accepts fresh conn]"
+}
+
 # multiconnect_case: verify zquic handles multiple independent connections.
 # Server direction: N sequential ref-client calls, each its own connection, to one
 # zquic server — exercises per-connection state teardown and re-init.
@@ -674,7 +704,7 @@ if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
     # Standalone cases run outside the per-impl loop (server properties / behavioral).
-    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration) continue ;; esac
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration|idletimeout) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -702,7 +732,7 @@ done
 # explicitly. Each function picks the best available impl for its needs.
 _want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
 _any_svr=0
-for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration; do
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration idletimeout; do
   _want_svr "$_sc" && _any_svr=1 && break
 done
 
@@ -768,6 +798,14 @@ if [ "$_any_svr" -eq 1 ]; then
   if _want_svr connectionmigration; then
     trig=""; impl_ok quicgo && trig=quicgo
     [ -n "$trig" ] && { connectionmigration_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+  fi
+
+  # idletimeout: server with a 3s idle timeout must emit [IDLE] after silence
+  # and still accept a fresh connection afterward (RFC 9000 §10.1 / §10.2).
+  # Uses the server-side [IDLE] log as wire proof; no proxy needed.
+  if _want_svr idletimeout; then
+    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { idle_timeout_case "$trig" "$port"; port=$((port + 1)); }
   fi
 fi
 

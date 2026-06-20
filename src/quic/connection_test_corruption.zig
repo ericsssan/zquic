@@ -4,7 +4,7 @@
 //! 1. A corrupted Initial packet that fails decryption does NOT leave the
 //!    connection in an unrecoverable zombie state (Bug: state transitions
 //!    to .handshake before decryption, storing corrupted first_initial_dcid).
-//! 2. Idle timeout emits a connection_closed event so the slot can be freed.
+//! 2. Idle timeout emits an idle_timed_out event so the slot can be freed.
 //! 3. Drain timeout emits a connection_closed event so the slot can be freed.
 
 const std = @import("std");
@@ -182,13 +182,14 @@ test "corrupted Initial payload (not DCID) should allow valid retransmission" {
 }
 
 // ---------------------------------------------------------------------------
-// Bug 2: Idle timeout does not emit connection_closed event
+// Bug 2: Idle timeout does not emit idle_timed_out event
 // ---------------------------------------------------------------------------
 
-test "idle timeout must emit connection_closed event" {
+test "idle timeout must emit idle_timed_out event" {
     // When the idle timeout fires (RFC 9000 §10.1), the connection transitions
-    // to .closed state. A connection_closed event MUST be emitted so the
-    // application (server) can free the connection slot.
+    // to .closed state. An idle_timed_out event MUST be emitted (distinct from
+    // connection_closed which signals a peer-initiated or error close) so the
+    // server can free the slot and log it.
     //
     // Without this event, zombie connections persist forever in the connection
     // table, preventing new connections from the same client address.
@@ -217,11 +218,11 @@ test "idle timeout must emit connection_closed event" {
     // Connection should be closed.
     try testing.expectEqual(ConnState.closed, conn.hot.state);
 
-    // A connection_closed event MUST have been emitted.
+    // An idle_timed_out event MUST have been emitted.
     var found_closed = false;
     while (conn.pollEvent()) |ev| {
         switch (ev) {
-            .connection_closed => {
+            .idle_timed_out => {
                 found_closed = true;
             },
             else => {},
@@ -467,7 +468,7 @@ test "corrupted SCID does not prevent handshake when DCID is correct" {
     try testing.expectEqualSlices(u8, &dcid, conn.first_initial_dcid[0..8]);
 }
 
-test "idle timeout after successful handshake start emits connection_closed" {
+test "idle timeout after successful handshake start emits idle_timed_out" {
     // Ensure that idle timeout works correctly for a connection that
     // successfully started handshake (not just zombie connections).
     const testing = std.testing;
@@ -493,11 +494,11 @@ test "idle timeout after successful handshake start emits connection_closed" {
 
     try testing.expectEqual(ConnState.closed, conn.hot.state);
 
-    // Must emit connection_closed.
+    // Must emit idle_timed_out (distinct from connection_closed).
     var found = false;
     while (conn.pollEvent()) |ev| {
         switch (ev) {
-            .connection_closed => found = true,
+            .idle_timed_out => found = true,
             else => {},
         }
     }

@@ -307,6 +307,11 @@ pub fn main(init: std.process.Init) !void {
         const s = init.environ_map.get("CM_PORT") orelse break :blk CM_PORT_DEFAULT;
         break :blk std.fmt.parseInt(u16, s, 10) catch CM_PORT_DEFAULT;
     };
+    const idle_timeout_ns: u64 = blk: {
+        const s = init.environ_map.get("IDLE_TIMEOUT") orelse break :blk 30_000_000_000;
+        const secs = std.fmt.parseInt(u64, s, 10) catch break :blk 30_000_000_000;
+        break :blk secs * 1_000_000_000;
+    };
 
     // Generate a random ticket encryption key for session resumption / 0-RTT.
     var ticket_key: [32]u8 = undefined;
@@ -332,6 +337,7 @@ pub fn main(init: std.process.Init) !void {
         .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else @as([16]u8, @splat(0)),
         .preferred_addr_ipv6_port = if (is_cm) cm_port else 0,
         .ticket_key = &ticket_key,
+        .idle_timeout_ns = idle_timeout_ns,
     };
 
     // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6
@@ -590,6 +596,17 @@ fn processPacket(
                 // stale address.
                 s.peer_addr = socketAddrToIp(s.conn.peer_addr);
                 std.debug.print("[CM] path_migrated: client now at preferred_address\n", .{});
+            },
+            .idle_timed_out => {
+                std.debug.print("[IDLE] connection timed out\n", .{});
+                for (0..conn_slots.len) |i| {
+                    if (conn_slots[i] == s) {
+                        freeSlot(&conn_slots[i], io);
+                        slot_freed = true;
+                        break;
+                    }
+                }
+                break;
             },
             else => {},
         }

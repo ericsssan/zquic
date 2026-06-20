@@ -79,6 +79,8 @@ pub const Event = union(enum) {
     path_migrated,
     /// A Retry packet was sent; caller should drain send buf, then discard this connection object.
     retry_sent,
+    /// Idle timeout expired (RFC 9000 §10.1) — connection closed silently, no CONNECTION_CLOSE sent.
+    idle_timed_out,
 };
 
 pub const EventQueue = struct {
@@ -1202,7 +1204,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 if (now_ns >= d) {
                     self.hot.state = .closed;
                     self.idle_deadline_ns = null;
-                    self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                    self.events.push(.idle_timed_out);
                 }
             }
 
