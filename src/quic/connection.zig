@@ -1317,10 +1317,15 @@ pub fn Connection(comptime max_streams: usize) type {
                                         // (not just our own previous PINGs). Without this guard,
                                         // PTO sends infinite PINGs after all transfers complete:
                                         // each PING creates in-flight state → PTO fires → PING → loop.
-                                        // Limit to 6 consecutive idle PINGs, then let idle timeout close.
-                                        if (self.idle_ping_count < 6) {
+                                        // Cap at 30 consecutive idle PINGs, then reschedule PTO to
+                                        // a 5s future deadline (prevents tight-loop when cap is hit).
+                                        if (self.idle_ping_count < 30) {
                                             self.queuePing() catch {};
                                             self.idle_ping_count += 1;
+                                        } else {
+                                            // PTO fired but no probe sent: advance deadline to avoid
+                                            // busy-looping with a stale past deadline.
+                                            self.pto_deadline_ns = self.current_time_ns +| @as(i64, 5_000_000_000);
                                         }
                                     } else {
                                         // RFC 9002 §6.2: SHOULD send two full-sized datagrams per
@@ -2697,6 +2702,21 @@ pub fn Connection(comptime max_streams: usize) type {
 
             self.peer_disable_migration = params.disable_active_migration;
 
+            // RFC 9000 §18.2: server sends stateless_reset_token for its initial
+            // connection ID in transport parameters. Store it in peer_cid_table so
+            // checkStatelessResetToken() can match a reset using the initial CID.
+            // The client always uses peer_cid (= server SCID from handshake) as DCID.
+            if (!self.config.is_server) {
+                if (params.stateless_reset_token) |tok| {
+                    self.peer_cid_table[0] = .{
+                        .valid = true,
+                        .seq = 0,
+                        .cid = self.peer_cid,
+                        .reset_token = tok,
+                    };
+                }
+            }
+
             // 0-RTT acceptance phase is over once handshake completes.
             self.accepting_early_data = false;
 
@@ -3450,11 +3470,20 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         pub fn queuePing(self: *Self) !void {
-            const n = frame.encodeFrame(&self.pkt_scratch, .ping);
+            var pos: usize = 0;
+            pos += frame.encodeFrame(self.pkt_scratch[pos..], .ping);
+            // Pad so the total packet exceeds peer stateless-reset thresholds.
+            // RFC 9000 §10.3.1: endpoints MUST NOT send stateless resets for packets
+            // smaller than MinStatelessResetSize (42 bytes in quic-go). Payload bytes
+            // needed: > 42 - 1(first_byte) - cid_mod.len(DCID) - 4(PN) - 16(AEAD) = 13.
+            const min_payload = 21; // 1 PING + 20 PADDING: total packet > 42-byte peer stateless-reset threshold
+            if (pos < min_payload) {
+                pos += frame.encodeFrame(self.pkt_scratch[pos..], .{ .padding = min_payload - pos });
+            }
             var fi = loss_recovery_mod.SentFrameInfo{};
             fi.frames[0] = .ping;
             fi.count = 1;
-            _ = try self.sendShortHeaderPacket(n, fi, true);
+            _ = try self.sendShortHeaderPacket(pos, fi, true);
         }
 
         /// Queue a PMTUD probe: a PING frame padded to target_size.

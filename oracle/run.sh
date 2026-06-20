@@ -91,10 +91,11 @@ declare -A IMPL_TC=( [ngtcp2]="http3" [quiche-h3]="http3" )
 # quiche-h3 exists to guard the H3 GREASE-frame handling (RFC 9114 §9) — quiche is
 # the only client that prepends GREASE. Its data-path cases do that; loss/RTT are
 # already covered by ngtcp2-h3, and quiche-h3 is slow under 30% loss, so skip them.
-declare -A IMPL_SKIP=( [ngtcp2]="retry ecn keyupdate" [quiche-h3]="retry handshakeloss transferloss longrtt ecn keyupdate" )
+declare -A IMPL_SKIP=( [ngtcp2]="retry ecn keyupdate" [quiche]="keyupdate" [quiche-h3]="retry handshakeloss transferloss longrtt ecn keyupdate" )
 # Cases to skip only in the dp_zquic_client direction (ref server + zquic client).
-# quiche-server drops streams after a Key Phase bit flip, but quiche-client handles
-# server-initiated key updates correctly — so only the client direction is skipped (#22).
+# quiche-server drops streams after a Key Phase bit flip (#22); quiche is fully skipped
+# for keyupdate (client doesn't initiate key updates, same as ngtcp2), so this is redundant
+# but kept for clarity.
 declare -A SKIP_CLIENT=( [quiche]="keyupdate" )
 DATA_CASES=(handshake transfer multiplexing keyupdate)
 # ecn moved to PROXIED_CASES: server-direction only via proxy with -ecn (#41 wire-proof).
@@ -551,7 +552,7 @@ statelessreset_case() { # <impl> <port>
   # Remaining bytes are random. The last 16 bytes do NOT match a valid token
   # (random dcid), so AEAD will fail and the server will generate [SRST].
   printf '\x41\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e' | \
-    nc -u -q1 127.0.0.1 "$port" >/dev/null 2>&1 || true
+    nc -u -w 1 127.0.0.1 "$port" >/dev/null 2>&1 || true
   sleep 1
   stop "$sp2"
   if grep -q '\[SRST\] stateless reset sent' "$d/zsrv2.log" 2>/dev/null; then
@@ -577,25 +578,36 @@ statelessreset_client_case() { # <port>
   local key="deadbeefcafebabedeadbeefcafebabe0102030405060708090a0b0c0d0e0f10"
   rm -rf "$d/out"; mkdir -p "$d/out"
 
+  # Create a temporary www dir with a 2GB sparse file. On loopback QUIC can reach
+  # ~50 MB/s so a 1 MB file completes in <100ms. A sparse 2 GB file takes minutes
+  # to download, ensuring the client is still mid-transfer when we kill server 1.
+  # truncate -s creates a sparse file instantly (no disk writes needed).
+  local tw="$d/tmpwww"; mkdir -p "$tw"
+  truncate -s 2g "$tw/big.bin" 2>/dev/null || \
+    dd if=/dev/zero of="$tw/big.bin" bs=1M count=2048 2>/dev/null
+
   # Phase 1: start quicgo server with RESET_KEY + zquic client (big.bin, stays alive)
-  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" \
+  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
     >"$d/qgsrv1.log" 2>&1 & local sp1=$!
   _HARNESS_PIDS+=("$sp1")
   wait_listen "$sp1" "$port" || { bad "statelessreset-client (phase 1: no quicgo bind)"; stop "$sp1"; return; }
 
-  # Start client in background; big.bin takes a few seconds → still alive mid-transfer.
+  # Start client in background; 2GB big.bin takes several seconds → still alive mid-transfer.
   to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=transfer \
     REQUESTS="https://127.0.0.1:$port/big.bin" DOWNLOADS="$d/out" \
     "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1 & local cp=$!
   _HARNESS_PIDS+=("$cp")
 
   # Allow handshake to complete so quicgo sends NEW_CONNECTION_ID with reset tokens.
-  sleep 0.4
-  # Kill the original quicgo (state loss simulated).
-  stop "$sp1"
+  # Use 1s: on loopback the handshake takes <5ms, so this is comfortably past it.
+  sleep 1
+  # Kill the original quicgo (state loss simulated). Use SIGKILL so quicgo exits
+  # immediately without sending a CONNECTION_CLOSE — a graceful close would cause the
+  # zquic client to exit cleanly instead of waiting for a stateless reset.
+  kill -9 "$sp1" 2>/dev/null; wait "$sp1" 2>/dev/null || true
 
   # Phase 2: restart quicgo with same RESET_KEY at same port.
-  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$WWW" \
+  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
     >"$d/qgsrv2.log" 2>&1 & local sp2=$!
   _HARNESS_PIDS+=("$sp2")
   wait_listen "$sp2" "$port" || { stop "$cp"; bad "statelessreset-client (phase 2: no quicgo bind)"; stop "$sp2"; return; }
