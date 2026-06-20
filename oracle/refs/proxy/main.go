@@ -13,10 +13,12 @@
 // the Nth datagram still depends on endpoint timing (coalescing, PTO) — so loss
 // is reproducible-sequence, not outcome-deterministic. See harness issue #8.
 //
-//	proxy -listen :PORT -target HOST:PORT -capture FILE [-loss PCT -delayms MS -seed N]
+//	proxy -listen :PORT -target HOST:PORT -capture FILE [-loss PCT -corrupt PCT -delayms MS -seed N]
 //
-// Capture: one line PER QUIC packet, "<c2s|s2c> <CLASS> <datagram_bytes>".
-// Recorded on receipt (what the sender transmitted), before any simulated drop.
+// Capture: one line PER DATAGRAM ("c2s DGRAM N") for byte-counting, followed
+// by one line per QUIC packet within that datagram ("c2s CLASS N"). CLASS is
+// from classifyAll. The DGRAM line lets byte-count checks (e.g. amplificationlimit)
+// avoid double-counting coalesced packets. Recorded before any simulated drop/corrupt.
 //
 // Limitation: tracks a single client flow (last sender address wins) — multi-
 // connection cases (resumption/multiconnect) are out of scope.
@@ -111,6 +113,7 @@ func main() {
 	target := flag.String("target", "", "server addr, e.g. 127.0.0.1:4433")
 	capture := flag.String("capture", "", "capture file path")
 	loss := flag.Int("loss", 0, "loss percent [0..100]")
+	corrupt := flag.Int("corrupt", 0, "corrupt percent [0..100]: bit-flip one byte in that fraction of forwarded packets (skips header type byte; AEAD detects corruption)")
 	delayms := flag.Int("delayms", 0, "one-way delay in ms")
 	seed := flag.Int64("seed", 42, "PRNG seed for a reproducible loss sequence")
 	flag.Parse()
@@ -136,11 +139,25 @@ func main() {
 		if capFile == nil {
 			return
 		}
+		// One DGRAM line per datagram for byte-count checks (amplificationlimit).
+		// Followed by one CLASS line per QUIC packet found in the datagram.
+		// write(2) is immediately visible to readers; no fsync needed.
+		fmt.Fprintf(capFile, "%s DGRAM %d\n", dir, len(b))
 		for _, c := range classifyAll(b) {
-			// write(2) is immediately visible to a reader in another process;
-			// no fsync needed for the harness to grep the capture.
 			fmt.Fprintf(capFile, "%s %s %d\n", dir, c, len(b))
 		}
+	}
+	// maybecorrupt returns a bit-flipped copy at the configured rate (using the
+	// same per-direction RNG as drop, after the drop decision). Skips byte 0
+	// (header type byte) so the packet is still routed correctly by the receiver
+	// before AEAD rejects it. Returns the original slice if no corruption.
+	maybecorrupt := func(r *rand.Rand, b []byte) []byte {
+		if *corrupt <= 0 || r.Intn(100) >= *corrupt || len(b) < 2 {
+			return b
+		}
+		c := append([]byte(nil), b...)
+		c[1+r.Intn(len(c)-1)] ^= 0x01
+		return c
 	}
 	// One PRNG per direction (each driven by a single goroutine) so the drop
 	// sequence is race-free AND reproducible for a given seed. (Which logical
@@ -173,7 +190,7 @@ func main() {
 			pkt := append([]byte(nil), buf[:n]...)
 			record("s2c", pkt)
 			if ca := getClient(); ca != nil && !drop(rngS) {
-				fwd(func(p []byte) { front.WriteTo(p, ca) }, pkt)
+				fwd(func(p []byte) { front.WriteTo(p, ca) }, maybecorrupt(rngS, pkt))
 			}
 		}
 	}()
@@ -189,7 +206,7 @@ func main() {
 		pkt := append([]byte(nil), buf[:n]...)
 		record("c2s", pkt)
 		if !drop(rngC) {
-			fwd(func(p []byte) { back.Write(p) }, pkt)
+			fwd(func(p []byte) { back.Write(p) }, maybecorrupt(rngC, pkt))
 		}
 	}
 }

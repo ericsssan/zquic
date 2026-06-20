@@ -48,6 +48,8 @@ declare -A CASE_PATHS=(
   [handshakeloss]="/1.bin"
   [transferloss]="/big.bin"
   [longrtt]="/1.bin"   # high-RTT correctness, not bulk throughput — keep it small + fast
+  [handshakecorruption]="/1.bin"
+  [transfercorruption]="/big.bin"
 )
 # Behavioral cases: required wire token (class the proxy capture must contain).
 declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" )
@@ -59,10 +61,13 @@ declare -A IMPAIR=(
   [handshakeloss]="-loss 30 -seed 7"
   [transferloss]="-loss 6 -seed 7"
   [longrtt]="-delayms 100"   # 200ms RTT: exercises RTT estimation / timers / pacing
+  [handshakecorruption]="-corrupt 5 -seed 42"   # 5% bit-flip; AEAD drops → retransmit
+  [transfercorruption]="-corrupt 2 -seed 42"    # 2% on big.bin (5% cascades on 1MB)
 )
 # zquic TESTCASE to pass to the endpoints (default = case name). Impaired cases
 # just serve/fetch like transfer; the impairment is injected by the proxy.
-declare -A TC=( [handshakeloss]="transfer" [transferloss]="transfer" [longrtt]="transfer" )
+declare -A TC=( [handshakeloss]="transfer" [transferloss]="transfer" [longrtt]="transfer" \
+                [handshakecorruption]="transfer" [transfercorruption]="transfer" )
 # Per-impl protocol override: ngtcp2's example binaries are HTTP/3 only, so pair
 # them with zquic's http3 path — this exercises zquic's H3/QPACK, which the
 # quic-go (hq-interop / HTTP-0.9) cases never touch.
@@ -74,7 +79,7 @@ declare -A IMPL_TC=( [ngtcp2]="http3" [quiche-h3]="http3" )
 # already covered by ngtcp2-h3, and quiche-h3 is slow under 30% loss, so skip them.
 declare -A IMPL_SKIP=( [ngtcp2]="retry" [quiche-h3]="retry handshakeloss transferloss longrtt" )
 DATA_CASES=(handshake transfer multiplexing)
-PROXIED_CASES=(retry handshakeloss transferloss longrtt)
+PROXIED_CASES=(retry handshakeloss transferloss longrtt handshakecorruption transfercorruption)
 
 # zquic TESTCASE for (impl, case): impl protocol override > case override > name.
 ztc() { echo "${IMPL_TC[$1]:-${TC[$2]:-$2}}"; }
@@ -276,6 +281,104 @@ vn_case() { # <trigger_impl> <sport> <pport>
   fi
 }
 
+# chacha20: assert transfer completes when server is pinned to TLS_CHACHA20_POLY1305_SHA256.
+# Server-only (server sets preferred_cipher; both quicgo and quiche offer chacha20).
+chacha20_case() { # <impl> <port>
+  local impl=$1 port=$2 d="$TMP/server/chacha20"; rm -rf "$d/out"; mkdir -p "$d/out"
+  TESTCASE=chacha20 CERTS="$CERTS" WWW="$WWW" PORT="$port" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$port" || { bad "chacha20 [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$d/out" /1.bin >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp"
+  [ $rc -eq 124 ] && { bad "chacha20 [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "chacha20 [zquic-server <-> $impl-client] (client rc=$rc)"; return; }
+  local m; if m="$(assert_match "$d/out" "/1.bin")"; then
+    ok "chacha20 [zquic-server <-> $impl-client | TLS_CHACHA20_POLY1305_SHA256]"
+  else
+    bad "chacha20 [zquic-server <-> $impl-client] ($m)"
+  fi
+}
+
+# v2_case: assert transfer completes with QUIC v2 (0x6b3343cf) server and ref client.
+# Uses quicgo -v2 (quic-go supports Version2 via Config.Versions).
+v2_case() { # <impl> <port>
+  local impl=$1 port=$2 d="$TMP/server/v2"; rm -rf "$d/out"; mkdir -p "$d/out"
+  TESTCASE=v2 CERTS="$CERTS" WWW="$WWW" PORT="$port" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$port" || { bad "v2 [zquic-server <-> $impl-client] (no bind)"; stop "$sp"; return; }
+  case "$impl" in
+    quicgo) to "$CLIENT_TIMEOUT" "$BIN/quicgo" client -v2 "$d/out" \
+              "https://127.0.0.1:$port/1.bin" >"$d/cli.log" 2>&1 ;;
+    *) bad "v2: no v2-capable ref impl available"; stop "$sp"; return ;;
+  esac
+  local rc=$?; stop "$sp"
+  [ $rc -eq 124 ] && { bad "v2 [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "v2 [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if m="$(assert_match "$d/out" "/1.bin")"; then
+    ok "v2 [zquic-server <-> $impl-client | QUIC v2 (0x6b3343cf)]"
+  else
+    bad "v2 [zquic-server <-> $impl-client] ($m)"
+  fi
+}
+
+# amplimit_case: assert server doesn't violate the 3× amplification limit (RFC 9000 §8.1).
+# Uses DGRAM records in the proxy capture (added for this check) to count actual
+# datagram bytes, avoiding the double-count from coalesced packets.
+amplimit_case() { # <impl> <sport> <pport>
+  local impl=$1 sport=$2 pport=$3 d="$TMP/server/amplificationlimit"
+  rm -rf "$d/out"; mkdir -p "$d/out"; local capf="$d/capture.txt"
+  TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$sport" || { bad "amplificationlimit (no server bind)"; stop "$sp"; return; }
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
+  wait_listen "$px" "$pport" || { bad "amplificationlimit (no proxy bind)"; stop "$sp" "$px"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$d/out" /1.bin >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp" "$px"
+  [ $rc -eq 124 ] && { bad "amplificationlimit (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "amplificationlimit (client rc=$rc)"; return; }
+  # Count DGRAM bytes per direction before the first c2s HANDSHAKE (= address
+  # validation event per RFC 9001 §4.1.2). Assert s2c ≤ 3× c2s.
+  local msg; msg=$(awk '
+    BEGIN { c2s=0; s2c=0; done=0 }
+    done  { next }
+    /^c2s HANDSHAKE/ { done=1; next }
+    /^c2s DGRAM/ { c2s += $3 }
+    /^s2c DGRAM/ { s2c += $3 }
+    END {
+      if (c2s == 0) { print "skip: no c2s bytes in capture"; exit 0 }
+      if (s2c > c2s * 3) { print "FAIL s2c=" s2c " > 3x c2s=" c2s " (limit=" c2s*3 ")"; exit 1 }
+      print "OK s2c=" s2c " <= 3x c2s=" c2s " (limit=" c2s*3 ")"
+    }
+  ' "$capf"); local awk_rc=$?
+  if [ $awk_rc -ne 0 ]; then bad "amplificationlimit [$impl] — $msg"; else ok "amplificationlimit [$impl] — $msg (RFC 9000 §8.1 ✓)"; fi
+}
+
+# zerortt_case: assert 0-RTT packets appear on the wire (c2s 0RTT in proxy capture).
+# zquic client (TESTCASE=zerortt) makes two sequential connections through the proxy:
+# connection 1 warms up a session ticket, connection 2 sends early data (0-RTT).
+zerortt_case() { # <impl> <sport> <pport>
+  local impl=$1 sport=$2 pport=$3 d="$TMP/$impl/zerortt"
+  rm -rf "$d/out"; mkdir -p "$d/out"; local capf="$d/capture.txt"
+  ref_server "$impl" "$sport" "$d/rsrv.log" || { bad "zerortt [zquic-client <-> $impl-server] (no server cmd)"; return; }
+  local sp=$_LAST_SERVER_PID
+  wait_listen "$sp" "$sport" || { bad "zerortt [zquic-client <-> $impl-server] (no bind)"; stop "$sp"; return; }
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
+  wait_listen "$px" "$pport" || { bad "zerortt [zquic-client <-> $impl-server] (no proxy bind)"; stop "$sp" "$px"; return; }
+  # Both connections go through the proxy. The capture captures both sequentially.
+  to "$CLIENT_TIMEOUT" env TESTCASE=zerortt REQUESTS="https://127.0.0.1:$pport/1.bin" \
+    DOWNLOADS="$d/out" "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1; local rc=$?
+  stop "$sp" "$px"
+  [ $rc -eq 124 ] && { bad "zerortt [zquic-client <-> $impl-server] (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "zerortt [zquic-client <-> $impl-server] (client rc=$rc)"; return; }
+  if wire_has "c2s 0RTT" "$capf"; then
+    ok "zerortt [zquic-client <-> $impl-server | wire: c2s 0RTT ✓]"
+  else
+    bad "zerortt [zquic-client <-> $impl-server] — transfer ok but 0RTT NOT seen on wire"
+  fi
+}
+
 # self_test (#9): prove the harness's OWN assertions still reject the negative case
 # — otherwise a refactor could turn assert_match / the wire-checks into no-ops that
 # pass everything green. Each check below FAILS the run if an assertion stops
@@ -312,8 +415,10 @@ self_test() {
   stop "$sp" "$px"
   if [ $rc -ne 0 ]; then bad "meta: self-test transfer failed (rc=$rc) — capture unverifiable"; return; fi
   if wire_has " INITIAL " "$capf" && wire_has " HANDSHAKE " "$capf"; then ok "meta: classifier emits INITIAL+HANDSHAKE on a normal transfer"; else bad "meta: classifier emitted no handshake classes (capture broken)"; fi
+  if wire_has "c2s DGRAM" "$capf" && wire_has "s2c DGRAM" "$capf"; then ok "meta: proxy emits per-datagram DGRAM byte-count records"; else bad "meta: proxy emits no DGRAM records (amplificationlimit check broken — rebuild proxy)"; fi
   if wire_has "s2c RETRY" "$capf"; then bad "meta: RETRY seen in a non-retry transfer (false-pass risk)"; else ok "meta: retry wire-check fails on a transfer capture (falsification)"; fi
   if wire_has "s2c VERSION_NEGOTIATION" "$capf"; then bad "meta: VN seen in a v1 handshake (false-pass risk)"; else ok "meta: VN wire-check fails on a v1 capture (falsification)"; fi
+  if wire_has "c2s 0RTT" "$capf"; then bad "meta: 0RTT seen in a plain transfer (false-pass risk)"; else ok "meta: zerortt wire-check fails on a plain transfer (falsification)"; fi
 }
 
 CASES=(); REQUIRE=(); REPEAT=1; SELFTEST=0
@@ -401,7 +506,8 @@ sel_data=("${DATA_CASES[@]}"); sel_prox=("${PROXIED_CASES[@]}")
 if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
-    [ "$c" = versionnegotiation ] && continue # server-property case, run by vn_case below
+    # Standalone cases run outside the per-impl loop (server properties / behavioral).
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -424,13 +530,45 @@ for impl in "${IMPLS[@]}"; do
   done
 done
 
-# Server-property checks (use ngtcp2's --version). On a full run, or when
-# versionnegotiation is explicitly requested.
-if [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx versionnegotiation; then
-  trig=""; impl_ok ngtcp2 && trig=ngtcp2 || { impl_ok quiche && trig=quiche; }
-  if [ -n "$trig" ]; then
-    echo ""; echo "═══ oracle: server properties ═══"
-    vn_case "$trig" "$port" "$((port + 1))"; port=$((port + 2))
+# Server-property and standalone behavioral cases. Run on a full run or when named
+# explicitly. Each function picks the best available impl for its needs.
+_want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
+_any_svr=0
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt; do
+  _want_svr "$_sc" && _any_svr=1 && break
+done
+
+if [ "$_any_svr" -eq 1 ]; then
+  echo ""; echo "═══ oracle: server properties & standalone ═══"
+
+  # versionnegotiation: server must emit VN when client offers an unknown version.
+  if _want_svr versionnegotiation; then
+    trig=""; impl_ok ngtcp2 && trig=ngtcp2 || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { vn_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+  fi
+
+  # chacha20: transfer must complete when server prefers TLS_CHACHA20_POLY1305_SHA256.
+  if _want_svr chacha20; then
+    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { chacha20_case "$trig" "$port"; port=$((port + 1)); }
+  fi
+
+  # v2: transfer must complete with QUIC v2 server and a v2-capable ref client (quicgo -v2).
+  if _want_svr v2; then
+    impl_ok quicgo && { v2_case quicgo "$port"; port=$((port + 1)); }
+  fi
+
+  # amplificationlimit: server must not send > 3× client bytes before address validation.
+  if _want_svr amplificationlimit; then
+    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { amplimit_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+  fi
+
+  # zerortt: 0-RTT packets must appear on the wire (c2s 0RTT in proxy capture).
+  if _want_svr zerortt; then
+    [ -x "$ZQUIC_CLIENT" ] || bad "zerortt: $ZQUIC_CLIENT missing — run: zig build"
+    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { zerortt_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
   fi
 fi
 

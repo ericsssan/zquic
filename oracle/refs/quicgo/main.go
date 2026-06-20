@@ -50,10 +50,11 @@ func main() {
 func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	caFile := fs.String("ca", "", "PEM CA to verify the server cert; empty = skip verification")
+	useV2 := fs.Bool("v2", false, "use QUIC v2 (RFC 9369) instead of v1")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if len(rest) < 2 {
-		fatal("usage: quicgo client [-ca file] <outdir> <url>...")
+		fatal("usage: quicgo client [-ca file] [-v2] <outdir> <url>...")
 	}
 	outdir, urls := rest[0], rest[1:]
 
@@ -88,7 +89,11 @@ func runClient(args []string) {
 		tlsConf.InsecureSkipVerify = true
 	}
 
-	conn, err := quic.DialAddr(ctx, host, tlsConf, &quic.Config{})
+	quicConf := &quic.Config{}
+	if *useV2 {
+		quicConf.Versions = []quic.Version{quic.Version2}
+	}
+	conn, err := quic.DialAddr(ctx, host, tlsConf, quicConf)
 	if err != nil {
 		fatal("dial %s: %v", host, err)
 	}
