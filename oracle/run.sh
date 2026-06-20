@@ -229,7 +229,7 @@ proxied() {
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
-  [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; return; }
+  [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; echo "[HSDONE loss=$(grep -c 'HSDONE.*loss' "$d/zsrv.log" 2>/dev/null) retx=$(grep -c 'HSDONE.*queue' "$d/zsrv.log" 2>/dev/null)]"; echo "[AUTH]"; grep 'AUTH\]' "$d/zsrv.log" 2>/dev/null | head -3; echo "[PTO]"; grep 'PTO\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[STREAM]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | head -5; echo "[STREAM last]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[ACKR]"; grep 'ACKR\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null; echo "[cli]"; cat "$d/cli.log" 2>/dev/null; echo "[proxy drop]"; grep -i 'drop\|loss\|discard' "$d/proxy.log" 2>/dev/null | tail -5; echo "[cap $(wc -l <"$d/capture.txt" 2>/dev/null)]"; sort "$d/capture.txt" 2>/dev/null | uniq -c | sort -rn | head -10; echo "[cap tail]"; tail -20 "$d/capture.txt" 2>/dev/null; return; }
   [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
   local m; if ! m="$(assert_match "$out" $paths)"; then bad "$tag (transfer: $m)"; return; fi
   if [ -n "$want" ] && ! wire_has "$want" "$capf"; then

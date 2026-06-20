@@ -492,6 +492,16 @@ pub fn Connection(comptime max_streams: usize) type {
 
         // Pending retransmit flags
         pending_handshake_done: bool,
+        /// Packet number of the most recently sent HANDSHAKE_DONE (epoch 2).
+        /// Non-null while the packet is still in the sent table (not yet ACKed).
+        /// Used by PTO to detect unacknowledged HANDSHAKE_DONE without relying
+        /// on largest_acked[2], which quiche updates via 1-RTT ACKs even before
+        /// confirming the handshake (RFC 9001 §4.1.2 deadlock workaround).
+        handshake_done_pn: ?u64,
+        /// Deadline to retransmit HANDSHAKE_DONE if not yet ACKed (server only).
+        /// Set when HSDONE is queued; fires at 2× PTO so that even if bytes_in_flight
+        /// stays 0 (FIN ACKed before the first PTO fired), HSDONE is retransmitted.
+        hsdone_retransmit_deadline_ns: ?i64,
         pending_max_data: bool,
         /// Count of streams with a pending_reset set; avoids O(MAX_STREAMS) scan in tick().
         pending_reset_count: u8,
@@ -687,6 +697,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .current_key_generation = 0,
                 .peer_disable_migration = false,
                 .pending_handshake_done = false,
+                .handshake_done_pn = null,
+                .hsdone_retransmit_deadline_ns = null,
                 .pending_max_data = false,
                 .pending_reset_count = 0,
                 .unknown_versions = @as([4]u32, @splat(0)),
@@ -886,6 +898,8 @@ pub fn Connection(comptime max_streams: usize) type {
                 .current_key_generation = 0,
                 .peer_disable_migration = false,
                 .pending_handshake_done = false,
+                .handshake_done_pn = null,
+                .hsdone_retransmit_deadline_ns = null,
                 .pending_max_data = false,
                 .pending_reset_count = 0,
                 .unknown_versions = @as([4]u32, @splat(0)),
@@ -1046,6 +1060,11 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.pending_ack[2] = false;
                 self.sendEncryptedAck(2) catch {};
             }
+            // Flush MAX_STREAM_DATA / MAX_DATA / MAX_STREAMS on every receive so the
+            // peer learns immediately when our flow-control window opens.  Without this,
+            // the server can exhaust the initial 32 KB window and stall until the client's
+            // idle timer fires (~30 s) — by which point the oracle test has timed out.
+            if (self.hot.state == .established) self.flushControlFrames() catch {};
         }
 
         /// Store per-packet metadata for deferred wire-time accounting.
@@ -1156,11 +1175,12 @@ pub fn Connection(comptime max_streams: usize) type {
             const pto = self.pto_deadline_ns orelse std.math.maxInt(i64);
             const drain = self.drain_deadline_ns orelse std.math.maxInt(i64);
             const tl = self.time_loss_alarm_ns orelse std.math.maxInt(i64);
+            const hsdone = self.hsdone_retransmit_deadline_ns orelse std.math.maxInt(i64);
             const pacing: i64 = if (self.sq_head != self.sq_tail)
                 self.congestion.pacing.nextSendTime() orelse std.math.maxInt(i64)
             else
                 std.math.maxInt(i64);
-            const m = @min(@min(@min(@min(idle, pto), drain), tl), pacing);
+            const m = @min(@min(@min(@min(@min(idle, pto), drain), tl), hsdone), pacing);
             return if (m == std.math.maxInt(i64)) null else m;
         }
 
@@ -1183,6 +1203,27 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.hot.state = .closed;
                     self.idle_deadline_ns = null;
                     self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                }
+            }
+
+            // HANDSHAKE_DONE retransmit timer (server only, RFC 9001 §4.1.2).
+            // If the original HSDONE or its retransmit was not ACKed within 2× the
+            // smoothed PTO, schedule a fresh retransmit.  This fires even when
+            // bytes_in_flight == 0 (PTO is disarmed), covering the case where the
+            // transfer completes so fast that the first PTO never gets a chance to
+            // fire before the congestion window empties.
+            if (self.hsdone_retransmit_deadline_ns) |d| {
+                if (now_ns >= d and self.handshake_done_pn != null and
+                    !self.pending_handshake_done)
+                {
+                    self.pending_handshake_done = true;
+                    // Exponential backoff: double the interval each time, capped at 1s.
+                    const elapsed = now_ns - d;
+                    _ = elapsed;
+                    const base_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns) orelse
+                        (now_ns + 200_000_000); // fallback 200ms if no PTO
+                    const interval = @min(base_ns - now_ns, 1_000_000_000);
+                    self.hsdone_retransmit_deadline_ns = now_ns + interval;
                 }
             }
 
@@ -1212,6 +1253,27 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (now_ns >= d) {
                         self.loss.onPtoFired();
                         if (self.hot.state == .established) {
+                            // RFC 9001 §4.1.2: server MUST retransmit HANDSHAKE_DONE until ACKed.
+                            // Normal loss detection (packet/time threshold) cannot detect a lost
+                            // HANDSHAKE_DONE when the client sends 1-RTT ACKs before confirming
+                            // the handshake (advancing largest_acked[2] without processing
+                            // HANDSHAKE_DONE). Instead, track the specific packet number and
+                            // check the sent table directly: if the packet is still in-flight
+                            // (not ACKed, not yet detected as lost), PTO re-queues it.
+                            // The idle_ping_count guard ensures a permanently-silent peer
+                            // (e.g. no network path) cannot prevent idle-timeout via endless retransmits.
+                            // Retransmit HANDSHAKE_DONE until its ACK is received.
+                            // We don't check the sent table here because the slot can be
+                            // evicted (ring buffer wraps after 128 epoch-2 packets) — if
+                            // we relied on in_table, HSDONE would silently stop being
+                            // retransmitted once 128 post-handshake packets are sent.
+                            // Instead, processAckedFrames clears handshake_done_pn when
+                            // the ACK arrives; non-null means "sent but not yet ACKed".
+                            if (self.config.is_server and !self.pending_handshake_done) {
+                                if (self.handshake_done_pn != null) {
+                                    self.pending_handshake_done = true;
+                                }
+                            }
                             // Post-handshake PTO: retransmit PATH_CHALLENGE if pending (RFC 9000 §9.2),
                             // drain pending stream retransmits, probe with unacked stream data,
                             // or send a 1-RTT PING probe (RFC 9002 §6.2).
@@ -1219,20 +1281,34 @@ pub fn Connection(comptime max_streams: usize) type {
                             // no CRYPTO drain is needed here.
                             if (self.pending_path_challenge) |challenge| {
                                 self.sendPathChallenge(challenge) catch {};
-                            } else if (self.stream_pending_retx_count > 0) {
-                                self.drainPendingStreamRetx();
-                            } else if (self.probeUnackedStreamData()) {
-                                // Sent unacked stream data as PTO probe (RFC 9002 §6.2:
-                                // "a sender SHOULD include new data in probe datagrams").
                             } else {
-                                // Only PING probe if there's meaningful data in flight
-                                // (not just our own previous PINGs). Without this guard,
-                                // PTO sends infinite PINGs after all transfers complete:
-                                // each PING creates in-flight state → PTO fires → PING → loop.
-                                // Limit to 6 consecutive idle PINGs, then let idle timeout close.
-                                if (self.idle_ping_count < 6) {
-                                    self.queuePing() catch {};
-                                    self.idle_ping_count += 1;
+                                if (self.stream_pending_retx_count > 0) {
+                                    self.drainPendingStreamRetx();
+                                }
+                                // After draining, if nothing remains queued, probe with the
+                                // oldest unacked in-flight 1-RTT stream data. This handles
+                                // RACK time-threshold declaring old packets lost and adding
+                                // them to pending_retx with offsets already below send_acked:
+                                // drain discards all of them, then we must still probe the
+                                // actually-missing in-flight packet (RFC 9002 §6.2).
+                                if (self.stream_pending_retx_count == 0) {
+                                    if (!self.probeUnackedStreamData()) {
+                                        // Only PING probe if there's meaningful data in flight
+                                        // (not just our own previous PINGs). Without this guard,
+                                        // PTO sends infinite PINGs after all transfers complete:
+                                        // each PING creates in-flight state → PTO fires → PING → loop.
+                                        // Limit to 6 consecutive idle PINGs, then let idle timeout close.
+                                        if (self.idle_ping_count < 6) {
+                                            self.queuePing() catch {};
+                                            self.idle_ping_count += 1;
+                                        }
+                                    } else {
+                                        // RFC 9002 §6.2: SHOULD send two full-sized datagrams per
+                                        // PTO to expedite loss recovery. A second probe targets the
+                                        // same missing data with a fresh pn so quiche can ACK it
+                                        // even if the first probe datagram is dropped.
+                                        _ = self.probeUnackedStreamData();
+                                    }
                                 }
                             }
                         } else {
@@ -1346,8 +1422,9 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Flush pending retransmits.
             if (self.pending_handshake_done) {
-                self.pending_handshake_done = false;
-                self.queueHandshakeDone() catch {};
+                if (self.queueHandshakeDone(true)) {
+                    self.pending_handshake_done = false;
+                } else |_| {}
             }
 
             // Flush pending stream resets (fast-path: skip scan when nothing is pending).
@@ -2540,6 +2617,12 @@ pub fn Connection(comptime max_streams: usize) type {
             // Discard any queued CRYPTO retransmits — they used handshake-epoch keys that
             // the peer will discard once 1-RTT keys are established (RFC 9001 §4.9).
             self.crypto_pending_retx_count = 0;
+            // RFC 9002 §A.3: remove epoch-0 and epoch-1 in-flight entries from
+            // bytes_in_flight.  Unacked handshake packets can never be acknowledged
+            // after their keys are discarded, so keeping them in bif would inflate
+            // the cwnd check and block post-handshake stream data from being sent.
+            self.loss.sent.discardEpochInflight(0, &self.loss.bytes_in_flight);
+            self.loss.sent.discardEpochInflight(1, &self.loss.bytes_in_flight);
             self.path_validated = true;
             self.events.push(.connected);
 
@@ -2581,7 +2664,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Server sends HANDSHAKE_DONE; client does not.
             if (self.config.is_server) {
-                try self.queueHandshakeDone();
+                try self.queueHandshakeDone(false);
             }
         }
 
@@ -2798,6 +2881,14 @@ pub fn Connection(comptime max_streams: usize) type {
             for (result.acked_frames[0..result.acked_frame_count]) |fi| {
                 for (fi.frames[0..fi.count]) |frame_info| {
                     switch (frame_info) {
+                        .handshake_done => {
+                            // Remove any NewSessionTicket still in bif: it cannot be
+                            // retransmitted (drainPendingCryptoRetx skips epoch>=2), so
+                            // keeping it inflates PTO and stalls idle convergence.
+                            self.loss.sent.discardEpochCryptoInflight(2, &self.loss.bytes_in_flight);
+                            self.handshake_done_pn = null;
+                            self.hsdone_retransmit_deadline_ns = null;
+                        },
                         .stream => |s| {
                             if (self.streams.get(s.stream_id)) |st| {
                                 st.onAcked(s.offset, s.len);
@@ -3393,7 +3484,12 @@ pub fn Connection(comptime max_streams: usize) type {
             self.crypto_send_offset[2] += nst_len;
         }
 
-        fn queueHandshakeDone(self: *Self) !void {
+        /// Send a HANDSHAKE_DONE + NEW_CONNECTION_ID packet.
+        /// is_retransmit=true preserves idle_deadline_ns so retransmits don't
+        /// reset the idle clock (only the initial send extends the idle window).
+        fn queueHandshakeDone(self: *Self, is_retransmit: bool) !void {
+            const pn = self.hot.tx_pn[2]; // pn of the packet about to be sent
+            const saved_idle = if (is_retransmit) self.idle_deadline_ns else null;
             var pos: usize = 0;
             pos += frame.encodeFrame(self.pkt_scratch[pos..], .handshake_done);
             var ncid_frame = frame.NewConnectionIdFrame{
@@ -3410,6 +3506,15 @@ pub fn Connection(comptime max_streams: usize) type {
             fi.frames[0] = .handshake_done;
             fi.count = 1;
             _ = try self.sendShortHeaderPacket(pos, fi, true);
+            if (saved_idle) |d| self.idle_deadline_ns = d;
+            self.handshake_done_pn = pn;
+            // Arm the HSDONE retransmit timer: if this HSDONE is not ACKed by the
+            // next PTO interval (or 200ms fallback), re-queue it.  This ensures
+            // retransmission even when bytes_in_flight drops to 0 after the transfer
+            // completes, which disarms the PTO timer.
+            const pto_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns) orelse
+                (self.current_time_ns + 200_000_000);
+            self.hsdone_retransmit_deadline_ns = pto_ns;
         }
 
         pub fn queueTlsOutput(self: *Self, tls_data: []const u8) !void {

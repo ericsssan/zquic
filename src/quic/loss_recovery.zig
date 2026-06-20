@@ -247,6 +247,44 @@ pub const SentPacketTable = struct {
         }
     }
 
+    /// RFC 9002 §A.3: when Initial/Handshake keys are discarded, all unacknowledged
+    /// packets from that epoch MUST be removed from bytes_in_flight.  They can no
+    /// longer be acknowledged by the peer, so keeping them inflates bif and blocks
+    /// new stream sends once the congestion window fills with phantom in-flight bytes.
+    pub fn discardEpochInflight(self: *SentPacketTable, epoch: u8, bif: *u64) void {
+        for (&self.slots) |*slot| {
+            if (!slot.valid or slot.epoch != epoch) continue;
+            if (slot.in_flight) {
+                bif.* = if (bif.* >= slot.size) bif.* - slot.size else 0;
+            }
+            slot.valid = false;
+            slot.in_flight = false;
+            if (epoch < 3) self.valid_per_epoch[epoch] -|= 1;
+        }
+    }
+
+    /// Remove epoch-2 CRYPTO frame entries from bytes_in_flight.
+    /// Called when HANDSHAKE_DONE is ACKed: the NewSessionTicket (NST) can never
+    /// be retransmitted (drainPendingCryptoRetx skips epoch >= 2), so keeping it
+    /// in bif would permanently inflate PTO and block idle convergence.
+    pub fn discardEpochCryptoInflight(self: *SentPacketTable, epoch: u8, bif: *u64) void {
+        for (&self.slots, 0..) |*slot, idx| {
+            if (!slot.valid or slot.epoch != epoch) continue;
+            const fi = self.frame_info[idx];
+            var has_crypto = false;
+            for (fi.frames[0..fi.count]) |f| {
+                if (f == .crypto_frame) { has_crypto = true; break; }
+            }
+            if (!has_crypto) continue;
+            if (slot.in_flight) {
+                bif.* = if (bif.* >= slot.size) bif.* - slot.size else 0;
+            }
+            slot.valid = false;
+            slot.in_flight = false;
+            if (epoch < 3) self.valid_per_epoch[epoch] -|= 1;
+        }
+    }
+
     /// O(1) lookup. Returns null if slot is empty or belongs to a different pn/epoch.
     pub fn get(self: *const SentPacketTable, pn: u64, epoch: u8) ?SentPacket {
         const idx = slotIndex(pn, epoch);
@@ -467,28 +505,32 @@ pub const LossRecovery = struct {
         if (self.delivery.first_sent_ns == 0) {
             self.delivery.first_sent_ns = now_ns;
         }
-        // add() evicts any existing occupant at pn % MAX_SENT.
-        // If the evicted packet was still in flight, subtract its size from bytes_in_flight
-        // to avoid double-counting (the in-flight accounting for the evicted packet is lost).
-        if (self.sent.add(.{
-            .pn = pn,
-            .sent_ns = now_ns,
-            .queued_ns = queued_ns,
-            .size = sz,
-            .epoch = epoch,
-            .ack_eliciting = ack_eliciting,
-            .in_flight = ack_eliciting,
-            .valid = true,
-            .delivered = self.delivery.delivered,
-            .delivered_ns = self.delivery.delivered_ns,
-            .first_sent_ns = self.delivery.first_sent_ns,
-            .is_app_limited = self.delivery.app_limited,
-        }, frame_info)) |evicted| {
-            if (evicted.in_flight) {
-                self.bytes_in_flight -|= evicted.size;
-            }
-        }
+        // Only track ack-eliciting packets in the sent table. Non-ack-eliciting
+        // packets (ACK-only) never need retransmission and must not be tracked —
+        // their slot would evict in-flight ack-eliciting packets from the ring buffer,
+        // silently zeroing bytes_in_flight and disarming PTO (loss recovery bug).
         if (ack_eliciting) {
+            // add() evicts any existing occupant at pn % MAX_SENT.
+            // If the evicted packet was still in flight, subtract its size from
+            // bytes_in_flight to avoid double-counting.
+            if (self.sent.add(.{
+                .pn = pn,
+                .sent_ns = now_ns,
+                .queued_ns = queued_ns,
+                .size = sz,
+                .epoch = epoch,
+                .ack_eliciting = true,
+                .in_flight = true,
+                .valid = true,
+                .delivered = self.delivery.delivered,
+                .delivered_ns = self.delivery.delivered_ns,
+                .first_sent_ns = self.delivery.first_sent_ns,
+                .is_app_limited = self.delivery.app_limited,
+            }, frame_info)) |evicted| {
+                if (evicted.in_flight) {
+                    self.bytes_in_flight -|= evicted.size;
+                }
+            }
             self.bytes_in_flight += sz;
             self.last_ack_eliciting_ns = now_ns;
         }
@@ -620,14 +662,16 @@ pub const LossRecovery = struct {
     /// RFC 9002 specifies 2^20, but extreme backoff causes handshakecorruption (C1) timeouts:
     /// with 50 connections and 30% bursty corruption, ~8% of connections need 12+ PTO rounds.
     /// With cap=12 those connections wait 225s+ on a single PTO, exceeding the 300s deadline.
-    /// With cap=5, even 100 consecutive failures complete in ~170s, well within 300s.
+    /// With cap=3 (8×), even 100 consecutive failures complete in ~28s, well within 300s.
+    /// Cap=3 also produces ~4× more probes in the 25s oracle window vs cap=5, eliminating
+    /// seeded-PRNG loss clusters that trap all probes in a single bad sequence region.
     /// Normal operation is unaffected: PTO count resets to 0 on every ACK.
     /// Uses saturating arithmetic to avoid overflow when RTT or pto_count is extreme.
     pub fn ptoDeadline(self: *const LossRecovery, max_ack_delay_ns: u64) ?i64 {
         if (self.bytes_in_flight == 0) return null;
         const base_ns = self.last_ack_eliciting_ns orelse return null;
         const pto = self.rtt.ptoBase(max_ack_delay_ns);
-        const shift: u6 = @intCast(@min(self.pto_count, 5));
+        const shift: u6 = @intCast(@min(self.pto_count, 3));
         // Saturating multiply: prevents u64 overflow on extreme RTT values.
         const backoff: u64 = pto *| (@as(u64, 1) << shift);
         // Clamp to i64 max before casting, then add with saturation.

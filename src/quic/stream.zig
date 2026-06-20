@@ -278,7 +278,7 @@ pub const Stream = struct {
     /// Out-of-order (SACK) acknowledged ranges waiting for the gap to be filled.
     /// Adjacent/overlapping entries are merged on insertion; when full, the two
     /// closest ranges are coalesced so no ACK info is ever silently dropped.
-    sack_ranges: [32]struct { offset: u64, end: u64 },
+    sack_ranges: [128]struct { offset: u64, end: u64 },
     sack_count: u8,
     /// FIN has been queued for sending.
     send_fin: bool,
