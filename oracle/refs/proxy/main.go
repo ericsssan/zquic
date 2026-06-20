@@ -142,8 +142,10 @@ func main() {
 	if *capture != "" {
 		capFile, err = os.Create(*capture)
 		must(err)
-		defer capFile.Close()
+		// Closed explicitly after wg.Wait() below — not via defer — so the
+		// s2c goroutine cannot write to a closed file (#28).
 	}
+	var capMu sync.Mutex // serialises concurrent c2s (main) + s2c (goroutine) writes
 	record := func(dir string, b []byte) {
 		if capFile == nil {
 			return
@@ -151,10 +153,12 @@ func main() {
 		// One DGRAM line per datagram for byte-count checks (amplificationlimit).
 		// Followed by one CLASS line per QUIC packet found in the datagram.
 		// write(2) is immediately visible to readers; no fsync needed.
+		capMu.Lock()
 		fmt.Fprintf(capFile, "%s DGRAM %d\n", dir, len(b))
 		for _, c := range classifyAll(b) {
 			fmt.Fprintf(capFile, "%s %s %d\n", dir, c.label, c.length)
 		}
+		capMu.Unlock()
 	}
 	// maybecorrupt returns a bit-flipped copy at the configured rate (using the
 	// same per-direction RNG as drop, after the drop decision). Skips byte 0
@@ -189,7 +193,10 @@ func main() {
 	setClient := func(a net.Addr) { mu.Lock(); clientAddr = a; mu.Unlock() }
 
 	// Server replies (back) -> client (front).
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		buf := make([]byte, 65535)
 		for {
 			n, err := back.Read(buf)
@@ -209,7 +216,7 @@ func main() {
 	for {
 		n, addr, err := front.ReadFrom(buf)
 		if err != nil {
-			return
+			break
 		}
 		setClient(addr)
 		pkt := append([]byte(nil), buf[:n]...)
@@ -217,6 +224,14 @@ func main() {
 		if !drop(rngC) {
 			fwd(func(p []byte) { back.Write(p) }, maybecorrupt(rngC, pkt))
 		}
+	}
+	// Drain the s2c goroutine before closing the capture file (#28).
+	// Closing back unblocks back.Read; wg.Wait ensures the last record()
+	// call completes before capFile.Close() runs.
+	back.Close()
+	wg.Wait()
+	if capFile != nil {
+		capFile.Close()
 	}
 }
 
