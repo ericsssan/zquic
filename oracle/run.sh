@@ -486,11 +486,18 @@ connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
   stop "$sp"
   [ $rc -eq 124 ] && { bad "connectionmigration (TIMEOUT)"; return; }
   [ $rc -eq 0 ] || { bad "connectionmigration (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
-  local m; if m="$(assert_match "$d/out" "/big.bin")"; then
-    ok "connectionmigration [zquic-server → $impl preferred_addr 127.0.0.1:$mport]"
-  else
-    bad "connectionmigration ($m)"
+  local m; if ! m="$(assert_match "$d/out" "/big.bin")"; then
+    bad "connectionmigration ($m)"; return
   fi
+  # Wire proof: server must log [CM] path_migrated, proving the client sent a
+  # PATH_CHALLENGE to the preferred_address port and the server adopted it.
+  # Without this, a client that ignores preferred_address still transfers big.bin
+  # on the original path, yielding a false PASS.
+  if ! grep -q '\[CM\] path_migrated' "$d/zsrv.log" 2>/dev/null; then
+    bad "connectionmigration (no path_migrated in server log — client did not migrate to 127.0.0.1:$mport)"
+    return
+  fi
+  ok "connectionmigration [zquic-server → $impl preferred_addr 127.0.0.1:$mport]"
 }
 
 # multiconnect_case: verify zquic handles multiple independent connections.

@@ -589,6 +589,7 @@ fn processPacket(
                 // old address (via s.peer_addr = from) route sends to the
                 // stale address.
                 s.peer_addr = socketAddrToIp(s.conn.peer_addr);
+                std.debug.print("[CM] path_migrated: client now at preferred_address\n", .{});
             },
             else => {},
         }
