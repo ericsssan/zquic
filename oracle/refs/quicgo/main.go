@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -244,9 +245,11 @@ func serveConn(ctx context.Context, conn quic.Connection, wwwdir string) {
 				stream.Close()
 				return
 			}
-			// "GET /path\r\n"
+			// "GET /path\r\n" — Go's %s stops at \r (isSpace includes \r), so path
+			// is already clean. TrimRight is defensive in case that ever changes.
 			var path string
 			fmt.Sscanf(line, "GET %s", &path)
+			path = strings.TrimRight(path, "\r")
 			data, err := os.ReadFile(filepath.Join(wwwdir, filepath.Base(path)))
 			if err != nil {
 				stream.CancelWrite(1) // signal an error rather than a silent 0-byte body
