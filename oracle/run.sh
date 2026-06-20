@@ -298,13 +298,18 @@ vn_case() { # <trigger_impl> <sport> <pport>
   wait_listen "$px" "$pport" || { bad "versionnegotiation (no proxy bind)"; stop "$sp" "$px"; return; }
   # Each client offers an unknown version: ngtcp2 via --version, quiche via its
   # default GREASE wire-version (babababa). Wire-only — the handshake won't complete.
+  local vn_rc
   case "$trig" in
     ngtcp2) to 8 "$BIN/ngtcp2-client" -q --download="$d" --exit-on-all-streams-close --version=0x1a2a3a4a \
-              127.0.0.1 "$pport" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1 ;;
+              127.0.0.1 "$pport" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1; vn_rc=$? ;;
     quiche) to 8 "$BIN/quiche-client" --no-verify --wire-version babababa --http-version HTTP/0.9 \
-              --dump-responses "$d" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1 ;;
+              --dump-responses "$d" "https://127.0.0.1:$pport/1.bin" >"$d/cli.log" 2>&1; vn_rc=$? ;;
   esac
   stop "$sp" "$px"
+  if [ "$vn_rc" -eq 0 ]; then
+    bad "versionnegotiation ($trig exited 0 — handshake completed with unknown version; server should have rejected it)"
+    return
+  fi
   if wire_has "s2c VERSION_NEGOTIATION" "$capf"; then
     ok "versionnegotiation [zquic server emits VN; $trig offers unknown version | wire ✓]"
   else

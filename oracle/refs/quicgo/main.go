@@ -111,12 +111,20 @@ func runClient(args []string) {
 		if err := fetch(ctx, conn1, urls[0], outdir); err != nil {
 			fatal("conn1: %v", err)
 		}
+		// Wait for the NewSessionTicket to arrive before closing. NST is sent
+		// post-handshake; CloseWithError discards in-flight CRYPTO frames, so
+		// without this drain the session cache stays empty and conn2 falls back
+		// to a full handshake, making the resumption assertion below vacuous (#25).
+		time.Sleep(50 * time.Millisecond)
 		conn1.CloseWithError(0, "done")
 
 		// Connection 2: same tlsConf → session cache hit → PSK resumption.
 		conn2, err := quic.DialAddr(ctx, host, tlsConf, quicConf)
 		if err != nil {
 			fatal("dial %s (conn2): %v", host, err)
+		}
+		if !conn2.ConnectionState().TLS.DidResume {
+			fatal("conn2: session was not resumed — server did not issue a ticket or PSK was rejected")
 		}
 		defer conn2.CloseWithError(0, "done")
 		var wg sync.WaitGroup
