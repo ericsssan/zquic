@@ -51,59 +51,68 @@ func readVarint(b []byte) (val uint64, n int) {
 	return val, length
 }
 
+type pktClass struct {
+	label  string
+	length int // bytes this packet occupies in the datagram
+}
+
 // classifyAll walks coalesced QUIC packets in one UDP datagram and returns the
-// type of each. Returns a best-effort list; stops at the first unparseable point.
-func classifyAll(b []byte) []string {
-	var out []string
+// type and per-packet byte length of each. Returns a best-effort list; stops at
+// the first unparseable point. For packet types with no Length field (SHORT,
+// RETRY, VERSION_NEGOTIATION) the length is the remaining datagram bytes.
+func classifyAll(b []byte) []pktClass {
+	var out []pktClass
 	for len(b) >= 1 {
 		if b[0]&0x80 == 0 {
-			return append(out, "SHORT") // short header runs to end of datagram
+			return append(out, pktClass{"SHORT", len(b)}) // runs to end of datagram
 		}
 		if len(b) < 5 {
-			return append(out, "LONG_TRUNC")
+			return append(out, pktClass{"LONG_TRUNC", len(b)})
 		}
 		if binary.BigEndian.Uint32(b[1:5]) == 0 {
-			return append(out, "VERSION_NEGOTIATION")
+			return append(out, pktClass{"VERSION_NEGOTIATION", len(b)})
 		}
 		t := (b[0] >> 4) & 0x03 // QUIC v1 long-header type
 		if t == 3 {
-			return append(out, "RETRY") // Retry has no Length; runs to end
+			return append(out, pktClass{"RETRY", len(b)}) // no Length field; runs to end
 		}
 		// Parse header far enough to find the Length field.
 		p := 5
 		if p >= len(b) {
-			return append(out, "LONG_TRUNC")
+			return append(out, pktClass{"LONG_TRUNC", len(b)})
 		}
 		p += 1 + int(b[p]) // dcid len + dcid
 		if p >= len(b) {
-			return append(out, "LONG_TRUNC")
+			return append(out, pktClass{"LONG_TRUNC", len(b)})
 		}
 		p += 1 + int(b[p]) // scid len + scid
+		var label string
 		switch t {
 		case 0:
-			out = append(out, "INITIAL")
+			label = "INITIAL"
 			tl, n := readVarint(b[p:]) // token length + token
 			if n == 0 {
-				return out
+				return append(out, pktClass{label, len(b)})
 			}
 			p += n + int(tl)
 		case 1:
-			out = append(out, "0RTT")
+			label = "0RTT"
 		case 2:
-			out = append(out, "HANDSHAKE")
+			label = "HANDSHAKE"
 		}
 		if p >= len(b) {
-			return out
+			return append(out, pktClass{label, len(b)})
 		}
 		ln, n := readVarint(b[p:]) // Length: rest of this packet
 		if n == 0 {
-			return out
+			return append(out, pktClass{label, len(b)})
 		}
-		p += n + int(ln)
-		if p > len(b) || p <= 0 {
-			return out
+		pktLen := p + n + int(ln) // header + length-varint + payload
+		if pktLen > len(b) || pktLen <= 0 {
+			return append(out, pktClass{label, len(b)})
 		}
-		b = b[p:]
+		out = append(out, pktClass{label, pktLen})
+		b = b[pktLen:]
 	}
 	return out
 }
@@ -144,7 +153,7 @@ func main() {
 		// write(2) is immediately visible to readers; no fsync needed.
 		fmt.Fprintf(capFile, "%s DGRAM %d\n", dir, len(b))
 		for _, c := range classifyAll(b) {
-			fmt.Fprintf(capFile, "%s %s %d\n", dir, c, len(b))
+			fmt.Fprintf(capFile, "%s %s %d\n", dir, c.label, c.length)
 		}
 	}
 	// maybecorrupt returns a bit-flipped copy at the configured rate (using the
