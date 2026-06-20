@@ -751,6 +751,78 @@ test "pair: 0-RTT early data accepted by server" {
     try testing.expectEqual(@as(u8, 0xEE), recv_buf[0]);
 }
 
+test "pair: 0-RTT early data survives 15% packet loss" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    const tls_mod = @import("tls.zig");
+
+    const ticket_key: [32]u8 = .{ 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17 } ++ .{ 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33 };
+
+    var sim1 = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9202 });
+    var server1 = try Connection(16).accept(.{ .ticket_key = &ticket_key }, io);
+    server1.current_time_ns = sim1.now_ns;
+    var client1 = try Connection(16).connect(.{}, io);
+    client1.current_time_ns = sim1.now_ns;
+    try testing.expect(try sim1.runPairHandshake(&client1, &server1, io));
+    try sim1.runPairIdle(&client1, &server1, io);
+
+    const ticket: tls_mod.SessionTicket = client1.getSessionTicket() orelse return;
+    try testing.expect(ticket.identity_len > 0);
+
+    // Second connection: 15% packet loss — early data must survive via retransmission
+    var sim2 = NetSim.init(.{ .delay_ns = 25_000_000, .loss_pct = 15, .seed = 9203 });
+    var server2 = try Connection(16).accept(.{ .ticket_key = &ticket_key }, io);
+    server2.current_time_ns = sim2.now_ns;
+    var client2 = try Connection(16).connect(.{ .session_ticket = ticket }, io);
+    client2.current_time_ns = sim2.now_ns;
+
+    try testing.expect(client2.zero_rtt_keys != null);
+
+    var payload: [512]u8 = undefined;
+    @memset(&payload, 0xAA);
+    try client2.streamSend(0, &payload, true);
+
+    try testing.expect(try sim2.runPairHandshake(&client2, &server2, io));
+    try sim2.runPairIdle(&client2, &server2, io);
+
+    var recv_buf2: [1024]u8 = undefined;
+    const received2 = server2.streamRecv(0, &recv_buf2);
+    try testing.expectEqual(@as(usize, 512), received2);
+    try testing.expectEqual(@as(u8, 0xAA), recv_buf2[0]);
+}
+
+test "pair: PSK resumption handshake survives 20% reordering" {
+    const io = std.testing.io;
+    const testing = std.testing;
+    const tls_mod = @import("tls.zig");
+
+    const ticket_key: [32]u8 = .{ 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 } ++ .{ 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34 };
+
+    var sim1 = NetSim.init(.{ .delay_ns = 25_000_000, .seed = 9204 });
+    var server1 = try Connection(16).accept(.{ .ticket_key = &ticket_key }, io);
+    server1.current_time_ns = sim1.now_ns;
+    var client1 = try Connection(16).connect(.{}, io);
+    client1.current_time_ns = sim1.now_ns;
+    try testing.expect(try sim1.runPairHandshake(&client1, &server1, io));
+    try sim1.runPairIdle(&client1, &server1, io);
+
+    const ticket: tls_mod.SessionTicket = client1.getSessionTicket() orelse return;
+    try testing.expect(ticket.identity_len > 0);
+
+    // Second connection: 20% reordering — PSK Finished must arrive and be accepted
+    var sim2 = NetSim.init(.{ .delay_ns = 25_000_000, .reorder_pct = 20, .seed = 9205 });
+    var server2 = try Connection(16).accept(.{ .ticket_key = &ticket_key }, io);
+    server2.current_time_ns = sim2.now_ns;
+    var client2 = try Connection(16).connect(.{ .session_ticket = ticket }, io);
+    client2.current_time_ns = sim2.now_ns;
+
+    try testing.expect(try sim2.runPairHandshake(&client2, &server2, io));
+    try sim2.runPairIdle(&client2, &server2, io);
+
+    try testing.expect(client2.hot.state == .established);
+    try testing.expect(server2.hot.state == .established);
+}
+
 test "pair: bidirectional simultaneous transfer" {
     const io = std.testing.io;
     const testing = std.testing;
