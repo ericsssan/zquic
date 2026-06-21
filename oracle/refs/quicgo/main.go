@@ -293,12 +293,15 @@ func serveConn(ctx context.Context, conn *quic.Conn, wwwdir string) {
 			var path string
 			fmt.Sscanf(line, "GET %s", &path)
 			path = strings.TrimRight(path, "\r")
-			data, err := os.ReadFile(filepath.Join(wwwdir, filepath.Base(path)))
+			// Stream the file rather than ReadFile: sparse 2GB test files would
+			// OOM a ReadFile call on CI runners.
+			f, err := os.Open(filepath.Join(wwwdir, filepath.Base(path)))
 			if err != nil {
 				stream.CancelWrite(1) // signal an error rather than a silent 0-byte body
 				return
 			}
-			stream.Write(data)
+			defer f.Close()
+			io.Copy(stream, f) //nolint:errcheck
 			stream.Close()
 		}()
 	}
