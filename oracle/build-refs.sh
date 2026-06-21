@@ -82,17 +82,20 @@ elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && command -v brew
 elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && [ "$(uname -s)" = "Linux" ]; then
   # Linux: GnuTLS 3.7+ has QUIC transport support (apt-get install libgnutls28-dev libev-dev libnghttp3-dev)
   echo "==> building ngtcp2 (HTTP/3 oracle, Linux/GnuTLS) — this is slow the first time"
+  _cmake_log=$(mktemp)
   if ( cd "$NGTCP2_SRC" \
        && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_GNUTLS=ON -DENABLE_EXAMPLES=ON >/dev/null 2>&1 \
-       && cmake --build build -j"$(nproc)" --target gtlsclient gtlsserver >/dev/null 2>&1 ); then
+            -DENABLE_GNUTLS=ON -DENABLE_EXAMPLES=ON >"$_cmake_log" 2>&1 \
+       && cmake --build build -j"$(nproc)" --target gtlsclient gtlsserver >>"$_cmake_log" 2>&1 ); then
     ln -sf "$NGTCP2_SRC/build/examples/gtlsclient" "$BIN/ngtcp2-client"
     ln -sf "$NGTCP2_SRC/build/examples/gtlsserver" "$BIN/ngtcp2-server"
     echo "==> ngtcp2 built (Linux/GnuTLS)"
   else
-    echo "==> ngtcp2 build failed — skipping (quic-go oracle still runs)"
+    echo "==> ngtcp2 build failed — cmake output:"
+    cat "$_cmake_log"
     echo "    ensure deps: sudo apt-get install libgnutls28-dev libev-dev libnghttp3-dev"
   fi
+  rm -f "$_cmake_log"
 else
   echo "==> ngtcp2 source (../ngtcp2) or cmake not found — skip (HTTP/3 oracle)"
   echo "    macOS: brew install openssl@3 libev libnghttp3"
