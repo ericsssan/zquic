@@ -190,7 +190,7 @@ func runClient(args []string) {
 	}
 }
 
-func fetch(ctx context.Context, conn quic.Connection, u, outdir string) error {
+func fetch(ctx context.Context, conn *quic.Conn, u, outdir string) error {
 	pu, err := url.Parse(u)
 	if err != nil {
 		return err
@@ -276,7 +276,7 @@ func runServer(args []string) {
 	}
 }
 
-func serveConn(ctx context.Context, conn quic.Connection, wwwdir string) {
+func serveConn(ctx context.Context, conn *quic.Conn, wwwdir string) {
 	for {
 		stream, err := conn.AcceptStream(ctx)
 		if err != nil {
