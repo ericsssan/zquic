@@ -31,7 +31,7 @@ const MAX_CONNS = 50;
 // QUIC packets into one compound datagram per sendmsg call.  The kernel/NIC
 // segments the compound buffer, eliminating per-packet stack overhead.
 // SOL_UDP=17, UDP_SEGMENT=103 (linux/udp.h).  Requires Linux 4.18+.
-const SOL_UDP: u32 = 17;
+const SOL_UDP: i32 = 17;
 const UDP_SEGMENT: u32 = 103;
 // 44 × 1452 = 63,888 bytes — just under the 64 KB kernel GSO limit.
 const GSO_MAX_SEGS: usize = 44;
@@ -402,7 +402,7 @@ pub fn main(init: std.process.Init) !void {
     // Probe for UDP_SEGMENT (GSO) support on Linux 4.18+.
     // Sets g_gso_supported; drainSend dispatches to drainSendGso when true.
     if (comptime builtin.os.tag == .linux) {
-        const probe: u16 = 1;
+        const probe: u16 = MAX_DATAGRAM;
         const rc = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
             std.mem.asBytes(&probe).ptr, @sizeOf(u16));
         if (rc == 0) {
