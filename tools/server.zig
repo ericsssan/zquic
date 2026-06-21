@@ -209,11 +209,15 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
         const slot = s_opt.* orelse continue;
         slot.conn.tick(now_ns);
 
-        // Drain events and free slot if connection closed via timeout.
+        // Drain events and free slot if connection closed or idle-timed-out.
         var should_free = false;
         while (slot.conn.pollEvent()) |ev| {
             switch (ev) {
                 .connection_closed => should_free = true,
+                .idle_timed_out => {
+                    std.debug.print("[IDLE] connection timed out\n", .{});
+                    should_free = true;
+                },
                 .stream_data => |st| startTransfer(slot, st.stream_id, www_dir, io),
                 else => {},
             }
@@ -298,7 +302,10 @@ pub fn main(init: std.process.Init) !void {
     const cert_chain_len = pem.pemToCertChain(cert_pem_buf[0..cert_pem_len], &cert_chain_buf) catch 0;
 
     g_is_h3 = std.mem.eql(u8, testcase, "http3");
-    const is_cm = std.mem.eql(u8, testcase, "connectionmigration");
+    // CM socket active when explicitly requested via env vars (allows TESTCASE=http3
+    // with ngtcp2 to also get the CM socket) or via the dedicated testcase name.
+    const is_cm = std.mem.eql(u8, testcase, "connectionmigration") or
+        init.environ_map.get("CM_PORT") != null;
     const cm_addr4: [4]u8 = blk: {
         const s = init.environ_map.get("CM_ADDR4") orelse break :blk CM_IPV4_DEFAULT;
         break :blk parseIPv4(s) catch CM_IPV4_DEFAULT;

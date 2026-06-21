@@ -489,10 +489,13 @@ resumption_case() { # <impl> <srv_port> <cli_port>
 # ref client migrates to it mid-transfer and the bulk download still completes.
 # Server direction only — zquic client does not yet follow preferred_address.
 # Two ports: handshake_port (initial connection) + migrate_port (preferred_address).
+# ngtcp2 speaks HTTP/3 only, so we pair it with TESTCASE=http3 + CM_PORT (the server
+# enables the CM socket whenever CM_PORT is set, regardless of testcase name).
 connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
   local impl=$1 hport=$2 mport=$3 d="$TMP/server/connectionmigration"
+  local tc="connectionmigration"; [ "$impl" = ngtcp2 ] && tc="http3"
   rm -rf "$d/out"; mkdir -p "$d/out"
-  CM_ADDR4=127.0.0.1 CM_PORT="$mport" TESTCASE=connectionmigration \
+  CM_ADDR4=127.0.0.1 CM_PORT="$mport" TESTCASE="$tc" \
     CERTS="$CERTS" WWW="$WWW" PORT="$hport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$hport" || { bad "connectionmigration (no server bind on $hport)"; stop "$sp"; return; }
@@ -634,15 +637,22 @@ idle_timeout_case() { # <impl> <port>
     "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$port" || { bad "idletimeout (no server bind)"; stop "$sp"; return; }
-  # First transfer — establishes a connection; idle timer starts when client exits.
-  to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$d/out" /1.bin >"$d/cli.log" 2>&1
-  local rc=$?
-  [ $rc -eq 0 ] || { bad "idletimeout (first transfer failed rc=$rc)"; stop "$sp"; return; }
+  # First transfer — exits WITHOUT sending CONNECTION_CLOSE (-no-close flag) so the
+  # server sees the client vanish and must fire its idle timer.
+  # quicgo is the only impl with -no-close; other impls may send CONNECTION_CLOSE.
+  local first_rc
+  if [ "$impl" = quicgo ]; then
+    to "$CLIENT_TIMEOUT" "$BIN/quicgo" client -ca "$CERTS/cert.pem" -no-close \
+      "$d/out" "https://127.0.0.1:$port/1.bin" >"$d/cli.log" 2>&1; first_rc=$?
+  else
+    to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$d/out" /1.bin >"$d/cli.log" 2>&1; first_rc=$?
+  fi
+  [ $first_rc -eq 0 ] || { bad "idletimeout (first transfer failed rc=$first_rc)"; stop "$sp"; return; }
   # Wait for idle timeout (3s) + margin.
   sleep 4
   # Second transfer — new QUIC connection; proves server is alive after cleanup.
   to "$CLIENT_TIMEOUT" ref_client "$impl" "$port" "$d/out2" /2.bin >"$d/cli2.log" 2>&1
-  rc=$?
+  local rc=$?
   stop "$sp"
   [ $rc -eq 0 ] || { bad "idletimeout (second transfer failed rc=$rc — server died or slot not freed)"; return; }
   # Wire proof: server must have logged the idle timeout event.
@@ -918,9 +928,11 @@ if [ "$_any_svr" -eq 1 ]; then
 
   # connectionmigration: server advertises preferred_address; ref client migrates to it
   # mid-transfer and the download must still complete. Two ports: handshake + migrate.
-  # quic-go follows preferred_address by default; no extra client flags needed.
+  # Uses ngtcp2 (HTTP/3 mode) — it follows preferred_address by default.
+  # quic-go does not implement preferred_address migration ("We don't support
+  # connection migration yet" in connection.go) so it cannot trigger this test.
   if _want_svr connectionmigration; then
-    trig=""; impl_ok quicgo && trig=quicgo
+    trig=""; impl_ok ngtcp2 && trig=ngtcp2
     [ -n "$trig" ] && { connectionmigration_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
   fi
 

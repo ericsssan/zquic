@@ -55,10 +55,11 @@ func runClient(args []string) {
 	caFile := fs.String("ca", "", "PEM CA to verify the server cert; empty = skip verification")
 	useV2 := fs.Bool("v2", false, "use QUIC v2 (RFC 9369) instead of v1")
 	useResumption := fs.Bool("resumption", false, "make two sequential connections; second resumes with session ticket (PSK)")
+	noClose := fs.Bool("no-close", false, "exit without sending CONNECTION_CLOSE (lets server's idle timer fire)")
 	_ = fs.Parse(args)
 	rest := fs.Args()
 	if len(rest) < 2 {
-		fatal("usage: quicgo client [-ca file] [-v2] [-resumption] <outdir> <url>...")
+		fatal("usage: quicgo client [-ca file] [-v2] [-resumption] [-no-close] <outdir> <url>...")
 	}
 	outdir, urls := rest[0], rest[1:]
 
@@ -157,7 +158,9 @@ func runClient(args []string) {
 	if err != nil {
 		fatal("dial %s: %v", host, err)
 	}
-	defer conn.CloseWithError(0, "done")
+	if !*noClose {
+		defer conn.CloseWithError(0, "done")
+	}
 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -178,6 +181,12 @@ func runClient(args []string) {
 	wg.Wait()
 	if firstErr != nil {
 		fatal("%v", firstErr)
+	}
+	if *noClose {
+		// Exit without running defers so the QUIC connection is not closed.
+		// context.WithCancel and CloseWithError would both send CONNECTION_CLOSE,
+		// preventing the server's idle timer from firing.
+		os.Exit(0)
 	}
 }
 

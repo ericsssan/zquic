@@ -331,6 +331,9 @@ pub fn Connection(comptime max_streams: usize) type {
 
         // Timers
         idle_deadline_ns: ?i64,
+        /// RFC 9000 §10.1: idle timer resets on first ack-eliciting send since last
+        /// receive, but NOT on subsequent sends until the next receive.
+        idle_sent_ae: bool = false,
         pto_deadline_ns: ?i64,
         /// Deadline for transitioning out of closing/draining state.
         drain_deadline_ns: ?i64,
@@ -1027,9 +1030,12 @@ pub fn Connection(comptime max_streams: usize) type {
             // Draining / closed: silently discard.
             if (self.hot.state == .draining or self.hot.state == .closed) return;
 
-            // Refresh idle timer.
+            // Refresh idle timer and clear the "already sent since last receive" flag
+            // so the next outbound send (which is the first send since this receive)
+            // is allowed to extend the idle deadline (RFC 9000 §10.1).
             if (self.idle_timeout_i64 > 0) {
                 self.idle_deadline_ns = now_ns +| self.idle_timeout_i64;
+                self.idle_sent_ae = false;
             }
 
             // Amplification limit: track bytes received before path validation.
@@ -3307,8 +3313,12 @@ pub fn Connection(comptime max_streams: usize) type {
         fn reserveSendSlot(self: *Self, size: usize) ![]u8 {
             if (self.sq_tail - self.sq_head >= SEND_QUEUE_DEPTH) return error.SendQueueFull;
 
-            if (self.idle_timeout_i64 > 0) {
+            // RFC 9000 §10.1: only reset the idle deadline on the FIRST ack-eliciting
+            // send since the last receive.  Subsequent sends (PTO probes, retransmits,
+            // PINGs) into a silent peer must not keep pushing the idle deadline forward.
+            if (self.idle_timeout_i64 > 0 and !self.idle_sent_ae) {
                 self.idle_deadline_ns = self.current_time_ns +| self.idle_timeout_i64;
+                self.idle_sent_ae = true;
             }
 
             if (!self.path_validated and self.bytes_unvalidated_recv > 0) {
@@ -3557,11 +3567,11 @@ pub fn Connection(comptime max_streams: usize) type {
         }
 
         /// Send a HANDSHAKE_DONE + NEW_CONNECTION_ID packet.
-        /// is_retransmit=true preserves idle_deadline_ns so retransmits don't
-        /// reset the idle clock (only the initial send extends the idle window).
+        /// idle_deadline_ns is managed by reserveSendSlot's idle_sent_ae logic:
+        /// retransmits don't reset the clock because idle_sent_ae is already true.
         fn queueHandshakeDone(self: *Self, is_retransmit: bool) !void {
+            _ = is_retransmit;
             const pn = self.hot.tx_pn[2]; // pn of the packet about to be sent
-            const saved_idle = if (is_retransmit) self.idle_deadline_ns else null;
             var pos: usize = 0;
             pos += frame.encodeFrame(self.pkt_scratch[pos..], .handshake_done);
             var ncid_frame = frame.NewConnectionIdFrame{
@@ -3578,7 +3588,6 @@ pub fn Connection(comptime max_streams: usize) type {
             fi.frames[0] = .handshake_done;
             fi.count = 1;
             _ = try self.sendShortHeaderPacket(pos, fi, true);
-            if (saved_idle) |d| self.idle_deadline_ns = d;
             self.handshake_done_pn = pn;
             // Arm the HSDONE retransmit timer: if this HSDONE is not ACKed by the
             // next PTO interval (or 200ms fallback), re-queue it.  This ensures
