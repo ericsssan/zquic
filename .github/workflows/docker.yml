@@ -6,7 +6,7 @@ on:
     paths:
       - '**/*.zig'
       - 'build.zig.zon'
-      - 'tools/Dockerfile'
+      - 'interop/Dockerfile'
   workflow_dispatch:
 
 jobs:
@@ -31,6 +31,6 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: tools/Dockerfile
+          file: interop/Dockerfile
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/zquic-interop:latest
