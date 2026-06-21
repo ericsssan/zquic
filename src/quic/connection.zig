@@ -357,12 +357,9 @@ pub fn Connection(comptime max_streams: usize) type {
         closing_frame_buf: [128]u8,
         closing_frame_len: usize,
 
-        // Scratch buffer shared by all queue* helpers for frame serialisation.
-        // enc_scratch holds the encrypted packet output (header + ciphertext).
-        // Safe to share because those helpers are never called re-entrantly.
-        // Sized to MAX_SEND_PACKET_SIZE to allow large data chunks + frame headers.
+        // Scratch buffer for frame serialisation (plaintext before encryption).
+        // Safe to share because send helpers are never called re-entrantly.
         pkt_scratch: [MAX_SEND_PACKET_SIZE]u8,
-        enc_scratch: [MAX_SEND_PACKET_SIZE]u8,
 
         // Receive-path: in-place decrypt on caller's mutable buffer (zero copy).
         // rx_hp_buf and rx_plaintext eliminated — saves 3000 bytes per connection.
@@ -682,7 +679,6 @@ pub fn Connection(comptime max_streams: usize) type {
                 .closing_frame_buf = undefined,
                 .closing_frame_len = 0,
                 .pkt_scratch = undefined,
-                .enc_scratch = undefined,
                 // rx_hp_buf and rx_plaintext removed (in-place decrypt)
                 .inline_borrow_stream = null,
                 .idle_ping_count = 0,
@@ -890,7 +886,6 @@ pub fn Connection(comptime max_streams: usize) type {
                 .closing_frame_buf = undefined,
                 .closing_frame_len = 0,
                 .pkt_scratch = undefined,
-                .enc_scratch = undefined,
                 .inline_borrow_stream = null,
                 .idle_ping_count = 0,
                 .peer_max_streams_bidi = 0,
@@ -3385,8 +3380,9 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
+                    const slot_buf = try self.reserveSendSlot(ct_len + 100);
                     const hdr_len = packet.encodeLongHeader(
-                        &self.enc_scratch,
+                        slot_buf,
                         .initial,
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
@@ -3396,9 +3392,9 @@ pub fn Connection(comptime max_streams: usize) type {
                         ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
                     );
                     if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-                    crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                    crypto.applyHeaderProtection(ik, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                    try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+                    crypto.encryptPayload(ik, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(ik, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+                    self.commitSendSlot(hdr_len + ct_len);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.count = 0; // ACK is not ack-eliciting; no frame info tracked
                     self.storeSendMeta(pn, 0, hdr_len + ct_len, false, fi);
@@ -3409,8 +3405,9 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[1];
                     self.hot.tx_pn[1] += 1;
                     const ct_len = fpos + 16;
+                    const slot_buf = try self.reserveSendSlot(ct_len + 100);
                     const hdr_len = packet.encodeLongHeader(
-                        &self.enc_scratch,
+                        slot_buf,
                         .handshake,
                         self.quic_version,
                         self.peer_scid[0..self.peer_scid_len],
@@ -3420,9 +3417,9 @@ pub fn Connection(comptime max_streams: usize) type {
                         ct_len, // payload_len = ciphertext + AEAD tag (RFC 9000 §17.2)
                     );
                     if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-                    crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                    crypto.applyHeaderProtection(hk, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                    try self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]);
+                    crypto.encryptPayload(hk, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(hk, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+                    self.commitSendSlot(hdr_len + ct_len);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.count = 0;
                     self.storeSendMeta(pn, 1, hdr_len + ct_len, false, fi);
@@ -3711,8 +3708,15 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
+                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch |err| {
+                        if (err == error.AmplificationLimitExceeded) {
+                            self.hot.tx_pn[0] -= 1;
+                            return 0;
+                        }
+                        return err;
+                    };
                     const hdr_len = packet.encodeLongHeader(
-                        &self.enc_scratch,
+                        slot_buf,
                         .initial,
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
@@ -3722,16 +3726,9 @@ pub fn Connection(comptime max_streams: usize) type {
                         ct_len,
                     );
                     if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-                    crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                    crypto.applyHeaderProtection(ik, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                    self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch |err| {
-                        // If amplification limit exceeded, revert packet number and return 0 to retry later
-                        if (err == error.AmplificationLimitExceeded) {
-                            self.hot.tx_pn[0] -= 1;
-                            return 0;
-                        }
-                        return err;
-                    };
+                    crypto.encryptPayload(ik, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(ik, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+                    self.commitSendSlot(hdr_len + ct_len);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.frames[0] = .{ .crypto_frame = .{
                         .offset = @intCast(tls_offset),
@@ -3746,10 +3743,17 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[1];
                     self.hot.tx_pn[1] += 1;
                     const ct_len = fpos + 16;
+                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch |err| {
+                        if (err == error.AmplificationLimitExceeded) {
+                            self.hot.tx_pn[1] -= 1;
+                            return 0;
+                        }
+                        return err;
+                    };
                     // RFC 9369: Send Handshake packet with negotiated version.
                     // Keys are derived from client's version for compatibility.
                     const hdr_len = packet.encodeLongHeader(
-                        &self.enc_scratch,
+                        slot_buf,
                         .handshake,
                         self.quic_version,
                         self.peer_scid[0..self.peer_scid_len],
@@ -3759,16 +3763,9 @@ pub fn Connection(comptime max_streams: usize) type {
                         ct_len,
                     );
                     if (hdr_len + ct_len > MAX_SEND_PACKET_SIZE) return error.PacketTooLarge;
-                    crypto.encryptPayload(hk, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                    crypto.applyHeaderProtection(hk, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                    self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch |err| {
-                        // If amplification limit exceeded, revert packet number and return 0 to retry later
-                        if (err == error.AmplificationLimitExceeded) {
-                            self.hot.tx_pn[1] -= 1;
-                            return 0;
-                        }
-                        return err;
-                    };
+                    crypto.encryptPayload(hk, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(hk, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+                    self.commitSendSlot(hdr_len + ct_len);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.frames[0] = .{ .crypto_frame = .{
                         .offset = @intCast(tls_offset),
@@ -3846,8 +3843,9 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
+                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch break;
                     const hdr_len = packet.encodeLongHeader(
-                        &self.enc_scratch,
+                        slot_buf,
                         .initial,
                         packet_version,
                         self.peer_scid[0..self.peer_scid_len],
@@ -3860,9 +3858,9 @@ pub fn Connection(comptime max_streams: usize) type {
                         self.hot.tx_pn[0] -= 1; // Revert pn if packet too large
                         break;
                     }
-                    crypto.encryptPayload(ik, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                    crypto.applyHeaderProtection(ik, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                    self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch break;
+                    crypto.encryptPayload(ik, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(ik, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+                    self.commitSendSlot(hdr_len + ct_len);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(sent), .len = @intCast(chunk.len) } };
                     fi.count = 1;
@@ -3872,8 +3870,9 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[1];
                     self.hot.tx_pn[1] += 1;
                     const ct_len = fpos + 16;
+                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch break;
                     const hdr_len = packet.encodeLongHeader(
-                        &self.enc_scratch,
+                        slot_buf,
                         .handshake,
                         self.quic_version,
                         self.peer_scid[0..self.peer_scid_len],
@@ -3886,9 +3885,9 @@ pub fn Connection(comptime max_streams: usize) type {
                         self.hot.tx_pn[1] -= 1; // Revert pn if packet too large
                         break;
                     }
-                    crypto.encryptPayload(hk.server, pn, self.enc_scratch[0..hdr_len], self.pkt_scratch[0..fpos], self.enc_scratch[hdr_len..][0..ct_len]);
-                    crypto.applyHeaderProtection(hk.server, &self.enc_scratch[0], self.enc_scratch[hdr_len - 4 ..][0..4], self.enc_scratch[hdr_len..][0..16]);
-                    self.enqueueSend(self.enc_scratch[0 .. hdr_len + ct_len]) catch break;
+                    crypto.encryptPayload(hk.server, pn, slot_buf[0..hdr_len], self.pkt_scratch[0..fpos], slot_buf[hdr_len..][0..ct_len]);
+                    crypto.applyHeaderProtection(hk.server, &slot_buf[0], slot_buf[hdr_len - 4 ..][0..4], slot_buf[hdr_len..][0..16]);
+                    self.commitSendSlot(hdr_len + ct_len);
                     var fi = loss_recovery_mod.SentFrameInfo{};
                     fi.frames[0] = .{ .crypto_frame = .{ .offset = @intCast(sent), .len = @intCast(chunk.len) } };
                     fi.count = 1;
