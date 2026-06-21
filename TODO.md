@@ -3,8 +3,8 @@
 ## High-bandwidth scaling (target: 100 Gbps)
 
 ### Ring buffer sizing
-- [ ] Make `SEND_QUEUE_DEPTH` runtime-configurable (currently 256, overflows at ~3 Gbps/30ms)
-- [ ] Make `MAX_SENT` runtime-configurable (currently 256, same limit — evictions break loss detection)
+- [x] Make `SEND_QUEUE_DEPTH` build-configurable (`-Dsend_queue_depth=N`, default 256; larger values require heap-allocated connections)
+- [x] Make `MAX_SENT` build-configurable (`-Dmax_sent=N`, default 2048)
 - [ ] Scale `SEND_BUF_SIZE` per-stream based on negotiated BDP (currently 64 KB, tight at 10 Mbps)
 
 ### Syscall reduction

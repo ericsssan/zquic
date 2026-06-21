@@ -9,8 +9,13 @@ pub fn build(b: *std.Build) void {
     const congestion = b.option(Algorithm, "congestion", "Congestion control algorithm: bbr (default) or cubic") orelse .bbr;
     const congestion_cubic = congestion == .cubic;
 
+    const send_queue_depth = b.option(usize, "send_queue_depth", "Send queue ring buffer depth (power of 2, default 256)") orelse 256;
+    const max_sent = b.option(usize, "max_sent", "Sent packet tracking depth (power of 2, default 2048)") orelse 2048;
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "congestion_cubic", congestion_cubic);
+    build_options.addOption(usize, "send_queue_depth", send_queue_depth);
+    build_options.addOption(usize, "max_sent", max_sent);
     const build_options_mod = build_options.createModule();
 
     // Public module: consumers import this as @import("zquic")

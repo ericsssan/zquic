@@ -23,6 +23,7 @@ const stream_mod = @import("stream.zig");
 const flow_control = @import("flow_control.zig");
 const cc_mod = @import("congestion/cc.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
+const build_options = @import("build_options");
 
 const ConnectionId = cid_mod.ConnectionId;
 
@@ -144,17 +145,17 @@ pub const ConnectionHot = struct {
 
 pub const MAX_PACKET_SIZE = 1500; // Maximum received packet size (standard MTU)
 pub const MAX_SEND_PACKET_SIZE = 1452; // Maximum packet size for sending (UDP datagram limit)
-pub const SEND_QUEUE_DEPTH = 256;
+pub const SEND_QUEUE_DEPTH: usize = build_options.send_queue_depth;
+comptime {
+    std.debug.assert(SEND_QUEUE_DEPTH >= 1 and (SEND_QUEUE_DEPTH & (SEND_QUEUE_DEPTH - 1)) == 0);
+}
 
 /// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
 const CRYPTO_STAGE_DEPTH = 16;
 /// Maximum bytes in a single staged CRYPTO fragment (conservatively > max QUIC payload).
 pub const CRYPTO_STAGE_FRAG = 1400;
 /// Maximum number of pending stream retransmits when send queue is full.
-/// Must be large enough to handle worst-case burst losses when pacing
-/// keeps the send queue non-empty during loss detection.  The epoch 2
-/// sent buffer holds up to 128 packets, each with up to 1 stream frame
-/// in practice, so 128 covers the realistic worst case.
+/// 128 covers realistic worst-case burst losses (one stream frame per in-flight packet).
 const MAX_PENDING_RETX = 128;
 
 /// A single buffered out-of-order CRYPTO fragment.

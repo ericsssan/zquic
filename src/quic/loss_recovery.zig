@@ -7,6 +7,7 @@
 //!   - PTO calculation (§6.2)
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 // ---------------------------------------------------------------------------
 // Constants (RFC 9002)
@@ -17,17 +18,20 @@ pub const K_TIME_THRESHOLD_NUM: u64 = 9; // 9/8 threshold (§6.1.2)
 pub const K_TIME_THRESHOLD_DEN: u64 = 8;
 pub const K_GRANULARITY_NS: u64 = 1_000_000; // 1ms minimum timer granularity
 pub const K_INITIAL_RTT_NS: u64 = 10_000_000; // 10ms — balanced conservative estimate
-pub const MAX_SENT: usize = 256; // Ring buffer capacity
+pub const MAX_SENT: usize = build_options.max_sent; // Ring buffer capacity (power of 2)
+comptime {
+    std.debug.assert(MAX_SENT >= 4 and (MAX_SENT & (MAX_SENT - 1)) == 0);
+}
 pub const MAX_FRAMES_PER_PACKET: usize = 4;
 // Per-ACK capacity for lost frame tracking.
 // Lost frames: detectLoss defers packets that don't fit to the next alarm round
 // (see detectLoss — skips eviction instead of silently dropping retransmit info).
 pub const MAX_LOSS_EVENTS: usize = 64;
-// Acked frames: must match the largest epoch's sent buffer (EPOCH_SIZES[2] = 128)
+// Acked frames: must cover the largest epoch's sent buffer (EPOCH_SIZES[2] = MAX_SENT/2)
 // so that a single ACK covering all in-flight packets never overflows.  Overflow
 // silently drops frame info, preventing send_acked from advancing (same class of
 // bug as SACK overflow — permanent stream buffer stall).
-pub const MAX_ACKED_FRAMES: usize = MAX_SENT / 2; // 128 — matches epoch 2
+pub const MAX_ACKED_FRAMES: usize = MAX_SENT / 2; // must cover EPOCH_SIZES[2] = MAX_SENT/2
 
 // ---------------------------------------------------------------------------
 // FrameInfo — per-frame metadata for retransmission
@@ -211,7 +215,7 @@ pub const SentPacketTable = struct {
     /// cross-epoch collisions: Handshake pkn N and 1-RTT pkn N must never
     /// share an index, otherwise one evicts the other and loss recovery breaks.
     /// Each epoch gets MAX_SENT/4 = 64 slots (epoch 2 gets 128 for 1-RTT bulk).
-    pub const EPOCH_REGION_SIZE: usize = MAX_SENT / 4; // 64 slots per epoch
+    pub const EPOCH_REGION_SIZE: usize = MAX_SENT / 4; // slots per Initial/Handshake epoch
     pub const EPOCH_OFFSETS = [3]usize{ 0, EPOCH_REGION_SIZE, EPOCH_REGION_SIZE * 2 };
     pub const EPOCH_SIZES = [3]usize{ EPOCH_REGION_SIZE, EPOCH_REGION_SIZE, EPOCH_REGION_SIZE * 2 };
 
@@ -273,7 +277,10 @@ pub const SentPacketTable = struct {
             const fi = self.frame_info[idx];
             var has_crypto = false;
             for (fi.frames[0..fi.count]) |f| {
-                if (f == .crypto_frame) { has_crypto = true; break; }
+                if (f == .crypto_frame) {
+                    has_crypto = true;
+                    break;
+                }
             }
             if (!has_crypto) continue;
             if (slot.in_flight) {
@@ -917,8 +924,8 @@ test "sent_table: eviction decrements bytes_in_flight to avoid double-counting" 
     const testing = std.testing;
     var lr = LossRecovery.init();
 
-    // Use epoch 2 (1-RTT) which has 128 slots. Fill them all.
-    const region = SentPacketTable.EPOCH_SIZES[2]; // 128
+    // Use epoch 2 (1-RTT) which has EPOCH_SIZES[2] slots. Fill them all.
+    const region = SentPacketTable.EPOCH_SIZES[2];
     var pn: u64 = 0;
     while (pn < region) : (pn += 1) {
         lr.onPacketSent(pn, 2, 1200, true, 0, 0, .{});
@@ -926,7 +933,7 @@ test "sent_table: eviction decrements bytes_in_flight to avoid double-counting" 
     const bif_after = lr.bytes_in_flight;
     try testing.expectEqual(@as(u64, region * 1200), bif_after);
 
-    // Send pn=128: maps to same slot as pn=0, evicting it.
+    // Send pn=region: maps to same slot as pn=0, evicting it.
     // bytes_in_flight should stay the same (evict 1200, add 1200).
     lr.onPacketSent(region, 2, 1200, true, 0, 0, .{});
     try testing.expectEqual(bif_after, lr.bytes_in_flight);
