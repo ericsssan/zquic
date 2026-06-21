@@ -219,6 +219,10 @@ fn runConnection(
 
     const timeout_5s: std.Io.Timeout = .{ .duration = .{ .raw = .{ .nanoseconds = 5_000_000_000 }, .clock = .awake } };
     var idle_ticks: usize = 0;
+    // Tracks when downloads first completed so we can cap the NST wait.
+    // Some servers (e.g. quiche in HTTP/0.9 mode) never send a NewSessionTicket;
+    // without this, the resumption loop spins forever waiting for one.
+    var downloads_done_ns: ?i64 = null;
 
     while (!all_done and idle_ticks < 100) {
         const conn_timeout = conn.nextTimeout();
@@ -326,6 +330,12 @@ fn runConnection(
                 const need_ticket = std.mem.eql(u8, testcase, "resumption") or std.mem.eql(u8, testcase, "zerortt");
                 if (!need_ticket or conn.getSessionTicket() != null) {
                     all_done = true;
+                } else {
+                    // Some servers (e.g. quiche in HTTP/0.9 mode) never send an NST.
+                    // Cap the wait at 1s so connection 2 can still proceed (full HS).
+                    const now_wait: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+                    if (downloads_done_ns == null) downloads_done_ns = now_wait;
+                    if (now_wait - downloads_done_ns.? >= 1_000_000_000) all_done = true;
                 }
             }
         }
