@@ -378,7 +378,7 @@ test "pending stream retransmit arms PTO when drained via tick" {
         .fin = true,
     };
     conn.stream_pending_retx_count = 1;
-    const st = conn.streams.getOrCreate(0) orelse return error.TestUnexpectedResult;
+    const st = (try conn.streams.getOrCreate(0)) orelse return error.TestUnexpectedResult;
     st.send_max = 1_000_000;
     _ = st.bufferSendData(&(@as([50]u8, @splat(0xBB))));
 

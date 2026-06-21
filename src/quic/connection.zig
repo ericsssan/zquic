@@ -1490,7 +1490,7 @@ pub fn Connection(comptime max_streams: usize) type {
 
         /// Buffer stream data for sending and queue a packet.
         pub fn streamSend(self: *Self, stream_id: u62, data: []const u8, fin: bool) !void {
-            const st = self.streams.getOrCreate(stream_id) orelse return error.TooManyStreams;
+            const st = (try self.streams.getOrCreate(stream_id)) orelse return error.TooManyStreams;
             if (!st.canSend(@intCast(data.len))) {
                 // RFC 9000 §19.13 SHOULD: signal peer to increase the flow control window.
                 if (self.hot.state == .established) {
@@ -1580,7 +1580,20 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Zero all cryptographic key material held by this connection.
         /// Must be called when the connection is no longer needed.
         /// Uses volatile writes (secureZero) to prevent compiler elision.
+        /// Return the send buffer capacity for new streams: max(SEND_BUF_SIZE, ceil_pow2(2×BDP)).
+        /// Falls back to SEND_BUF_SIZE before RTT is measured (BBR returns INITIAL_CWND ≈ 14 KB).
+        fn sendBufCap(self: *const Self) usize {
+            const bdp: u64 = self.congestion.bdp();
+            const doubled: u64 = bdp *| 2;
+            const capped: usize = @intCast(@min(doubled, 128 * 1024 * 1024));
+            const target: usize = @max(stream_mod.SEND_BUF_SIZE, capped);
+            var p: usize = 1;
+            while (p < target) p <<= 1;
+            return p;
+        }
+
         pub fn deinit(self: *Self) void {
+            self.streams.deinit();
             self.tls_state.deinit();
             std.crypto.secureZero(u8, @as(*volatile [@sizeOf(crypto.InitialKeys)]u8, @ptrCast(&self.initial_keys)));
             std.crypto.secureZero(u8, @as(*volatile [32]u8, @ptrCast(&self.next_client_secret)));
@@ -2735,6 +2748,9 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.pending_new_session_ticket = true;
             }
 
+            // Scale send buffers for future streams to BDP now that RTT is known.
+            self.streams.buf_cap = self.sendBufCap();
+
             // Server sends HANDSHAKE_DONE; client does not.
             if (self.config.is_server) {
                 try self.queueHandshakeDone(false);
@@ -2775,7 +2791,7 @@ pub fn Connection(comptime max_streams: usize) type {
             const fc_delta: u64 = if (new_end > old_hwm) new_end - old_hwm else 0;
             if (!self.conn_flow.canReceive(fc_delta)) return error.FlowControlViolation;
             const is_new = existing_st == null;
-            const st = self.streams.getOrCreate(f.stream_id) orelse return error.TooManyStreams;
+            const st = (try self.streams.getOrCreate(f.stream_id)) orelse return error.TooManyStreams;
             // Apply the peer's per-stream send limit on first access (RFC 9000 §7.3).
             // Stream.init() defaults send_max to STREAM_BUF_SIZE; override with the negotiated value
             // so the server is not artificially throttled below the peer's advertised window.
@@ -4244,7 +4260,7 @@ pub fn Connection(comptime max_streams: usize) type {
         fn queueStreamData(self: *Self, id: u62, data: []const u8, fin: bool) !void {
             if (self.app_keys == null and self.zero_rtt_keys == null) return;
 
-            const st = self.streams.getOrCreate(id) orelse return;
+            const st = (try self.streams.getOrCreate(id)) orelse return;
             const offset: u62 = @intCast(st.send_offset);
             // Enqueue the packet first; if the send queue is full this returns an error
             // and no state is changed (send_buf and send_offset remain unmodified).

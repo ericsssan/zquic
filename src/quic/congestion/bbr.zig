@@ -352,7 +352,7 @@ pub const Bbr = struct {
     // Internal: BDP computation
     // -----------------------------------------------------------------------
 
-    fn bdp(self: *const Bbr) u64 {
+    pub fn bdp(self: *const Bbr) u64 {
         if (self.min_rtt_ns == std.math.maxInt(u64) or self.max_bw == 0) {
             return INITIAL_CWND;
         }

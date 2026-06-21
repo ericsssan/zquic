@@ -104,7 +104,7 @@ fn fuzzStreamReceive(_: void, input: FuzzInput) anyerror!void {
     const offset: u64 = std.mem.readInt(u64, bytes[0..8], .little);
     const fin = bytes[8] & 1 != 0;
     const data = bytes[9..];
-    var s = stream_mod.Stream.init(0);
+    var s = try stream_mod.Stream.init(0, stream_mod.SEND_BUF_SIZE);
     // Must not crash; flow-control or buffer errors are expected and fine.
     s.receiveData(offset, data, fin) catch return;
 }
@@ -178,7 +178,7 @@ fn fuzzStreamSendBuffer(_: void, input: FuzzInput) anyerror!void {
     var buf: [4096]u8 = undefined;
     const bytes = getBytes(input, &buf);
     if (bytes.len < 2) return;
-    var s = stream_mod.Stream.init(0);
+    var s = try stream_mod.Stream.init(0, stream_mod.SEND_BUF_SIZE);
     s.send_max = std.math.maxInt(u64); // no flow-control limit for this fuzz target
     var i: usize = 0;
     while (i < bytes.len) {

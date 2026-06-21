@@ -46,6 +46,101 @@ pub fn streamKind(id: u62) StreamKind {
     return @enumFromInt(@as(u1, @intCast((id >> 1) & 1)));
 }
 
+/// A heap-allocated ring buffer for the stream send side.
+/// `cap` (buf.len) must be a power of two.
+pub const SendBufDyn = struct {
+    buf: []u8,
+    rp: usize = 0,
+    wp: usize = 0,
+
+    pub fn init(cap: usize) !SendBufDyn {
+        std.debug.assert(cap > 0 and cap & (cap - 1) == 0);
+        return .{ .buf = try std.heap.page_allocator.alloc(u8, cap), .rp = 0, .wp = 0 };
+    }
+
+    pub fn deinit(self: *SendBufDyn) void {
+        std.heap.page_allocator.free(self.buf);
+        self.buf = &.{};
+    }
+
+    pub fn writable(self: *const SendBufDyn) usize {
+        return self.buf.len - (self.wp - self.rp);
+    }
+
+    pub fn readable(self: *const SendBufDyn) usize {
+        return self.wp - self.rp;
+    }
+
+    pub fn write(self: *SendBufDyn, data: []const u8) usize {
+        const cap = self.buf.len;
+        const n = @min(data.len, self.writable());
+        if (n == 0) return 0;
+        const start = self.wp & (cap - 1);
+        const first = @min(n, cap - start);
+        @memcpy(self.buf[start..][0..first], data[0..first]);
+        if (n > first) @memcpy(self.buf[0 .. n - first], data[first..n]);
+        self.wp += n;
+        return n;
+    }
+
+    pub fn read(self: *SendBufDyn, out: []u8) usize {
+        const cap = self.buf.len;
+        const n = @min(out.len, self.readable());
+        if (n == 0) return 0;
+        const start = self.rp & (cap - 1);
+        const first = @min(n, cap - start);
+        @memcpy(out[0..first], self.buf[start..][0..first]);
+        if (n > first) @memcpy(out[first..n], self.buf[0 .. n - first]);
+        self.rp += n;
+        return n;
+    }
+
+    pub fn writeAt(self: *SendBufDyn, rel_offset: usize, data: []const u8) usize {
+        const cap = self.buf.len;
+        if (rel_offset >= cap) return 0;
+        const available = cap - rel_offset;
+        const n = @min(data.len, available);
+        if (n == 0) return 0;
+        const start = (self.rp + rel_offset) & (cap - 1);
+        const first = @min(n, cap - start);
+        @memcpy(self.buf[start..][0..first], data[0..first]);
+        if (n > first) @memcpy(self.buf[0 .. n - first], data[first..n]);
+        return n;
+    }
+
+    pub fn peek(self: *const SendBufDyn, rel_offset: usize, out: []u8) usize {
+        const cap = self.buf.len;
+        const avail = self.readable();
+        if (rel_offset >= avail) return 0;
+        const n = @min(out.len, avail - rel_offset);
+        if (n == 0) return 0;
+        const start = (self.rp + rel_offset) & (cap - 1);
+        const first = @min(n, cap - start);
+        @memcpy(out[0..first], self.buf[start..][0..first]);
+        if (n > first) @memcpy(out[first..n], self.buf[0 .. n - first]);
+        return n;
+    }
+
+    pub fn discard(self: *SendBufDyn, n: usize) usize {
+        const actual = @min(n, self.readable());
+        self.rp += actual;
+        return actual;
+    }
+
+    pub fn peekContiguous(self: *const SendBufDyn) []const u8 {
+        const cap = self.buf.len;
+        const n = self.readable();
+        if (n == 0) return &.{};
+        const start = self.rp & (cap - 1);
+        const first = @min(n, cap - start);
+        return self.buf[start..][0..first];
+    }
+
+    pub fn consume(self: *SendBufDyn, n: usize) void {
+        self.rp += @min(n, self.readable());
+    }
+};
+
 /// A fixed-size ring buffer for stream data (receive or send side).
 /// `cap` must be a power of two (enforced by comptime assert).
 pub fn RingBuf(comptime cap: usize) type {
@@ -279,8 +374,8 @@ pub const Stream = struct {
     send_max: u64,
 
     // Send-side buffer: holds data until acknowledged (for retransmission).
-    // Larger than recv_buf to exceed BDP on high-bandwidth links.
-    send_buf: RingBuf(SEND_BUF_SIZE),
+    // Heap-allocated; sized at stream creation to 2× BDP (min SEND_BUF_SIZE).
+    send_buf: SendBufDyn,
     /// Cumulative bytes acknowledged on the send side.
     send_acked: u64,
     /// Out-of-order (SACK) acknowledged ranges waiting for the gap to be filled.
@@ -316,7 +411,9 @@ pub const Stream = struct {
     /// If non-null, peekInline() returns this instead of reading from recv_buf.
     inline_recv: ?[]const u8 = null,
 
-    pub fn init(id: u62) Stream {
+    /// Create a stream with a heap-allocated send buffer of `buf_cap` bytes.
+    /// `buf_cap` must be a power of two and >= 1.
+    pub fn init(id: u62, buf_cap: usize) !Stream {
         return .{
             .id = id,
             .state = .open,
@@ -325,7 +422,7 @@ pub const Stream = struct {
             .recv_buf = .{},
             .recv_max = STREAM_BUF_SIZE,
             .send_max = STREAM_BUF_SIZE,
-            .send_buf = .{},
+            .send_buf = try SendBufDyn.init(buf_cap),
             .send_acked = 0,
             .sack_ranges = undefined,
             .sack_count = 0,
@@ -339,6 +436,10 @@ pub const Stream = struct {
             .highest_recv_offset = 0,
             .inline_recv = null,
         };
+    }
+
+    pub fn deinit(self: *Stream) void {
+        self.send_buf.deinit();
     }
 
     pub fn isReadable(self: *const Stream) bool {
@@ -724,6 +825,7 @@ pub fn StreamTable(comptime capacity: usize) type {
         ids: [capacity]u62 = undefined,
         states: [capacity]SlotState = @as([capacity]SlotState, @splat(.empty)),
         count: usize = 0,
+        buf_cap: usize = SEND_BUF_SIZE,
 
         /// Return true if slot i holds a live stream.
         pub fn occupied(self: *const Self, i: usize) bool {
@@ -732,7 +834,8 @@ pub fn StreamTable(comptime capacity: usize) type {
 
         /// Open or retrieve a stream by ID.
         /// Returns null only when all capacity slots are simultaneously active.
-        pub fn getOrCreate(self: *Self, id: u62) ?*Stream {
+        /// Returns error.OutOfMemory if the send buffer allocation fails.
+        pub fn getOrCreate(self: *Self, id: u62) !?*Stream {
             if (self.count >= capacity) return null;
             const mask = capacity - 1;
             const start: usize = @as(usize, @intCast(id)) & mask;
@@ -751,7 +854,7 @@ pub fn StreamTable(comptime capacity: usize) type {
                         // ID not present; insert at first tombstone (recycling) or here.
                         const slot = first_tombstone orelse i;
                         self.ids[slot] = id;
-                        self.streams[slot] = Stream.init(id);
+                        self.streams[slot] = try Stream.init(id, self.buf_cap);
                         self.states[slot] = .occupied;
                         self.count += 1;
                         return &self.streams[slot];
@@ -761,7 +864,7 @@ pub fn StreamTable(comptime capacity: usize) type {
             // No empty slot — table is tombstone-saturated but count < capacity.
             if (first_tombstone) |slot| {
                 self.ids[slot] = id;
-                self.streams[slot] = Stream.init(id);
+                self.streams[slot] = try Stream.init(id, self.buf_cap);
                 self.states[slot] = .occupied;
                 self.count += 1;
                 return &self.streams[slot];
@@ -795,6 +898,7 @@ pub fn StreamTable(comptime capacity: usize) type {
                 switch (self.states[i]) {
                     .occupied => {
                         if (self.ids[i] == id) {
+                            self.streams[i].deinit();
                             self.states[i] = .tombstone;
                             self.count -= 1;
                             return;
@@ -805,6 +909,16 @@ pub fn StreamTable(comptime capacity: usize) type {
                 }
             }
         }
+
+        pub fn deinit(self: *Self) void {
+            for (0..capacity) |i| {
+                if (self.states[i] == .occupied) {
+                    self.streams[i].deinit();
+                    self.states[i] = .tombstone;
+                }
+            }
+            self.count = 0;
+        }
     };
 }
 
@@ -813,7 +927,7 @@ pub fn StreamTable(comptime capacity: usize) type {
 // ---------------------------------------------------------------------------
 test "stream: receive and read in-order" {
     const testing = std.testing;
-    var s = Stream.init(4);
+    var s = try Stream.init(4, SEND_BUF_SIZE);
     try s.receiveData(0, "hello", false);
     var buf: [16]u8 = undefined;
     const n = s.read(&buf);
@@ -823,7 +937,7 @@ test "stream: receive and read in-order" {
 
 test "stream: fin transitions state" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     try s.receiveData(0, "data", true);
     try testing.expectEqual(StreamState.half_closed_remote, s.state);
     s.sendFin();
@@ -831,7 +945,7 @@ test "stream: fin transitions state" {
 }
 
 test "stream: flow control violation" {
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 4;
     const err = s.receiveData(0, "12345", false);
     try std.testing.expectError(error.FlowControlViolation, err);
@@ -840,7 +954,7 @@ test "stream: flow control violation" {
 test "stream_table: getOrCreate and get" {
     const testing = std.testing;
     var table: StreamTable(64) = .{};
-    const s = table.getOrCreate(0).?;
+    const s = (try table.getOrCreate(0)).?;
     s.send_offset = 42;
     const s2 = table.get(0).?;
     try testing.expectEqual(@as(u64, 42), s2.send_offset);
@@ -851,10 +965,10 @@ test "stream_table: capacity limit" {
     var table: StreamTable(capacity) = .{};
     var i: u62 = 0;
     while (i < capacity) : (i += 1) {
-        _ = table.getOrCreate(i * 4);
+        _ = try table.getOrCreate(i * 4);
     }
     // Next allocation should fail
-    const overflow = table.getOrCreate(@intCast(capacity * 4));
+    const overflow = try table.getOrCreate(@intCast(capacity * 4));
     const testing = std.testing;
     try testing.expectEqual(@as(?*Stream, null), overflow);
 }
@@ -874,7 +988,7 @@ test "stream: streamDir and streamKind decode ID bits" {
 
 test "stream: onSent advances send_offset" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     try testing.expectEqual(@as(u64, 0), s.send_offset);
     s.onSent(100);
     try testing.expectEqual(@as(u64, 100), s.send_offset);
@@ -884,7 +998,7 @@ test "stream: onSent advances send_offset" {
 
 test "stream: out-of-order receive and reassembly" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     // Data at offset 5 arrives before offset 0 — buffered, not dropped.
     try s.receiveData(5, "world", false);
     var buf: [16]u8 = undefined;
@@ -899,7 +1013,7 @@ test "stream: out-of-order receive and reassembly" {
 }
 
 test "stream: receiveData returns BufferFull when ring buffer is full" {
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     // Fill the ring buffer to capacity with in-order data
     var data: [STREAM_BUF_SIZE]u8 = undefined;
     @memset(&data, 0xaa);
@@ -914,7 +1028,7 @@ test "stream: receiveData returns BufferFull when ring buffer is full" {
 
 test "stream: recv_max extends after read" {
     const testing = std.testing;
-    var s = Stream.init(4);
+    var s = try Stream.init(4, SEND_BUF_SIZE);
     const initial_max = s.recv_max; // STREAM_BUF_SIZE
 
     // Receive some data
@@ -948,7 +1062,7 @@ test "ringbuf: wrap-around" {
 
 test "stream_send: bufferSendData and getSendData round-trip" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     const n = s.bufferSendData("hello");
     try testing.expectEqual(@as(usize, 5), n);
 
@@ -960,7 +1074,7 @@ test "stream_send: bufferSendData and getSendData round-trip" {
 
 test "stream_send: onAcked advances send_acked and frees send_buf space" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     _ = s.bufferSendData("hello world"); // 11 bytes
     s.send_offset = 11; // simulate having sent all
 
@@ -972,7 +1086,7 @@ test "stream_send: onAcked advances send_acked and frees send_buf space" {
 
 test "stream_send: getSendData returns data for un-acked offset" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     _ = s.bufferSendData("abcdefgh"); // 8 bytes at offset 0
 
     var buf: [8]u8 = undefined;
@@ -983,7 +1097,7 @@ test "stream_send: getSendData returns data for un-acked offset" {
 
 test "stream_send: getSendData returns 0 for already-acked offset" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     _ = s.bufferSendData("hello");
     s.onAcked(0, 5);
 
@@ -997,7 +1111,7 @@ test "stream_send: out-of-order onAcked (SACK) frees ring buffer when gap filled
     // before ACK for offset 0. When offset 0 is finally acked, the ring buffer should
     // advance through both ranges (0-1200 and 1200-2400) in one flush.
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     // Buffer 2400 bytes (two 1200-byte chunks)
     var data: [2400]u8 = undefined;
     _ = s.bufferSendData(&data);
@@ -1020,7 +1134,7 @@ test "stream_send: out-of-order onAcked (SACK) frees ring buffer when gap filled
 test "stream_send: multiple out-of-order SACK ranges resolved in one flush" {
     // Three chunks: offsets 0, 1200, 2400. Chunks 1200 and 2400 acked before 0.
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     var data: [3600]u8 = undefined;
     _ = s.bufferSendData(&data);
     s.send_offset = 3600;
@@ -1039,7 +1153,7 @@ test "stream_send: multiple out-of-order SACK ranges resolved in one flush" {
 
 test "stream_send: stale SACK ranges (before send_acked) are discarded" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     var data: [1200]u8 = undefined;
     _ = s.bufferSendData(&data);
     s.send_offset = 1200;
@@ -1057,7 +1171,7 @@ test "stream_send: stale SACK ranges (before send_acked) are discarded" {
 
 test "stream_send: send_fin and fin_acked flags" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     try testing.expect(!s.send_fin);
     try testing.expect(!s.fin_acked);
 
@@ -1104,28 +1218,28 @@ test "ringbuf: discard advances rp" {
 
 test "stream_reset: onResetReceived open to reset" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     try s.onResetReceived(42, 0);
     try testing.expectEqual(StreamState.reset, s.state);
 }
 
 test "stream_reset: onResetReceived half_closed_local to closed" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.state = .half_closed_local;
     try s.onResetReceived(0, 0);
     try testing.expectEqual(StreamState.closed, s.state);
 }
 
 test "stream_reset: onResetReceived bad final_size returns FinalSizeError" {
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_offset = 100;
     try std.testing.expectError(error.FinalSizeError, s.onResetReceived(0, 50));
 }
 
 test "stream_reset: onStopSendingReceived sets pending_reset" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.send_offset = 200;
     s.onStopSendingReceived(7);
     try testing.expect(s.pending_reset != null);
@@ -1135,7 +1249,7 @@ test "stream_reset: onStopSendingReceived sets pending_reset" {
 
 test "stream: receiveData overflow-safe offset + len check" {
     // offset near u64 max: offset + data.len would overflow — must return OffsetOverflow
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = std.math.maxInt(u64);
     const err = s.receiveData(std.math.maxInt(u64) - 2, "hello", false);
     try std.testing.expectError(error.OffsetOverflow, err);
@@ -1145,7 +1259,7 @@ test "stream: out-of-order FIN does not prematurely close" {
     // FIN arrives with a future offset before the gap data arrives.
     // Stream state must remain open until recv_offset catches up.
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 1024;
 
     // FIN at offset=10 with 5 bytes of data (bytes 10-14), but recv_offset=0.
@@ -1158,7 +1272,7 @@ test "stream: out-of-order FIN does not prematurely close" {
 test "stream: FIN applied when recv_offset catches up" {
     // After the gap is filled, state must transition to half_closed_remote.
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 1024;
 
     // FIN at offset=5 (10 bytes total: "world" at [5,10)), arrives out of order first.
@@ -1181,7 +1295,7 @@ test "stream: FIN applied when recv_offset catches up" {
 test "stream: in-order FIN still works" {
     // When FIN arrives in order with data, state transitions immediately.
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 1024;
 
     try s.receiveData(0, "hello", true);
@@ -1231,13 +1345,13 @@ test "stream_table: getOrCreate after close still finds correct stream" {
     // Verify that a stream closed (tombstone) does not block retrieval of others.
     const testing = std.testing;
     var table: StreamTable(64) = .{};
-    _ = table.getOrCreate(10);
-    _ = table.getOrCreate(20);
-    _ = table.getOrCreate(30);
+    _ = try table.getOrCreate(10);
+    _ = try table.getOrCreate(20);
+    _ = try table.getOrCreate(30);
     table.close(20); // tombstone at 20's slot
 
     // New ID must be created successfully and be retrievable.
-    const s = table.getOrCreate(99).?;
+    const s = (try table.getOrCreate(99)).?;
     try testing.expectEqual(@as(u62, 99), s.id);
     const s2 = table.get(99).?;
     try testing.expectEqual(@as(u62, 99), s2.id);
@@ -1254,12 +1368,12 @@ test "stream_table: tombstone slot is recycled on insert" {
     const testing = std.testing;
     var table: StreamTable(64) = .{};
     // id=0 and id=512 both hash to slot 0 (0 & 511 == 0, 512 & 511 == 0).
-    _ = table.getOrCreate(0); // slot 0
-    _ = table.getOrCreate(512); // slot 1 (probe past occupied slot 0)
+    _ = try table.getOrCreate(0); // slot 0
+    _ = try table.getOrCreate(512); // slot 1 (probe past occupied slot 0)
     table.close(0); // slot 0 becomes tombstone; count=1
     // id=1024 also hashes to slot 0: probe 0 (tombstone → record), 1 (id=512≠1024), 2 (empty).
     // Insert at first tombstone (slot 0), not slot 2.
-    const s = table.getOrCreate(1024).?;
+    const s = (try table.getOrCreate(1024)).?;
     try testing.expectEqual(@as(u62, 1024), s.id);
     try testing.expectEqual(&table.streams[0], s);
     try testing.expectEqual(@as(usize, 2), table.count);
@@ -1271,13 +1385,13 @@ test "stream_table: reuse after cycling capacity streams" {
     var table: StreamTable(capacity) = .{};
     var i: u62 = 0;
     while (i < capacity) : (i += 1) {
-        const s = table.getOrCreate(i * 4).?;
+        const s = (try table.getOrCreate(i * 4)).?;
         _ = s;
         table.close(i * 4);
     }
     try std.testing.expectEqual(@as(usize, 0), table.count);
     // Table has tombstones but no occupied slots; must accept a new stream.
-    const s = table.getOrCreate(9999).?;
+    const s = (try table.getOrCreate(9999)).?;
     try std.testing.expectEqual(@as(u62, 9999), s.id);
     try std.testing.expectEqual(@as(usize, 1), table.count);
 }
@@ -1285,7 +1399,7 @@ test "stream_table: reuse after cycling capacity streams" {
 test "stream: receiveData exact-boundary: offset + len == u64 max is not overflow" {
     // offset + len == u64 max exactly (no overflow) — verified as OffsetOverflow-safe.
     // Data is astronomically far from the ring buffer window → BufferFull (not OffsetOverflow).
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = std.math.maxInt(u64);
     const offset: u64 = std.math.maxInt(u64) - 4;
     const data = [_]u8{ 1, 2, 3, 4 }; // len=4; offset+4 == u64 max (no overflow)
@@ -1295,7 +1409,7 @@ test "stream: receiveData exact-boundary: offset + len == u64 max is not overflo
 
 test "stream_reset: initiateReset sets pending and transitions state" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.send_offset = 100;
     s.initiateReset(5);
     try testing.expect(s.pending_reset != null);
@@ -1306,7 +1420,7 @@ test "stream_reset: initiateReset sets pending and transitions state" {
 
 test "stream: canSend returns false in half_closed_local state" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.sendFin(); // transitions to half_closed_local
     try testing.expectEqual(StreamState.half_closed_local, s.state);
     try testing.expect(!s.canSend(1));
@@ -1314,7 +1428,7 @@ test "stream: canSend returns false in half_closed_local state" {
 
 test "stream: canSend returns false in closed state" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.sendFin(); // half_closed_local
     // Simulate receiving FIN → closed
     try s.receiveData(0, &.{}, true); // fin on recv side → half_closed_remote then closed
@@ -1324,7 +1438,7 @@ test "stream: canSend returns false in closed state" {
 
 test "stream: canSend returns false in reset state" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.initiateReset(0);
     try testing.expectEqual(StreamState.reset, s.state);
     try testing.expect(!s.canSend(1));
@@ -1332,7 +1446,7 @@ test "stream: canSend returns false in reset state" {
 
 test "stream: canSend returns false when window exhausted" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     // send_max = STREAM_BUF_SIZE = 4096, send_offset = 0
     // Asking for exactly send_max is fine (0 + 4096 <= 4096)
     try testing.expect(s.canSend(STREAM_BUF_SIZE));
@@ -1342,7 +1456,7 @@ test "stream: canSend returns false when window exhausted" {
 
 test "stream: onAcked with non-consecutive offset buffers for later" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     const data = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
     _ = s.bufferSendData(&data);
     s.onSent(data.len);
@@ -1363,14 +1477,14 @@ test "stream: onAcked with non-consecutive offset buffers for later" {
 
 test "stream: shouldSendMaxStreamData false initially" {
     const testing = std.testing;
-    const s = Stream.init(0);
+    const s = try Stream.init(0, SEND_BUF_SIZE);
     // last_sent_max_stream_data = recv_max = STREAM_BUF_SIZE at init
     try testing.expect(!s.shouldSendMaxStreamData());
 }
 
 test "stream: shouldSendMaxStreamData true after reading 25%+ of buffer" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     // Small reads below threshold should NOT trigger MAX_STREAM_DATA
     try s.receiveData(0, "hello world", false);
     var buf: [16]u8 = undefined;
@@ -1541,7 +1655,7 @@ test "gap_list: MAX_GAPS overflow drops tail fragment" {
 
 test "stream: overlapping segments are harmless" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     try s.receiveData(0, "hello", false);
     try s.receiveData(3, "loXYZ", false);
     var buf: [16]u8 = undefined;
@@ -1552,7 +1666,7 @@ test "stream: overlapping segments are harmless" {
 
 test "stream: duplicate segment is harmless" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     try s.receiveData(0, "hello", false);
     // Exact duplicate — should be a no-op.
     try s.receiveData(0, "hello", false);
@@ -1564,7 +1678,7 @@ test "stream: duplicate segment is harmless" {
 
 test "stream: FIN with out-of-order data defers transition" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 1024;
     try s.receiveData(10, "final", true);
     try testing.expectEqual(StreamState.open, s.state);
@@ -1579,7 +1693,7 @@ test "stream: FIN with out-of-order data defers transition" {
 // write to the ring buffer and leave unreachable (phantom) bytes.
 test "stream: gap-list saturated rejects data beyond window (no phantom write)" {
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     // Simulate the app consuming 1 000 bytes so rp > 0 and rel < cap.
     s.recv_buf.rp = 1000;
     s.recv_buf.wp = 1000;
@@ -1610,7 +1724,7 @@ test "stream: gap-list saturated rejects data beyond window (no phantom write)" 
 test "stream: conflicting FIN offsets return FinalSizeError" {
     // FIN at offset 10 (final_size=10) arrives first, then a second FIN at 20.
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 1024;
     try s.receiveData(0, "hello", true); // FIN → final_size = 5
     // Second FIN with different final size must be rejected.
@@ -1619,7 +1733,7 @@ test "stream: conflicting FIN offsets return FinalSizeError" {
 
 test "stream: duplicate FIN at same offset is silently accepted" {
     // Retransmitted FIN with the same final offset must not be an error.
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 1024;
     try s.receiveData(0, "hello", true); // FIN → final_size = 5
     // Exact retransmission: same data, same FIN offset.
@@ -1629,7 +1743,7 @@ test "stream: duplicate FIN at same offset is silently accepted" {
 test "stream: data beyond established final size returns FinalSizeError" {
     // FIN received at offset 5 (final_size=5). Later data arrives beyond that.
     const testing = std.testing;
-    var s = Stream.init(0);
+    var s = try Stream.init(0, SEND_BUF_SIZE);
     s.recv_max = 1024;
     try s.receiveData(0, "hello", true); // final_size = 5
     // Data frame ending at offset 7 violates the known final size.

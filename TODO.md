@@ -6,7 +6,7 @@
 - [x] Make `SEND_QUEUE_DEPTH` build-configurable (`-Dsend_queue_depth=N`, default 256; larger values require heap-allocated connections)
 - [x] Make `MAX_SENT` build-configurable (`-Dmax_sent=N`, default 2048)
 - [x] Make `SEND_BUF_SIZE` build-configurable (`-Dsend_buf_size=N`, default 64 KB; set to 2× BDP for high-throughput links)
-- [ ] True per-stream dynamic `SEND_BUF_SIZE` scaling (requires runtime-sized RingBuf with allocator)
+- [x] True per-stream dynamic `SEND_BUF_SIZE` scaling (`SendBufDyn` heap ring buf; `StreamTable.buf_cap` set to 2×BDP at handshake)
 
 ### Syscall reduction
 - [x] GSO (`UDP_SEGMENT`) for Linux — batch N QUIC packets into 1 sendmsg (60× fewer send syscalls at 1 Gbps)

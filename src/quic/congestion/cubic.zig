@@ -136,6 +136,10 @@ pub const Cubic = struct {
         self.pacing.consume(bytes);
     }
 
+    pub fn bdp(self: *const Cubic) u64 {
+        return self.cwnd;
+    }
+
     fn updateCwndCubic(self: *Cubic, bytes_acked: u64, rtt_ns: u64, now_ns: i64) void {
         _ = rtt_ns; // RTT not used in CUBIC window computation; w_est uses per-packet accumulation
 

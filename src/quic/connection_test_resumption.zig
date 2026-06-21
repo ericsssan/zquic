@@ -296,7 +296,7 @@ test "streamSend returns error when connection not established" {
     defer conn.deinit();
     conn.hot.state = .handshake;
     // Create a stream so getOrCreate succeeds
-    _ = conn.streams.getOrCreate(0);
+    _ = try conn.streams.getOrCreate(0);
 
     const result = conn.streamSend(0, "hello", false);
     try testing.expectError(error.StreamNotWritable, result);
@@ -312,7 +312,7 @@ test "streamSend does not return StreamNotWritable when established" {
     // We verify the state check specifically by confirming handshake state errors
     // and established state does NOT error with StreamNotWritable for state reasons.
     conn.hot.state = .handshake;
-    _ = conn.streams.getOrCreate(0);
+    _ = try conn.streams.getOrCreate(0);
     const err1 = conn.streamSend(0, "hi", false);
     try testing.expectError(error.StreamNotWritable, err1);
 

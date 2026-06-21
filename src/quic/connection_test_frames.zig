@@ -31,7 +31,7 @@ test "connection: tick clears shouldSendMaxStreamData after stream read" {
 
     // Create a stream and simulate reading enough data to trigger MAX_STREAM_DATA
     // (threshold = 25% of buffer size = STREAM_BUF_SIZE / 4)
-    const st = conn.streams.getOrCreate(0).?;
+    const st = (try conn.streams.getOrCreate(0)).?;
     const quarter = @import("stream.zig").STREAM_BUF_SIZE / 4;
     var big_data: [quarter]u8 = undefined;
     @memset(&big_data, 0x42);
@@ -223,7 +223,7 @@ test "security: ACK frame in epoch 0 is allowed" {
 // SEC-007: stream.canSend overflow-safe
 test "security: stream.canSend prevents u64 wrap-around" {
     const testing = std.testing;
-    var s = stream_mod.Stream.init(0);
+    var s = try stream_mod.Stream.init(0, stream_mod.SEND_BUF_SIZE);
     s.send_max = std.math.maxInt(u64);
     s.send_offset = std.math.maxInt(u64) - 1;
     // Requesting 2 bytes would wrap: (maxInt - 1) + 2 overflows.
@@ -295,7 +295,7 @@ test "security: RESET_STREAM with inconsistent final_size while FIN pending retu
     // fin_recv_offset is set to 25 but recv_offset stays 0 (pending).
     // A RESET with final_size != 25 must be rejected (RFC 9000 §3.3).
     const testing = std.testing;
-    var s = stream_mod.Stream.init(0);
+    var s = try stream_mod.Stream.init(0, stream_mod.SEND_BUF_SIZE);
     s.recv_max = 1024;
     // FIN at offset 20 with 5 bytes; out-of-order so recv_offset stays 0.
     try s.receiveData(20, "world", true); // fin_recv_offset = 25
@@ -306,7 +306,7 @@ test "security: RESET_STREAM with inconsistent final_size while FIN pending retu
 
 test "security: RESET_STREAM with matching final_size while FIN pending is accepted" {
     const testing = std.testing;
-    var s = stream_mod.Stream.init(0);
+    var s = try stream_mod.Stream.init(0, stream_mod.SEND_BUF_SIZE);
     s.recv_max = 1024;
     // FIN at offset 20 with 5 bytes; fin_recv_offset = 25, recv_offset = 0.
     try s.receiveData(20, "world", true);
@@ -322,7 +322,7 @@ test "perf: flushPendingMaxStreamData not called when not established" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const st = conn.streams.getOrCreate(0).?;
+    const st = (try conn.streams.getOrCreate(0)).?;
     // Force shouldSendMaxStreamData by setting last_sent below recv_max by >= threshold
     st.last_sent_max_stream_data = 0;
     try testing.expect(st.shouldSendMaxStreamData());
@@ -371,7 +371,7 @@ test "connection: STREAM_DATA_BLOCKED triggers MAX_STREAM_DATA update" {
     const testing = std.testing;
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
-    const st = conn.streams.getOrCreate(0).?;
+    const st = (try conn.streams.getOrCreate(0)).?;
     st.recv_max = stream_mod.STREAM_BUF_SIZE;
     // Mark "already sent" at current recv_max — no update should be pending yet.
     st.last_sent_max_stream_data = st.recv_max;
@@ -898,7 +898,7 @@ test "connection: recv window grows when 75% consumed" {
     while (total_consumed < threshold) {
         const chunk_size = @min(data.len, threshold - total_consumed);
         const chunk = data[0..chunk_size];
-        const st = conn.streams.getOrCreate(0).?;
+        const st = (try conn.streams.getOrCreate(0)).?;
         // receiveData only accepts up to stream recv_max; create new streams as needed
         st.receiveData(st.recv_offset, chunk, false) catch {};
         conn.conn_flow.onReceived(chunk_size);
@@ -1006,7 +1006,7 @@ test "connection: tick batches MAX_DATA and MAX_STREAM_DATA in one packet" {
     conn.pending_max_data = true;
 
     // Set up a stream needing MAX_STREAM_DATA.
-    const st = conn.streams.getOrCreate(0).?;
+    const st = (try conn.streams.getOrCreate(0)).?;
     st.last_sent_max_stream_data = 0; // force shouldSendMaxStreamData() = true
 
     const sq_before = conn.sq_tail;

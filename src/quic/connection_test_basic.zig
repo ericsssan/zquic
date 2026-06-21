@@ -382,7 +382,7 @@ test "retransmit: acked stream frame advances send_acked" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Set up a stream with buffered send data
-    const st = conn.streams.getOrCreate(0).?;
+    const st = (try conn.streams.getOrCreate(0)).?;
     _ = st.bufferSendData("hello world"); // 11 bytes at offset 0
     st.send_offset = 11;
 
@@ -409,7 +409,7 @@ test "retransmit: acked FIN on closed stream triggers stream reclamation" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const st = conn.streams.getOrCreate(4).?;
+    const st = (try conn.streams.getOrCreate(4)).?;
     st.state = .closed;
     _ = st.bufferSendData("bye");
     st.send_offset = 3;
@@ -442,7 +442,7 @@ test "retransmit: lost data retransmitted before FIN ACK frees stream" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const st = conn.streams.getOrCreate(4).?;
+    const st = (try conn.streams.getOrCreate(4)).?;
     st.state = .closed;
     _ = st.bufferSendData("hi"); // 2 bytes at offset 0 (unsent/lost)
     st.send_offset = 2;
@@ -727,7 +727,7 @@ test "stream_reset: processFrames handles RESET_STREAM and pushes event" {
     var conn = try Connection(16).accept(.{}, io);
 
     // Create a stream first
-    _ = conn.streams.getOrCreate(0).?;
+    _ = (try conn.streams.getOrCreate(0)).?;
 
     // Build a raw RESET_STREAM frame
     var buf: [32]u8 = undefined;
@@ -932,7 +932,7 @@ test "stream_reset: processFrames handles STOP_SENDING and pushes event" {
     const io = std.testing.io;
     var conn = try Connection(16).accept(.{}, io);
 
-    const st = conn.streams.getOrCreate(0).?;
+    const st = (try conn.streams.getOrCreate(0)).?;
     st.send_offset = 100;
 
     // Build a raw STOP_SENDING frame
