@@ -3843,7 +3843,10 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[0];
                     self.hot.tx_pn[0] += 1;
                     const ct_len = fpos + 16;
-                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch break;
+                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch {
+                        self.hot.tx_pn[0] -= 1;
+                        break;
+                    };
                     const hdr_len = packet.encodeLongHeader(
                         slot_buf,
                         .initial,
@@ -3870,7 +3873,10 @@ pub fn Connection(comptime max_streams: usize) type {
                     const pn = self.hot.tx_pn[1];
                     self.hot.tx_pn[1] += 1;
                     const ct_len = fpos + 16;
-                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch break;
+                    const slot_buf = self.reserveSendSlot(ct_len + 100) catch {
+                        self.hot.tx_pn[1] -= 1;
+                        break;
+                    };
                     const hdr_len = packet.encodeLongHeader(
                         slot_buf,
                         .handshake,
