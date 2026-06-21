@@ -5,11 +5,19 @@
 //!   bit 1: 0 = bidirectional,   1 = unidirectional
 
 const std = @import("std");
+const build_options = @import("build_options");
 
 pub const STREAM_BUF_SIZE: usize = 32768;
-/// Send buffer is larger to exceed BDP on high-bandwidth links.
-/// Recv buffer stays at 32KB (app consumes promptly via peekContiguous/inline borrow).
-pub const SEND_BUF_SIZE: usize = 65536;
+/// Per-stream send-side retransmission buffer. Must exceed the connection BDP to avoid
+/// throughput stall: at 10 Mbps / 100ms RTT, BDP ≈ 125 KB. Set -Dsend_buf_size=N
+/// (power of 2) at build time to 2× your target BDP. True per-stream dynamic sizing
+/// (via allocator + runtime RingBuf) is a future improvement.
+/// Recv buffer stays at 32 KB (app consumes promptly via peekContiguous/inline borrow).
+pub const SEND_BUF_SIZE: usize = build_options.send_buf_size;
+comptime {
+    if (SEND_BUF_SIZE < 1 or (SEND_BUF_SIZE & (SEND_BUF_SIZE - 1)) != 0)
+        @compileError("send_buf_size must be a power of 2 >= 1");
+}
 
 pub const StreamState = enum(u8) {
     open,

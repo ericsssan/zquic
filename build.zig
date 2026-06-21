@@ -11,11 +11,13 @@ pub fn build(b: *std.Build) void {
 
     const send_queue_depth = b.option(usize, "send_queue_depth", "Send queue ring buffer depth (power of 2, default 256)") orelse 256;
     const max_sent = b.option(usize, "max_sent", "Sent packet tracking depth (power of 2, default 2048)") orelse 2048;
+    const send_buf_size = b.option(usize, "send_buf_size", "Per-stream send buffer size in bytes (power of 2, default 65536). Set to 2x BDP for high-throughput links.") orelse 65536;
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "congestion_cubic", congestion_cubic);
     build_options.addOption(usize, "send_queue_depth", send_queue_depth);
     build_options.addOption(usize, "max_sent", max_sent);
+    build_options.addOption(usize, "send_buf_size", send_buf_size);
     const build_options_mod = build_options.createModule();
 
     // Public module: consumers import this as @import("zquic")
