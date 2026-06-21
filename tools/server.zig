@@ -403,14 +403,12 @@ pub fn main(init: std.process.Init) !void {
     // Sets g_gso_supported; drainSend dispatches to drainSendGso when true.
     if (comptime builtin.os.tag == .linux) {
         const probe: u16 = MAX_DATAGRAM;
-        const rc = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
-            std.mem.asBytes(&probe).ptr, @sizeOf(u16));
+        const rc = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&probe).ptr, @sizeOf(u16));
         if (rc == 0) {
             g_gso_supported = true;
             // Disable the socket-level default; flushGso uses per-send setsockopt.
             const zero: u16 = 0;
-            _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
-                std.mem.asBytes(&zero).ptr, @sizeOf(u16));
+            _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&zero).ptr, @sizeOf(u16));
             std.debug.print("[GSO] UDP_SEGMENT enabled (up to {} datagrams/send)\n", .{GSO_MAX_SEGS});
         }
     }
@@ -1323,14 +1321,12 @@ fn flushGso(sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, buf
         return;
     }
     const seg_size: u16 = MAX_DATAGRAM;
-    _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
-        std.mem.asBytes(&seg_size).ptr, @sizeOf(u16));
+    _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&seg_size).ptr, @sizeOf(u16));
     var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = @ptrCast(&bufs.gso), .data_len = n_segs * MAX_DATAGRAM }};
     sock.sendMany(io, &msg, .{}) catch {};
     // Restore to 0 so ordinary sendMany calls after this are unaffected.
     const zero: u16 = 0;
-    _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
-        std.mem.asBytes(&zero).ptr, @sizeOf(u16));
+    _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&zero).ptr, @sizeOf(u16));
 }
 
 const SEND_BATCH = 32;
