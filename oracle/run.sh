@@ -631,11 +631,11 @@ statelessreset_client_case() { # <sport> <pport>
     dd if=/dev/zero of="$tw/big.bin" bs=1M count=2048 2>/dev/null
 
   # Phase 1: quicgo server → proxy (20ms delay) → zquic client.
-  # The 20ms one-way delay caps QUIC throughput to window/40ms; even a 16 MB receive
-  # window gives only ~400 MB/s, so 2 GB takes >=5s — well past the sleep 1 below.
-  # Without the proxy, fast CI loopbacks can complete the 2 GB transfer in <1s and
-  # the client exits before the server is killed, making the test flaky.
-  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
+  # SERVE_RATE_KBPS=512 limits server output to 512 KB/s: 2 GB / 0.5 MB/s = 4096 s,
+  # so the client is mid-download at the sleep 1 below regardless of QUIC window growth.
+  # (Without rate limiting, the QUIC receive window doubles every RTT and can transfer
+  # 2 GB in ~520ms even through a 20ms-delay proxy, making the test flaky.)
+  RESET_KEY="$key" SERVE_RATE_KBPS=512 "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
     >"$d/qgsrv1.log" 2>&1 & local sp1=$!
   _HARNESS_PIDS+=("$sp1")
   wait_listen "$sp1" "$sport" || { bad "statelessreset-client (phase 1: no quicgo bind)"; stop "$sp1"; return; }

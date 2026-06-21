@@ -216,6 +216,7 @@ fn runConnection(
     }
 
     var all_done = false;
+    var key_update_done = false;
 
     const timeout_5s: std.Io.Timeout = .{ .duration = .{ .raw = .{ .nanoseconds = 5_000_000_000 }, .clock = .awake } };
     var idle_ticks: usize = 0;
@@ -274,9 +275,6 @@ fn runConnection(
                             sendRequests(conn, downloads, req_paths, req_path_lens, req_count, downloads_dir, &next_req);
                         drainSend(conn, sock, io, dest, &send_buf);
                     }
-                    if (std.mem.eql(u8, testcase, "keyupdate")) {
-                        conn.initiateKeyUpdate() catch {};
-                    }
                 },
                 .stream_data => |sd| {
                     const use_h3_rx = std.mem.eql(u8, testcase, "http3");
@@ -284,6 +282,10 @@ fn runConnection(
                         receiveH3StreamData(conn, downloads, sd.stream_id, io)
                     else
                         receiveStreamData(conn, downloads, sd.stream_id, io);
+                    if (std.mem.eql(u8, testcase, "keyupdate") and !key_update_done) {
+                        conn.initiateKeyUpdate() catch {};
+                        key_update_done = true;
+                    }
                     conn.flushControlFrames() catch {};
                     if (next_req < req_count) {
                         if (use_h3_rx)

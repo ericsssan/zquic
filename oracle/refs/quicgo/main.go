@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -276,6 +277,26 @@ func runServer(args []string) {
 	}
 }
 
+// throttledCopy copies src→dst at rateKBps kilobytes/second (4 KiB chunks).
+// Stops on the first write error (e.g. stream reset by peer).
+func throttledCopy(dst io.Writer, src io.Reader, rateKBps int) {
+	const chunkSize = 4096
+	buf := make([]byte, chunkSize)
+	interval := time.Duration(float64(time.Second) * float64(chunkSize) / float64(rateKBps*1024))
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			time.Sleep(interval)
+		}
+		if rerr != nil {
+			return
+		}
+	}
+}
+
 func serveConn(ctx context.Context, conn *quic.Conn, wwwdir string) {
 	for {
 		stream, err := conn.AcceptStream(ctx)
@@ -301,7 +322,15 @@ func serveConn(ctx context.Context, conn *quic.Conn, wwwdir string) {
 				return
 			}
 			defer f.Close()
-			io.Copy(stream, f) //nolint:errcheck
+			rateKBps := 0
+			if s := os.Getenv("SERVE_RATE_KBPS"); s != "" {
+				rateKBps, _ = strconv.Atoi(s)
+			}
+			if rateKBps > 0 {
+				throttledCopy(stream, f, rateKBps)
+			} else {
+				io.Copy(stream, f) //nolint:errcheck
+			}
 			stream.Close()
 		}()
 	}
