@@ -441,7 +441,8 @@ pub fn main(init: std.process.Init) !void {
     // iov.base pointers point directly into batch_bufs[] for the lifetime of this frame.
     var recv_batch: RecvBatch = undefined;
     if (comptime builtin.os.tag == .linux) {
-        for (0..BATCH_SIZE) |i| {
+        // Slot 0 is used by Phase 1 (sock.receiveTimeout); recvmmsg only uses slots 1..BATCH_SIZE-1.
+        for (1..BATCH_SIZE) |i| {
             recv_batch.iovs[i] = .{ .base = @ptrCast(&batch_bufs[i]), .len = MAX_DATAGRAM };
             recv_batch.msgs[i] = .{
                 .hdr = .{
@@ -1255,7 +1256,8 @@ fn ipFromStorage(s: *const std.os.linux.sockaddr.storage) net.IpAddress {
                 .bytes = in6.addr,
             } };
         },
-        else => .{ .ip4 = net.Ip4Address.loopback(0) },
+        // A dual-stack UDP IPv6 socket only delivers AF_INET6.
+        else => unreachable,
     };
 }
 
