@@ -123,7 +123,7 @@ jobs:
       # standard prefix search order.
       - name: Build + install nghttp3 from source
         run: |
-          git clone --depth 1 --branch "$NGHTTP3_REF" \
+          git clone --depth 1 --branch "$NGHTTP3_REF" --recurse-submodules \
             https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3
           cmake -S /tmp/nghttp3 -B /tmp/nghttp3/build \
             -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON
