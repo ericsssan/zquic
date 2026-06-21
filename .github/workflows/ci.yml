@@ -67,6 +67,7 @@ jobs:
     env:
       QUICHE_REF: "0.29.2"   # pinned for reproducible CI builds
       NGTCP2_REF: "v1.9.0"   # pinned; build-refs.sh uses GnuTLS on Linux (#29)
+      NGHTTP3_REF: "v1.7.0"  # noble ships 0.8.0; ngtcp2 v1.9.0 requires >=1.0.0
     steps:
       - uses: actions/checkout@v4
 
@@ -111,8 +112,24 @@ jobs:
       # ngtcp2 exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3). Built with
       # GnuTLS on Linux (GnuTLS 3.7+ has the QUIC transport API; Ubuntu's OpenSSL
       # 3.0 does not). The clone + cache mirror the quiche pattern above (#29, #31).
-      - name: Install ngtcp2 deps (GnuTLS + libev + nghttp3)
-        run: sudo apt-get update -qq && sudo apt-get install -y libgnutls28-dev libev-dev libnghttp3-dev
+      - name: Install ngtcp2 deps (GnuTLS + libev)
+        run: sudo apt-get update -qq && sudo apt-get install -y libgnutls28-dev libev-dev
+
+      # noble (ubuntu-24.04) ships libnghttp3 0.8.0 but ngtcp2 v1.9.0 requires
+      # >=1.0.0. Build from source; cmake's CMAKE_SYSTEM_PREFIX_PATH searches
+      # /usr/local before /usr so find_path(nghttp3/nghttp3.h) picks up the 1.7.0
+      # header over the apt-installed 0.8.0 one. libnghttp3-dev is not apt-installed
+      # so pkg_check_modules returns no HINTS, letting find_path fall back to the
+      # standard prefix search order.
+      - name: Build + install nghttp3 from source
+        run: |
+          git clone --depth 1 --branch "$NGHTTP3_REF" \
+            https://github.com/ngtcp2/nghttp3.git /tmp/nghttp3
+          cmake -S /tmp/nghttp3 -B /tmp/nghttp3/build \
+            -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON
+          cmake --build /tmp/nghttp3/build -j$(nproc)
+          sudo cmake --install /tmp/nghttp3/build
+          sudo ldconfig
 
       - name: Clone ngtcp2 (pinned)
         run: git clone --depth 1 --branch "$NGTCP2_REF" https://github.com/ngtcp2/ngtcp2.git "$NGTCP2_DIR"
