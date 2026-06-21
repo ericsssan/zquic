@@ -85,7 +85,7 @@ elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && [ "$(uname -s)"
   _cmake_log=$(mktemp)
   if ( cd "$NGTCP2_SRC" \
        && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_GNUTLS=ON -DENABLE_EXAMPLES=ON >"$_cmake_log" 2>&1 \
+            -DENABLE_GNUTLS=ON -DENABLE_OPENSSL=OFF -DENABLE_EXAMPLES=ON >"$_cmake_log" 2>&1 \
        && cmake --build build -j"$(nproc)" --target gtlsclient gtlsserver >>"$_cmake_log" 2>&1 ); then
     ln -sf "$NGTCP2_SRC/build/examples/gtlsclient" "$BIN/ngtcp2-client"
     ln -sf "$NGTCP2_SRC/build/examples/gtlsserver" "$BIN/ngtcp2-server"
