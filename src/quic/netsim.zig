@@ -600,6 +600,7 @@ pub const NetSim = struct {
         server: *Connection(16),
         io: std.Io,
     ) !void {
+        const start_ns = self.now_ns;
         var ticks: usize = 0;
         while (ticks < 1000) : (ticks += 1) {
             // Always drain both send queues first — callers may have enqueued data
@@ -611,7 +612,10 @@ pub const NetSim = struct {
             const ct = client.nextTimeout();
             const st = server.nextTimeout();
             const next_time = minOptional(net_time, minOptional(ct, st)) orelse break;
-            if (next_time > self.now_ns + 5_000_000_000) break; // 5s limit
+            // Break if the next event is more than 5s of sim time from when we started.
+            // This prevents idle-timeout cascades from PTO probe cycles that keep resetting
+            // the peer's idle timer — connections remain established for the caller.
+            if (next_time > start_ns + 5_000_000_000) break;
             self.advanceTo(next_time);
 
             if (ct) |t| {

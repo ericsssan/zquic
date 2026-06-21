@@ -2751,6 +2751,12 @@ pub fn Connection(comptime max_streams: usize) type {
             // Scale send buffers for future streams to BDP now that RTT is known.
             self.streams.buf_cap = self.sendBufCap();
 
+            // Schedule first PMTUD probe 10s after handshake completes (RFC 9000 §14).
+            // Initializing to 0 would cause probing on the very first tick(), driving
+            // simulation loops (runPairIdle) through hundreds of PTO cycles and into
+            // the idle timeout.
+            self.pmtud_next_probe_ns = self.current_time_ns + 10_000_000_000;
+
             // Server sends HANDSHAKE_DONE; client does not.
             if (self.config.is_server) {
                 try self.queueHandshakeDone(false);
