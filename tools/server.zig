@@ -68,6 +68,10 @@ var g_is_h3: bool = false;
 /// in full on each update so createFileAbsolute truncation doesn't lose data.
 var g_keylog_buf: [65536]u8 = undefined;
 var g_keylog_len: usize = 0;
+/// Path for SSLKEYLOGFILE output.  When SSLKEYLOGFILE env var is set, use that
+/// path; otherwise fall back to /logs/keys.log (Docker interop runner convention).
+var g_keylog_path_buf: [512]u8 = undefined;
+var g_keylog_path: []const u8 = "/logs/keys.log";
 
 // IPv4/IPv6 addresses for preferred_address in connectionmigration test.
 // Defaults are the Docker interop runner addresses; override with CM_ADDR4 / CM_PORT env vars
@@ -302,6 +306,11 @@ pub fn main(init: std.process.Init) !void {
     const cert_chain_len = pem.pemToCertChain(cert_pem_buf[0..cert_pem_len], &cert_chain_buf) catch 0;
 
     g_is_h3 = std.mem.eql(u8, testcase, "http3");
+    if (init.environ_map.get("SSLKEYLOGFILE")) |kl_path| {
+        const n = @min(kl_path.len, g_keylog_path_buf.len);
+        @memcpy(g_keylog_path_buf[0..n], kl_path[0..n]);
+        g_keylog_path = g_keylog_path_buf[0..n];
+    }
     // CM socket active when explicitly requested via env vars (allows TESTCASE=http3
     // with ngtcp2 to also get the CM socket) or via the dedicated testcase name.
     const is_cm = std.mem.eql(u8, testcase, "connectionmigration") or
@@ -1259,7 +1268,7 @@ fn appendKeyLog(io: std.Io, data: []const u8) void {
     if (n == 0) return;
     @memcpy(g_keylog_buf[g_keylog_len..][0..n], data[0..n]);
     g_keylog_len += n;
-    const file = std.Io.Dir.createFileAbsolute(io, "/logs/keys.log", .{}) catch return;
+    const file = std.Io.Dir.createFileAbsolute(io, g_keylog_path, .{}) catch return;
     defer file.close(io);
     file.writePositionalAll(io, g_keylog_buf[0..g_keylog_len], 0) catch return;
     file.sync(io) catch {};

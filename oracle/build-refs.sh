@@ -42,6 +42,14 @@ else
   echo "==> quic-go oracle present (skip)"
 fi
 
+# ---- kpcheck (pure go stdlib — no external deps) ----------------------------
+if [ ! -x "$BIN/kpcheck" ]; then
+  echo "==> building kpcheck (KP bit wire-proof tool, #40)"
+  ( cd "$ORACLE/refs/kpcheck" && go build -o "$BIN/kpcheck" . )
+else
+  echo "==> kpcheck present (skip)"
+fi
+
 # ---- ngtcp2 (optional: HTTP/3 oracle; local source + cmake) --------------------
 # Two build paths — same source, different TLS backends:
 #   macOS: OpenSSL 3 QUIC API via brew (osslclient / osslserver)

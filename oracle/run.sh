@@ -42,6 +42,7 @@ ZQUIC_SERVER="$ROOT/zig-out/bin/server"
 ZQUIC_CLIENT="$ROOT/zig-out/bin/client"
 CERTS="$ORACLE/certs"; WWW="$ORACLE/www"; BIN="$ORACLE/.cache/bin"; TMP="$ORACLE/.cache/run"
 PROXY="$BIN/proxy"
+KPCHECK="$BIN/kpcheck"
 PORT_BASE=59200  # RFC 6335 dynamic/private range; avoids IANA-registered 4500 (ipsec-msft)
 CLIENT_TIMEOUT=25   # seconds; loopback handshake+1MB is <1s, so this only catches hangs
 
@@ -302,6 +303,43 @@ proxied() {
     return
   fi
   ok "$tag${want:+ ✓}"
+}
+
+# kp_case: Key Phase bit wire-proof (#40).
+# Runs keyupdate through the capturing proxy (which dumps SHORT packet bytes via
+# -shorts), then kpcheck removes header protection using the server's SSLKEYLOGFILE
+# and asserts the Key Phase bit actually flipped on wire — not just in server logs.
+# Only runs against quicgo (the only impl that initiates key updates in the oracle).
+kp_case() { # <impl> <sport> <pport>
+  local impl=$1 sport=$2 pport=$3
+  local d="$TMP/$impl/keyupdate_kp" paths="${CASE_PATHS[keyupdate]}"
+  local tag="keyupdate [zquic-server <-> $impl-client | kp-wire-proof]"
+  local keylogf="$d/keys.log" shortsf="$d/shorts.txt" capf="$d/capture.txt"
+  rm -rf "$d"; mkdir -p "$d/wire"
+  TESTCASE=keyupdate CERTS="$CERTS" WWW="$WWW" PORT="$sport" SSLKEYLOGFILE="$keylogf" \
+    "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" \
+    -capture "$capf" -shorts "$shortsf" >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
+  wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
+  local reqs=(); for p in $paths; do reqs+=("https://127.0.0.1:$pport$p"); done
+  to "$CLIENT_TIMEOUT" "$BIN/quicgo" client -ca "$CERTS/cert.pem" "$d/wire" "${reqs[@]}" \
+    >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp" "$px"
+  [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; return; }
+  [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if ! m="$(assert_match "$d/wire" $paths)"; then bad "$tag (transfer: $m)"; return; fi
+  if [ ! -x "$KPCHECK" ]; then
+    ok "$tag (kpcheck not built — log-only fallback; run oracle/build-refs.sh)"
+    return
+  fi
+  if "$KPCHECK" -keylog "$keylogf" -shorts "$shortsf" >"$d/kpcheck.log" 2>&1; then
+    ok "$tag ✓"
+  else
+    bad "$tag — KP bit did not flip on wire: $(cat "$d/kpcheck.log")"
+  fi
 }
 
 # versionnegotiation (server property, not per-impl): a client offering an unknown
@@ -748,6 +786,23 @@ self_test() {
   if wire_has "s2c VERSION_NEGOTIATION" "$capf"; then bad "meta: VN seen in a v1 handshake (false-pass risk)"; else ok "meta: VN wire-check fails on a v1 capture (falsification)"; fi
   if wire_has "c2s 0RTT" "$capf"; then bad "meta: 0RTT seen in a plain transfer (false-pass risk)"; else ok "meta: zerortt wire-check fails on a plain transfer (falsification)"; fi
   if grep -q "\[KPHS\]" "$d/zsrv.log"; then bad "meta: [KPHS] seen in a plain transfer (keyupdate wire-check false-pass risk)"; else ok "meta: keyupdate log-check fails on plain transfer (falsification)"; fi
+
+  # (d) kpcheck falsification (#40): uniform KP bits (no key update) must be rejected.
+  # Two identical all-zero SHORT packets → same HP mask → same KP bit → no flip detected.
+  if [ -x "$KPCHECK" ]; then
+    local zeros64; zeros64=$(printf '%064d' 0 | tr '0' '0') # 64 zero hex chars (32-byte secret)
+    local zeros100; zeros100=$(printf '%0100d' 0 | tr '0' '0') # 100 zero hex chars (50-byte packet)
+    local fake_kl="$d/fake.keys" fake_sh="$d/fake.shorts"
+    printf 'CLIENT_TRAFFIC_SECRET_0 %s %s\nSERVER_TRAFFIC_SECRET_0 %s %s\n' \
+      "$zeros64" "$zeros64" "$zeros64" "$zeros64" >"$fake_kl"
+    printf 'c2s-dcid-len 8\ns2c-dcid-len 8\ns2c %s\ns2c %s\n' \
+      "$zeros100" "$zeros100" >"$fake_sh"
+    if "$KPCHECK" -keylog "$fake_kl" -shorts "$fake_sh" >/dev/null 2>&1; then
+      bad "meta: kpcheck PASSED on uniform KP bits (false-pass risk — #40)"
+    else
+      ok "meta: kpcheck fails when KP bit never flips (falsification ✓)"
+    fi
+  fi
 }
 
 CASES=(); REQUIRE=(); REPEAT=1; SELFTEST=0
@@ -860,6 +915,10 @@ for impl in "${IMPLS[@]}"; do
     mkdir -p "$TMP/$impl/$case"
     proxied "$impl" "$case" "$port" "$((port + 1))"; port=$((port + 2))
   done
+  # Key Phase bit wire-proof (#40): runs only with quicgo (initiates key updates).
+  if [ "$impl" = quicgo ] && { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "keyupdate"; }; then
+    kp_case quicgo "$port" "$((port + 1))"; port=$((port + 2))
+  fi
 done
 
 # Server-property and standalone behavioral cases. Run on a full run or when named

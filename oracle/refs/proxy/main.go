@@ -31,6 +31,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"math/rand"
@@ -133,6 +134,7 @@ func main() {
 	delayms := flag.Int("delayms", 0, "one-way delay in ms")
 	seed := flag.Int64("seed", 42, "PRNG seed for a reproducible loss sequence")
 	ecnFlag := flag.Bool("ecn", false, "read IP ECN bits from s2c packets via IP_RECVTOS CMSG (Linux only) and append counts to capture file (#41)")
+	shortsFlag := flag.String("shorts", "", "file path for SHORT packet hex dump used by kpcheck for KP bit wire-proof (#40)")
 	flag.Parse()
 	if *listen == "" || *target == "" {
 		fmt.Fprintln(os.Stderr, "proxy: -listen and -target required")
@@ -153,20 +155,77 @@ func main() {
 		// Closed explicitly after wg.Wait() below — not via defer — so the
 		// s2c goroutine cannot write to a closed file (#28).
 	}
+	var shortsFile *os.File
+	if *shortsFlag != "" {
+		shortsFile, err = os.Create(*shortsFlag)
+		must(err)
+	}
+	// DCID lengths for SHORT packets, derived from first INITIAL packets (#40).
+	// c2sDCIDLen = server SCID len (from first s2c INITIAL) = DCID in c2s SHORT packets.
+	// s2cDCIDLen = client SCID len (from first c2s INITIAL) = DCID in s2c SHORT packets.
+	var (
+		c2sDCIDLen       = -1
+		s2cDCIDLen       = -1
+		shortsHdrWritten = false
+	)
 	var capMu sync.Mutex // serialises concurrent c2s (main) + s2c (goroutine) writes
 	record := func(dir string, b []byte) {
-		if capFile == nil {
+		if capFile == nil && shortsFile == nil {
 			return
 		}
-		// One DGRAM line per datagram for byte-count checks (amplificationlimit).
-		// Followed by one CLASS line per QUIC packet found in the datagram.
-		// write(2) is immediately visible to readers; no fsync needed.
 		capMu.Lock()
-		fmt.Fprintf(capFile, "%s DGRAM %d\n", dir, len(b))
-		for _, c := range classifyAll(b) {
-			fmt.Fprintf(capFile, "%s %s %d\n", dir, c.label, c.length)
+		defer capMu.Unlock()
+		if capFile != nil {
+			// One DGRAM line per datagram for byte-count checks (amplificationlimit).
+			// Followed by one CLASS line per QUIC packet found in the datagram.
+			// write(2) is immediately visible to readers; no fsync needed.
+			fmt.Fprintf(capFile, "%s DGRAM %d\n", dir, len(b))
+			for _, c := range classifyAll(b) {
+				fmt.Fprintf(capFile, "%s %s %d\n", dir, c.label, c.length)
+			}
 		}
-		capMu.Unlock()
+		if shortsFile != nil {
+			// Walk datagram: extract SCID lengths from first INITIAL packets and
+			// dump SHORT packet bytes for KP bit wire-proof (#40).
+			offset := 0
+			for _, c := range classifyAll(b) {
+				end := offset + c.length
+				if end > len(b) {
+					break
+				}
+				pkt := b[offset:end]
+				switch c.label {
+				case "INITIAL":
+					// Long-header INITIAL: byte 5 = DCID length, byte 6+dcidLen = SCID length.
+					if len(pkt) >= 7 {
+						dcidLen := int(pkt[5])
+						scidOff := 6 + dcidLen
+						if scidOff < len(pkt) {
+							scidLen := int(pkt[scidOff])
+							// client→server INITIAL: client SCID = DCID of s2c SHORT packets.
+							if dir == "c2s" && s2cDCIDLen < 0 {
+								s2cDCIDLen = scidLen
+							}
+							// server→client INITIAL: server SCID = DCID of c2s SHORT packets.
+							if dir == "s2c" && c2sDCIDLen < 0 {
+								c2sDCIDLen = scidLen
+							}
+						}
+					}
+				case "SHORT":
+					// Write header once both DCID lengths are known, then dump SHORT bytes.
+					if !shortsHdrWritten && c2sDCIDLen >= 0 && s2cDCIDLen >= 0 {
+						fmt.Fprintf(shortsFile, "c2s-dcid-len %d\n", c2sDCIDLen)
+						fmt.Fprintf(shortsFile, "s2c-dcid-len %d\n", s2cDCIDLen)
+						shortsHdrWritten = true
+					}
+					if shortsHdrWritten {
+						fmt.Fprintf(shortsFile, "%s %s\n", dir, hex.EncodeToString(pkt))
+					}
+				}
+				offset = end
+			}
+		}
 	}
 	// maybecorrupt returns a bit-flipped copy at the configured rate (using the
 	// same per-direction RNG as drop, after the drop decision). Skips byte 0
@@ -284,6 +343,9 @@ func main() {
 	wg.Wait()
 	if capFile != nil {
 		capFile.Close()
+	}
+	if shortsFile != nil {
+		shortsFile.Close()
 	}
 }
 
