@@ -270,7 +270,12 @@ dp_zquic_client() { # ref server <-> zquic client (no cert verify — zquic clie
   [ "$case" = keyupdate ] && ! grep -q "\[KPHS\]" "$d/zcli.log" && kphs_chk=0
   if m="$(assert_match "$out" $paths)"; then
     if [ "$kphs_chk" -eq 0 ]; then bad "$case [$impl-server <-> zquic-client] (no key phase rotation in client log)"; else ok "$case [$impl-server <-> zquic-client | cert-verified]"; fi
-  else bad "$case [$impl-server <-> zquic-client] ($m)"; fi
+  else
+    bad "$case [$impl-server <-> zquic-client] ($m)"
+    if [ "$case" = keyupdate ]; then
+      echo "=== keyupdate debug ===" ; echo "--- zcli.log ---"; cat "$d/zcli.log" 2>/dev/null; echo "--- rsrv.log (last 10) ---"; tail -10 "$d/rsrv.log" 2>/dev/null
+    fi
+  fi
 }
 # proxied: zquic server <-> [proxy: capture (+optional impairment)] <-> ref client.
 # Always asserts hash. If WIRE_REQUIRE[case] is set, also asserts the mechanism
@@ -668,6 +673,11 @@ statelessreset_client_case() { # <sport> <pport>
     ok "statelessreset-client [quicgo-server restart → zquic-client detects [SRST]]"
   else
     bad "statelessreset-client (no [SRST] in client log — stateless reset not detected)"
+    echo "=== statelessreset-client debug ==="
+    echo "--- zcli.log ---"; cat "$d/zcli.log" 2>/dev/null
+    echo "--- proxy.log ---"; cat "$d/proxy.log" 2>/dev/null
+    echo "--- qgsrv1.log (last 5) ---"; tail -5 "$d/qgsrv1.log" 2>/dev/null
+    echo "--- qgsrv2.log (last 5) ---"; tail -5 "$d/qgsrv2.log" 2>/dev/null
   fi
 }
 
