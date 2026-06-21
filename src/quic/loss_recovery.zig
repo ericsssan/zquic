@@ -20,7 +20,10 @@ pub const K_GRANULARITY_NS: u64 = 1_000_000; // 1ms minimum timer granularity
 pub const K_INITIAL_RTT_NS: u64 = 10_000_000; // 10ms — balanced conservative estimate
 pub const MAX_SENT: usize = build_options.max_sent; // Ring buffer capacity (power of 2)
 comptime {
-    std.debug.assert(MAX_SENT >= 4 and (MAX_SENT & (MAX_SENT - 1)) == 0);
+    if (MAX_SENT < 4 or (MAX_SENT & (MAX_SENT - 1)) != 0)
+        @compileError("max_sent must be a power of 2 >= 4");
+    if (MAX_SENT / 2 > std.math.maxInt(u32))
+        @compileError("max_sent too large: EPOCH_SIZES[2] would overflow u32 valid_per_epoch counter");
 }
 pub const MAX_FRAMES_PER_PACKET: usize = 4;
 // Per-ACK capacity for lost frame tracking.
@@ -198,7 +201,7 @@ pub const SentPacketTable = struct {
     /// Count of valid (occupied) slots per epoch [Initial, Handshake, 1-RTT].
     /// Enables early exit in detectLoss() and lastAckElicitingNs() once all
     /// valid entries for an epoch have been visited.
-    valid_per_epoch: [3]u16,
+    valid_per_epoch: [3]u32,
 
     pub fn init() SentPacketTable {
         var t: SentPacketTable = undefined;
@@ -214,7 +217,7 @@ pub const SentPacketTable = struct {
     /// Partitions the table into 3 regions (one per epoch) to prevent
     /// cross-epoch collisions: Handshake pkn N and 1-RTT pkn N must never
     /// share an index, otherwise one evicts the other and loss recovery breaks.
-    /// Each epoch gets MAX_SENT/4 = 64 slots (epoch 2 gets 128 for 1-RTT bulk).
+    /// Epoch 0/1 each get MAX_SENT/4 slots; epoch 2 gets MAX_SENT/2 slots (1-RTT bulk).
     pub const EPOCH_REGION_SIZE: usize = MAX_SENT / 4; // slots per Initial/Handshake epoch
     pub const EPOCH_OFFSETS = [3]usize{ 0, EPOCH_REGION_SIZE, EPOCH_REGION_SIZE * 2 };
     pub const EPOCH_SIZES = [3]usize{ EPOCH_REGION_SIZE, EPOCH_REGION_SIZE, EPOCH_REGION_SIZE * 2 };
@@ -355,8 +358,8 @@ pub const SentPacketTable = struct {
     ) void {
         // Snapshot the count before the loop; we decrement valid_per_epoch as packets
         // are declared lost, but to_find must not change so the early-exit stays correct.
-        const to_find: u16 = if (epoch < 3) self.valid_per_epoch[epoch] else 0;
-        var found: u16 = 0;
+        const to_find: u32 = if (epoch < 3) self.valid_per_epoch[epoch] else 0;
+        var found: u32 = 0;
         for (&self.slots, 0..) |*slot, idx| {
             if (found >= to_find) break; // early exit: all valid slots for this epoch visited
             if (!slot.valid or slot.epoch != epoch) continue; // per packet number space
@@ -409,9 +412,9 @@ pub const SentPacketTable = struct {
         time_threshold_ns: u64,
         epoch: u8,
     ) ?i64 {
-        const to_find: u16 = if (epoch < 3) self.valid_per_epoch[epoch] else 0;
+        const to_find: u32 = if (epoch < 3) self.valid_per_epoch[epoch] else 0;
         if (to_find == 0) return null;
-        var found: u16 = 0;
+        var found: u32 = 0;
         var earliest: ?i64 = null;
         const tns_capped: i64 = @intCast(@min(time_threshold_ns, @as(u64, std.math.maxInt(i64))));
         for (self.slots) |slot| {

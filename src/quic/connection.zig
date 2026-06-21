@@ -147,7 +147,10 @@ pub const MAX_PACKET_SIZE = 1500; // Maximum received packet size (standard MTU)
 pub const MAX_SEND_PACKET_SIZE = 1452; // Maximum packet size for sending (UDP datagram limit)
 pub const SEND_QUEUE_DEPTH: usize = build_options.send_queue_depth;
 comptime {
-    std.debug.assert(SEND_QUEUE_DEPTH >= 1 and (SEND_QUEUE_DEPTH & (SEND_QUEUE_DEPTH - 1)) == 0);
+    if (SEND_QUEUE_DEPTH < 1 or (SEND_QUEUE_DEPTH & (SEND_QUEUE_DEPTH - 1)) != 0)
+        @compileError("send_queue_depth must be a power of 2 >= 1");
+    if (SEND_QUEUE_DEPTH * 8 < loss_recovery_mod.MAX_SENT)
+        @compileError("send_queue_depth is too small relative to max_sent; burst retransmits will stall. Set -Dsend_queue_depth >= max_sent/8.");
 }
 
 /// Maximum number of out-of-order CRYPTO fragments buffered per epoch.
@@ -156,7 +159,12 @@ const CRYPTO_STAGE_DEPTH = 16;
 pub const CRYPTO_STAGE_FRAG = 1400;
 /// Maximum number of pending stream retransmits when send queue is full.
 /// 128 covers realistic worst-case burst losses (one stream frame per in-flight packet).
+/// Counters are u8 — changing this above 255 requires updating counter types too.
 const MAX_PENDING_RETX = 128;
+comptime {
+    if (MAX_PENDING_RETX > std.math.maxInt(u8))
+        @compileError("MAX_PENDING_RETX exceeds u8 range; update stream_pending_retx_count and crypto_pending_retx_count to u16");
+}
 
 /// A single buffered out-of-order CRYPTO fragment.
 const CryptoStagedFrag = struct {
