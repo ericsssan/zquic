@@ -607,55 +607,62 @@ statelessreset_case() { # <impl> <port>
 # a quicgo server that restarted with the same RESET_KEY (#42).
 # Flow:
 #   1. Start quicgo server with RESET_KEY=K (deterministic tokens via HMAC-SHA256).
-#   2. Start zquic client requesting /big.bin (keeps it alive during transfer).
+#   2. Route client through proxy with -delayms 20 (40ms RTT cap) so the 2GB sparse
+#      file download outlasts the sleep 1 even on the fastest CI loopback.
 #   3. Allow time for handshake to complete (quicgo sends NEW_CONNECTION_ID + tokens).
 #   4. Kill quicgo and immediately restart with same RESET_KEY at same port.
-#   5. Client sends a SHORT packet; new server doesn't know the conn → stateless reset.
+#   5. Proxy continues forwarding; new server doesn't know the conn → stateless reset.
 #   6. Reset token = HMAC(K, client_dcid)[:16] matches zquic's peer_cid_table entry.
 #   7. Client logs [SRST] stateless reset received.
-statelessreset_client_case() { # <port>
-  local port=$1
+statelessreset_client_case() { # <sport> <pport>
+  local sport=$1 pport=$2
   local d="$TMP/client/statelessreset_cli"
   local key="deadbeefcafebabedeadbeefcafebabe0102030405060708090a0b0c0d0e0f10"
   rm -rf "$d/out"; mkdir -p "$d/out"
 
-  # Create a temporary www dir with a 2GB sparse file. On loopback QUIC can reach
-  # ~50 MB/s so a 1 MB file completes in <100ms. A sparse 2 GB file takes minutes
-  # to download, ensuring the client is still mid-transfer when we kill server 1.
-  # truncate -s creates a sparse file instantly (no disk writes needed).
+  # Create a temporary www dir with a 2GB sparse file. truncate -s is instant.
   local tw="$d/tmpwww"; mkdir -p "$tw"
   truncate -s 2g "$tw/big.bin" 2>/dev/null || \
     dd if=/dev/zero of="$tw/big.bin" bs=1M count=2048 2>/dev/null
 
-  # Phase 1: start quicgo server with RESET_KEY + zquic client (big.bin, stays alive)
-  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
+  # Phase 1: quicgo server → proxy (20ms delay) → zquic client.
+  # The 20ms one-way delay caps QUIC throughput to window/40ms; even a 16 MB receive
+  # window gives only ~400 MB/s, so 2 GB takes >=5s — well past the sleep 1 below.
+  # Without the proxy, fast CI loopbacks can complete the 2 GB transfer in <1s and
+  # the client exits before the server is killed, making the test flaky.
+  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
     >"$d/qgsrv1.log" 2>&1 & local sp1=$!
   _HARNESS_PIDS+=("$sp1")
-  wait_listen "$sp1" "$port" || { bad "statelessreset-client (phase 1: no quicgo bind)"; stop "$sp1"; return; }
+  wait_listen "$sp1" "$sport" || { bad "statelessreset-client (phase 1: no quicgo bind)"; stop "$sp1"; return; }
 
-  # Start client in background; 2GB big.bin takes several seconds → still alive mid-transfer.
+  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -delayms 20 -tolerant-back \
+    >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
+  wait_listen "$px" "$pport" || { bad "statelessreset-client (no proxy bind)"; stop "$sp1" "$px"; return; }
+
   to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=transfer \
-    REQUESTS="https://127.0.0.1:$port/big.bin" DOWNLOADS="$d/out" \
+    REQUESTS="https://127.0.0.1:$pport/big.bin" DOWNLOADS="$d/out" \
     "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1 & local cp=$!
   _HARNESS_PIDS+=("$cp")
 
   # Allow handshake to complete so quicgo sends NEW_CONNECTION_ID with reset tokens.
-  # Use 1s: on loopback the handshake takes <5ms, so this is comfortably past it.
   sleep 1
   # Kill the original quicgo (state loss simulated). Use SIGKILL so quicgo exits
   # immediately without sending a CONNECTION_CLOSE — a graceful close would cause the
   # zquic client to exit cleanly instead of waiting for a stateless reset.
   kill -9 "$sp1" 2>/dev/null; wait "$sp1" 2>/dev/null || true
 
-  # Phase 2: restart quicgo with same RESET_KEY at same port.
-  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$port" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
+  # Phase 2: restart quicgo with same RESET_KEY at same port. The proxy continues
+  # forwarding client packets; the new server doesn't know the connection and sends
+  # a stateless reset back through the proxy to the client.
+  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
     >"$d/qgsrv2.log" 2>&1 & local sp2=$!
   _HARNESS_PIDS+=("$sp2")
-  wait_listen "$sp2" "$port" || { stop "$cp"; bad "statelessreset-client (phase 2: no quicgo bind)"; stop "$sp2"; return; }
+  wait_listen "$sp2" "$sport" || { stop "$cp" "$px"; bad "statelessreset-client (phase 2: no quicgo bind)"; stop "$sp2"; return; }
 
   # Wait for the client to receive the stateless reset and exit (or time out).
   wait "$cp" 2>/dev/null || true
-  stop "$sp2"
+  stop "$sp2" "$px"
 
   if grep -q '\[SRST\] stateless reset received' "$d/zcli.log" 2>/dev/null; then
     ok "statelessreset-client [quicgo-server restart → zquic-client detects [SRST]]"
@@ -1015,7 +1022,7 @@ if [ "$_any_svr" -eq 1 ]; then
   # Requires zquic client binary and quicgo (which supports StatelessResetKey).
   if _want_svr statelessresetclient; then
     [ -x "$ZQUIC_CLIENT" ] || bad "statelessreset-client: $ZQUIC_CLIENT missing — run: zig build"
-    impl_ok quicgo && { statelessreset_client_case "$port"; port=$((port + 1)); }
+    impl_ok quicgo && { statelessreset_client_case "$port" "$((port + 1))"; port=$((port + 2)); }
   fi
 fi
 

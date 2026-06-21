@@ -135,6 +135,7 @@ func main() {
 	seed := flag.Int64("seed", 42, "PRNG seed for a reproducible loss sequence")
 	ecnFlag := flag.Bool("ecn", false, "read IP ECN bits from s2c packets via IP_RECVTOS CMSG (Linux only) and append counts to capture file (#41)")
 	shortsFlag := flag.String("shorts", "", "file path for SHORT packet hex dump used by kpcheck for KP bit wire-proof (#40)")
+	tolerantBack := flag.Bool("tolerant-back", false, "retry s2c Read after errors instead of exiting (for tests where the server restarts mid-connection)")
 	flag.Parse()
 	if *listen == "" || *target == "" {
 		fmt.Fprintln(os.Stderr, "proxy: -listen and -target required")
@@ -312,6 +313,10 @@ func main() {
 				n, err = back.Read(buf)
 			}
 			if err != nil {
+				if *tolerantBack {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
 				return
 			}
 			pkt := append([]byte(nil), buf[:n]...)
