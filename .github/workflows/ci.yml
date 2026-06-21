@@ -132,7 +132,7 @@ jobs:
           sudo ldconfig
 
       - name: Clone ngtcp2 (pinned)
-        run: git clone --depth 1 --branch "$NGTCP2_REF" https://github.com/ngtcp2/ngtcp2.git "$NGTCP2_DIR"
+        run: git clone --depth 1 --branch "$NGTCP2_REF" --recurse-submodules https://github.com/ngtcp2/ngtcp2.git "$NGTCP2_DIR"
 
       - name: Cache ngtcp2 build
         uses: actions/cache@v4

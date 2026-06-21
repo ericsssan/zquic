@@ -84,6 +84,7 @@ elif [ -d "$NGTCP2_SRC" ] && command -v cmake >/dev/null 2>&1 && [ "$(uname -s)"
   echo "==> building ngtcp2 (HTTP/3 oracle, Linux/GnuTLS) — this is slow the first time"
   _cmake_log=$(mktemp)
   if ( cd "$NGTCP2_SRC" \
+       && git submodule update --init --depth 1 >/dev/null 2>&1 \
        && cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_GNUTLS=ON -DENABLE_OPENSSL=OFF -DENABLE_EXAMPLES=ON >"$_cmake_log" 2>&1 \
        && cmake --build build -j"$(nproc)" --target gtlsclient gtlsserver >>"$_cmake_log" 2>&1 ); then
