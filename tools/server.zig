@@ -7,6 +7,7 @@
 //! so that the 4096-byte stream send buffer never overflows.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const quic = @import("zquic");
 const pem = @import("pem.zig");
 const http3 = @import("http3");
@@ -25,6 +26,18 @@ const MAX_TRANSFERS = 64;
 
 // Maximum concurrent connections.
 const MAX_CONNS = 50;
+
+// Linux UDP GSO (Generic Segmentation Offload): pack up to GSO_MAX_SEGS same-size
+// QUIC packets into one compound datagram per sendmsg call.  The kernel/NIC
+// segments the compound buffer, eliminating per-packet stack overhead.
+// SOL_UDP=17, UDP_SEGMENT=103 (linux/udp.h).  Requires Linux 4.18+.
+const SOL_UDP: u32 = 17;
+const UDP_SEGMENT: u32 = 103;
+// 44 × 1452 = 63,888 bytes — just under the 64 KB kernel GSO limit.
+const GSO_MAX_SEGS: usize = 44;
+
+// Set to true at startup when UDP_SEGMENT is available; read by drainSend.
+var g_gso_supported: bool = false;
 
 // Connection type: parameterized for 64 concurrent streams (= MAX_TRANSFERS).
 const Conn = quic.Connection(64);
@@ -386,8 +399,23 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("zquic interop server: testcase={s} port={d}\n", .{ testcase, port });
 
-    // Heap-allocated send buffer pool: 32 × 1452 = ~46KB.
-    // Separate buffer per outgoing packet enables sendmmsg batch send.
+    // Probe for UDP_SEGMENT (GSO) support on Linux 4.18+.
+    // Sets g_gso_supported; drainSend dispatches to drainSendGso when true.
+    if (comptime builtin.os.tag == .linux) {
+        const probe: u16 = 1;
+        const rc = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
+            std.mem.asBytes(&probe).ptr, @sizeOf(u16));
+        if (rc == 0) {
+            g_gso_supported = true;
+            // Disable the socket-level default; flushGso uses per-send setsockopt.
+            const zero: u16 = 0;
+            _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
+                std.mem.asBytes(&zero).ptr, @sizeOf(u16));
+            std.debug.print("[GSO] UDP_SEGMENT enabled (up to {} datagrams/send)\n", .{GSO_MAX_SEGS});
+        }
+    }
+
+    // Send buffer pool: plain path = 32 × 1452 B; GSO path adds 44 × 1452 B compound.
     var send_bufs_storage: SendBufs = undefined;
     const send_bufs: *SendBufs = &send_bufs_storage;
 
@@ -1167,6 +1195,12 @@ fn configureEcn(sock: *const net.Socket) !void {
 /// On Linux, sendMany uses sendmmsg (1 syscall for N packets).
 /// On macOS, sendMany loops sendto (N syscalls — no batch syscall available).
 fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs) void {
+    if (comptime builtin.os.tag == .linux) {
+        if (g_gso_supported) {
+            drainSendGso(conn, sock, io, dest, bufs);
+            return;
+        }
+    }
     var messages: [SEND_BATCH]net.OutgoingMessage = undefined;
     var count: usize = 0;
     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
@@ -1189,12 +1223,64 @@ fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.
     sock.sendMany(io, messages[0..count], .{}) catch {};
 }
 
+// Pack MAX_DATAGRAM-sized packets into a single compound buffer and flush with
+// UDP_SEGMENT so the kernel/NIC segments them.  Partial packets (ACKs, handshake
+// packets shorter than MAX_DATAGRAM) fall through to plain sendMany individually.
+fn drainSendGso(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs) void {
+    const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+    var n_full: usize = 0;
+    while (n_full < GSO_MAX_SEGS) {
+        const n = conn.send(bufs.gso[n_full * MAX_DATAGRAM ..][0..MAX_DATAGRAM], now_ns);
+        if (n == 0) break;
+        if (n == MAX_DATAGRAM) {
+            n_full += 1;
+        } else {
+            // Partial packet: flush any accumulated full segments first, then send
+            // this short packet individually (can't mix segment sizes in one GSO send).
+            if (n_full > 0) flushGso(sock, io, dest, bufs, n_full);
+            @memcpy(bufs.bufs[0][0..n], bufs.gso[n_full * MAX_DATAGRAM ..][0..n]);
+            var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = &bufs.bufs[0], .data_len = n }};
+            sock.sendMany(io, &msg, .{}) catch {};
+            n_full = 0;
+        }
+    }
+    if (n_full > 0) flushGso(sock, io, dest, bufs, n_full);
+}
+
+fn flushGso(sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs, n_segs: usize) void {
+    if (n_segs == 0) return;
+    if (n_segs == 1) {
+        // Single segment: no GSO overhead needed.
+        var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = @ptrCast(&bufs.gso), .data_len = MAX_DATAGRAM }};
+        sock.sendMany(io, &msg, .{}) catch {};
+        return;
+    }
+    const seg_size: u16 = MAX_DATAGRAM;
+    _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
+        std.mem.asBytes(&seg_size).ptr, @sizeOf(u16));
+    var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = @ptrCast(&bufs.gso), .data_len = n_segs * MAX_DATAGRAM }};
+    sock.sendMany(io, &msg, .{}) catch {};
+    // Restore to 0 so ordinary sendMany calls after this are unaffected.
+    const zero: u16 = 0;
+    _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT,
+        std.mem.asBytes(&zero).ptr, @sizeOf(u16));
+}
+
 const SEND_BATCH = 32;
 
-/// Per-connection send buffer pool: separate buffer per outgoing packet
-/// so sendMany can reference them all simultaneously.
+/// Per-connection send buffer pool.
+///
+/// `bufs`  — SEND_BATCH separate per-packet buffers for the plain sendmmsg path
+///            (used on macOS and as a fallback on Linux when GSO is unavailable).
+///
+/// `gso`   — Flat compound buffer for the Linux GSO path.  drainSendGso packs
+///            consecutive MAX_DATAGRAM-size packets end-to-end here, then sends
+///            the whole run with one sendmsg + UDP_SEGMENT cmsg (Linux 4.18+).
+///            Non-MAX_DATAGRAM packets (ACKs, handshake) are copied to bufs[0]
+///            and sent via a plain sendMany call.
 const SendBufs = struct {
     bufs: [SEND_BATCH][MAX_DATAGRAM]u8,
+    gso: [GSO_MAX_SEGS * MAX_DATAGRAM]u8,
 };
 
 fn computeTimeout(deadline: ?i64) std.Io.Timeout {
