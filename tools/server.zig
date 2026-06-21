@@ -432,11 +432,31 @@ pub fn main(init: std.process.Init) !void {
     // Separate buffers per packet are required because in-place decrypt modifies
     // the buffer. With SIMD multi-buffer decrypt, same-connection packets in the
     // batch share the pre-expanded AES key schedule (CachedKeyCtx).
-    const BATCH_SIZE = 16;
     var batch_bufs: [BATCH_SIZE][MAX_DATAGRAM]u8 = undefined;
     var batch_lens: [BATCH_SIZE]u16 = undefined;
     var batch_froms: [BATCH_SIZE]net.IpAddress = undefined;
     var batch_is_cm: [BATCH_SIZE]bool = undefined;
+
+    // Pre-allocated recvmmsg state (Linux Phase 2 batch drain).
+    // iov.base pointers point directly into batch_bufs[] for the lifetime of this frame.
+    var recv_batch: RecvBatch = undefined;
+    if (comptime builtin.os.tag == .linux) {
+        for (0..BATCH_SIZE) |i| {
+            recv_batch.iovs[i] = .{ .base = @ptrCast(&batch_bufs[i]), .len = MAX_DATAGRAM };
+            recv_batch.msgs[i] = .{
+                .hdr = .{
+                    .name = @ptrCast(&recv_batch.addrs[i]),
+                    .namelen = @sizeOf(std.os.linux.sockaddr.storage),
+                    .iov = @ptrCast(&recv_batch.iovs[i]),
+                    .iovlen = 1,
+                    .control = null,
+                    .controllen = 0,
+                    .flags = 0,
+                },
+                .len = 0,
+            };
+        }
+    }
 
     // Multiplexed event loop: collect batch → process → tick/send.
     while (true) {
@@ -463,13 +483,35 @@ pub fn main(init: std.process.Init) !void {
 
         // Phase 2: Drain remaining packets into batch (non-blocking).
         if (batch_count > 0) {
-            while (batch_count < BATCH_SIZE) {
-                if (sock.receiveTimeout(io, &batch_bufs[batch_count], nonblocking)) |msg| {
-                    batch_lens[batch_count] = @intCast(msg.data.len);
-                    batch_froms[batch_count] = msg.from;
-                    batch_is_cm[batch_count] = false;
-                    batch_count += 1;
-                } else |_| break;
+            if (comptime builtin.os.tag == .linux) {
+                // Restore namelen fields kernel may have shrunk in the previous tick.
+                for (1..BATCH_SIZE) |i| recv_batch.msgs[i].hdr.namelen = @sizeOf(std.os.linux.sockaddr.storage);
+                const rc = std.os.linux.recvmmsg(
+                    sock.handle,
+                    recv_batch.msgs[1..].ptr,
+                    BATCH_SIZE - 1,
+                    std.os.linux.MSG.DONTWAIT,
+                    null,
+                );
+                if (@as(isize, @bitCast(rc)) > 0) {
+                    const n: usize = @intCast(rc);
+                    for (0..n) |j| {
+                        const slot = 1 + j;
+                        batch_lens[slot] = @intCast(recv_batch.msgs[slot].len);
+                        batch_froms[slot] = ipFromStorage(&recv_batch.addrs[slot]);
+                        batch_is_cm[slot] = false;
+                    }
+                    batch_count += n;
+                }
+            } else {
+                while (batch_count < BATCH_SIZE) {
+                    if (sock.receiveTimeout(io, &batch_bufs[batch_count], nonblocking)) |msg| {
+                        batch_lens[batch_count] = @intCast(msg.data.len);
+                        batch_froms[batch_count] = msg.from;
+                        batch_is_cm[batch_count] = false;
+                        batch_count += 1;
+                    } else |_| break;
+                }
             }
         }
 
@@ -1194,6 +1236,29 @@ fn configureEcn(sock: *const net.Socket) !void {
 /// Batch send: collect all outgoing packets, then send via sendMany().
 /// On Linux, sendMany uses sendmmsg (1 syscall for N packets).
 /// On macOS, sendMany loops sendto (N syscalls — no batch syscall available).
+/// Convert a Linux sockaddr.storage (as filled by recvmmsg) to net.IpAddress.
+/// Port is byte-swapped from network byte order to native endian to match what
+/// receiveTimeout returns.
+fn ipFromStorage(s: *const std.os.linux.sockaddr.storage) net.IpAddress {
+    return switch (s.family) {
+        std.os.linux.AF.INET => blk: {
+            const in: *const std.os.linux.sockaddr.in = @ptrCast(s);
+            break :blk .{ .ip4 = .{
+                .bytes = @bitCast(in.addr),
+                .port = std.mem.bigToNative(u16, in.port),
+            } };
+        },
+        std.os.linux.AF.INET6 => blk: {
+            const in6: *const std.os.linux.sockaddr.in6 = @ptrCast(s);
+            break :blk .{ .ip6 = .{
+                .port = std.mem.bigToNative(u16, in6.port),
+                .bytes = in6.addr,
+            } };
+        },
+        else => .{ .ip4 = net.Ip4Address.loopback(0) },
+    };
+}
+
 fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs) void {
     if (comptime builtin.os.tag == .linux) {
         if (g_gso_supported) {
@@ -1267,6 +1332,15 @@ fn flushGso(sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, buf
 }
 
 const SEND_BATCH = 32;
+const BATCH_SIZE = 32;
+
+/// Pre-allocated state for Linux recvmmsg Phase 2 (non-blocking batch drain).
+/// std.os.linux types are always available regardless of host OS.
+const RecvBatch = struct {
+    iovs: [BATCH_SIZE]std.posix.iovec,
+    addrs: [BATCH_SIZE]std.os.linux.sockaddr.storage,
+    msgs: [BATCH_SIZE]std.os.linux.mmsghdr,
+};
 
 /// Per-connection send buffer pool.
 ///

@@ -9,8 +9,8 @@
 
 ### Syscall reduction
 - [x] GSO (`UDP_SEGMENT`) for Linux — batch N QUIC packets into 1 sendmsg (60× fewer send syscalls at 1 Gbps)
-- [ ] recvmmsg for Linux — batch receive multiple datagrams per syscall
-- [ ] Increase `SEND_BATCH` and `BATCH_SIZE` for higher packet rates (currently 32/16)
+- [x] recvmmsg for Linux — batch receive multiple datagrams per syscall
+- [x] Increase `SEND_BATCH` and `BATCH_SIZE` for higher packet rates (now both 32)
 
 ### Zero-copy send path
 - [x] Encrypt directly into send queue slot (pkt_scratch → sq[].buf; enc_scratch removed)
