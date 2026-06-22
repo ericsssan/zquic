@@ -39,45 +39,11 @@ const GSO_MAX_SEGS: usize = 44;
 // Set to true at startup when UDP_SEGMENT is available; read by drainSend.
 var g_gso_supported: bool = false;
 
-// ECN (RFC 3168 / RFC 9000 §13.4): when TESTCASE=ecn, mark every outgoing 1-RTT
-// packet with ECT(0) so an on-path observer (the oracle proxy reading IP_RECVTOS)
-// can confirm the codepoint on the wire.  Set per-packet via a sendmsg control
-// message rather than a socket option: the server binds a dual-stack IPv6 socket
-// and replies to IPv4-mapped peers, whose packets leave via the kernel's IPv4
-// path — socket-level IPV6_TCLASS does not reach that path, but an IP_TOS control
-// message does (this is how quic-go marks ECN on the same dual-stack setup).
-var g_ecn_enabled: bool = false;
+// ECN (RFC 3168 / RFC 9000 §13.4): when TESTCASE=ecn, the server binds a native
+// AF_INET socket (see the bind site) and configureEcn sets socket-level IP_TOS to
+// ECT(0), which marks every outgoing packet — so an on-path observer (the oracle
+// proxy reading IP_RECVTOS) can confirm the codepoint on the wire.
 const ECN_ECT0: c_int = 0x02; // RFC 3168 ECT(0) codepoint in the low TOS bits
-const ECN_IPPROTO_IP: i32 = 0;
-const ECN_IPPROTO_IPV6: i32 = 41;
-const ECN_IP_TOS: i32 = 1;
-const ECN_IPV6_TCLASS: i32 = 67;
-// One control message carrying a single int (CMSG_LEN(sizeof(int))).
-const ECN_CMSG_BYTES = @sizeOf(std.os.linux.cmsghdr) + @sizeOf(c_int);
-
-// Build an ECN-marking control message into `buf` for the given destination and
-// return the slice to assign to OutgoingMessage.control (empty when ECN is off).
-// IPv4 and IPv4-mapped destinations use IPPROTO_IP/IP_TOS; native IPv6 uses
-// IPPROTO_IPV6/IPV6_TCLASS.  The buffer must be 8-byte aligned (cmsghdr alignment).
-fn ecnControl(buf: *align(8) [ECN_CMSG_BYTES]u8, dest: *const net.IpAddress) []const u8 {
-    // The control message uses the Linux cmsghdr layout and IP option numbers, and
-    // the ECN wire-proof only runs on Linux — never attach it on other platforms.
-    if (comptime builtin.os.tag != .linux) return &.{};
-    if (!g_ecn_enabled) return &.{};
-    const is_v4 = switch (dest.*) {
-        .ip4 => true,
-        .ip6 => |v6| net.Ip4Address.fromIp6(v6) != null,
-    };
-    const hdr = std.os.linux.cmsghdr{
-        .len = ECN_CMSG_BYTES,
-        .level = if (is_v4) ECN_IPPROTO_IP else ECN_IPPROTO_IPV6,
-        .type = if (is_v4) ECN_IP_TOS else ECN_IPV6_TCLASS,
-    };
-    @memcpy(buf[0..@sizeOf(std.os.linux.cmsghdr)], std.mem.asBytes(&hdr));
-    const tos: c_int = ECN_ECT0;
-    @memcpy(buf[@sizeOf(std.os.linux.cmsghdr)..][0..@sizeOf(c_int)], std.mem.asBytes(&tos));
-    return buf[0..ECN_CMSG_BYTES];
-}
 
 // Connection type: parameterized for 64 concurrent streams (= MAX_TRANSFERS).
 const Conn = quic.Connection(64);
@@ -446,11 +412,9 @@ pub fn main(init: std.process.Init) !void {
     defer if (cm_sock) |s| s.close(io);
 
     // Enable ECN (Explicit Congestion Notification) if testcase is "ecn".
-    // configureEcn sets the RX socket options (IP_RECVTOS); outgoing packets are
-    // marked per-packet via ecnControl() in the send paths (g_ecn_enabled).
+    // configureEcn sets IP_TOS (ECT(0) marking) and IP_RECVTOS on the AF_INET socket.
     if (is_ecn) {
         try configureEcn(&sock);
-        g_ecn_enabled = true;
     }
 
     std.debug.print("zquic interop server: testcase={s} port={d}\n", .{ testcase, port });
@@ -1306,8 +1270,6 @@ fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.
     var messages: [SEND_BATCH]net.OutgoingMessage = undefined;
     var count: usize = 0;
     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-    var ecn_buf: [ECN_CMSG_BYTES]u8 align(8) = undefined;
-    const ecn_ctrl = ecnControl(&ecn_buf, dest);
 
     // Phase 1: collect all outgoing packets into separate buffers.
     while (count < SEND_BATCH) {
@@ -1317,7 +1279,6 @@ fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.
             .address = dest,
             .data_ptr = &bufs.bufs[count],
             .data_len = n,
-            .control = ecn_ctrl,
         };
         count += 1;
     }
@@ -1333,9 +1294,6 @@ fn drainSend(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.
 // packets shorter than MAX_DATAGRAM) fall through to plain sendMany individually.
 fn drainSendGso(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs) void {
     const now_ns: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
-    // The ECN control message applies to every datagram in this drain (one dest).
-    var ecn_buf: [ECN_CMSG_BYTES]u8 align(8) = undefined;
-    const ecn_ctrl = ecnControl(&ecn_buf, dest);
     var n_full: usize = 0;
     while (n_full < GSO_MAX_SEGS) {
         const n = conn.send(bufs.gso[n_full * MAX_DATAGRAM ..][0..MAX_DATAGRAM], now_ns);
@@ -1345,27 +1303,27 @@ fn drainSendGso(conn: *Conn, sock: *const net.Socket, io: std.Io, dest: *const n
         } else {
             // Partial packet: flush any accumulated full segments first, then send
             // this short packet individually (can't mix segment sizes in one GSO send).
-            if (n_full > 0) flushGso(sock, io, dest, bufs, n_full, ecn_ctrl);
+            if (n_full > 0) flushGso(sock, io, dest, bufs, n_full);
             @memcpy(bufs.bufs[0][0..n], bufs.gso[n_full * MAX_DATAGRAM ..][0..n]);
-            var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = &bufs.bufs[0], .data_len = n, .control = ecn_ctrl }};
+            var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = &bufs.bufs[0], .data_len = n }};
             sock.sendMany(io, &msg, .{}) catch {};
             n_full = 0;
         }
     }
-    if (n_full > 0) flushGso(sock, io, dest, bufs, n_full, ecn_ctrl);
+    if (n_full > 0) flushGso(sock, io, dest, bufs, n_full);
 }
 
-fn flushGso(sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs, n_segs: usize, ecn_ctrl: []const u8) void {
+fn flushGso(sock: *const net.Socket, io: std.Io, dest: *const net.IpAddress, bufs: *SendBufs, n_segs: usize) void {
     if (n_segs == 0) return;
     if (n_segs == 1) {
         // Single segment: no GSO overhead needed.
-        var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = @ptrCast(&bufs.gso), .data_len = MAX_DATAGRAM, .control = ecn_ctrl }};
+        var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = @ptrCast(&bufs.gso), .data_len = MAX_DATAGRAM }};
         sock.sendMany(io, &msg, .{}) catch {};
         return;
     }
     const seg_size: u16 = MAX_DATAGRAM;
     _ = std.os.linux.setsockopt(sock.handle, SOL_UDP, UDP_SEGMENT, std.mem.asBytes(&seg_size).ptr, @sizeOf(u16));
-    var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = @ptrCast(&bufs.gso), .data_len = n_segs * MAX_DATAGRAM, .control = ecn_ctrl }};
+    var msg = [1]net.OutgoingMessage{.{ .address = dest, .data_ptr = @ptrCast(&bufs.gso), .data_len = n_segs * MAX_DATAGRAM }};
     sock.sendMany(io, &msg, .{}) catch {};
     // Restore to 0 so ordinary sendMany calls after this are unaffected.
     const zero: u16 = 0;
