@@ -96,6 +96,8 @@ const ConnSlot = struct {
     peer_addr: ?net.IpAddress = null,
     /// True when the most recent packet arrived on the CM socket.
     use_cm_sock: bool = false,
+    /// True once we have logged the client's migration to the preferred address.
+    cm_migrated: bool = false,
     transfers: [MAX_TRANSFERS]FileTransfer = @as([MAX_TRANSFERS]FileTransfer, @splat(.{})),
     /// Parsed requests deferred because all transfer slots were occupied.
     /// Retried at the start of each flushTransfers() pass.
@@ -576,7 +578,6 @@ pub fn main(init: std.process.Init) !void {
                     batch_froms[batch_count] = msg.from;
                     batch_is_cm[batch_count] = true;
                     batch_count += 1;
-                    std.debug.print("[CMRX] cm-sock packet len={d}\n", .{msg.data.len});
                 } else |_| break;
             }
         }
@@ -693,6 +694,16 @@ fn processPacket(
         var challenge: [8]u8 = undefined;
         io.random(&challenge);
         s.conn.sendPathChallenge(challenge) catch {};
+        // A packet on the preferred-address (CM) socket from an established
+        // connection means the client has migrated to the server's
+        // preferred_address (RFC 9000 §9.6). The connection layer only detects
+        // source-address migration; a preferred-address move keeps the client's
+        // source and changes the server destination, so it is detected here via
+        // the CM socket. Emit the wire-proof exactly once.
+        if (!s.cm_migrated and s.conn.hot.state == .established) {
+            s.cm_migrated = true;
+            std.debug.print("[CM] path_migrated: client now at preferred_address\n", .{});
+        }
     }
     // Track the CURRENT socket — not a one-way flag.  When the client
     // rebinds back to the original path (or sim stops NAT'ing through CM),
