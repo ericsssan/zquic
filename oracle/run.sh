@@ -556,9 +556,6 @@ connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
   # on the original path, yielding a false PASS.
   if ! grep -q '\[CM\] path_migrated' "$d/zsrv.log" 2>/dev/null; then
     bad "connectionmigration (no path_migrated in server log — client did not migrate to 127.0.0.1:$mport)"
-    echo "  --- zsrv.log (CM diag, [CMRX] count=$(grep -c CMRX "$d/zsrv.log" 2>/dev/null)) ---"
-    grep -iE "CMRX|CM\]|migrat|GSO|testcase" "$d/zsrv.log" 2>/dev/null | head -15
-    echo "  --- cli.log tail ---"; tail -8 "$d/cli.log" 2>/dev/null
     return
   fi
   ok "connectionmigration [zquic-server → $impl preferred_addr 127.0.0.1:$mport]"
