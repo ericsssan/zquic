@@ -429,6 +429,11 @@ pub fn Connection(comptime max_streams: usize) type {
         current_key_phase: bool,
         /// Pre-computed next-generation app keys (ready to use on peer-initiated update).
         next_app_keys: ?tls.AppKeys,
+        /// Old-generation RX keys retained during a locally-initiated key update so
+        /// that in-flight packets from the peer (sent before it saw our new key phase)
+        /// can still be decrypted.  Cleared on first same-phase RX success confirming
+        /// the peer has rotated (RFC 9001 §6.1).
+        old_app_keys: ?tls.AppKeys,
 
         // Cached AES contexts — pre-expanded key schedule for multi-buffer SIMD.
         // Avoids ~200ns key expansion per packet on the 1-RTT hot path.
@@ -712,6 +717,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .key_update_pending = false,
                 .current_key_phase = false,
                 .next_app_keys = null,
+                .old_app_keys = null,
                 .cached_app_keys = null,
                 .cached_next_keys = null,
                 .next_client_secret = @as([32]u8, @splat(0)),
@@ -918,6 +924,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 .key_update_pending = false,
                 .current_key_phase = false,
                 .next_app_keys = null,
+                .old_app_keys = null,
                 .cached_app_keys = null,
                 .cached_next_keys = null,
                 .next_client_secret = @as([32]u8, @splat(0)),
@@ -1662,6 +1669,11 @@ pub fn Connection(comptime max_streams: usize) type {
             return if (self.config.is_server) ks.client else ks.server;
         }
 
+        inline fn rxOldAppKeys(self: *const Self) ?crypto.PacketKeys {
+            const ks = self.old_app_keys orelse return null;
+            return if (self.config.is_server) ks.client else ks.server;
+        }
+
         // -----------------------------------------------------------------------
         // Internal packet processing
         // -----------------------------------------------------------------------
@@ -2207,18 +2219,33 @@ pub fn Connection(comptime max_streams: usize) type {
                     self.rotateKeys();
                     self.key_update_pending = false;
                 } else {
-                    // Fallback: current keys (handles reordering during key transition).
+                    // Fallback 1: current keys (handles reordering of same-phase packets
+                    // during a peer-initiated transition).
                     const rx_keys = self.rxAppKeys().?;
                     const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(rx_keys);
                     const nonce = crypto.buildNonce(rx_keys.iv, pn);
-                    _ = crypto_simd.decryptCached(ctx, nonce, aad, payload) catch {
-                        if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
-                            self.hot.state = .closed;
-                            self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
-                            std.debug.print("[SRST] stateless reset received\n", .{});
+                    if (crypto_simd.decryptCached(ctx, nonce, aad, payload)) |_| {
+                        // ok
+                    } else |_| {
+                        // Fallback 2: old keys retained from our own key update (RFC 9001
+                        // §6.1) — peer in-flight at the moment we rotated.
+                        var old_ok = false;
+                        if (self.rxOldAppKeys()) |rx_old| {
+                            const old_ctx = crypto_simd.CachedKeyCtx.init(rx_old);
+                            const old_nonce = crypto.buildNonce(rx_old.iv, pn);
+                            if (crypto_simd.decryptCached(old_ctx, old_nonce, aad, payload)) |_| {
+                                old_ok = true;
+                            } else |_| {}
                         }
-                        return data.len;
-                    };
+                        if (!old_ok) {
+                            if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
+                                self.hot.state = .closed;
+                                self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                                std.debug.print("[SRST] stateless reset received\n", .{});
+                            }
+                            return data.len;
+                        }
+                    }
                 }
             } else {
                 // Same phase — HOT PATH. Cached key schedule, no branch on cipher suite.
@@ -2234,6 +2261,12 @@ pub fn Connection(comptime max_streams: usize) type {
                     return data.len;
                 };
                 self.key_update_pending = false;
+                // Peer is now in the same phase — discard old keys retained for the
+                // transition window (RFC 9001 §6.1: no longer needed).
+                if (self.old_app_keys) |*old| {
+                    std.crypto.secureZero(u8, @as(*volatile [@sizeOf(tls.AppKeys)]u8, @ptrCast(old)));
+                    self.old_app_keys = null;
+                }
             }
 
             // Record packet reception AFTER successful decryption AND key rotation
@@ -4533,6 +4566,10 @@ pub fn Connection(comptime max_streams: usize) type {
         /// derive the new next generation.  Called on peer-initiated key updates
         /// (inside processShortHeaderPacket) and as part of initiateKeyUpdate.
         pub fn rotateKeys(self: *Self) void {
+            // Retain old RX keys so in-flight packets from the peer (sent before it
+            // saw our new key-phase bit) can still be decrypted (RFC 9001 §6.1).
+            // Cleared once the peer confirms the new phase (first same-phase RX hit).
+            self.old_app_keys = self.app_keys;
             // Zero the outgoing application keys before replacing them (RFC 9001 §6,
             // defence-in-depth: previous-epoch key material must not linger in memory).
             if (self.app_keys) |*old| {
