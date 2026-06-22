@@ -359,6 +359,8 @@ pub fn Connection(comptime max_streams: usize) type {
         /// type (FrameInfo tag). Used by debugSendState to identify what keeps PTO
         /// armed during a no-ack stall. Cheap (one increment per ack-eliciting send).
         dbg_ae_send_counts: [12]u32 = @splat(0),
+        /// Investigation: PTO outcome counters — [fired, stream-probe, ping, cap-hit].
+        dbg_pto: [4]u32 = @splat(0),
 
         // Config
         config: Config,
@@ -1295,6 +1297,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 if (self.pto_deadline_ns) |d| {
                     if (now_ns >= d) {
                         self.loss.onPtoFired();
+                        self.dbg_pto[0] +%= 1;
                         if (self.hot.state == .established) {
                             // RFC 9001 §4.1.2: server MUST retransmit HANDSHAKE_DONE until ACKed.
                             // Normal loss detection (packet/time threshold) cannot detect a lost
@@ -1345,12 +1348,15 @@ pub fn Connection(comptime max_streams: usize) type {
                                         if (self.idle_ping_count < 30) {
                                             self.queuePing() catch {};
                                             self.idle_ping_count += 1;
+                                            self.dbg_pto[2] +%= 1;
                                         } else {
                                             // PTO fired but no probe sent: advance deadline to avoid
                                             // busy-looping with a stale past deadline.
                                             self.pto_deadline_ns = self.current_time_ns +| @as(i64, 5_000_000_000);
+                                            self.dbg_pto[3] +%= 1;
                                         }
                                     } else {
+                                        self.dbg_pto[1] +%= 1;
                                         // RFC 9002 §6.2: SHOULD send two full-sized datagrams per
                                         // PTO to expedite loss recovery. A second probe targets the
                                         // same missing data with a fresh pn so quiche can ACK it
@@ -1563,11 +1569,12 @@ pub fn Connection(comptime max_streams: usize) type {
             const lae_ms: i64 = if (self.loss.last_ack_eliciting_ns) |l| @divTrunc(l - now_ns, 1_000_000) else -999999;
             var ae_total: u32 = 0;
             for (c) |x| ae_total +%= x;
-            std.debug.print("[{s}] off={d} acked={d} cwnd={d} bif={d} queued={d} pto_ms={d} lae_ms={d} ptoc={d} retx={d} ping={d} rx={d} tx={d} | ae_total={d} strm={d} hsd={d} c0={d} c2={d}\n", .{
+            const p = self.dbg_pto; // [fired, stream-probe, ping, cap-hit]
+            std.debug.print("[{s}] off={d} acked={d} cwnd={d} bif={d} queued={d} pto_ms={d} lae_ms={d} ptoc={d} retx={d} ping={d} rx={d} tx={d} | ae={d} strm={d} c2={d} | PTO fired={d} sprobe={d} ping={d} cap={d}\n", .{
                 tag,                  st.send_offset, st.send_acked,  self.congestion.cwnd, self.loss.bytes_in_flight,
                 self.bytes_queued,    pto_in_ms,      lae_ms,         self.loss.pto_count,  self.stream_pending_retx_count,
                 self.idle_ping_count, self.pkts_recv, self.pkts_sent, ae_total,             c[1],
-                c[4],                 c[0],           c[2],
+                c[2],                 p[0],           p[1],           p[2],                 p[3],
             });
         }
 

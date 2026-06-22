@@ -272,12 +272,20 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
             // stalled tail (seeded-loss truncation) shows whether send_offset froze
             // (send stall) or send_acked froze (retransmit failure).
             if (g_transfer_debug and now_ns - slot.dbg_last_ns > 300_000_000) {
+                var dumped = false;
                 for (&slot.transfers) |*t| {
                     if (t.active) {
                         slot.conn.debugSendState(t.stream_id, now_ns, "XFER");
-                        slot.dbg_last_ns = now_ns;
+                        dumped = true;
                     }
                 }
+                // Capture post-FIN tail stalls: the transfer is inactive (all data +
+                // FIN queued) but bytes remain unacked — the case that truncates at
+                // ~909636. Dump stream 0 (the H3/hq response stream) too.
+                if (!dumped and slot.conn.hot.state == .established and slot.conn.loss.bytes_in_flight > 0) {
+                    slot.conn.debugSendState(0, now_ns, "TAIL");
+                }
+                slot.dbg_last_ns = now_ns;
             }
         }
     }
