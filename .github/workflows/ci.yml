@@ -143,9 +143,21 @@ jobs:
       - name: Build reference impls + fixtures
         run: bash oracle/build-refs.sh
 
-      # --require fails the job if any impl didn't build, instead of silently
-      # running a smaller green matrix (#7). ngtcp2 is the only impl that
-      # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
-      # would silently drop 11 H3 test runs (#16).
-      - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+      # TEMP (invest/seeded-loss branch only): run the seeded loss/corruption
+      # tests in stability mode to measure the real failure rate on Linux and
+      # capture first-diff-offset + server-log diagnostics on any hash mismatch.
+      - name: Seeded-loss stability investigation
+        continue-on-error: true
+        run: ORACLE_REPEAT=20 bash oracle/run.sh transferloss transfercorruption 2>&1 | tee /tmp/invest.log
+
+      - name: Summarize investigation
+        run: |
+          echo "=== iterations green/total ==="; grep -E "STABILITY:" /tmp/invest.log || true
+          echo "=== per-iteration totals ==="; grep -E "TOTAL:" /tmp/invest.log || true
+          echo "=== all FAIL lines ==="; grep -E "FAIL " /tmp/invest.log || true
+          echo "=== all [diag] lines ==="; grep -E "\[diag\]" /tmp/invest.log || true
+          echo "=== failure-mode tally ==="
+          echo "hash-mismatch: $(grep -c 'transfer: hash mismatch' /tmp/invest.log)"
+          echo "missing-file:  $(grep -c '\[diag\].*MISSING' /tmp/invest.log)"
+          echo "timeout:       $(grep -c 'TIMEOUT' /tmp/invest.log)"
+          echo "client-rc:     $(grep -c 'client rc=' /tmp/invest.log)"
