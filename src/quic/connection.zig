@@ -4585,6 +4585,12 @@ pub fn Connection(comptime max_streams: usize) type {
             // Retain old RX keys so in-flight packets from the peer (sent before it
             // saw our new key-phase bit) can still be decrypted (RFC 9001 §6.1).
             // Cleared once the peer confirms the new phase (first same-phase RX hit).
+            // Zero any previously-retained old keys before overwriting them, matching
+            // the defence-in-depth zeroing of app_keys below (a second rotation before
+            // the prior old keys were cleared must not drop their material un-wiped).
+            if (self.old_app_keys) |*prev_old| {
+                std.crypto.secureZero(u8, @as(*volatile [@sizeOf(tls.AppKeys)]u8, @ptrCast(prev_old)));
+            }
             self.old_app_keys = self.app_keys;
             // Zero the outgoing application keys before replacing them (RFC 9001 §6,
             // defence-in-depth: previous-epoch key material must not linger in memory).
