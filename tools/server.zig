@@ -47,7 +47,6 @@ var g_gso_supported: bool = false;
 // path — socket-level IPV6_TCLASS does not reach that path, but an IP_TOS control
 // message does (this is how quic-go marks ECN on the same dual-stack setup).
 var g_ecn_enabled: bool = false;
-var g_ecn_diag_printed: bool = false;
 const ECN_ECT0: c_int = 0x02; // RFC 3168 ECT(0) codepoint in the low TOS bits
 const ECN_IPPROTO_IP: i32 = 0;
 const ECN_IPPROTO_IPV6: i32 = 41;
@@ -69,10 +68,6 @@ fn ecnControl(buf: *align(8) [ECN_CMSG_BYTES]u8, dest: *const net.IpAddress) []c
         .ip4 => true,
         .ip6 => |v6| net.Ip4Address.fromIp6(v6) != null,
     };
-    if (!g_ecn_diag_printed) {
-        g_ecn_diag_printed = true;
-        std.debug.print("[ECN] marking ECT(0) is_v4={} dest_family={s} cmsg_len={d}\n", .{ is_v4, @tagName(dest.*), ECN_CMSG_BYTES });
-    }
     const hdr = std.os.linux.cmsghdr{
         .len = ECN_CMSG_BYTES,
         .level = if (is_v4) ECN_IPPROTO_IP else ECN_IPPROTO_IPV6,
@@ -1236,59 +1231,30 @@ fn readFileFull(io: std.Io, path: []const u8, out: []u8) !usize {
     return file.readPositionalAll(io, out, 0);
 }
 
-/// Configure socket for ECN (Explicit Congestion Notification).
-/// Sets socket options to mark outgoing packets with ECT(0) and receive ECN bits.
+/// Configure the ECN socket options for the ecn testcase (RFC 3168).
+/// The ecn server binds a native AF_INET socket (see the bind site), so only the
+/// IPv4 options apply: IP_TOS marks outgoing packets with ECT(0) and IP_RECVTOS
+/// requests the TOS byte of received datagrams.  Outgoing marking is additionally
+/// set per-packet via ecnControl()/OutgoingMessage.control in the send paths, which
+/// keeps the codepoint correct even under UDP GSO.
 fn configureEcn(sock: *const net.Socket) !void {
-    // On Linux, use raw syscalls to configure ECN socket options.
-    // std.Io.net.Socket doesn't expose setsockopt directly.
+    // std.Io.net.Socket doesn't expose setsockopt, so use raw Linux syscalls.
     const fd = sock.handle;
-
-    // Socket option level and name constants (from Linux headers)
     const SOL_IP: i32 = 0; // IPPROTO_IP
-    const SOL_IPV6: i32 = 41; // IPPROTO_IPV6
-    const IP_TOS: i32 = 1; // Type of service
-    const IP_RECVTOS: i32 = 13; // Receive TOS with datagram
-    const IPV6_TCLASS: i32 = 67; // Traffic class
-    const IPV6_RECVTCLASS: i32 = 66; // Receive traffic class
+    const IP_TOS: i32 = 1; // Type of service (ECN bits are the low 2 bits)
+    const IP_RECVTOS: i32 = 13; // Deliver received TOS as a control message
 
-    // Enable ECT(0) marking on outgoing IPv4 packets: IP_TOS with ECT(0)=0x02
-    // ECT(0) = 0b0000 0010 in DSCP/ECN bits (RFC 3168)
-    const tos_value: c_int = 0x02; // ECT(0)
-    const tos_bytes = std.mem.asBytes(&tos_value);
-    const tos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_TOS, tos_bytes.ptr, @sizeOf(c_int));
+    const tos_value: c_int = ECN_ECT0;
+    const tos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_TOS, std.mem.asBytes(&tos_value).ptr, @sizeOf(c_int));
     if (tos_result < 0) {
-        const err = @as(i32, @intCast(-tos_result));
-        std.debug.print("WARNING: Failed to set IP_TOS: errno={}\n", .{err});
+        std.debug.print("WARNING: Failed to set IP_TOS: errno={}\n", .{@as(i32, @intCast(-tos_result))});
     }
 
-    // Enable receiving IPv4 ECN bits: IP_RECVTOS
     const recvtos_value: c_int = 1;
-    const recvtos_bytes = std.mem.asBytes(&recvtos_value);
-    const recvtos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_RECVTOS, recvtos_bytes.ptr, @sizeOf(c_int));
+    const recvtos_result = std.os.linux.setsockopt(fd, SOL_IP, IP_RECVTOS, std.mem.asBytes(&recvtos_value).ptr, @sizeOf(c_int));
     if (recvtos_result < 0) {
-        const err = @as(i32, @intCast(-recvtos_result));
-        std.debug.print("WARNING: Failed to set IP_RECVTOS: errno={}\n", .{err});
+        std.debug.print("WARNING: Failed to set IP_RECVTOS: errno={}\n", .{@as(i32, @intCast(-recvtos_result))});
     }
-
-    // Enable ECT(0) marking on outgoing IPv6 packets: IPV6_TCLASS
-    const tclass_value: c_int = 0x02; // ECT(0)
-    const tclass_bytes = std.mem.asBytes(&tclass_value);
-    const tclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_TCLASS, tclass_bytes.ptr, @sizeOf(c_int));
-    if (tclass_result < 0) {
-        const err = @as(i32, @intCast(-tclass_result));
-        std.debug.print("WARNING: Failed to set IPV6_TCLASS: errno={}\n", .{err});
-    }
-
-    // Enable receiving IPv6 ECN bits: IPV6_RECVTCLASS
-    const recvtclass_value: c_int = 1;
-    const recvtclass_bytes = std.mem.asBytes(&recvtclass_value);
-    const recvtclass_result = std.os.linux.setsockopt(fd, SOL_IPV6, IPV6_RECVTCLASS, recvtclass_bytes.ptr, @sizeOf(c_int));
-    if (recvtclass_result < 0) {
-        const err = @as(i32, @intCast(-recvtclass_result));
-        std.debug.print("WARNING: Failed to set IPV6_RECVTCLASS: errno={}\n", .{err});
-    }
-
-    std.debug.print("ECN socket configuration completed\n", .{});
 }
 
 /// Batch send: collect all outgoing packets, then send via sendMany().
