@@ -1675,3 +1675,45 @@ test "NEW_CONNECTION_ID: retired seq is silently dropped" {
 // ============================================================================
 // PMTUD (Path MTU Discovery) Regression Tests
 // ============================================================================
+
+// ============================================================================
+// PTO probe target selection (RFC 9002 §6.2) — regression for the seeded-loss
+// tail-truncation stall.
+// ============================================================================
+
+test "PTO probe targets oldest UNACKED stream packet, not oldest in-flight" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.hot.state = .established;
+
+    // Stream 0 holds 2000 bytes; the first 1000 are acked (send_acked = 1000),
+    // leaving [1000, 2000) as the genuinely-missing data PTO must retransmit.
+    const st = (try conn.streams.getOrCreate(0)).?;
+    st.send_max = 1 << 20;
+    var data: [2000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    _ = st.send_buf.write(&data);
+    st.send_offset = 2000;
+    st.onAcked(0, 1000);
+    try testing.expectEqual(@as(u64, 1000), st.send_acked);
+
+    // Sent table (1-RTT): the OLDEST in-flight packet (pn=1) carries the
+    // already-acked range [0,1000); a newer packet (pn=2) carries the unacked
+    // [1000,2000). Both are still marked in_flight (out-of-order SACK case).
+    var fi1 = loss_recovery_mod.SentFrameInfo{};
+    fi1.frames[0] = .{ .stream = .{ .stream_id = 0, .offset = 0, .len = 1000, .fin = false } };
+    fi1.count = 1;
+    conn.loss.onPacketSent(1, 2, 1050, true, 0, 0, fi1);
+    var fi2 = loss_recovery_mod.SentFrameInfo{};
+    fi2.frames[0] = .{ .stream = .{ .stream_id = 0, .offset = 1000, .len = 1000, .fin = false } };
+    fi2.count = 1;
+    conn.loss.onPacketSent(2, 2, 1050, true, 0, 0, fi2);
+
+    // Before the fix, the scan picked pn=1 (oldest in-flight with a stream frame),
+    // then skipped it (offset < send_acked) and returned false — leaving the
+    // missing tail unprobed. It must instead probe pn=2's unacked data.
+    try testing.expect(conn.probeUnackedStreamData());
+}
