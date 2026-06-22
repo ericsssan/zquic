@@ -277,22 +277,14 @@ func main() {
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 65535)
-		// ECN codepoint counts for server→proxy direction (#41).
+		// ECN codepoint observations for the server→proxy direction (#41).
 		// Index = ECN bits (0=Not-ECT, 1=ECT(1), 2=ECT(0), 3=CE) from IP TOS.
-		var ecnCounts [4]uint64
-		defer func() {
-			if !useECN || capFile == nil {
-				return
-			}
-			labels := [4]string{"NOT_ECT", "ECT1", "ECT0", "CE"}
-			capMu.Lock()
-			for i, cnt := range ecnCounts {
-				if cnt > 0 {
-					fmt.Fprintf(capFile, "s2c %s %d\n", labels[i], cnt)
-				}
-			}
-			capMu.Unlock()
-		}()
+		// Each codepoint is written to the capture the FIRST time it is seen, with
+		// an immediate (durable) write(2) — not aggregated in a defer. The proxy is
+		// stopped with SIGTERM (no signal handler), so a deferred flush would never
+		// run and the wire-proof line would be lost even when ECN is on the wire.
+		ecnLabels := [4]string{"NOT_ECT", "ECT1", "ECT0", "CE"}
+		var ecnSeen [4]bool
 		var oob [64]byte
 		for {
 			var n int
@@ -305,7 +297,13 @@ func main() {
 					msgs, _ := syscall.ParseSocketControlMessage(oob[:oobn])
 					for _, m := range msgs {
 						if m.Header.Level == syscall.IPPROTO_IP && m.Header.Type == 1 && len(m.Data) > 0 {
-							ecnCounts[m.Data[0]&0x03]++
+							idx := m.Data[0] & 0x03
+							if capFile != nil && !ecnSeen[idx] {
+								ecnSeen[idx] = true
+								capMu.Lock()
+								fmt.Fprintf(capFile, "s2c %s 1\n", ecnLabels[idx])
+								capMu.Unlock()
+							}
 						}
 					}
 				}
