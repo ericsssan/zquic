@@ -4712,6 +4712,29 @@ pub fn Connection(comptime max_streams: usize) type {
             self.events.push(.path_migrated);
         }
 
+        /// Note that the peer has migrated to our advertised preferred_address
+        /// (RFC 9000 §9.6).  Unlike a source-address migration, the peer keeps its
+        /// source address and only changes the server destination it sends to, so
+        /// the source-based detection above never fires; the owner of the sockets
+        /// (which can see that an AUTHENTICATED 1-RTT packet arrived on the
+        /// preferred-address path) drives this instead.  Re-arm path validation and
+        /// the per-path anti-amplification limit (RFC 9000 §8 / §9.3-§9.4), seeded
+        /// with the triggering datagram's size, send a PATH_CHALLENGE, and emit the
+        /// path_migrated event.  Congestion/RTT state is preserved — the underlying
+        /// path is physically unchanged; only the server's local address differs.
+        /// `recv_bytes` is the size of the datagram that triggered the migration so
+        /// the 3x amplification budget starts from a real received amount.
+        pub fn notePreferredAddressMigration(self: *Self, recv_bytes: usize, io: std.Io) !void {
+            if (self.hot.state != .established) return;
+            self.path_validated = false;
+            self.bytes_unvalidated_recv = recv_bytes;
+            self.bytes_unvalidated_sent = 0;
+            var challenge: [8]u8 = undefined;
+            io.random(&challenge);
+            try self.sendPathChallenge(challenge);
+            self.events.push(.path_migrated);
+        }
+
         /// Helper: normalize address to IPv6 for token hashing.
         fn normalizeAddressToIPv6(src: SocketAddr) [16]u8 {
             var ipv6: [16]u8 = @as([16]u8, @splat(0));

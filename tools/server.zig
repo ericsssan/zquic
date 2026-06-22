@@ -650,35 +650,37 @@ fn processPacket(
     }
     s.peer_addr = from;
 
-    // Track which socket this connection should use for sending.
-    // On first CM socket packet: send PATH_CHALLENGE to validate the new path
-    // BEFORE processing the incoming packet, so PATH_CHALLENGE is the first
-    // frame sent from the new address (required by interop test).
-    if (is_cm_socket and !s.use_cm_sock) {
-        var challenge: [8]u8 = undefined;
-        io.random(&challenge);
-        s.conn.sendPathChallenge(challenge) catch {};
-        // A packet on the preferred-address (CM) socket from an established
-        // connection means the client has migrated to the server's
-        // preferred_address (RFC 9000 §9.6). The connection layer only detects
-        // source-address migration; a preferred-address move keeps the client's
-        // source and changes the server destination, so it is detected here via
-        // the CM socket. Emit the wire-proof exactly once.
-        if (!s.cm_migrated and s.conn.hot.state == .established) {
-            s.cm_migrated = true;
-            std.debug.print("[CM] path_migrated: client now at preferred_address\n", .{});
-        }
-    }
-    // Track the CURRENT socket — not a one-way flag.  When the client
-    // rebinds back to the original path (or sim stops NAT'ing through CM),
-    // the server must follow.  Without this, use_cm_sock stays true forever
-    // and data sent via CM socket can't reach clients on the original network.
-    if (s.use_cm_sock != is_cm_socket) s.use_cm_sock = is_cm_socket;
-
     const ecn_bits: u2 = 0;
+    // Snapshot the authenticated-packet counter so we can tell, after receive(),
+    // whether THIS datagram decrypted — migration and the send-socket switch must
+    // act only on authenticated packets (RFC 9000 §9.3), never on a spoofed or
+    // garbage datagram that merely carried a matching cleartext DCID.
+    const pkts_before = s.conn.pkts_recv;
     s.conn.receive(data, ipToSocketAddr(from), now_ns, ecn_bits, io) catch |err| {
         std.debug.print("receive error: {}\n", .{err});
     };
+    const authenticated = s.conn.pkts_recv > pkts_before;
+
+    if (authenticated) {
+        // First authenticated packet on the preferred-address (CM) socket from an
+        // established connection ⇒ the client has migrated to our preferred_address
+        // (RFC 9000 §9.6). The connection only detects source-address migration; a
+        // preferred-address move keeps the client's source and changes the server
+        // destination, so it is detected here via the CM socket.
+        if (is_cm_socket and !s.cm_migrated and s.conn.hot.state == .established) {
+            s.cm_migrated = true;
+            // If the peer ALSO changed source (some clients do), the connection's
+            // source-based onPathMigration already re-armed validation and emitted
+            // path_migrated (path_validated is now false) — don't double-trigger.
+            if (s.conn.path_validated) {
+                s.conn.notePreferredAddressMigration(data.len, io) catch {};
+            }
+        }
+        // Follow the socket of the most recent AUTHENTICATED packet so the server's
+        // sends track the client's current path (and so a spoofed datagram cannot
+        // redirect them). Computed before active_sock below.
+        if (s.use_cm_sock != is_cm_socket) s.use_cm_sock = is_cm_socket;
+    }
 
     // Write keylog when app_keys are available.
     if (!s.keylog_written and s.conn.app_keys != null) {
