@@ -64,6 +64,8 @@ const ConnSlot = struct {
     use_cm_sock: bool = false,
     /// True once we have logged the client's migration to the preferred address.
     cm_migrated: bool = false,
+    /// Investigation: last wall-clock (ns) we dumped transfer state (TRANSFER_DEBUG).
+    dbg_last_ns: i64 = 0,
     transfers: [MAX_TRANSFERS]FileTransfer = @as([MAX_TRANSFERS]FileTransfer, @splat(.{})),
     /// Parsed requests deferred because all transfer slots were occupied.
     /// Retried at the start of each flushTransfers() pass.
@@ -85,6 +87,10 @@ const supported_cases = [_][]const u8{
 
 /// True when TESTCASE=http3 — uses H3 framing instead of HTTP/0.9.
 var g_is_h3: bool = false;
+// Investigation: when TRANSFER_DEBUG is set, periodically dump send/loss state so a
+// stalled transfer (seeded-loss truncation) reveals whether it stopped sending or
+// failed to retransmit. Off unless the env var is present.
+var g_transfer_debug: bool = false;
 /// Accumulated SSLKEYLOG data for all connections.  Written to /logs/keys.log
 /// in full on each update so createFileAbsolute truncation doesn't lose data.
 var g_keylog_buf: [65536]u8 = undefined;
@@ -262,6 +268,17 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
                 sendH3ControlStreams(slot);
             }
             flushTransfers(slot, www_dir, io, send_sock, &pa, send_bufs);
+            // Investigation: every ~1s, dump the state of any active transfer so a
+            // stalled tail (seeded-loss truncation) shows whether send_offset froze
+            // (send stall) or send_acked froze (retransmit failure).
+            if (g_transfer_debug and now_ns - slot.dbg_last_ns > 1_000_000_000) {
+                for (&slot.transfers) |*t| {
+                    if (t.active) {
+                        slot.conn.debugSendState(t.stream_id, now_ns, "XFER");
+                        slot.dbg_last_ns = now_ns;
+                    }
+                }
+            }
         }
     }
 }
@@ -329,6 +346,7 @@ pub fn main(init: std.process.Init) !void {
     const cert_chain_len = pem.pemToCertChain(cert_pem_buf[0..cert_pem_len], &cert_chain_buf) catch 0;
 
     g_is_h3 = std.mem.eql(u8, testcase, "http3");
+    g_transfer_debug = init.environ_map.get("TRANSFER_DEBUG") != null;
     if (init.environ_map.get("SSLKEYLOGFILE")) |kl_path| {
         const n = @min(kl_path.len, g_keylog_path_buf.len);
         @memcpy(g_keylog_path_buf[0..n], kl_path[0..n]);

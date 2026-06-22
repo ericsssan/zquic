@@ -148,7 +148,7 @@ jobs:
       # capture first-diff-offset + server-log diagnostics on any hash mismatch.
       - name: Seeded-loss stability investigation
         continue-on-error: true
-        run: ORACLE_REPEAT=20 bash oracle/run.sh transferloss transfercorruption 2>&1 | tee /tmp/invest.log
+        run: ORACLE_XFER_DEBUG=1 ORACLE_REPEAT=6 bash oracle/run.sh -i ngtcp2 transferloss 2>&1 | tee /tmp/invest.log
 
       - name: Summarize investigation
         run: |

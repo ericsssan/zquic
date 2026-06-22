@@ -1547,6 +1547,19 @@ pub fn Connection(comptime max_streams: usize) type {
             return st.state == .half_closed_remote or st.state == .closed;
         }
 
+        /// Diagnostic (investigation): dump loss-recovery + flow-control state for a
+        /// send stream, to distinguish a send-side stall (send_offset frozen) from a
+        /// retransmit failure (send_offset complete but send_acked frozen).
+        pub fn debugSendState(self: *Self, stream_id: u62, now_ns: i64, tag: []const u8) void {
+            const st = self.streams.get(stream_id) orelse return;
+            const pto_in_ms: i64 = if (self.pto_deadline_ns) |d| @divTrunc(d - now_ns, 1_000_000) else -999999;
+            std.debug.print("[{s}] sid={d} off={d} acked={d} smax={d} unacked={d} cwnd={d} bif={d} queued={d} pto_ms={d} ptoc={d} retx={d} ping={d}\n", .{
+                tag,                             stream_id,                      st.send_offset,            st.send_acked,     st.send_max,
+                st.send_offset -| st.send_acked, self.congestion.cwnd,           self.loss.bytes_in_flight, self.bytes_queued, pto_in_ms,
+                self.loss.pto_count,             self.stream_pending_retx_count, self.idle_ping_count,
+            });
+        }
+
         /// Returns the stored session ticket (if server sent NewSessionTicket).
         pub fn getSessionTicket(self: *const Self) ?tls.SessionTicket {
             return switch (self.tls_state) {
