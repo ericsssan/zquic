@@ -424,7 +424,18 @@ pub fn main(init: std.process.Init) !void {
 
     // Bind to all interfaces (dual-stack). IPv4 clients arrive as IPv4-mapped IPv6
     // addresses (::ffff:a.b.c.d); IPv6 clients connect directly.
-    const bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(port) };
+    //
+    // Exception: the ecn testcase binds a native IPv4 socket.  ECN marking on a
+    // dual-stack IPv6 socket does not reach IPv4-mapped sends — the kernel emits
+    // those as real IPv4 packets whose TOS comes from the IPv4 layer, which neither
+    // the v6 socket's IPV6_TCLASS nor an IP_TOS control message updates.  A native
+    // AF_INET socket has its IP_TOS honoured, so ECT(0) appears on the wire. The
+    // oracle's ecn client always connects over IPv4 (127.0.0.1), so this is safe.
+    const is_ecn = std.mem.eql(u8, testcase, "ecn");
+    const bind_addr = if (is_ecn)
+        net.IpAddress{ .ip4 = net.Ip4Address.unspecified(port) }
+    else
+        net.IpAddress{ .ip6 = net.Ip6Address.unspecified(port) };
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
 
@@ -440,7 +451,7 @@ pub fn main(init: std.process.Init) !void {
     // Enable ECN (Explicit Congestion Notification) if testcase is "ecn".
     // configureEcn sets the RX socket options (IP_RECVTOS); outgoing packets are
     // marked per-packet via ecnControl() in the send paths (g_ecn_enabled).
-    if (std.mem.eql(u8, testcase, "ecn")) {
+    if (is_ecn) {
         try configureEcn(&sock);
         g_ecn_enabled = true;
     }
