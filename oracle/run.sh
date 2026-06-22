@@ -305,6 +305,7 @@ proxied() {
   if [ -n "$want" ] && ! wire_has "$want" "$capf"; then
     bad "$tag — transfer ok but '$want' NOT seen on wire"
     dump_capture "$capf"
+    echo "  --- zsrv.log (ECN diag) ---"; grep -iE "ECN|TOS|TCLASS|family|dest" "$d/zsrv.log" 2>/dev/null | head -10
     return
   fi
   ok "$tag${want:+ ✓}"

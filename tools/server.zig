@@ -47,6 +47,7 @@ var g_gso_supported: bool = false;
 // path — socket-level IPV6_TCLASS does not reach that path, but an IP_TOS control
 // message does (this is how quic-go marks ECN on the same dual-stack setup).
 var g_ecn_enabled: bool = false;
+var g_ecn_diag_printed: bool = false;
 const ECN_ECT0: c_int = 0x02; // RFC 3168 ECT(0) codepoint in the low TOS bits
 const ECN_IPPROTO_IP: i32 = 0;
 const ECN_IPPROTO_IPV6: i32 = 41;
@@ -68,6 +69,10 @@ fn ecnControl(buf: *align(8) [ECN_CMSG_BYTES]u8, dest: *const net.IpAddress) []c
         .ip4 => true,
         .ip6 => |v6| net.Ip4Address.fromIp6(v6) != null,
     };
+    if (!g_ecn_diag_printed) {
+        g_ecn_diag_printed = true;
+        std.debug.print("[ECN] marking ECT(0) is_v4={} dest_family={s} cmsg_len={d}\n", .{ is_v4, @tagName(dest.*), ECN_CMSG_BYTES });
+    }
     const hdr = std.os.linux.cmsghdr{
         .len = ECN_CMSG_BYTES,
         .level = if (is_v4) ECN_IPPROTO_IP else ECN_IPPROTO_IPV6,
