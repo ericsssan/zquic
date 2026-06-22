@@ -84,6 +84,14 @@ jobs:
       - name: Ensure cmake (for quiche / BoringSSL)
         run: cmake --version || { sudo apt-get update && sudo apt-get install -y cmake; }
 
+      # Raise the kernel cap on UDP socket buffers so the server's 8 MiB
+      # SO_RCVBUF/SO_SNDBUF requests take effect (default rmem_max ~208 KiB).
+      # Extra receive headroom lets the server absorb ACK bursts without drops
+      # when it is briefly starved of CPU under the loaded oracle matrix, which
+      # is a contributor to the seeded-loss recovery stalls.
+      - name: Raise UDP socket buffer limits
+        run: sudo sysctl -w net.core.rmem_max=8388608 net.core.wmem_max=8388608
+
       # build-refs.sh looks for quiche at the repo's sibling (../quiche). Resolve
       # that to a clean absolute path (no "..") so it's cacheable.
       - name: Resolve quiche path

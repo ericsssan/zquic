@@ -437,6 +437,7 @@ pub fn main(init: std.process.Init) !void {
         net.IpAddress{ .ip6 = net.Ip6Address.unspecified(port) };
     const sock = try net.IpAddress.bind(&bind_addr, io, .{ .mode = .dgram });
     defer sock.close(io);
+    raiseSocketBuffers(&sock);
 
     // For connectionmigration: bind a second socket on cm_port so the server
     // can receive packets after the client migrates to the preferred_address.
@@ -444,6 +445,7 @@ pub fn main(init: std.process.Init) !void {
     if (is_cm) {
         const cm_bind_addr = net.IpAddress{ .ip6 = net.Ip6Address.unspecified(cm_port) };
         cm_sock = try net.IpAddress.bind(&cm_bind_addr, io, .{ .mode = .dgram });
+        raiseSocketBuffers(&cm_sock.?);
     }
     defer if (cm_sock) |s| s.close(io);
 
@@ -1243,6 +1245,31 @@ fn readFileFull(io: std.Io, path: []const u8, out: []u8) !usize {
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
     defer file.close(io);
     return file.readPositionalAll(io, out, 0);
+}
+
+/// Raise the UDP receive (and send) socket buffers so the server can absorb
+/// bursts of client packets — ACKs especially — without the kernel dropping them
+/// while the process is briefly starved of CPU (e.g. under heavy CI load). A
+/// dropped ACK can't be recovered by the peer; it just delays our send_acked,
+/// throttling the transfer and, under seeded loss, contributing to recovery
+/// stalls. SO_RCVBUF requests 2× the value and is capped by net.core.rmem_max
+/// (the oracle CI raises that so this takes effect). Best-effort: a failed
+/// setsockopt leaves the kernel default, which still works.
+fn raiseSocketBuffers(sock: *const net.Socket) void {
+    if (comptime builtin.os.tag != .linux) return;
+    const SOL_SOCKET: i32 = 1;
+    const SO_SNDBUF: i32 = 7;
+    const SO_RCVBUF: i32 = 8;
+    const want: c_int = 8 * 1024 * 1024; // 8 MiB; kernel clamps to {r,w}mem_max
+    const wb = std.mem.asBytes(&want);
+    _ = std.os.linux.setsockopt(sock.handle, SOL_SOCKET, SO_RCVBUF, wb.ptr, @sizeOf(c_int));
+    _ = std.os.linux.setsockopt(sock.handle, SOL_SOCKET, SO_SNDBUF, wb.ptr, @sizeOf(c_int));
+    // Read back the effective size (kernel returns 2× the actual buffer) so the
+    // log confirms whether the request took effect or was capped by rmem_max.
+    var got: c_int = 0;
+    var len: std.os.linux.socklen_t = @sizeOf(c_int);
+    if (std.os.linux.getsockopt(sock.handle, SOL_SOCKET, SO_RCVBUF, std.mem.asBytes(&got), &len) == 0)
+        std.debug.print("[RCVBUF] {d} bytes\n", .{got});
 }
 
 /// Configure the ECN socket options for the ecn testcase (RFC 3168).
