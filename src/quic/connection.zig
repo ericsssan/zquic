@@ -2839,6 +2839,12 @@ pub fn Connection(comptime max_streams: usize) type {
             const old_hwm: u64 = if (existing_st) |est| est.highest_recv_offset else 0;
             const fc_delta: u64 = if (new_end > old_hwm) new_end - old_hwm else 0;
             if (!self.conn_flow.canReceive(fc_delta)) return error.FlowControlViolation;
+            // Receiving new stream data is real connection progress — reset the idle
+            // PING budget so a long download that pauses (e.g. peer dies mid-transfer)
+            // still has a full quota of PTO probes to detect the dead path. Without
+            // this, a receive-only client never resets the counter and may exhaust its
+            // probe budget before a stateless reset can be elicited (#42).
+            if (fc_delta > 0) self.idle_ping_count = 0;
             const is_new = existing_st == null;
             const st = (try self.streams.getOrCreate(f.stream_id)) orelse return error.TooManyStreams;
             // Apply the peer's per-stream send limit on first access (RFC 9000 §7.3).
