@@ -289,7 +289,14 @@ proxied() {
   TRANSFER_DEBUG="${ORACLE_XFER_DEBUG:-}" TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
+  # GOMAXPROCS=1: the capturing proxy is purely I/O-bound packet forwarding, but
+  # Go defaults GOMAXPROCS to the runner's core count and spreads it across all of
+  # them, competing with the single-threaded, latency-sensitive zquic server. On a
+  # loaded CI runner that starves the server's receive path (it drops client ACKs →
+  # send_acked stalls → seeded-loss recovery stalls / truncations). Pinning the
+  # proxy to one OS thread keeps cores free for the server. Applied at every proxy
+  # launch below.
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$ct" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
@@ -342,7 +349,7 @@ kp_case() { # <impl> <sport> <pport>
     "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" \
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" \
     -capture "$capf" -shorts "$shortsf" >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
@@ -373,7 +380,7 @@ vn_case() { # <trigger_impl> <sport> <pport>
   TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "versionnegotiation (no server bind)"; stop "$sp"; return; }
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "versionnegotiation (no proxy bind)"; stop "$sp" "$px"; return; }
   # Each client offers an unknown version: ngtcp2 via --version, quiche via its
@@ -447,7 +454,7 @@ amplimit_case() { # <impl> <sport> <pport>
   TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "amplificationlimit (no server bind)"; stop "$sp"; return; }
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "amplificationlimit (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$d/out" /1.bin >"$d/cli.log" 2>&1; local rc=$?
@@ -481,7 +488,7 @@ zerortt_case() { # <impl> <sport> <pport>
   ref_server "$impl" "$sport" "$d/rsrv.log" || { bad "zerortt [zquic-client <-> $impl-server] (no server cmd)"; return; }
   local sp=$_LAST_SERVER_PID
   wait_listen "$sp" "$sport" || { bad "zerortt [zquic-client <-> $impl-server] (no bind)"; stop "$sp"; return; }
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "zerortt [zquic-client <-> $impl-server] (no proxy bind)"; stop "$sp" "$px"; return; }
   # Both connections go through the proxy. The capture captures both sequentially.
@@ -657,7 +664,7 @@ statelessreset_client_case() { # <sport> <pport>
   _HARNESS_PIDS+=("$sp1")
   wait_listen "$sp1" "$sport" || { bad "statelessreset-client (phase 1: no quicgo bind)"; stop "$sp1"; return; }
 
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -delayms 20 -tolerant-back \
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -delayms 20 -tolerant-back \
     >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "statelessreset-client (no proxy bind)"; stop "$sp1" "$px"; return; }
@@ -808,7 +815,7 @@ self_test() {
   TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   if ! wait_listen "$sp" "$sport"; then bad "meta: self-test server bind"; stop "$sp"; return; fi
-  "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   if ! wait_listen "$px" "$pport"; then bad "meta: self-test proxy bind"; stop "$sp" "$px"; return; fi
   to "$CLIENT_TIMEOUT" ref_client "$sti" "$pport" "$d/out" /1.bin >"$d/cli.log" 2>&1; local rc=$?
