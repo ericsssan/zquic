@@ -94,9 +94,11 @@ var g_keylog_len: usize = 0;
 var g_keylog_path_buf: [512]u8 = undefined;
 var g_keylog_path: []const u8 = "/logs/keys.log";
 
-// IPv4/IPv6 addresses for preferred_address in connectionmigration test.
-// Defaults are the Docker interop runner addresses; override with CM_ADDR4 / CM_PORT env vars
-// (e.g. CM_ADDR4=127.0.0.1 CM_PORT=4434 for the loopback oracle).
+// IPv4/IPv6 addresses for preferred_address in the connectionmigration test.
+// Defaults are the Docker interop runner addresses; override with the
+// CM_ADDR4 / CM_ADDR6 / CM_PORT env vars (e.g. CM_ADDR4=127.0.0.1 CM_PORT=4434
+// for the loopback oracle). CM_ADDR6 is omitted there so the server does not
+// advertise the unreachable Docker ULA on loopback (see cm_addr6 below).
 // server4:  193.167.100.100  (0xc1, 0xa7, 0x64, 0x64)
 // server6:  fd00:cafe:cafe:0100::100
 const CM_IPV4_DEFAULT: [4]u8 = .{ 193, 167, 100, 100 };
@@ -340,6 +342,20 @@ pub fn main(init: std.process.Init) !void {
         const s = init.environ_map.get("CM_ADDR4") orelse break :blk CM_IPV4_DEFAULT;
         break :blk parseIPv4(s) catch CM_IPV4_DEFAULT;
     };
+    // IPv6 preferred address (RFC 9000 §18.2.3). null ⇒ advertise no IPv6 preferred
+    // address (v6 fields encoded as all-zeros). An explicit CM_ADDR6 (e.g. "::1")
+    // always wins. With no override, fall back to the Docker default ONLY when
+    // CM_ADDR4 is also at its default — i.e. we are on the Docker interop network,
+    // where fd00:cafe:cafe:100::100 is reachable. A deployment that customised
+    // CM_ADDR4 (such as the loopback oracle) must not advertise that unreachable
+    // ULA and strand an IPv6-preferring client, so omit IPv6 unless CM_ADDR6 is set.
+    const cm_addr6: ?[16]u8 = blk: {
+        if (init.environ_map.get("CM_ADDR6")) |s| {
+            const a6 = net.Ip6Address.parse(s, 0) catch break :blk null;
+            break :blk a6.bytes;
+        }
+        break :blk if (init.environ_map.get("CM_ADDR4") != null) null else CM_IPV6;
+    };
     const cm_port: u16 = blk: {
         const s = init.environ_map.get("CM_PORT") orelse break :blk CM_PORT_DEFAULT;
         break :blk std.fmt.parseInt(u16, s, 10) catch CM_PORT_DEFAULT;
@@ -375,11 +391,13 @@ pub fn main(init: std.process.Init) !void {
         .preferred_cipher = if (std.mem.eql(u8, testcase, "chacha20")) .chacha20_poly1305 else .aes_128_gcm,
         .initial_max_streams_bidi = 64, // Match MAX_TRANSFERS; grows as streams close
         .initial_max_streams_uni = 100,
-        // RFC 9000 §18.2.3: advertise preferred IPv4+IPv6 addresses for migration.
+        // RFC 9000 §18.2.3: advertise a preferred address for migration. IPv4 is
+        // always advertised when CM is active; IPv6 only when we have a reachable
+        // one (cm_addr6 non-null) — otherwise the v6 fields are all-zeros (absent).
         .preferred_addr_ipv4 = if (is_cm) cm_addr4 else null,
         .preferred_addr_ipv4_port = if (is_cm) cm_port else 0,
-        .preferred_addr_ipv6 = if (is_cm) CM_IPV6 else @as([16]u8, @splat(0)),
-        .preferred_addr_ipv6_port = if (is_cm) cm_port else 0,
+        .preferred_addr_ipv6 = if (is_cm) (cm_addr6 orelse @as([16]u8, @splat(0))) else @as([16]u8, @splat(0)),
+        .preferred_addr_ipv6_port = if (is_cm and cm_addr6 != null) cm_port else 0,
         .ticket_key = &ticket_key,
         .idle_timeout_ns = idle_timeout_ns,
         .reset_key = reset_key,
