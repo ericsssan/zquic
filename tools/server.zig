@@ -271,7 +271,7 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
             // Investigation: every ~1s, dump the state of any active transfer so a
             // stalled tail (seeded-loss truncation) shows whether send_offset froze
             // (send stall) or send_acked froze (retransmit failure).
-            if (g_transfer_debug and now_ns - slot.dbg_last_ns > 1_000_000_000) {
+            if (g_transfer_debug and now_ns - slot.dbg_last_ns > 300_000_000) {
                 for (&slot.transfers) |*t| {
                     if (t.active) {
                         slot.conn.debugSendState(t.stream_id, now_ns, "XFER");

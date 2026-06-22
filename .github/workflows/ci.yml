@@ -149,7 +149,7 @@ jobs:
       # would silently drop 11 H3 test runs (#16).
       - name: Seeded-loss PTO investigation
         continue-on-error: true
-        run: ORACLE_XFER_DEBUG=1 ORACLE_REPEAT=10 bash oracle/run.sh transferloss transfercorruption 2>&1 | tee /tmp/invest.log
+        run: ORACLE_XFER_DEBUG=1 ORACLE_REPEAT=20 bash oracle/run.sh transferloss transfercorruption 2>&1 | tee /tmp/invest.log
 
       - name: Summarize
         run: |

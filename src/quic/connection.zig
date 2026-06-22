@@ -1563,9 +1563,8 @@ pub fn Connection(comptime max_streams: usize) type {
             std.debug.print("[{s}] sid={d} off={d} acked={d} smax={d} unacked={d} cwnd={d} bif={d} queued={d} pto_ms={d} ptoc={d} retx={d} ping={d} | ae strm={d} ping={d} hsd={d} mdata={d} msd={d} cc={d}\n", .{
                 tag,                             stream_id,                      st.send_offset,            st.send_acked,     st.send_max,
                 st.send_offset -| st.send_acked, self.congestion.cwnd,           self.loss.bytes_in_flight, self.bytes_queued, pto_in_ms,
-                self.loss.pto_count,             self.stream_pending_retx_count, self.idle_ping_count,
-                c[1],                            c[3],                           c[4],                      c[5],              c[6],
-                c[10],
+                self.loss.pto_count,             self.stream_pending_retx_count, self.idle_ping_count,      c[1],              c[3],
+                c[4],                            c[5],                           c[6],                      c[10],
             });
         }
 
