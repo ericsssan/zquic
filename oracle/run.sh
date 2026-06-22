@@ -296,7 +296,22 @@ proxied() {
   stop "$sp" "$px"
   [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; echo "[HSDONE loss=$(grep -c 'HSDONE.*loss' "$d/zsrv.log" 2>/dev/null) retx=$(grep -c 'HSDONE.*queue' "$d/zsrv.log" 2>/dev/null)]"; echo "[AUTH]"; grep 'AUTH\]' "$d/zsrv.log" 2>/dev/null | head -3; echo "[PTO]"; grep 'PTO\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[STREAM]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | head -5; echo "[STREAM last]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[ACKR]"; grep 'ACKR\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null; echo "[cli]"; cat "$d/cli.log" 2>/dev/null; echo "[proxy drop]"; grep -i 'drop\|loss\|discard' "$d/proxy.log" 2>/dev/null | tail -5; echo "[cap $(wc -l <"$d/capture.txt" 2>/dev/null)]"; sort "$d/capture.txt" 2>/dev/null | uniq -c | sort -rn | head -10; echo "[cap tail]"; tail -20 "$d/capture.txt" 2>/dev/null; return; }
   [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
-  local m; if ! m="$(assert_match "$out" $paths)"; then bad "$tag (transfer: $m)"; return; fi
+  local m; if ! m="$(assert_match "$out" $paths)"; then
+    bad "$tag (transfer: $m)"
+    # Hash-mismatch diagnostics (#seeded-loss investigation): a mismatch under
+    # pure loss means wrong bytes were delivered (loss should retransmit identical
+    # bytes), so locate the first differing offset and dump the server's view.
+    local bp; for bp in $paths; do local bb; bb="$(basename "$bp")"
+      if [ -f "$out/$bb" ]; then
+        local esz gsz; esz=$(wc -c <"$WWW/$bb"); gsz=$(wc -c <"$out/$bb")
+        echo "  [diag] $bb expected=$esz got=$gsz first-diff-offset=$(cmp "$WWW/$bb" "$out/$bb" 2>&1 | sed 's/.*char //;s/,.*//' | head -1)"
+      else echo "  [diag] $bb MISSING in $out"; fi
+    done
+    echo "  [zsrv tail]"; tail -4 "$d/zsrv.log" 2>/dev/null
+    echo "  [zsrv errors]"; grep -iE "error|panic|overflow|reset|violat" "$d/zsrv.log" 2>/dev/null | head -5
+    echo "  [cli tail]"; tail -3 "$d/cli.log" 2>/dev/null
+    return
+  fi
   # ECN wire-proof requires Linux: IP_RECVTOS CMSG is not reliably populated on macOS loopback (#41).
   if [ -n "$want" ] && echo "$want" | grep -q "ECT\|^CE" && [ "$(uname -s)" != "Linux" ]; then
     ok "$tag (ECN wire-proof skipped on $(uname -s))"
