@@ -889,6 +889,24 @@ pub fn StreamTable(comptime capacity: usize) type {
             return null;
         }
 
+        /// Iterate live streams (order is slot order, not ID order).
+        pub fn iter(self: *Self) Iterator {
+            return .{ .table = self, .i = 0 };
+        }
+
+        pub const Iterator = struct {
+            table: *Self,
+            i: usize,
+            pub fn next(it: *Iterator) ?*Stream {
+                while (it.i < capacity) {
+                    const idx = it.i;
+                    it.i += 1;
+                    if (it.table.states[idx] == .occupied) return &it.table.streams[idx];
+                }
+                return null;
+            }
+        };
+
         pub fn close(self: *Self, id: u62) void {
             const mask = capacity - 1;
             const start: usize = @as(usize, @intCast(id)) & mask;

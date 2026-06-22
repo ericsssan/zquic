@@ -1330,19 +1330,25 @@ pub fn Connection(comptime max_streams: usize) type {
                                 // actually-missing in-flight packet (RFC 9002 §6.2).
                                 if (self.stream_pending_retx_count == 0) {
                                     if (!self.probeUnackedStreamData()) {
-                                        // Only PING probe if there's meaningful data in flight
-                                        // (not just our own previous PINGs). Without this guard,
-                                        // PTO sends infinite PINGs after all transfers complete:
-                                        // each PING creates in-flight state → PTO fires → PING → loop.
-                                        // Cap at 30 consecutive idle PINGs, then reschedule PTO to
-                                        // a 5s future deadline (prevents tight-loop when cap is hit).
-                                        if (self.idle_ping_count < 30) {
-                                            self.queuePing() catch {};
-                                            self.idle_ping_count += 1;
-                                        } else {
-                                            // PTO fired but no probe sent: advance deadline to avoid
-                                            // busy-looping with a stale past deadline.
-                                            self.pto_deadline_ns = self.current_time_ns +| @as(i64, 5_000_000_000);
+                                        // No in-flight stream packet to probe. Before falling to
+                                        // idle PINGs, re-drive a stalled tail whose sent-table entry
+                                        // was evicted — PINGs only elicit ACKs, they never deliver
+                                        // the missing bytes, so the idle-PING cap must NOT apply
+                                        // while a stream still has unacked data.
+                                        if (!self.probeStalledStreamTail()) {
+                                            // Truly idle (no unacked stream data): PING, capped.
+                                            // Without this guard, PTO sends infinite PINGs after all
+                                            // transfers complete: each PING creates in-flight state →
+                                            // PTO fires → PING → loop. Cap at 30 consecutive idle
+                                            // PINGs, then reschedule PTO to a 5s future deadline.
+                                            if (self.idle_ping_count < 30) {
+                                                self.queuePing() catch {};
+                                                self.idle_ping_count += 1;
+                                            } else {
+                                                // PTO fired but no probe sent: advance deadline to
+                                                // avoid busy-looping with a stale past deadline.
+                                                self.pto_deadline_ns = self.current_time_ns +| @as(i64, 5_000_000_000);
+                                            }
                                         }
                                     } else {
                                         // RFC 9002 §6.2: SHOULD send two full-sized datagrams per
@@ -3271,6 +3277,32 @@ pub fn Connection(comptime max_streams: usize) type {
                         }
                     },
                     else => {},
+                }
+            }
+            return false;
+        }
+
+        /// PTO fallback: re-drive the oldest unacked byte of any stream that still
+        /// has data (or a FIN) the peer has not acknowledged, retransmitting from
+        /// send_acked directly. probeUnackedStreamData scans the bounded sent table,
+        /// so it returns false when the packet holding the missing tail was evicted
+        /// (a 1 MB transfer overruns MAX_SENT). Without this, such a stall falls to
+        /// the capped idle-PING path, which only elicits ACKs and never delivers the
+        /// missing bytes — the seeded-loss truncation. Returns true if a probe was
+        /// sent. Bounded: once retransmitted the bytes re-enter the sent table, and
+        /// when fully acked (send_acked == send_offset) this returns false, so no
+        /// PING-flood loop on a completed transfer.
+        pub fn probeStalledStreamTail(self: *Self) bool {
+            var buf: [MAX_SEND_PACKET_SIZE]u8 = undefined;
+            var it = self.streams.iter();
+            while (it.next()) |st| {
+                if (st.send_offset <= st.send_acked) continue; // nothing unacked to re-drive
+                const off = st.send_acked;
+                const n = st.getSendData(off, &buf);
+                const fin = st.send_fin and (off + n >= st.send_offset);
+                if (n > 0 or fin) {
+                    self.encryptAndEnqueueStreamFrame(st.id, @intCast(off), buf[0..n], fin) catch return false;
+                    return true;
                 }
             }
             return false;

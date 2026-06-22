@@ -1717,3 +1717,33 @@ test "PTO probe targets oldest UNACKED stream packet, not oldest in-flight" {
     // missing tail unprobed. It must instead probe pn=2's unacked data.
     try testing.expect(conn.probeUnackedStreamData());
 }
+
+test "PTO re-drives a stalled stream tail when its sent-table entry was evicted" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+    const k = crypto.PacketKeys{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = .aes_128_gcm };
+    conn.app_keys = tls.AppKeys{ .client = k, .server = k };
+    conn.hot.state = .established;
+
+    // Stream 0: 2000 bytes buffered, the first 1000 acked → [1000, 2000) unacked.
+    const st = (try conn.streams.getOrCreate(0)).?;
+    st.send_max = 1 << 20;
+    var data: [2000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i);
+    _ = st.send_buf.write(&data);
+    st.send_offset = 2000;
+    st.onAcked(0, 1000);
+
+    // The sent table is EMPTY (the packet that carried the tail was evicted from
+    // the bounded table), so the in-flight scan finds nothing to probe...
+    try testing.expect(!conn.probeUnackedStreamData());
+    // ...but the stalled-tail fallback must re-drive the genuinely-missing data
+    // instead of falling to a useless idle PING.
+    try testing.expect(conn.probeStalledStreamTail());
+
+    // A fully-acked stream must NOT be re-driven — that would re-introduce the
+    // PING-flood-equivalent loop the idle cap exists to prevent.
+    st.onAcked(1000, 1000); // ack the remainder → send_acked == send_offset
+    try testing.expect(!conn.probeStalledStreamTail());
+}
