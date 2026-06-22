@@ -3250,14 +3250,25 @@ pub fn Connection(comptime max_streams: usize) type {
                 if (!slot.valid or slot.epoch != 2) continue;
                 found += 1;
                 if (slot.in_flight and slot.pn < best_pn) {
-                    // Check if this packet carried stream data.
+                    // Pick this packet only if it still carries UNACKED stream data
+                    // (offset >= the stream's send_acked, or a FIN). Out-of-order
+                    // SACKs can advance send_acked past an older in-flight packet
+                    // while leaving it marked in_flight; picking such a packet would
+                    // make the retransmit step below skip it (offset < send_acked)
+                    // and return false, dropping PTO to capped idle PINGs and
+                    // stalling recovery of the genuinely-missing tail data (the
+                    // seeded-loss truncation). Require unacked data so PTO probes
+                    // the oldest packet that actually needs retransmission.
                     const fi = table.frame_info[idx];
                     for (fi.frames[0..fi.count]) |frame_info| {
                         switch (frame_info) {
-                            .stream => {
-                                best_pn = slot.pn;
-                                best_idx = idx;
-                                break;
+                            .stream => |s| {
+                                const st = self.streams.get(s.stream_id) orelse continue;
+                                if (s.offset >= st.send_acked or s.fin) {
+                                    best_pn = slot.pn;
+                                    best_idx = idx;
+                                    break;
+                                }
                             },
                             else => {},
                         }
