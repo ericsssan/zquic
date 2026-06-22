@@ -286,7 +286,7 @@ proxied() {
   local ct="${CASE_TIMEOUT[$case]:-$CLIENT_TIMEOUT}"
   local tag="$case [zquic-server <-> $impl-client${impair:+ | impair:$impair}${want:+ | wire: $want}]"
   local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
-  TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  TRANSFER_DEBUG="${ORACLE_XFER_DEBUG:-}" TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
   "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
@@ -309,6 +309,8 @@ proxied() {
     done
     echo "  [zsrv tail]"; tail -4 "$d/zsrv.log" 2>/dev/null
     echo "  [zsrv errors]"; grep -iE "error|panic|overflow|reset|violat" "$d/zsrv.log" 2>/dev/null | head -5
+    echo "  [XFER last 6]"; grep '\[XFER\]' "$d/zsrv.log" 2>/dev/null | tail -6
+    echo "  [s2c bytes proxy saw]"; awk '/s2c DGRAM/{n+=$3} END{print n+0}' "$capf" 2>/dev/null
     echo "  [cli tail]"; tail -3 "$d/cli.log" 2>/dev/null
     return
   fi
