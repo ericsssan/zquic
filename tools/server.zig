@@ -1208,11 +1208,10 @@ fn readFileFull(io: std.Io, path: []const u8, out: []u8) !usize {
 }
 
 /// Configure the ECN socket options for the ecn testcase (RFC 3168).
-/// The ecn server binds a native AF_INET socket (see the bind site), so only the
-/// IPv4 options apply: IP_TOS marks outgoing packets with ECT(0) and IP_RECVTOS
-/// requests the TOS byte of received datagrams.  Outgoing marking is additionally
-/// set per-packet via ecnControl()/OutgoingMessage.control in the send paths, which
-/// keeps the codepoint correct even under UDP GSO.
+/// The ecn server binds a native AF_INET socket (see the bind site), so the IPv4
+/// options apply directly: IP_TOS marks every outgoing packet with ECT(0) — at the
+/// socket level, so the GSO path inherits it too — and IP_RECVTOS requests the TOS
+/// byte of received datagrams.
 fn configureEcn(sock: *const net.Socket) !void {
     // std.Io.net.Socket doesn't expose setsockopt, so use raw Linux syscalls.
     const fd = sock.handle;
