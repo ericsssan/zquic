@@ -2206,29 +2206,39 @@ pub fn Connection(comptime max_streams: usize) type {
 
             // Key phase handling (RFC 9001 §6): different phase bit indicates key update.
             if (hdr.key_phase != self.current_key_phase) {
-                // Peer initiated key update. Try next-generation keys first.
+                // decryptCached overwrites payload even on auth failure, so save the
+                // ciphertext now; restore before each subsequent attempt.
+                var ct_save: [MAX_PACKET_SIZE]u8 = undefined;
+                @memcpy(ct_save[0..payload.len], payload);
+
+                // Attempt 1: next-gen keys — peer initiated a key update.
                 var decrypted_with_next = false;
                 if (self.rxNextAppKeys()) |rx_next| {
                     const ctx = self.cached_next_keys orelse crypto_simd.CachedKeyCtx.init(rx_next);
                     const nonce = crypto.buildNonce(rx_next.iv, pn);
                     if (crypto_simd.decryptCached(ctx, nonce, aad, payload)) |_| {
                         decrypted_with_next = true;
-                    } else |_| {}
+                    } else |_| {
+                        @memcpy(payload, ct_save[0..payload.len]); // restore for next try
+                    }
                 }
                 if (decrypted_with_next) {
                     self.rotateKeys();
                     self.key_update_pending = false;
                 } else {
-                    // Fallback 1: current keys (handles reordering of same-phase packets
-                    // during a peer-initiated transition).
+                    // Attempt 2: current keys — reordering during peer-initiated transition.
                     const rx_keys = self.rxAppKeys().?;
                     const ctx = self.cached_app_keys orelse crypto_simd.CachedKeyCtx.init(rx_keys);
                     const nonce = crypto.buildNonce(rx_keys.iv, pn);
-                    if (crypto_simd.decryptCached(ctx, nonce, aad, payload)) |_| {
-                        // ok
-                    } else |_| {
-                        // Fallback 2: old keys retained from our own key update (RFC 9001
-                        // §6.1) — peer in-flight at the moment we rotated.
+                    const cur_ok = if (crypto_simd.decryptCached(ctx, nonce, aad, payload)) |_| blk: {
+                        break :blk true;
+                    } else |_| blk: {
+                        @memcpy(payload, ct_save[0..payload.len]); // restore for next try
+                        break :blk false;
+                    };
+                    if (!cur_ok) {
+                        // Attempt 3: old keys — in-flight from before our own key update
+                        // (RFC 9001 §6.1: retain old read keys during the transition window).
                         var old_ok = false;
                         if (self.rxOldAppKeys()) |rx_old| {
                             const old_ctx = crypto_simd.CachedKeyCtx.init(rx_old);
