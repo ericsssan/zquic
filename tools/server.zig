@@ -576,6 +576,7 @@ pub fn main(init: std.process.Init) !void {
                     batch_froms[batch_count] = msg.from;
                     batch_is_cm[batch_count] = true;
                     batch_count += 1;
+                    std.debug.print("[CMRX] cm-sock packet len={d}\n", .{msg.data.len});
                 } else |_| break;
             }
         }
