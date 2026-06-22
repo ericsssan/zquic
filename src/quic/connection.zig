@@ -355,6 +355,10 @@ pub fn Connection(comptime max_streams: usize) type {
         bytes_recv: u64,
         pkts_sent: u64,
         pkts_recv: u64,
+        /// Investigation: count of ack-eliciting packets sent, keyed by first frame
+        /// type (FrameInfo tag). Used by debugSendState to identify what keeps PTO
+        /// armed during a no-ack stall. Cheap (one increment per ack-eliciting send).
+        dbg_ae_send_counts: [12]u32 = @splat(0),
 
         // Config
         config: Config,
@@ -1162,6 +1166,7 @@ pub fn Connection(comptime max_streams: usize) type {
             if (meta.ack_eliciting) {
                 self.bytes_queued -|= meta.size;
                 self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                self.dbg_ae_send_counts[@intFromEnum(meta.frame_info.frames[0])] +%= 1;
             }
             self.sq_head += 1;
 
@@ -1181,6 +1186,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (next_meta.ack_eliciting) {
                         self.bytes_queued -|= next_meta.size;
                         self.pto_deadline_ns = self.loss.ptoDeadline(self.cached_max_ack_delay_ns);
+                        self.dbg_ae_send_counts[@intFromEnum(next_meta.frame_info.frames[0])] +%= 1;
                     }
                     total += next_slot.len;
                     self.sq_head += 1;
@@ -1553,10 +1559,13 @@ pub fn Connection(comptime max_streams: usize) type {
         pub fn debugSendState(self: *Self, stream_id: u62, now_ns: i64, tag: []const u8) void {
             const st = self.streams.get(stream_id) orelse return;
             const pto_in_ms: i64 = if (self.pto_deadline_ns) |d| @divTrunc(d - now_ns, 1_000_000) else -999999;
-            std.debug.print("[{s}] sid={d} off={d} acked={d} smax={d} unacked={d} cwnd={d} bif={d} queued={d} pto_ms={d} ptoc={d} retx={d} ping={d}\n", .{
+            const c = self.dbg_ae_send_counts; // FrameInfo tags: 1=stream 3=ping 4=hsdone 5=max_data 6=max_stream_data
+            std.debug.print("[{s}] sid={d} off={d} acked={d} smax={d} unacked={d} cwnd={d} bif={d} queued={d} pto_ms={d} ptoc={d} retx={d} ping={d} | ae strm={d} ping={d} hsd={d} mdata={d} msd={d} cc={d}\n", .{
                 tag,                             stream_id,                      st.send_offset,            st.send_acked,     st.send_max,
                 st.send_offset -| st.send_acked, self.congestion.cwnd,           self.loss.bytes_in_flight, self.bytes_queued, pto_in_ms,
                 self.loss.pto_count,             self.stream_pending_retx_count, self.idle_ping_count,
+                c[1],                            c[3],                           c[4],                      c[5],              c[6],
+                c[10],
             });
         }
 

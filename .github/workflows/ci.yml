@@ -147,5 +147,13 @@ jobs:
       # running a smaller green matrix (#7). ngtcp2 is the only impl that
       # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
       # would silently drop 11 H3 test runs (#16).
-      - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+      - name: Seeded-loss PTO investigation
+        continue-on-error: true
+        run: ORACLE_XFER_DEBUG=1 ORACLE_REPEAT=10 bash oracle/run.sh transferloss transfercorruption 2>&1 | tee /tmp/invest.log
+
+      - name: Summarize
+        run: |
+          echo "=== STABILITY ==="; grep -E "STABILITY:" /tmp/invest.log || true
+          echo "=== XFER stall states (frame histogram) ==="; grep "\[XFER\]" /tmp/invest.log | sed -E 's/.*\| //' | sort | uniq -c | sort -rn | head -20
+          echo "=== full XFER sample (last 12) ==="; grep "\[XFER\]" /tmp/invest.log | tail -12
+          echo "=== diag offsets ==="; grep "\[diag\]" /tmp/invest.log | grep -oE "got=[0-9]+" | sort | uniq -c
