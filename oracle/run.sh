@@ -286,7 +286,14 @@ proxied() {
   local ct="${CASE_TIMEOUT[$case]:-$CLIENT_TIMEOUT}"
   local tag="$case [zquic-server <-> $impl-client${impair:+ | impair:$impair}${want:+ | wire: $want}]"
   local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
-  TRANSFER_DEBUG="${ORACLE_XFER_DEBUG:-}" TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  # Outcome-deterministic loss (#8): for the bulk-data seeded tests, give the
+  # server an SSLKEYLOGFILE and point the proxy at it so loss/corruption keys on
+  # the decrypted s2c STREAM offset (impair each selected offset once) instead of
+  # the timing-dependent datagram ordinal. handshakeloss/handshakecorruption keep
+  # ordinal impairment (no stream data to key on during the handshake).
+  local keylog="$d/keys.log"; rm -f "$keylog"; local detloss=""
+  case "$case" in transferloss | transfercorruption) detloss="-loss-keylog $keylog" ;; esac
+  SSLKEYLOGFILE="$keylog" TRANSFER_DEBUG="${ORACLE_XFER_DEBUG:-}" TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
   # GOMAXPROCS=1: the capturing proxy is purely I/O-bound packet forwarding, but
@@ -296,11 +303,14 @@ proxied() {
   # send_acked stalls → seeded-loss recovery stalls / truncations). Pinning the
   # proxy to one OS thread keeps cores free for the server. Applied at every proxy
   # launch below.
-  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair $detloss >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$ct" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
+  # Deterministic loss must actually impair packets (else a fail-open crypto bug
+  # would make the test pass vacuously). Surface the count when det-loss is on.
+  [ -n "$detloss" ] && echo "  [det-loss] $(grep -c 'impair s2c' "$d/proxy.log" 2>/dev/null) s2c offsets impaired ($(grep -q 'keys derived' "$d/proxy.log" 2>/dev/null && echo keys-ok || echo NO-KEYS))"
   [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; echo "[HSDONE loss=$(grep -c 'HSDONE.*loss' "$d/zsrv.log" 2>/dev/null) retx=$(grep -c 'HSDONE.*queue' "$d/zsrv.log" 2>/dev/null)]"; echo "[AUTH]"; grep 'AUTH\]' "$d/zsrv.log" 2>/dev/null | head -3; echo "[PTO]"; grep 'PTO\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[STREAM]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | head -5; echo "[STREAM last]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[ACKR]"; grep 'ACKR\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null; echo "[cli]"; cat "$d/cli.log" 2>/dev/null; echo "[proxy drop]"; grep -i 'drop\|loss\|discard' "$d/proxy.log" 2>/dev/null | tail -5; echo "[cap $(wc -l <"$d/capture.txt" 2>/dev/null)]"; sort "$d/capture.txt" 2>/dev/null | uniq -c | sort -rn | head -10; echo "[cap tail]"; tail -20 "$d/capture.txt" 2>/dev/null; return; }
   [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
   local m; if ! m="$(assert_match "$out" $paths)"; then
