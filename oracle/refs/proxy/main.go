@@ -136,22 +136,10 @@ func main() {
 	ecnFlag := flag.Bool("ecn", false, "read IP ECN bits from s2c packets via IP_RECVTOS CMSG (Linux only) and append counts to capture file (#41)")
 	shortsFlag := flag.String("shorts", "", "file path for SHORT packet hex dump used by kpcheck for KP bit wire-proof (#40)")
 	tolerantBack := flag.Bool("tolerant-back", false, "retry s2c Read after errors instead of exiting (for tests where the server restarts mid-connection)")
-	lossKeylog := flag.String("loss-keylog", "", "server SSLKEYLOGFILE: enables OUTCOME-deterministic loss/corruption (#8) — impair a seeded subset of s2c STREAM offsets (decrypted) once each, instead of dropping the Nth datagram by timing")
 	flag.Parse()
 	if *listen == "" || *target == "" {
 		fmt.Fprintln(os.Stderr, "proxy: -listen and -target required")
 		os.Exit(2)
-	}
-	// Deterministic-loss mode: when a keylog is supplied and an impairment rate is
-	// set, loss/corruption keys on the decrypted s2c STREAM offset (see loss.go)
-	// rather than the seeded datagram ordinal.
-	var dl *detLoss
-	if *lossKeylog != "" && (*loss > 0 || *corrupt > 0) {
-		rate := *loss
-		if rate == 0 {
-			rate = *corrupt
-		}
-		dl = newDetLoss(*lossKeylog, rate, *seed)
 	}
 
 	srvAddr, err := net.ResolveUDPAddr("udp", *target)
@@ -331,26 +319,7 @@ func main() {
 			}
 			pkt := append([]byte(nil), buf[:n]...)
 			record("s2c", pkt)
-			ca := getClient()
-			if ca == nil {
-				continue
-			}
-			if dl != nil {
-				// Deterministic mode: impair (drop or corrupt) a seeded subset of
-				// s2c STREAM offsets, once each; forward everything else verbatim.
-				if dl.shouldImpairS2C(pkt) {
-					if *corrupt > 0 {
-						c := append([]byte(nil), pkt...)
-						c[len(c)-1] ^= 0x01 // mangle GCM tag → receiver's AEAD drops it
-						fwd(func(p []byte) { front.WriteTo(p, ca) }, c)
-					}
-					// loss: drop (do not forward)
-					continue
-				}
-				fwd(func(p []byte) { front.WriteTo(p, ca) }, pkt)
-				continue
-			}
-			if !drop(rngS) {
+			if ca := getClient(); ca != nil && !drop(rngS) {
 				fwd(func(p []byte) { front.WriteTo(p, ca) }, maybecorrupt(rngS, pkt))
 			}
 		}
@@ -366,16 +335,6 @@ func main() {
 		setClient(addr)
 		pkt := append([]byte(nil), buf[:n]...)
 		record("c2s", pkt)
-		if dl != nil {
-			// Learn the client SCID length (= DCID length of s2c SHORT packets) so
-			// the s2c decryptor can locate the packet number. Deterministic mode
-			// applies loss only to s2c stream data, so forward all c2s packets —
-			// never dropping client ACKs, which keeps recovery from stalling and
-			// makes the seeded outcome reliably reproducible.
-			dl.observeC2SInitial(pkt)
-			fwd(func(p []byte) { back.Write(p) }, pkt)
-			continue
-		}
 		if !drop(rngC) {
 			fwd(func(p []byte) { back.Write(p) }, maybecorrupt(rngC, pkt))
 		}
@@ -385,9 +344,6 @@ func main() {
 	// call completes before capFile.Close() runs.
 	back.Close()
 	wg.Wait()
-	if dl != nil {
-		fmt.Fprintf(os.Stderr, "proxy: deterministic loss — decrypted %d s2c pkts, impaired %d offsets\n", dl.decrypted, dl.hit)
-	}
 	if capFile != nil {
 		capFile.Close()
 	}
