@@ -155,5 +155,19 @@ jobs:
       # running a smaller green matrix (#7). ngtcp2 is the only impl that
       # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
       # would silently drop 11 H3 test runs (#16).
-      - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+      # invest/recovery: catch failing transferloss runs on Linux and dump the
+      # server's recovery-state progression ([XFER]) so the residual ~8% stall
+      # can be diagnosed (hard stall vs slow recovery; flow-ctl/congestion/PTO).
+      - name: Investigate recovery stall (transferloss)
+        run: |
+          echo "nproc=$(nproc)"
+          run_one() {
+            echo "########## $1 transferloss × 40 ##########"
+            ORACLE_XFER_DEBUG=1 ORACLE_REPEAT=40 bash oracle/run.sh -i "$1" transferloss 2>&1
+          }
+          run_one ngtcp2 | tee /tmp/ng.log
+          run_one quiche | tee /tmp/qu.log
+          echo "===== SUMMARY ====="
+          for f in /tmp/ng.log /tmp/qu.log; do
+            echo "--- $(basename "$f") ---"; grep -E 'STABILITY|FAIL ' "$f"
+          done

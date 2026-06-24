@@ -112,6 +112,20 @@ PASS=0; FAIL=0; FAILED=()
 
 ok()  { printf '  \033[32mPASS\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED+=("$*"); }
+# dump_xfer LOGFILE: server-side recovery-state progression around a failed
+# transfer (invest/recovery). Shows transfer onset + the steady stall state so a
+# hard recovery stall (off frozen, unacked>0, acked frozen) can be told apart
+# from slow-but-progressing recovery (off/acked creeping). Fields per [XFER]:
+# off=bytes written, acked=client-acked, smax=flow-ctl limit, unacked=off-acked,
+# cwnd/bif=congestion vs in-flight, queued, pto_ms=ms-to-PTO, ptoc=PTO backoff,
+# retx=pending stream retx, ping=idle PINGs sent.
+dump_xfer() {
+  local f="$1"; local n; n=$(grep -c '\[XFER\]' "$f" 2>/dev/null || echo 0)
+  echo "  [XFER $n samples; onset 4 + stall tail 24]"
+  grep '\[XFER\]' "$f" 2>/dev/null | head -4 | sed 's/^/    /'
+  [ "$n" -gt 28 ] && echo "    ..."
+  grep '\[XFER\]' "$f" 2>/dev/null | tail -24 | sed 's/^/    /'
+}
 
 # PIDs of every process this oracle run has backgrounded. cleanup() kills by
 # exact PID rather than pkill -f (which matches any process carrying the binary
@@ -301,8 +315,16 @@ proxied() {
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$ct" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
-  [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; echo "[HSDONE loss=$(grep -c 'HSDONE.*loss' "$d/zsrv.log" 2>/dev/null) retx=$(grep -c 'HSDONE.*queue' "$d/zsrv.log" 2>/dev/null)]"; echo "[AUTH]"; grep 'AUTH\]' "$d/zsrv.log" 2>/dev/null | head -3; echo "[PTO]"; grep 'PTO\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[STREAM]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | head -5; echo "[STREAM last]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[ACKR]"; grep 'ACKR\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null; echo "[cli]"; cat "$d/cli.log" 2>/dev/null; echo "[proxy drop]"; grep -i 'drop\|loss\|discard' "$d/proxy.log" 2>/dev/null | tail -5; echo "[cap $(wc -l <"$d/capture.txt" 2>/dev/null)]"; sort "$d/capture.txt" 2>/dev/null | uniq -c | sort -rn | head -10; echo "[cap tail]"; tail -20 "$d/capture.txt" 2>/dev/null; return; }
-  [ $rc -eq 0 ] || { bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  [ $rc -eq 124 ] && { bad "$tag (TIMEOUT)"; echo "[HSDONE loss=$(grep -c 'HSDONE.*loss' "$d/zsrv.log" 2>/dev/null) retx=$(grep -c 'HSDONE.*queue' "$d/zsrv.log" 2>/dev/null)]"; echo "[AUTH]"; grep 'AUTH\]' "$d/zsrv.log" 2>/dev/null | head -3; echo "[PTO]"; grep 'PTO\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[STREAM]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | head -5; echo "[STREAM last]"; grep 'STREAM\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[ACKR]"; grep 'ACKR\]' "$d/zsrv.log" 2>/dev/null | tail -5; echo "[zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null; echo "[cli]"; cat "$d/cli.log" 2>/dev/null; echo "[proxy drop]"; grep -i 'drop\|loss\|discard' "$d/proxy.log" 2>/dev/null | tail -5; echo "[cap $(wc -l <"$d/capture.txt" 2>/dev/null)]"; sort "$d/capture.txt" 2>/dev/null | uniq -c | sort -rn | head -10; echo "[cap tail]"; tail -20 "$d/capture.txt" 2>/dev/null; dump_xfer "$d/zsrv.log"; return; }
+  [ $rc -eq 0 ] || {
+    bad "$tag (client rc=$rc: $(tail -1 "$d/cli.log"))"
+    # rc=254 = ref client (quiche/ngtcp2) idle-timed-out mid-transfer — the
+    # dominant seeded-loss failure. Dump the server's recovery state so we can
+    # see why the tail never lands (invest/recovery).
+    echo "  [s2c bytes proxy saw]"; awk '/s2c DGRAM/{n+=$3} END{print n+0}' "$capf" 2>/dev/null
+    dump_xfer "$d/zsrv.log"
+    return
+  }
   local m; if ! m="$(assert_match "$out" $paths)"; then
     bad "$tag (transfer: $m)"
     # Hash-mismatch diagnostics (#seeded-loss investigation): a mismatch under
@@ -316,7 +338,7 @@ proxied() {
     done
     echo "  [zsrv tail]"; tail -4 "$d/zsrv.log" 2>/dev/null
     echo "  [zsrv errors]"; grep -iE "error|panic|overflow|reset|violat" "$d/zsrv.log" 2>/dev/null | head -5
-    echo "  [XFER last 6]"; grep '\[XFER\]' "$d/zsrv.log" 2>/dev/null | tail -6
+    dump_xfer "$d/zsrv.log"
     echo "  [s2c bytes proxy saw]"; awk '/s2c DGRAM/{n+=$3} END{print n+0}' "$capf" 2>/dev/null
     echo "  [cli tail]"; tail -3 "$d/cli.log" 2>/dev/null
     return
