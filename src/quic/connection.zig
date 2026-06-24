@@ -1578,6 +1578,22 @@ pub fn Connection(comptime max_streams: usize) type {
             });
         }
 
+        /// Investigation: connection-level recovery state, independent of any
+        /// stream still being present. Shows whether PTO is armed (ptoarm) and
+        /// why ptoDeadline returns null (bif==0 or lae==false), plus cwnd so a
+        /// send-side stall (cwnd collapsed / bif≈cwnd) can be told apart from a
+        /// loss-recovery stall (bif>0 but pto unarmed).
+        pub fn debugConnState(self: *Self, now_ns: i64) void {
+            const pto_ms: i64 = if (self.pto_deadline_ns) |d| @divTrunc(d - now_ns, 1_000_000) else -1;
+            const idle_ms: i64 = if (self.idle_deadline_ns) |d| @divTrunc(d - now_ns, 1_000_000) else -1;
+            std.debug.print("[CONN] st={s} bif={d} cwnd={d} lae={} ptoarm={} pto_ms={d} ptoc={d} idle_ms={d} ipc={d} nstr={d}\n", .{
+                @tagName(self.hot.state),                self.loss.bytes_in_flight,    self.congestion.cwnd,
+                self.loss.last_ack_eliciting_ns != null, self.pto_deadline_ns != null, pto_ms,
+                self.loss.pto_count,                     idle_ms,                      self.idle_ping_count,
+                self.streams.count,
+            });
+        }
+
         /// Investigation: dump every stream that still has unacked send data,
         /// regardless of whether the transfer is still actively feeding bytes.
         /// The seeded-loss truncation stalls AFTER all data + FIN is fed, so a

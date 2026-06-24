@@ -276,12 +276,17 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
             // Investigation: every ~1s, dump the state of any active transfer so a
             // stalled tail (seeded-loss truncation) shows whether send_offset froze
             // (send stall) or send_acked froze (retransmit failure).
-            if (g_transfer_debug and now_ns - slot.dbg_last_ns > 250_000_000) {
-                // Dump every stream that still owes unacked bytes — NOT just active
-                // transfers. The seeded-loss truncation stalls AFTER all data + FIN
-                // is fed (transfer marked inactive), so a transfer-active-gated dump
-                // goes blind exactly when the tail recovery stalls.
-                if (slot.conn.debugDumpUnacked(now_ns)) slot.dbg_last_ns = now_ns;
+            if (g_transfer_debug and slot.conn.app_keys != null and now_ns - slot.dbg_last_ns > 250_000_000) {
+                // Fire every 250ms once the handshake completes, regardless of
+                // stream/transfer state, so the whole stall is visible. [CONN] =
+                // connection recovery state (bif/cwnd/pto-armed); [TX] = per-transfer
+                // feed state (active/offset); [XFER] = stream send_offset/send_acked.
+                slot.conn.debugConnState(now_ns);
+                for (&slot.transfers) |*t| {
+                    if (t.active or t.file != null) std.debug.print("[TX] sid={d} active={} off={d}\n", .{ t.stream_id, t.active, t.offset });
+                }
+                _ = slot.conn.debugDumpUnacked(now_ns);
+                slot.dbg_last_ns = now_ns;
             }
         }
     }

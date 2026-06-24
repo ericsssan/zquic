@@ -121,6 +121,10 @@ bad() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED+=("$*
 # retx=pending stream retx, ping=idle PINGs sent.
 dump_xfer() {
   local f="$1"; local n; n=$(grep -c '\[XFER\]' "$f" 2>/dev/null || echo 0)
+  echo "  [CONN recovery state over time — ptoarm=false while owing data ⇒ PTO unarmed bug]"
+  grep '\[CONN\]' "$f" 2>/dev/null | tail -16 | sed 's/^/    /'
+  echo "  [TX feed state — off frozen < filesize ⇒ send-side stall]"
+  grep '\[TX\]' "$f" 2>/dev/null | tail -8 | sed 's/^/    /'
   echo "  [XFER $n samples; onset 4 + stall tail 24]"
   grep '\[XFER\]' "$f" 2>/dev/null | head -4 | sed 's/^/    /'
   [ "$n" -gt 28 ] && echo "    ..."
