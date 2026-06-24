@@ -125,6 +125,12 @@ dump_xfer() {
   grep '\[XFER\]' "$f" 2>/dev/null | head -4 | sed 's/^/    /'
   [ "$n" -gt 28 ] && echo "    ..."
   grep '\[XFER\]' "$f" 2>/dev/null | tail -24 | sed 's/^/    /'
+  echo "  [LOOP heartbeat — gaps mean the loop blocked in receiveTimeout]"
+  grep '\[LOOP\]' "$f" 2>/dev/null | tail -8 | sed 's/^/    /'
+  echo "  [PTOB branch fires]"
+  grep '\[PTOB\]' "$f" 2>/dev/null | head -3 | sed 's/^/    /'
+  grep '\[PTOB\]' "$f" 2>/dev/null | tail -6 | sed 's/^/    /'
+  echo "  [IDLE] $(grep -c '\[IDLE\]' "$f" 2>/dev/null) server idle-timeouts"
 }
 
 # PIDs of every process this oracle run has backgrounded. cleanup() kills by

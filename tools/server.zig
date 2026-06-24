@@ -91,6 +91,11 @@ var g_is_h3: bool = false;
 // stalled transfer (seeded-loss truncation) reveals whether it stopped sending or
 // failed to retransmit. Off unless the env var is present.
 var g_transfer_debug: bool = false;
+// Investigation (invest/recovery): event-loop heartbeat counters.
+var g_loop_iters: u64 = 0;
+var g_loop_pkt: u64 = 0;
+var g_loop_to: u64 = 0;
+var g_last_hb_ns: i64 = 0;
 /// Accumulated SSLKEYLOG data for all connections.  Written to /logs/keys.log
 /// in full on each update so createFileAbsolute truncation doesn't lose data.
 var g_keylog_buf: [65536]u8 = undefined;
@@ -517,6 +522,20 @@ pub fn main(init: std.process.Init) !void {
 
     // Multiplexed event loop: collect batch → process → tick/send.
     while (true) {
+        // Investigation (invest/recovery): heartbeat at the top of every loop
+        // iteration, printed at most once/sec. If the loop blocks in Phase 1
+        // (receiveTimeout not honoring its deadline during silence), there is a
+        // multi-second GAP with no heartbeat while `iters` barely moves; if it
+        // spins, `iters` jumps by thousands/sec. `to`=Phase-1 timeouts (loop
+        // woke on its own deadline), `pkt`=Phase-1 packets.
+        if (g_transfer_debug) {
+            g_loop_iters += 1;
+            const hb_now: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+            if (hb_now - g_last_hb_ns > 1_000_000_000) {
+                std.debug.print("[LOOP] iters={d} pkt={d} to={d}\n", .{ g_loop_iters, g_loop_pkt, g_loop_to });
+                g_last_hb_ns = hb_now;
+            }
+        }
         var timeout = computeGlobalTimeout(&conn_slots, io);
 
         // When CM socket is active, cap the main socket timeout at 5ms so we
@@ -531,11 +550,13 @@ pub fn main(init: std.process.Init) !void {
             batch_froms[0] = msg.from;
             batch_is_cm[0] = false;
             batch_count = 1;
+            if (g_transfer_debug) g_loop_pkt += 1;
         } else |err| {
             if (err != error.Timeout) {
                 std.debug.print("recv error: {}\n", .{err});
                 break;
             }
+            if (g_transfer_debug) g_loop_to += 1;
         }
 
         // Phase 2: Drain remaining packets into batch (non-blocking).

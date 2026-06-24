@@ -165,9 +165,9 @@ jobs:
             echo "########## $1 transferloss × 40 ##########"
             ORACLE_XFER_DEBUG=1 ORACLE_REPEAT=40 bash oracle/run.sh -i "$1" transferloss 2>&1
           }
-          run_one ngtcp2 | tee /tmp/ng.log
           run_one quiche | tee /tmp/qu.log
+          run_one ngtcp2 | tee /tmp/ng.log
           echo "===== SUMMARY ====="
-          for f in /tmp/ng.log /tmp/qu.log; do
+          for f in /tmp/qu.log /tmp/ng.log; do
             echo "--- $(basename "$f") ---"; grep -E 'STABILITY|FAIL ' "$f"
           done
