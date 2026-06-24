@@ -544,6 +544,20 @@ pub fn main(init: std.process.Init) !void {
 
         var batch_count: usize = 0;
 
+        // Investigation: measure requested-vs-actual sleep. Decides whether
+        // receiveTimeout ignores its deadline (wanted<<slept) or the computed
+        // deadline is itself large (wanted≈slept ≈1s).
+        var want_ms: i64 = -1;
+        var t0: i64 = 0;
+        if (g_transfer_debug) {
+            t0 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+            want_ms = switch (timeout) {
+                .none => -1,
+                .deadline => |d| @divTrunc(@as(i64, @truncate(d.raw.nanoseconds)) - t0, 1_000_000),
+                .duration => |dd| @divTrunc(@as(i64, @truncate(dd.raw.nanoseconds)), 1_000_000),
+            };
+        }
+
         // Phase 1: Block for first packet (or timeout).
         if (sock.receiveTimeout(io, &batch_bufs[0], timeout)) |msg| {
             batch_lens[0] = @intCast(msg.data.len);
@@ -557,6 +571,13 @@ pub fn main(init: std.process.Init) !void {
                 break;
             }
             if (g_transfer_debug) g_loop_to += 1;
+        }
+
+        // Log any long Phase-1 sleep with what was requested vs actual.
+        if (g_transfer_debug and want_ms >= 0) {
+            const t1: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
+            const slept_ms = @divTrunc(t1 - t0, 1_000_000);
+            if (slept_ms > 100) std.debug.print("[SLEEP] wanted_ms={d} slept_ms={d} woke={s}\n", .{ want_ms, slept_ms, if (batch_count > 0) "pkt" else "to" });
         }
 
         // Phase 2: Drain remaining packets into batch (non-blocking).

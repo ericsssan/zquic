@@ -125,6 +125,8 @@ dump_xfer() {
   grep '\[XFER\]' "$f" 2>/dev/null | head -4 | sed 's/^/    /'
   [ "$n" -gt 28 ] && echo "    ..."
   grep '\[XFER\]' "$f" 2>/dev/null | tail -24 | sed 's/^/    /'
+  echo "  [SLEEP requested-vs-actual — wanted<<slept ⇒ receiveTimeout ignores deadline]"
+  grep '\[SLEEP\]' "$f" 2>/dev/null | tail -10 | sed 's/^/    /'
   echo "  [LOOP heartbeat — gaps mean the loop blocked in receiveTimeout]"
   grep '\[LOOP\]' "$f" 2>/dev/null | tail -8 | sed 's/^/    /'
   echo "  [PTOB branch fires]"
