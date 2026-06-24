@@ -1293,6 +1293,12 @@ pub fn Connection(comptime max_streams: usize) type {
                 self.hot.state != .closed)
             {
                 if (self.pto_deadline_ns) |d| {
+                    // Investigation: how far is the PTO deadline from now each time
+                    // tick() reaches this check with data in flight? Always-positive
+                    // d_minus_now ⇒ tick is called before the deadline (loop wakes on
+                    // packets, never at the timer) or the deadline keeps being re-armed.
+                    if (debug_recovery and self.hot.state == .established and self.loss.bytes_in_flight > 0)
+                        std.debug.print("[TICKPTO] d_minus_now_ms={d} bif={d} ptoc={d} fires={}\n", .{ @divTrunc(d - now_ns, 1_000_000), self.loss.bytes_in_flight, self.loss.pto_count, now_ns >= d });
                     if (now_ns >= d) {
                         self.loss.onPtoFired();
                         if (self.hot.state == .established) {

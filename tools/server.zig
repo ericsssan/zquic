@@ -96,6 +96,7 @@ var g_loop_iters: u64 = 0;
 var g_loop_pkt: u64 = 0;
 var g_loop_to: u64 = 0;
 var g_last_hb_ns: i64 = 0;
+var g_last_want_ms: i64 = 0;
 /// Accumulated SSLKEYLOG data for all connections.  Written to /logs/keys.log
 /// in full on each update so createFileAbsolute truncation doesn't lose data.
 var g_keylog_buf: [65536]u8 = undefined;
@@ -537,7 +538,7 @@ pub fn main(init: std.process.Init) !void {
             g_loop_iters += 1;
             const hb_now: i64 = @truncate(std.Io.Clock.awake.now(io).nanoseconds);
             if (hb_now - g_last_hb_ns > 1_000_000_000) {
-                std.debug.print("[LOOP] iters={d} pkt={d} to={d}\n", .{ g_loop_iters, g_loop_pkt, g_loop_to });
+                std.debug.print("[LOOP] iters={d} pkt={d} to={d} last_want_ms={d}\n", .{ g_loop_iters, g_loop_pkt, g_loop_to, g_last_want_ms });
                 g_last_hb_ns = hb_now;
             }
         }
@@ -561,6 +562,7 @@ pub fn main(init: std.process.Init) !void {
                 .deadline => |d| @divTrunc(@as(i64, @truncate(d.raw.nanoseconds)) - t0, 1_000_000),
                 .duration => |dd| @divTrunc(@as(i64, @truncate(dd.raw.nanoseconds)), 1_000_000),
             };
+            g_last_want_ms = want_ms;
         }
 
         // Phase 1: Block for first packet (or timeout).

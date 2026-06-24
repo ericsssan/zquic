@@ -133,6 +133,8 @@ dump_xfer() {
   grep '\[SLEEP\]' "$f" 2>/dev/null | tail -10 | sed 's/^/    /'
   echo "  [LOOP heartbeat — gaps mean the loop blocked in receiveTimeout]"
   grep '\[LOOP\]' "$f" 2>/dev/null | tail -8 | sed 's/^/    /'
+  echo "  [TICKPTO — d_minus_now>0 always ⇒ tick never reaches the deadline]"
+  grep '\[TICKPTO\]' "$f" 2>/dev/null | tail -10 | sed 's/^/    /'
   echo "  [PTOB branch fires]"
   grep '\[PTOB\]' "$f" 2>/dev/null | head -3 | sed 's/^/    /'
   grep '\[PTOB\]' "$f" 2>/dev/null | tail -6 | sed 's/^/    /'
