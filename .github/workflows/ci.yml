@@ -151,9 +151,32 @@ jobs:
       - name: Build reference impls + fixtures
         run: bash oracle/build-refs.sh
 
-      # --require fails the job if any impl didn't build, instead of silently
-      # running a smaller green matrix (#7). ngtcp2 is the only impl that
-      # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
-      # would silently drop 11 H3 test runs (#16).
-      - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+      # measure/ack-range-impact: interleaved A/B of the ACK >31-range fix on the
+      # SAME runner. Only frame.zig is swapped between the fixed version (this
+      # branch) and the buggy baseline (main); everything else is identical.
+      # Interleaving BASELINE/FIX across rounds controls for CI-load drift.
+      - name: Measure ACK-range fix impact (interleaved A/B)
+        run: |
+          # FIX = committed frame.zig (no >31 rejection). BASELINE = re-insert the
+          # one rejecting line; that single line is the entire behavioral revert.
+          cp src/quic/frame.zig /tmp/frame_fix.zig
+          sed 's|\(const range_count: usize = @intCast(count_vi.value);\)|\1\n            if (range_count > 31) return error.InvalidFrame;|' /tmp/frame_fix.zig > /tmp/frame_base.zig
+          grep -q "range_count > 31" /tmp/frame_base.zig || { echo "BASELINE PATCH FAILED"; exit 1; }
+          echo "nproc=$(nproc)"
+          run() { # $1=label $2=count $3=impl
+            local s
+            s=$(ORACLE_REPEAT="$2" bash oracle/run.sh -i "$3" transferloss 2>&1 | grep -oE "STABILITY: [0-9]+/[0-9]+")
+            echo "[$1 $3] $s"
+          }
+          for r in 1 2 3; do
+            echo "=================== round $r ==================="
+            cp /tmp/frame_base.zig src/quic/frame.zig; zig build 2>&1 | tail -1
+            run BASELINE 40 quiche
+            cp /tmp/frame_fix.zig  src/quic/frame.zig; zig build 2>&1 | tail -1
+            run FIX 40 quiche
+          done
+          echo "=================== ngtcp2 (H3) cross-check ==================="
+          cp /tmp/frame_base.zig src/quic/frame.zig; zig build 2>&1 | tail -1
+          run BASELINE 40 ngtcp2
+          cp /tmp/frame_fix.zig  src/quic/frame.zig; zig build 2>&1 | tail -1
+          run FIX 40 ngtcp2
