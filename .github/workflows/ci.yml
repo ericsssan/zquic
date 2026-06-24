@@ -155,5 +155,30 @@ jobs:
       # running a smaller green matrix (#7). ngtcp2 is the only impl that
       # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
       # would silently drop 11 H3 test runs (#16).
-      - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+      # Controlled load test (issue #8): same runner, same seeded loss — the ONLY
+      # difference is whether the server gets a dedicated CPU core (ORACLE_PIN).
+      # If PINNED is reliable and CONTROL is flaky, the flakiness is CPU contention
+      # (a test-topology artifact), not a protocol/recovery defect.
+      - name: nproc
+        run: nproc
+
+      - name: Load test — CONTROL (unpinned, current behavior)
+        continue-on-error: true
+        run: ORACLE_REPEAT=20 bash oracle/run.sh transferloss transfercorruption 2>&1 | tee /tmp/control.log
+
+      - name: Load test — PINNED (server on a dedicated core)
+        continue-on-error: true
+        run: ORACLE_PIN=1 ORACLE_REPEAT=20 bash oracle/run.sh transferloss transfercorruption 2>&1 | tee /tmp/pinned.log
+
+      - name: Tally
+        run: |
+          tally() {
+            local f=$1 name=$2
+            local r; r=$(grep -aE "(PASS|FAIL)" "$f" | grep -aE "transfer(loss|corruption) \[" | sed -E 's/\x1b\[[0-9;]*m//g')
+            local p; p=$(echo "$r" | grep -c PASS); local fl; fl=$(echo "$r" | grep -c FAIL)
+            echo "$name: PASS=$p FAIL=$fl  fail-rate=$(awk "BEGIN{t=$p+$fl; if(t>0)printf \"%.1f%%\",100*$fl/t; else print \"n/a\"}")  green=$(grep -aoE '[0-9]+/[0-9]+ iterations fully green' "$f" | tail -1)"
+            echo "  FAIL breakdown:"; echo "$r" | grep FAIL | grep -oE 'transfer(loss|corruption) \[[^]|]+' | sort | uniq -c | sort -rn
+          }
+          echo "=================== RESULTS ==================="
+          tally /tmp/control.log CONTROL
+          tally /tmp/pinned.log  PINNED

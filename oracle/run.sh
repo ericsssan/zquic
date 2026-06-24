@@ -208,10 +208,10 @@ ref_client() { # <impl> <port> <outdir> <path...>
   local impl=$1 port=$2 out=$3; shift 3
   local urls=() p; for p in "$@"; do urls+=("https://127.0.0.1:$port$p"); done
   case "$impl" in
-    quicgo) exec "$BIN/quicgo" client -ca "$CERTS/cert.pem" "$out" "${urls[@]}" ;;
-    ngtcp2) exec "$BIN/ngtcp2-client" -q --download="$out" --exit-on-all-streams-close 127.0.0.1 "$port" "${urls[@]}" ;;
-    quiche) exec "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/0.9 --dump-responses "$out" "${urls[@]}" ;;
-    quiche-h3) exec "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/3 --dump-responses "$out" "${urls[@]}" ;;
+    quicgo) exec $PIN_CLI "$BIN/quicgo" client -ca "$CERTS/cert.pem" "$out" "${urls[@]}" ;;
+    ngtcp2) exec $PIN_CLI "$BIN/ngtcp2-client" -q --download="$out" --exit-on-all-streams-close 127.0.0.1 "$port" "${urls[@]}" ;;
+    quiche) exec $PIN_CLI "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/0.9 --dump-responses "$out" "${urls[@]}" ;;
+    quiche-h3) exec $PIN_CLI "$BIN/quiche-client" --no-verify --wire-version 00000001 --http-version HTTP/3 --dump-responses "$out" "${urls[@]}" ;;
     *) echo "unknown impl $impl" >&2; exit 2 ;;
   esac
 }
@@ -286,7 +286,7 @@ proxied() {
   local ct="${CASE_TIMEOUT[$case]:-$CLIENT_TIMEOUT}"
   local tag="$case [zquic-server <-> $impl-client${impair:+ | impair:$impair}${want:+ | wire: $want}]"
   local out="$d/wire"; rm -rf "$out"; mkdir -p "$out"; local capf="$d/capture.txt"
-  TRANSFER_DEBUG="${ORACLE_XFER_DEBUG:-}" TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  TRANSFER_DEBUG="${ORACLE_XFER_DEBUG:-}" TESTCASE="$tc" CERTS="$CERTS" WWW="$WWW" PORT="$sport" $PIN_SRV "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
   _HARNESS_PIDS+=("$sp")
   wait_listen "$sp" "$sport" || { bad "$tag (no server bind)"; stop "$sp"; return; }
   # GOMAXPROCS=1: the capturing proxy is purely I/O-bound packet forwarding, but
@@ -296,7 +296,7 @@ proxied() {
   # send_acked stalls → seeded-loss recovery stalls / truncations). Pinning the
   # proxy to one OS thread keeps cores free for the server. Applied at every proxy
   # launch below.
-  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
+  GOMAXPROCS=1 $PIN_PROXY "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" $impair >"$d/proxy.log" 2>&1 & local px=$!
   _HARNESS_PIDS+=("$px")
   wait_listen "$px" "$pport" || { bad "$tag (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$ct" ref_client "$impl" "$pport" "$out" $paths >"$d/cli.log" 2>&1; local rc=$?
@@ -927,6 +927,21 @@ if [ "$SELFTEST" -eq 1 ]; then
   echo "TOTAL: $PASS passed, $FAIL failed"
   [ $FAIL -gt 0 ] && { printf '  - %s\n' "${FAILED[@]}"; exit 1; }
   exit 0
+fi
+
+# Controlled load test (ORACLE_PIN=1, Linux): pin server/proxy/client to separate
+# CPU cores so the latency-sensitive single-threaded server gets a dedicated core
+# and is never preempted by the proxy or client. This isolates the variable behind
+# the seeded-loss flakiness — CPU contention — from the protocol. Off by default.
+PIN_SRV=""; PIN_PROXY=""; PIN_CLI=""
+if [ -n "${ORACLE_PIN:-}" ] && command -v taskset >/dev/null 2>&1; then
+  ncpu=$(nproc 2>/dev/null || echo 1)
+  if [ "$ncpu" -ge 4 ]; then
+    PIN_SRV="taskset -c 0"; PIN_PROXY="taskset -c 1"; PIN_CLI="taskset -c 2,3"
+  elif [ "$ncpu" -ge 2 ]; then
+    PIN_SRV="taskset -c 0"; PIN_PROXY="taskset -c 1"; PIN_CLI="taskset -c 1"
+  fi
+  echo "oracle: CPU pinning ON (nproc=$ncpu) — server=0 proxy=1 client=rest"
 fi
 
 sel_data=("${DATA_CASES[@]}"); sel_prox=("${PROXIED_CASES[@]}")
