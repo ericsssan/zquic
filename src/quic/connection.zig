@@ -25,6 +25,12 @@ const cc_mod = @import("congestion/cc.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
 const build_options = @import("build_options");
 
+/// Investigation (invest/recovery): when set, the PTO path logs which recovery
+/// branch it takes each time it fires, so a post-feed tail stall (seeded-loss
+/// truncation) reveals whether the server probes the missing data, idle-PINGs,
+/// or goes silent. Set from the server when TRANSFER_DEBUG is in the env.
+pub var debug_recovery: bool = false;
+
 const ConnectionId = cid_mod.ConnectionId;
 
 // ---------------------------------------------------------------------------
@@ -1329,34 +1335,37 @@ pub fn Connection(comptime max_streams: usize) type {
                                 // drain discards all of them, then we must still probe the
                                 // actually-missing in-flight packet (RFC 9002 §6.2).
                                 if (self.stream_pending_retx_count == 0) {
-                                    if (!self.probeUnackedStreamData()) {
-                                        // No in-flight stream packet to probe. Before falling to
-                                        // idle PINGs, re-drive a stalled tail whose sent-table entry
-                                        // was evicted — PINGs only elicit ACKs, they never deliver
-                                        // the missing bytes, so the idle-PING cap must NOT apply
-                                        // while a stream still has unacked data.
-                                        if (!self.probeStalledStreamTail()) {
-                                            // Truly idle (no unacked stream data): PING, capped.
-                                            // Without this guard, PTO sends infinite PINGs after all
-                                            // transfers complete: each PING creates in-flight state →
-                                            // PTO fires → PING → loop. Cap at 30 consecutive idle
-                                            // PINGs, then reschedule PTO to a 5s future deadline.
-                                            if (self.idle_ping_count < 30) {
-                                                self.queuePing() catch {};
-                                                self.idle_ping_count += 1;
-                                            } else {
-                                                // PTO fired but no probe sent: advance deadline to
-                                                // avoid busy-looping with a stale past deadline.
-                                                self.pto_deadline_ns = self.current_time_ns +| @as(i64, 5_000_000_000);
-                                            }
-                                        }
-                                    } else {
+                                    var branch: []const u8 = "drain"; // pending_retx was drained above
+                                    if (self.probeUnackedStreamData()) {
                                         // RFC 9002 §6.2: SHOULD send two full-sized datagrams per
                                         // PTO to expedite loss recovery. A second probe targets the
                                         // same missing data with a fresh pn so quiche can ACK it
                                         // even if the first probe datagram is dropped.
                                         _ = self.probeUnackedStreamData();
+                                        branch = "unacked";
+                                    } else if (self.probeStalledStreamTail()) {
+                                        // No in-flight stream packet to probe. Before falling to
+                                        // idle PINGs, re-drive a stalled tail whose sent-table entry
+                                        // was evicted — PINGs only elicit ACKs, they never deliver
+                                        // the missing bytes, so the idle-PING cap must NOT apply
+                                        // while a stream still has unacked data.
+                                        branch = "tail";
+                                    } else if (self.idle_ping_count < 30) {
+                                        // Truly idle (no unacked stream data): PING, capped.
+                                        // Without this guard, PTO sends infinite PINGs after all
+                                        // transfers complete: each PING creates in-flight state →
+                                        // PTO fires → PING → loop. Cap at 30 consecutive idle
+                                        // PINGs, then reschedule PTO to a 5s future deadline.
+                                        self.queuePing() catch {};
+                                        self.idle_ping_count += 1;
+                                        branch = "ping";
+                                    } else {
+                                        // PTO fired but no probe sent: advance deadline to
+                                        // avoid busy-looping with a stale past deadline.
+                                        self.pto_deadline_ns = self.current_time_ns +| @as(i64, 5_000_000_000);
+                                        branch = "capped";
                                     }
+                                    if (debug_recovery) std.debug.print("[PTOB] {s} ptoc={d} ipc={d} bif={d} stp_retx={d}\n", .{ branch, self.loss.pto_count, self.idle_ping_count, self.loss.bytes_in_flight, self.stream_pending_retx_count });
                                 }
                             }
                         } else {
@@ -1559,11 +1568,32 @@ pub fn Connection(comptime max_streams: usize) type {
         pub fn debugSendState(self: *Self, stream_id: u62, now_ns: i64, tag: []const u8) void {
             const st = self.streams.get(stream_id) orelse return;
             const pto_in_ms: i64 = if (self.pto_deadline_ns) |d| @divTrunc(d - now_ns, 1_000_000) else -999999;
-            std.debug.print("[{s}] sid={d} off={d} acked={d} smax={d} unacked={d} cwnd={d} bif={d} queued={d} pto_ms={d} ptoc={d} retx={d} ping={d}\n", .{
-                tag,                             stream_id,                      st.send_offset,            st.send_acked,     st.send_max,
-                st.send_offset -| st.send_acked, self.congestion.cwnd,           self.loss.bytes_in_flight, self.bytes_queued, pto_in_ms,
-                self.loss.pto_count,             self.stream_pending_retx_count, self.idle_ping_count,
+            // buffered = bytes still retained in the send ring at send_acked; if it
+            // is < unacked, the tail data needed for retransmission was discarded
+            // (probeStalledStreamTail's getSendData would return 0 → silent stall).
+            std.debug.print("[{s}] sid={d} off={d} acked={d} smax={d} unacked={d} fin={} buffered={d} cwnd={d} bif={d} queued={d} pto_ms={d} ptoc={d} retx={d} ping={d}\n", .{
+                tag,                             stream_id,   st.send_offset,         st.send_acked,                  st.send_max,
+                st.send_offset -| st.send_acked, st.send_fin, st.send_buf.readable(), self.congestion.cwnd,           self.loss.bytes_in_flight,
+                self.bytes_queued,               pto_in_ms,   self.loss.pto_count,    self.stream_pending_retx_count, self.idle_ping_count,
             });
+        }
+
+        /// Investigation: dump every stream that still has unacked send data,
+        /// regardless of whether the transfer is still actively feeding bytes.
+        /// The seeded-loss truncation stalls AFTER all data + FIN is fed, so a
+        /// transfer-active-gated dump goes blind exactly when the stall happens.
+        /// Returns true if any unacked stream was found (so the caller can
+        /// throttle). Also dumps once when none remain so the transition shows.
+        pub fn debugDumpUnacked(self: *Self, now_ns: i64) bool {
+            var any = false;
+            var it = self.streams.iter();
+            while (it.next()) |st| {
+                if (st.send_offset > st.send_acked) {
+                    self.debugSendState(st.id, now_ns, "XFER");
+                    any = true;
+                }
+            }
+            return any;
         }
 
         /// Returns the stored session ticket (if server sent NewSessionTicket).

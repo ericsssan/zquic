@@ -32,6 +32,7 @@ pub const congestion = struct {
 pub const connection_id = @import("quic/connection_id.zig");
 
 // Top-level re-exports for the most common types
+pub const connection = @import("quic/connection.zig");
 pub const Connection = @import("quic/connection.zig").Connection;
 pub const Config = @import("quic/connection.zig").Config;
 pub const ConnState = @import("quic/connection.zig").ConnState;

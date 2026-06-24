@@ -272,12 +272,11 @@ fn tickAllConnections(slots: *[MAX_CONNS]?*ConnSlot, sock: *const net.Socket, cm
             // stalled tail (seeded-loss truncation) shows whether send_offset froze
             // (send stall) or send_acked froze (retransmit failure).
             if (g_transfer_debug and now_ns - slot.dbg_last_ns > 250_000_000) {
-                for (&slot.transfers) |*t| {
-                    if (t.active) {
-                        slot.conn.debugSendState(t.stream_id, now_ns, "XFER");
-                        slot.dbg_last_ns = now_ns;
-                    }
-                }
+                // Dump every stream that still owes unacked bytes — NOT just active
+                // transfers. The seeded-loss truncation stalls AFTER all data + FIN
+                // is fed (transfer marked inactive), so a transfer-active-gated dump
+                // goes blind exactly when the tail recovery stalls.
+                if (slot.conn.debugDumpUnacked(now_ns)) slot.dbg_last_ns = now_ns;
             }
         }
     }
@@ -347,6 +346,7 @@ pub fn main(init: std.process.Init) !void {
 
     g_is_h3 = std.mem.eql(u8, testcase, "http3");
     g_transfer_debug = init.environ_map.get("TRANSFER_DEBUG") != null;
+    quic.connection.debug_recovery = g_transfer_debug;
     if (init.environ_map.get("SSLKEYLOGFILE")) |kl_path| {
         const n = @min(kl_path.len, g_keylog_path_buf.len);
         @memcpy(g_keylog_path_buf[0..n], kl_path[0..n]);
