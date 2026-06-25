@@ -457,6 +457,11 @@ pub fn Connection(comptime max_streams: usize) type {
         /// §6.6 confidentiality accounting). Reset to 0 on every key rotation; when it
         /// reaches the negotiated AEAD's confidentiality limit, a key update is forced.
         app_tx_pkts: u64 = 0,
+        /// Running total of received packets that failed AEAD authentication over the
+        /// connection's lifetime, across all secret keys (RFC 9001 §6.6 integrity
+        /// accounting). When it exceeds the negotiated AEAD's integrity limit, the
+        /// connection is closed with AEAD_LIMIT_REACHED.
+        aead_auth_failures: u64 = 0,
 
         // Path migration state (RFC 9000 §9) ----------------------------------------
 
@@ -2038,6 +2043,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (hdr.payload.len - 16 > MAX_PACKET_SIZE) return error.PacketTooLarge;
 
                     const pt_len = crypto.decryptPayloadInPlace(keys, pn, aad, data[payload_start..][0..hdr.payload.len]) catch |err| {
+                        self.recordAuthFailure(); // RFC 9001 §6.6 integrity accounting (Handshake)
                         return err;
                     };
                     defer std.crypto.secureZero(u8, data[payload_start..][0..pt_len]);
@@ -2060,6 +2066,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (hdr.payload.len - 16 > MAX_PACKET_SIZE) return error.PacketTooLarge;
 
                     const pt_len = crypto.decryptPayloadInPlace(zk, pn, aad, data[payload_start..][0..hdr.payload.len]) catch {
+                        self.recordAuthFailure(); // RFC 9001 §6.6 integrity accounting (0-RTT)
                         return result.consumed; // silent drop on decrypt failure
                     };
                     self.markPnReceived(2, pn);
@@ -2291,6 +2298,8 @@ pub fn Connection(comptime max_streams: usize) type {
                                 self.hot.state = .closed;
                                 self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
                                 std.log.scoped(.quic).info("[SRST] stateless reset received", .{});
+                            } else {
+                                self.recordAuthFailure(); // RFC 9001 §6.6 integrity accounting (1-RTT)
                             }
                             return data.len;
                         }
@@ -2306,6 +2315,8 @@ pub fn Connection(comptime max_streams: usize) type {
                         self.hot.state = .closed;
                         self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
                         std.log.scoped(.quic).info("[SRST] stateless reset received", .{});
+                    } else {
+                        self.recordAuthFailure(); // RFC 9001 §6.6 integrity accounting (1-RTT)
                     }
                     return data.len;
                 };
@@ -3654,6 +3665,22 @@ pub fn Connection(comptime max_streams: usize) type {
             if (!self.key_update_pending) {
                 self.initiateKeyUpdate() catch {};
             } else {
+                self.close(0x0f, false, "") catch {};
+            }
+        }
+
+        /// RFC 9001 §6.6: record one received packet that failed AEAD authentication and,
+        /// once the running total across all secret keys exceeds the negotiated AEAD's
+        /// integrity limit, immediately close with AEAD_LIMIT_REACHED (0x0f) — the
+        /// forgery-flood safeguard. Counted for the Handshake, 0-RTT, and 1-RTT epochs;
+        /// Initial-epoch failures are excluded because Initial keys are publicly derivable
+        /// from the connection ID, so a failure there is not a forgery attempt against a
+        /// secret key. Stateless resets are handled before this is called, so they are not
+        /// counted. The limit is astronomically high (2^52 for AES-128-GCM), so a legitimate
+        /// lossy/reordered connection never approaches it — only a sustained forgery flood.
+        fn recordAuthFailure(self: *Self) void {
+            self.aead_auth_failures +|= 1;
+            if (self.aead_auth_failures > crypto.integrityLimit(self.tls_state.negotiatedCipher())) {
                 self.close(0x0f, false, "") catch {};
             }
         }

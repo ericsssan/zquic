@@ -1144,6 +1144,100 @@ test "connection: confidentiality limit reached with an update already pending c
     try testing.expect(saw_close);
 }
 
+// Put a fresh server connection into an established 1-RTT state with the given AEAD
+// suite, ready to receive Short Header packets.
+fn mockEstablished1Rtt(conn: anytype, suite: crypto.CipherSuite) void {
+    conn.hot.state = .established;
+    const pk: crypto.PacketKeys = .{ .key = @as([32]u8, @splat(0xAA)), .iv = @as([12]u8, @splat(0xBB)), .hp = @as([32]u8, @splat(0xCC)), .suite = suite };
+    conn.app_keys = .{ .client = pk, .server = pk };
+    conn.peer_cid = conn.local_cid;
+    conn.tls_state.server.negotiated_cipher = suite;
+}
+
+// Build a valid 1-RTT packet (PADDING payload) addressed to conn's local CID, then
+// corrupt the final auth-tag byte so AEAD decryption fails. The corrupted byte sits
+// past the 16-byte header-protection sample, so HP removal still succeeds and the
+// packet reaches — and fails — the AEAD step. Returns the total length in `out`.
+fn buildCorrupt1Rtt(conn: anytype, out: []u8, pn: u32) usize {
+    const hdr_len = packet.encodeShortHeader(out, &conn.local_cid.bytes, pn, false);
+    var pt: [32]u8 = undefined;
+    const pt_len = frame.encodeFrame(&pt, .{ .padding = 24 });
+    const ct_len = pt_len + 16;
+    crypto.encryptPayload(conn.app_keys.?.client, pn, out[0..hdr_len], pt[0..pt_len], out[hdr_len..][0..ct_len]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &out[0], out[hdr_len - 4 ..][0..4], out[hdr_len..][0..16]);
+    const total = hdr_len + ct_len;
+    out[total - 1] ^= 0xFF;
+    return total;
+}
+
+test "connection: 1-RTT auth failures exceeding the AEAD integrity limit close with AEAD_LIMIT_REACHED (RFC 9001 §6.6)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
+    mockEstablished1Rtt(&conn, .aes_128_gcm);
+
+    var pkt: [256]u8 = undefined;
+    const total = buildCorrupt1Rtt(&conn, &pkt, 1);
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+
+    // Pre-load the counter to the limit; this one further failure tips it over.
+    conn.aead_auth_failures = crypto.integrityLimit(.aes_128_gcm);
+    try conn.receive(pkt[0..total], src, 1_000_000_000, 0, io);
+
+    try testing.expectEqual(ConnState.closing, conn.hot.state);
+    var saw_close = false;
+    while (conn.pollEvent()) |ev| switch (ev) {
+        .connection_closed => |c| {
+            saw_close = true;
+            try testing.expectEqual(@as(u62, 0x0f), c.error_code);
+        },
+        else => {},
+    };
+    try testing.expect(saw_close);
+}
+
+test "connection: a 1-RTT auth failure below the integrity limit increments the counter and drops the packet (no close)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
+    mockEstablished1Rtt(&conn, .aes_128_gcm);
+
+    var pkt: [256]u8 = undefined;
+    const total = buildCorrupt1Rtt(&conn, &pkt, 1);
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+
+    try testing.expectEqual(@as(u64, 0), conn.aead_auth_failures);
+    try conn.receive(pkt[0..total], src, 1_000_000_000, 0, io);
+
+    // Counted and dropped, but ~2^52 below the limit → the connection stays open
+    // and the forged packet was not recorded as received.
+    try testing.expectEqual(@as(u64, 1), conn.aead_auth_failures);
+    try testing.expectEqual(ConnState.established, conn.hot.state);
+    try testing.expect(!conn.isPnDuplicate(2, 1));
+}
+
+test "connection: a valid 1-RTT packet does not increment the integrity-failure counter" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{ .validate_addr = false }, io);
+    mockEstablished1Rtt(&conn, .aes_128_gcm);
+
+    // Same packet as buildCorrupt1Rtt but WITHOUT the tag corruption — it decrypts.
+    var pkt: [256]u8 = undefined;
+    const hdr_len = packet.encodeShortHeader(&pkt, &conn.local_cid.bytes, 1, false);
+    var pt: [8]u8 = undefined;
+    const pt_len = frame.encodeFrame(&pt, .ping);
+    const ct_len = pt_len + 16;
+    crypto.encryptPayload(conn.app_keys.?.client, 1, pkt[0..hdr_len], pt[0..pt_len], pkt[hdr_len..][0..ct_len]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+
+    try conn.receive(pkt[0 .. hdr_len + ct_len], src, 1_000_000_000, 0, io);
+
+    try testing.expectEqual(@as(u64, 0), conn.aead_auth_failures); // success, not a failure
+    try testing.expect(conn.isPnDuplicate(2, 1)); // accepted
+}
+
 test "connection: deriveSecretsForGeneration returns correct generation secrets" {
     const testing = std.testing;
     const io = std.testing.io;
