@@ -52,10 +52,10 @@ declare -A CASE_PATHS=(
   [multiplexing]="/1.bin /2.bin /3.bin /4.bin"
   [retry]="/big.bin"
   [handshakeloss]="/1.bin"
-  [transferloss]="/big.bin"
+  [transferloss]="/loss.bin"   # 768 KiB < quiche FC limit: no MAX_STREAM_DATA dependency (#8)
   [longrtt]="/1.bin"   # high-RTT correctness, not bulk throughput — keep it small + fast
   [handshakecorruption]="/1.bin"
-  [transfercorruption]="/big.bin"
+  [transfercorruption]="/loss.bin"   # 768 KiB < quiche FC limit: no MAX_STREAM_DATA dependency (#8)
   [ecn]="/big.bin"         # meaningful: server TESTCASE=ecn enables ECN socket options
   [keyupdate]="/big.bin"   # meaningful (client dir): zquic client calls initiateKeyUpdate()
 )
@@ -69,7 +69,7 @@ declare -A IMPAIR=(
   [transferloss]="-loss 6 -seed 7"
   [longrtt]="-delayms 100"   # 200ms RTT: exercises RTT estimation / timers / pacing
   [handshakecorruption]="-corrupt 5 -seed 42"   # 5% bit-flip; AEAD drops → retransmit
-  [transfercorruption]="-corrupt 2 -seed 42"    # 2% on big.bin (5% cascades on 1MB)
+  [transfercorruption]="-corrupt 2 -seed 42"    # 2% on loss.bin (768 KiB)
   [ecn]="-ecn"               # proxy reads IP_RECVTOS CMSG; logs s2c ECT0 count (#41)
 )
 # Per-case timeout overrides (seconds). Loss cases need extra headroom: 30% loss

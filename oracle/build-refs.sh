@@ -25,6 +25,18 @@ if [ ! -f "$WWW/big.bin" ]; then
   for f in 1.bin 2.bin 3.bin 4.bin; do head -c 65536 /dev/urandom > "$WWW/$f"; done
   head -c 1048576 /dev/urandom > "$WWW/big.bin"
 fi
+# loss.bin: 768 KiB, deliberately BELOW quiche's default initial_max_stream_data
+# (1,000,000). The seeded-loss / corruption transfer cases serve this instead of
+# big.bin so they do not depend on a MAX_STREAM_DATA window extension. big.bin
+# (1 MB) exceeds quiche's stream FC limit, so EVERY transfer of it needs the peer
+# to extend the window; under heavy loss the peer's consumption (and thus its
+# extension) lags past the idle timeout — a client flow-control behavior, not a
+# server defect, and the dominant residual flakiness of transferloss/
+# transfercorruption. The no-loss transfer case keeps big.bin (FC-extension
+# coverage retained), since without impairment the extension always lands in time.
+if [ ! -f "$WWW/loss.bin" ]; then
+  head -c 786432 /dev/urandom > "$WWW/loss.bin"
+fi
 
 # ---- capturing proxy (pure go stdlib) ---------------------------------------
 if [ ! -x "$BIN/proxy" ]; then
