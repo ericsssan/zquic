@@ -2280,6 +2280,7 @@ pub fn Connection(comptime max_streams: usize) type {
                             if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                                 self.hot.state = .closed;
                                 self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                                std.log.scoped(.quic).info("[SRST] stateless reset received", .{});
                             }
                             return data.len;
                         }
@@ -2294,6 +2295,7 @@ pub fn Connection(comptime max_streams: usize) type {
                     if (data.len >= 21 and self.checkStatelessResetToken(&saved_tail)) {
                         self.hot.state = .closed;
                         self.events.push(.{ .connection_closed = .{ .error_code = 0, .is_app = false } });
+                        std.log.scoped(.quic).info("[SRST] stateless reset received", .{});
                     }
                     return data.len;
                 };
@@ -4670,6 +4672,7 @@ pub fn Connection(comptime max_streams: usize) type {
             self.current_key_phase = !self.current_key_phase;
             self.current_key_generation += 1;
             self.key_update_pending = false;
+            std.log.scoped(.quic).info("[KPHS] key phase rotated to {d}", .{@intFromBool(self.current_key_phase)});
 
             // Derive next-next generation from the (now-current) secrets.
             const new_client = crypto.deriveNextAppSecret(self.next_client_secret, self.quic_version);
