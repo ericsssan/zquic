@@ -50,6 +50,10 @@ Tested against 11 QUIC clients via [quic-interop-runner](https://github.com/quic
 Test cases: handshake, transfer, longrtt, chacha20, multiplexing, retry, resumption, zerortt, http3, blackhole, keyupdate, ecn, amplificationlimit, handshakeloss, transferloss, handshakecorruption, transfercorruption, v2, ipv6, rebind-port, rebind-addr, connectionmigration
 <!-- INTEROP_END -->
 
+## Testing
+
+Beyond the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) suite above, an in-tree oracle harness (`oracle/run.sh`) cross-checks the zquic server against quic-go, ngtcp2, and quiche clients through a capturing proxy. It exercises **seeded packet loss and corruption deterministically**: the `transferloss` (6% drop) and `transfercorruption` (2% bit-flip) cases pass reliably under a fixed seed, and `oracle/run.sh -n N` gates on N consecutive all-green runs.
+
 ## Limitations
 
 - Server-side only (no TLS client)
