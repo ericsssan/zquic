@@ -680,8 +680,22 @@ statelessreset_client_case() { # <sport> <pport>
     "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1 & local cp=$!
   _HARNESS_PIDS+=("$cp")
 
-  # Allow handshake to complete so quicgo sends NEW_CONNECTION_ID with reset tokens.
-  sleep 1
+  # Deterministically wait until the download is well underway before killing the
+  # server. Received bytes are a reliable precondition signal: they prove the
+  # handshake completed AND the server's early 1-RTT flight — the NEW_CONNECTION_ID
+  # frames carrying the stateless-reset tokens — reached the client and were stored.
+  # The client writes the download incrementally (writePositionalAll), so the output
+  # file's size tracks progress. This replaces a fixed `sleep 1`, which raced the
+  # handshake under CI load: if the token was not yet stored when the server
+  # restarted, the client could not match the reset, making the case flaky.
+  local ready=0 got=0
+  for _ in $(seq 1 100); do  # up to ~10s; loopback handshake+64KiB is normally <1s
+    kill -0 "$cp" 2>/dev/null || break  # client exited early → download will never progress
+    got=$(wc -c < "$d/out/big.bin" 2>/dev/null | tr -dc '0-9')
+    if [ -n "$got" ] && [ "$got" -ge 65536 ]; then ready=1; break; fi
+    sleep 0.1
+  done
+  [ "$ready" = 1 ] || { bad "statelessreset-client (download never reached 64KiB in 10s — handshake/reset-token not ready)"; stop "$cp" "$px" "$sp1"; return; }
   # Kill the original quicgo (state loss simulated). Use SIGKILL so quicgo exits
   # immediately without sending a CONNECTION_CLOSE — a graceful close would cause the
   # zquic client to exit cleanly instead of waiting for a stateless reset.
