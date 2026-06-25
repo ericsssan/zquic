@@ -33,6 +33,19 @@ pub fn confidentialityLimit(suite: CipherSuite) u64 {
     };
 }
 
+/// RFC 9001 §6.6 integrity limit: the maximum number of received packets that may
+/// fail authentication over a connection's lifetime before the AEAD's forgery
+/// resistance erodes. On exceeding it the endpoint must close the connection with
+/// AEAD_LIMIT_REACHED. Returned as an invalid-packet count for the negotiated suite.
+pub fn integrityLimit(suite: CipherSuite) u64 {
+    return switch (suite) {
+        // 2^52 invalid packets. (AEAD_AES_128_CCM would be 2^23.5, not negotiated here.)
+        .aes_128_gcm => 1 << 52,
+        // 2^36 invalid packets — far lower than AES-GCM, but still ~68 billion forgeries.
+        .chacha20_poly1305 => 1 << 36,
+    };
+}
+
 /// Keys for one direction of a QUIC epoch.
 /// key/hp are 32 bytes (max size); AES-128-GCM uses first 16, ChaCha20 uses all 32.
 pub const PacketKeys = struct {
