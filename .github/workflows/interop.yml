@@ -221,8 +221,27 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
-          git diff --cached --quiet || git commit -m "Update interop results [skip ci]"
-          git push
+          # Nothing changed → don't push at all. Pushing a now-stale local main
+          # (e.g. after merges to main) is rejected non-fast-forward and fails the
+          # job for no reason — which is exactly what happened during a merge flurry.
+          if git diff --cached --quiet; then
+            echo "interop results unchanged — nothing to commit"
+            exit 0
+          fi
+          git commit -m "Update interop results [skip ci]"
+          # main can move underneath us (concurrent interop runs, or merges) →
+          # non-fast-forward push. Rebase onto the latest main and retry.
+          for attempt in 1 2 3; do
+            git fetch origin main \
+              && git rebase origin/main \
+              && git push origin HEAD:main \
+              && exit 0
+            echo "push attempt $attempt failed (main moved); rebasing and retrying"
+            git rebase --abort 2>/dev/null || true
+            sleep 3
+          done
+          echo "::error::failed to push interop results after 3 attempts"
+          exit 1
 
       - name: Upload logs
         if: always()
