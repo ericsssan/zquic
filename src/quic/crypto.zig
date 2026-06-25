@@ -20,6 +20,19 @@ pub const CipherSuite = enum(u16) {
     chacha20_poly1305 = 0x1303,
 };
 
+/// RFC 9001 §6.6 confidentiality limit: the maximum number of packets that may be
+/// encrypted under a single key before the AEAD's confidentiality guarantee erodes.
+/// On reaching it the sender must rotate keys (or stop using the connection). Returned
+/// as a packet count for the negotiated suite.
+pub fn confidentialityLimit(suite: CipherSuite) u64 {
+    return switch (suite) {
+        // 2^23 packets. (AEAD_AES_128_CCM would be 2^21.5, but it is not negotiated here.)
+        .aes_128_gcm => 1 << 23,
+        // 2^62 packets — effectively unbounded; a key update is never forced for ChaCha20.
+        .chacha20_poly1305 => 1 << 62,
+    };
+}
+
 /// Keys for one direction of a QUIC epoch.
 /// key/hp are 32 bytes (max size); AES-128-GCM uses first 16, ChaCha20 uses all 32.
 pub const PacketKeys = struct {

@@ -453,6 +453,10 @@ pub fn Connection(comptime max_streams: usize) type {
         /// Current key generation number (0 = initial, 1 = first rotation, etc).
         /// Used for SSLKEYLOG tracking of rotated secrets.
         current_key_generation: u32,
+        /// Number of 1-RTT packets encrypted under the CURRENT app send key (RFC 9001
+        /// §6.6 confidentiality accounting). Reset to 0 on every key rotation; when it
+        /// reaches the negotiated AEAD's confidentiality limit, a key update is forced.
+        app_tx_pkts: u64 = 0,
 
         // Path migration state (RFC 9000 §9) ----------------------------------------
 
@@ -3625,7 +3629,33 @@ pub fn Connection(comptime max_streams: usize) type {
             self.commitSendSlot(out_len);
 
             self.storeSendMeta(pn, 2, out_len, ack_eliciting, fi orelse .{});
+
+            // RFC 9001 §6.6: account this packet against the current app send key and
+            // force a key update once the AEAD's confidentiality limit is reached. The
+            // packet above used the old key correctly; any rotation takes effect on the
+            // NEXT send.
+            self.app_tx_pkts += 1;
+            self.enforceConfidentialityLimit();
             return pn;
+        }
+
+        /// RFC 9001 §6.6: once the number of packets encrypted under the current 1-RTT
+        /// key reaches the negotiated AEAD's confidentiality limit, the key MUST NOT be
+        /// used again. Proactively initiate a key update so the connection can continue;
+        /// rotateKeys() resets app_tx_pkts. If an update is already in flight (the peer
+        /// has not yet confirmed a prior one) we cannot rotate again, so close with
+        /// AEAD_LIMIT_REACHED (0x0f) rather than overrun the limit. In practice the
+        /// close path is unreachable: a pending update is confirmed within ~1 RTT, long
+        /// before another confidentiality-limit worth of packets can be sent.
+        fn enforceConfidentialityLimit(self: *Self) void {
+            if (self.app_keys == null) return;
+            const limit = crypto.confidentialityLimit(self.tls_state.negotiatedCipher());
+            if (self.app_tx_pkts < limit) return;
+            if (!self.key_update_pending) {
+                self.initiateKeyUpdate() catch {};
+            } else {
+                self.close(0x0f, false, "") catch {};
+            }
         }
 
         pub fn queuePing(self: *Self) !void {
@@ -4678,6 +4708,9 @@ pub fn Connection(comptime max_streams: usize) type {
             self.current_key_phase = !self.current_key_phase;
             self.current_key_generation += 1;
             self.key_update_pending = false;
+            // RFC 9001 §6.6: the confidentiality budget is per-key — restart it for the
+            // new app send key (covers both locally-forced and peer-initiated updates).
+            self.app_tx_pkts = 0;
             std.log.scoped(.quic).info("[KPHS] key phase rotated to {d}", .{@intFromBool(self.current_key_phase)});
 
             // Derive next-next generation from the (now-current) secrets.
