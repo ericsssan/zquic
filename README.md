@@ -5,7 +5,7 @@ A QUIC protocol library for Zig. Sans-I/O — you own the socket; the library ow
 ## Features
 
 - QUIC v1 (RFC 9000) and v2 (RFC 9369)
-- TLS 1.3 server handshake with AES-128-GCM and ChaCha20-Poly1305 (RFC 9001)
+- TLS 1.3 client and server handshake with AES-128-GCM and ChaCha20-Poly1305 (RFC 9001)
 - Session resumption and 0-RTT
 - Loss recovery, RTT estimation, PTO (RFC 9002)
 - CUBIC and BBR v3 congestion control (RFC 9438)
@@ -52,11 +52,11 @@ Test cases: handshake, transfer, longrtt, chacha20, multiplexing, retry, resumpt
 
 ## Testing
 
-Beyond the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) suite above, an in-tree oracle harness (`oracle/run.sh`) cross-checks the zquic server against quic-go, ngtcp2, and quiche clients through a capturing proxy. It exercises **seeded packet loss and corruption deterministically**: the `transferloss` (6% drop) and `transfercorruption` (2% bit-flip) cases pass reliably under a fixed seed, and `oracle/run.sh -n N` gates on N consecutive all-green runs.
+Beyond the [quic-interop-runner](https://github.com/quic-interop/quic-interop-runner) suite above, an in-tree oracle harness (`oracle/run.sh`) cross-checks zquic — as both server and client — against quic-go, ngtcp2, and quiche through a capturing proxy. Its server-direction loss cases run **deterministically**: `transferloss` (6% drop) and `transfercorruption` (2% bit-flip) pass reliably under a fixed seed, and `oracle/run.sh -n N` gates on N consecutive all-green runs.
 
 ## Limitations
 
-- Server-side only (no TLS client)
+- The interop matrix above is server-side; the client is implemented and verified against reference servers for core cases, but its coverage is narrower than the server's.
 
 ## License
 
