@@ -238,8 +238,14 @@ pub const Config = struct {
     /// When true, the server may negotiate to v2 via compatible version negotiation.
     advertise_v2: bool = false,
     /// Maximum number of client-initiated bidirectional streams to advertise.
+    /// The stream table (the `Connection(max_streams)` comptime parameter) is a
+    /// SINGLE shared pool across both directions, so `initial_max_streams_bidi +
+    /// initial_max_streams_uni` should not exceed `max_streams`: a peer opening
+    /// streams within the advertised limits would otherwise overflow the table and
+    /// be closed with INTERNAL_ERROR. The defaults assume a table sized to match.
     initial_max_streams_bidi: u64 = 100,
     /// Maximum number of client-initiated unidirectional streams to advertise.
+    /// See `initial_max_streams_bidi`: the two share one fixed-size stream table.
     initial_max_streams_uni: u64 = 100,
     /// IPv4 address for preferred_address transport parameter (RFC 9000 §18.2.3).
     /// When non-null, the server advertises this as its preferred migration target.
