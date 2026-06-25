@@ -1505,9 +1505,19 @@ pub fn Connection(comptime max_streams: usize) type {
         pub fn streamSend(self: *Self, stream_id: u62, data: []const u8, fin: bool) !void {
             const st = (try self.streams.getOrCreate(stream_id)) orelse return error.TooManyStreams;
             if (!st.canSend(@intCast(data.len))) {
-                // RFC 9000 §19.13 SHOULD: signal peer to increase the flow control window.
+                // RFC 9000 §19.13 SHOULD: signal peer to increase the flow control
+                // window. Throttle: the send loop retries a blocked stream every
+                // ~1ms, so emit STREAM_DATA_BLOCKED only once per distinct blocked
+                // limit, then re-send at most once per PTO interval (so a lost
+                // frame still gets through) instead of flooding ~1000 packets/sec.
                 if (self.hot.state == .established) {
-                    self.queueStreamDataBlocked(stream_id, @intCast(st.send_max)) catch {};
+                    const now = self.current_time_ns;
+                    const pto: i64 = @intCast(@min(self.loss.rtt.ptoBase(self.cached_max_ack_delay_ns), @as(u64, std.math.maxInt(i64))));
+                    if (st.send_max != st.blocked_sdb_max or now -| st.blocked_sdb_sent_ns >= pto) {
+                        self.queueStreamDataBlocked(stream_id, @intCast(st.send_max)) catch {};
+                        st.blocked_sdb_max = st.send_max;
+                        st.blocked_sdb_sent_ns = now;
+                    }
                 }
                 return error.StreamNotWritable;
             }
