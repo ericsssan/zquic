@@ -151,9 +151,22 @@ jobs:
       - name: Build reference impls + fixtures
         run: bash oracle/build-refs.sh
 
-      # --require fails the job if any impl didn't build, instead of silently
-      # running a smaller green matrix (#7). ngtcp2 is the only impl that
-      # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
-      # would silently drop 11 H3 test runs (#16).
-      - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+      # measure/residual-3arm: 3-way interleaved A/B isolating each fix.
+      #   BASELINE = main (no fixes); ACK = +ACK >31-range fix; FULL = +flood throttle.
+      # Only frame.zig/connection.zig/stream.zig are swapped between main and HEAD.
+      - name: Measure residual fixes (3-arm interleaved)
+        run: |
+          git fetch --depth=1 origin main 2>&1 | tail -1
+          for f in frame connection stream; do
+            cp "src/quic/$f.zig" "/tmp/full_$f.zig"
+            git show origin/main:"src/quic/$f.zig" > "/tmp/base_$f.zig"
+          done
+          build_arm() { cp "$1" src/quic/frame.zig; cp "$2" src/quic/connection.zig; cp "$3" src/quic/stream.zig; zig build 2>&1 | tail -1; }
+          run() { ORACLE_REPEAT="$2" bash oracle/run.sh -i "$3" transferloss 2>&1 | grep -oE "STABILITY: [0-9]+/[0-9]+" | sed "s|^|[$1 $3] |"; }
+          echo "nproc=$(nproc)"
+          for r in 1 2; do
+            echo "=================== round $r ==================="
+            build_arm /tmp/base_frame.zig /tmp/base_connection.zig /tmp/base_stream.zig; run BASELINE 40 quiche
+            build_arm /tmp/full_frame.zig /tmp/base_connection.zig /tmp/base_stream.zig; run ACK      40 quiche
+            build_arm /tmp/full_frame.zig /tmp/full_connection.zig /tmp/full_stream.zig; run FULL     40 quiche
+          done
