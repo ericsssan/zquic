@@ -10,6 +10,11 @@
 //!   - Transport params: must never crash on any input.
 //!   - Packet header parser: must never crash on any input.
 //!   - Frame encode→parse round-trip: encodeFrame(f) must be parseable and reproduce f.
+//!   - Frame ACCEPTANCE: a structurally well-formed frame must NOT be rejected. The
+//!     crash/round-trip targets above start by parsing fuzz bytes (`catch return`),
+//!     so they are blind to a VALID frame being wrongly rejected — exactly the bug
+//!     class behind the >31-range ACK FRAME_ENCODING_ERROR. fuzzAckArbitraryRanges
+//!     builds a valid ACK with an arbitrary range count and asserts it parses.
 //!   - GapList: fill/contiguousFrom invariants under arbitrary out-of-order input.
 //!   - Stream send buffer: bufferSendData/getSendData/onAcked ring-buffer invariants.
 //!   - Loss recovery loop: onPacketSent/onAckReceived must not corrupt bytes_in_flight.
@@ -144,6 +149,51 @@ fn fuzzFrameRoundTrip(_: void, input: FuzzInput) anyerror!void {
     const r2 = frame.parseFrame(enc_buf[0..enc_len]) catch return;
     // After a clean round-trip the consumed byte count must be stable.
     try std.testing.expectEqual(enc_len, r2.consumed);
+}
+
+/// ACCEPTANCE property: a structurally well-formed ACK frame with an ARBITRARY
+/// number of ranges MUST parse — never error. RFC 9000 §19.3 sets no upper bound
+/// on the ACK Range Count; a fixed internal cap that *rejects* (instead of
+/// retaining-and-continuing) is mapped to FRAME_ENCODING_ERROR and tears down a
+/// healthy connection under loss. This builds a valid ACK with a fuzz-chosen
+/// range count — including well past the 32-slot storage array — and asserts
+/// parseFrame accepts it AND consumes every byte (so the parser reads all ranges,
+/// not just the retained ones). Regression guard for the >31-range bug; unlike the
+/// round-trip targets it does NOT `catch return`, so a wrong rejection fails loudly.
+fn fuzzAckArbitraryRanges(_: void, input: FuzzInput) anyerror!void {
+    var buf: [256]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    // Always bracket the 32-slot storage cap with fixed counts so EVERY run (the
+    // once-through smoke test included, regardless of seed) exercises the
+    // regression; the fuzzer adds an extra input-derived count for breadth.
+    // QUIC varints are u62 and all these values are tiny, so the casts are lossless.
+    const fuzz_count: u62 = if (bytes.len >= 1) @min(bytes[0], 200) else 0;
+    for ([_]u62{ 0, 1, 31, 32, 33, 64, 200, fuzz_count }) |range_count| {
+        var wire: [1024]u8 = undefined;
+        var w: usize = 0;
+        wire[w] = 0x02; // ACK frame type
+        w += 1;
+        w += varint.encode(wire[w..], 63); // Largest Acknowledged (1-byte varint)
+        w += varint.encode(wire[w..], 0); // ACK Delay
+        w += varint.encode(wire[w..], range_count); // ACK Range Count (the variable under test)
+        w += varint.encode(wire[w..], 0); // First ACK Range
+        var k: u62 = 0;
+        while (k < range_count) : (k += 1) {
+            // gap + ack_range, each a 1-byte varint (<64) so the frame stays well-formed.
+            const gap: u62 = if (bytes.len >= 2) bytes[1 + (@as(usize, k) % (bytes.len - 1))] & 0x3f else 0;
+            w += varint.encode(wire[w..], gap);
+            w += varint.encode(wire[w..], 0);
+        }
+        // A well-formed ACK with ANY range count must parse — a rejection IS the bug.
+        const result = try frame.parseFrame(wire[0..w]);
+        switch (result.frame) {
+            .ack => {},
+            else => return error.WrongFrameType,
+        }
+        // The parser must consume every byte (read all ranges), even when it only
+        // retains the first ranges.len of them.
+        try std.testing.expectEqual(w, result.consumed);
+    }
 }
 
 /// GapList invariants under arbitrary fill sequences (RFC 9000 §2.2 reassembly).
@@ -309,6 +359,10 @@ test "fuzz: RTT estimator update does not crash or overflow" {
 
 test "fuzz: frame encode-parse round-trip" {
     try std.testing.fuzz({}, fuzzFrameRoundTrip, .{});
+}
+
+test "fuzz: ACK with arbitrary range count is always accepted" {
+    try std.testing.fuzz({}, fuzzAckArbitraryRanges, .{});
 }
 
 test "fuzz: GapList fill/contiguousFrom invariants" {
