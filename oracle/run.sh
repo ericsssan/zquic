@@ -22,9 +22,10 @@
 #   -r/--require impl[,impl]  fail (exit 3) if a named impl isn't built, instead
 #                             of silently running a smaller green matrix (#7).
 #                             Also honored via the ORACLE_REQUIRE env var.
-#   -n/--repeat N             run the selection N times, require all green — a
-#                             stability check for the SEEDED (not outcome-
-#                             deterministic) loss cases (#8). Also ORACLE_REPEAT.
+#   -n/--repeat N             run the selection N times, require EVERY iteration
+#                             green — a strict regression gate for the seeded loss
+#                             cases (deterministically green since #57/#61; see
+#                             IMPAIR). Also ORACLE_REPEAT.
 #   --self-test               run only the meta-tests: prove the harness's own
 #                             assertions still reject their negatives (#9). Also
 #                             runs automatically at the end of every full run.
@@ -61,9 +62,14 @@ declare -A CASE_PATHS=(
 )
 # Behavioral cases: required wire token (class the proxy capture must contain).
 declare -A WIRE_REQUIRE=( [retry]="s2c RETRY" [ecn]="s2c ECT0" )
-# Proxy impairment / extra flags. SEEDED for loss cases (not outcome-deterministic:
-# the seed fixes the drop sequence, but which logical packet is the Nth datagram
-# shifts with timing — #8). Rates carry headroom; use `-n N` for repeat-stability.
+# Proxy impairment / extra flags. Loss cases are SEEDED by datagram drop sequence
+# (the seed fixes which datagrams drop; which logical packet lands at the Nth
+# datagram still shifts with timing — coalescing, PTO — #8). The server now
+# recovers from any such pattern, so these cases are DETERMINISTICALLY GREEN: a
+# transferloss/transfercorruption failure is a real regression, not seed noise.
+# (Two former causes are fixed: the ACK >31-range parse kill (#57), and the >1MB
+# MAX_STREAM_DATA-extension dependency — now served loss.bin < quiche's FC limit
+# (#61).) Use `-n N` to gate: every iteration must pass.
 declare -A IMPAIR=(
   [handshakeloss]="-loss 30 -seed 7"
   [transferloss]="-loss 6 -seed 7"
@@ -869,11 +875,12 @@ fi
 [ "$REPEAT" -eq 1 ] 2>/dev/null && [ -n "${ORACLE_REPEAT:-}" ] && REPEAT="$ORACLE_REPEAT"
 case "$REPEAT" in *[!0-9]* | '') REPEAT=1 ;; esac
 
-# Stability mode (#8): loss impairment is SEEDED, not outcome-deterministic — the
-# seed fixes the drop *sequence*, but which logical packet is the Nth datagram
-# shifts with timing (coalescing, PTO). So re-run the selection N times in fresh
-# processes and require EVERY iteration green; latent flakiness fails hard here
-# instead of surfacing as an intermittent red. Children carry ORACLE_IN_REPEAT.
+# Stability mode (#8): loss impairment is SEEDED by datagram drop sequence (which
+# logical packet lands at the Nth datagram still shifts with timing). The seeded
+# loss cases are now deterministically green (#57/#61), so this re-runs the
+# selection N times in fresh processes and requires EVERY iteration green — a
+# strict regression gate: any reintroduced flakiness fails hard here instead of
+# surfacing as an intermittent red. Children carry ORACLE_IN_REPEAT.
 if [ "$REPEAT" -gt 1 ] && [ -z "${ORACLE_IN_REPEAT:-}" ]; then
   FWD=()
   [ $IMPL_SET -eq 1 ] && FWD+=(-i "${IMPLS[0]}")
