@@ -211,8 +211,16 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
             const count_vi = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
             pos += count_vi.len;
             const range_count: usize = @intCast(count_vi.value);
-            // ranges[0] holds first_range; up to 31 additional ranges fit in ranges[1..31].
-            if (range_count > 31) return error.InvalidFrame;
+            // RFC 9000 §19.3 places NO limit on the number of ACK ranges. Under
+            // packet loss a peer legitimately sends many SACK ranges (one per gap):
+            // a 6%-loss 1 MB transfer routinely exceeds 31. Rejecting the frame
+            // (FRAME_ENCODING_ERROR) would tear down an otherwise-healthy connection
+            // mid-transfer, which is exactly the seeded-loss transfer stall. We must
+            // parse ALL range_count ranges so `consumed` stays correct, but the
+            // fixed-size `ranges` array only retains the first ranges.len of them
+            // (the most-recent, highest-PN ranges, which matter most for RTT and
+            // loss detection). Any older ranges beyond that are simply re-learned
+            // from subsequent ACKs / recovered by retransmission — never a kill.
 
             var ack: AckFrame = .{
                 .largest_acked = la.value,
@@ -238,7 +246,10 @@ pub fn parseFrame(buf: []const u8) !ParseResult {
                 pos += gap.len;
                 const r = varint.decode(buf[pos..]) orelse return error.InvalidFrame;
                 pos += r.len;
-                if (ack.range_count < 32) {
+                // Retain up to ranges.len; keep consuming the rest so the frame is
+                // parsed in full (correct `consumed`) even when the peer sends more
+                // ranges than we store.
+                if (ack.range_count < ack.ranges.len) {
                     ack.ranges[ack.range_count] = .{ .gap = gap.value, .ack_range = r.value };
                     ack.range_count += 1;
                 }
@@ -845,13 +856,15 @@ test "frame: ACK with multiple ranges encode/parse round-trip" {
     try testing.expectEqual(n, result.consumed);
 }
 
-test "frame: ACK range count boundary: 31 additional accepted, 32 rejected" {
-    // Regression: the limit was `> 32` but ranges[0] holds first_range, leaving
-    // only 31 slots for additional ranges. `> 32` would silently drop the 32nd
-    // extra range instead of rejecting. Correct check is `> 31`.
+test "frame: ACK range count boundary: 31 additional fills array, more are retained-capped not rejected" {
+    // RFC 9000 §19.3 sets NO upper bound on the number of ACK ranges. The fixed
+    // `ranges` array stores up to ranges.len; any extra ranges on the wire are
+    // still consumed (so `consumed` is correct) but not retained. A peer sending
+    // more ranges than we store must NOT cause FRAME_ENCODING_ERROR — doing so
+    // tears down a healthy connection under loss (the seeded-loss transfer stall).
     const testing = std.testing;
 
-    // --- Boundary case: 31 additional ranges accepted (32 total, fills array exactly) ---
+    // --- 31 additional ranges accepted (32 total, fills array exactly) ---
     var ranges: [32]AckRange = @as([32]AckRange, @splat(.{ .gap = 1, .ack_range = 0 }));
     ranges[0] = .{ .gap = 0, .ack_range = 0 };
     const ack_max = AckFrame{
@@ -872,8 +885,8 @@ test "frame: ACK range count boundary: 31 additional accepted, 32 rejected" {
         else => return error.WrongFrameType,
     }
 
-    // --- Overflow case: 32 additional ranges rejected (33 total, overflows array) ---
-    // Hand-craft wire bytes with extra_ranges = 32.
+    // --- Overflow case: 32 additional ranges PARSE (not rejected); array caps at
+    //     32, but all wire bytes are consumed (the frame is valid). ---
     var wire: [256]u8 = undefined;
     var wpos: usize = 0;
     wire[wpos] = 0x02;
@@ -892,7 +905,14 @@ test "frame: ACK range count boundary: 31 additional accepted, 32 rejected" {
         wire[wpos] = 0x00;
         wpos += 1; // ack_range = 0
     }
-    try testing.expectError(error.InvalidFrame, parseFrame(wire[0..wpos]));
+    const big = try parseFrame(wire[0..wpos]);
+    switch (big.frame) {
+        .ack => |a| {
+            try testing.expectEqual(@as(usize, 32), a.range_count); // retained, capped
+            try testing.expectEqual(wpos, big.consumed); // every range consumed
+        },
+        else => return error.WrongFrameType,
+    }
 }
 
 test "frame: MAX_STREAMS_BIDI encode/parse round-trip" {
@@ -954,37 +974,56 @@ test "frame: STREAM_DATA_BLOCKED encode/parse round-trip" {
     try testing.expectEqual(n, result.consumed);
 }
 
-test "frame: ACK range_count > 32 returns InvalidFrame" {
-    // Build an ACK with range_count = 257 (well above the cap of 32).
-    // Use a 2-byte varint for range_count to fit > 63.
+test "frame: ACK claiming more ranges than present is InvalidFrame (truncation)" {
+    // A frame that advertises 257 ranges but does not contain their bytes is
+    // genuinely malformed: parsing runs off the end of the buffer. This must be
+    // rejected — but for truncation, NOT for the range count itself (which RFC
+    // 9000 §19.3 does not bound). Contrast with the well-formed many-range test.
     var buf: [32]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 0x02;
     pos += 1; // ACK type
     pos += varint.encode(buf[pos..], 10); // largest_acked
     pos += varint.encode(buf[pos..], 0); // ack_delay
-    pos += varint.encode(buf[pos..], 257); // range_count > 32
-    pos += varint.encode(buf[pos..], 5); // first ACK range
-    // Do NOT add 257 additional range pairs — the cap fires before the loop.
+    pos += varint.encode(buf[pos..], 257); // claims 257 ranges...
+    pos += varint.encode(buf[pos..], 5); // ...but only the first range follows
     try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
 }
 
-test "frame: ACK range_count 33 returns InvalidFrame" {
-    // 33 is one past the storage cap of 32 — must be rejected.
-    var buf: [32]u8 = undefined;
+test "frame: ACK with 40 well-formed ranges parses (RFC 9000 §19.3, no count limit)" {
+    // Regression for the seeded-loss transfer stall: under loss a peer sends an
+    // ACK with many SACK ranges (>31). The server MUST parse it, not reject it
+    // with FRAME_ENCODING_ERROR. The fixed array retains the first ranges.len;
+    // any extra are consumed (correct `consumed`) but not stored.
+    var buf: [512]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 0x02;
     pos += 1; // ACK type
-    pos += varint.encode(buf[pos..], 10); // largest_acked
+    pos += varint.encode(buf[pos..], 200); // largest_acked
     pos += varint.encode(buf[pos..], 0); // ack_delay
-    pos += varint.encode(buf[pos..], 33); // range_count = 33 (one past cap)
-    pos += varint.encode(buf[pos..], 5); // first ACK range
-    try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
+    pos += varint.encode(buf[pos..], 40); // 40 additional ranges (well above 31)
+    pos += varint.encode(buf[pos..], 0); // first ACK range
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        pos += varint.encode(buf[pos..], 1); // gap
+        pos += varint.encode(buf[pos..], 0); // ack_range
+    }
+    const result = try parseFrame(buf[0..pos]);
+    switch (result.frame) {
+        .ack => |a| {
+            // First range + 40 additional = 41 total, but the [32] array caps at 32.
+            try std.testing.expectEqual(@as(usize, 32), a.range_count);
+            // The entire frame is consumed even though only 32 ranges are retained.
+            try std.testing.expectEqual(pos, result.consumed);
+            try std.testing.expectEqual(@as(u62, 200), a.largest_acked);
+        },
+        else => return error.WrongFrameType,
+    }
 }
 
 test "frame: ACK range_count exactly 31 additional is accepted (fills array)" {
     // 31 additional ranges + 1 first_range = 32 total, which fills the array exactly.
-    // This is the maximum accepted value (> 31 is rejected).
+    // This is the largest count that fits without the retain-cap engaging.
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 0x02;
@@ -1005,23 +1044,32 @@ test "frame: ACK range_count exactly 31 additional is accepted (fills array)" {
     }
 }
 
-test "frame: ACK range_count 32 additional rejected (would overflow array)" {
-    // 32 additional + 1 first_range = 33 total, exceeds the 32-entry array.
-    // Was previously accepted (silent truncation). Now correctly rejected.
+test "frame: ACK with 32 additional well-formed ranges parses (array caps, frame consumed)" {
+    // 32 additional + 1 first_range = 33 total, one past the 32-entry array.
+    // This is a VALID frame (RFC 9000 §19.3): it must parse, retaining 32 ranges
+    // and consuming all 33 from the wire — never error. (Previously this was
+    // wrongly rejected as InvalidFrame, killing connections under loss.)
     var buf: [512]u8 = undefined;
     var pos: usize = 0;
     buf[pos] = 0x02;
     pos += 1;
     pos += varint.encode(buf[pos..], 63);
     pos += varint.encode(buf[pos..], 0);
-    pos += varint.encode(buf[pos..], 32); // 32 additional — one too many
+    pos += varint.encode(buf[pos..], 32); // 32 additional ranges
     pos += varint.encode(buf[pos..], 0); // first ACK range
     var i: usize = 0;
     while (i < 32) : (i += 1) {
         pos += varint.encode(buf[pos..], 0);
         pos += varint.encode(buf[pos..], 0);
     }
-    try std.testing.expectError(error.InvalidFrame, parseFrame(buf[0..pos]));
+    const result = try parseFrame(buf[0..pos]);
+    switch (result.frame) {
+        .ack => |a| {
+            try std.testing.expectEqual(@as(usize, 32), a.range_count);
+            try std.testing.expectEqual(pos, result.consumed);
+        },
+        else => return error.WrongFrameType,
+    }
 }
 
 test "frame: parseFrame empty buffer returns BufferEmpty" {
