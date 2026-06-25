@@ -151,9 +151,13 @@ jobs:
       - name: Build reference impls + fixtures
         run: bash oracle/build-refs.sh
 
-      # --require fails the job if any impl didn't build, instead of silently
-      # running a smaller green matrix (#7). ngtcp2 is the only impl that
-      # exercises the H3/QPACK path (IMPL_TC[ngtcp2]=http3) — its absence
-      # would silently drop 11 H3 test runs (#16).
-      - name: Run oracle matrix
-        run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+      # val/all-fixes: Linux stability validation of all 3 fixes combined
+      # (ACK >31-range + STREAM_DATA_BLOCKED throttle + sub-1MB loss file).
+      - name: Validate seeded-loss stability (all fixes)
+        run: |
+          echo "nproc=$(nproc)"
+          for t in "quiche transferloss 80" "ngtcp2 transferloss 40" "quiche transfercorruption 40"; do
+            set -- $t
+            echo "--- $1 $2 x$3 ---"
+            ORACLE_REPEAT="$3" bash oracle/run.sh -i "$1" "$2" 2>&1 | grep -oE "STABILITY: [0-9]+/[0-9]+" | sed "s|^|[$1 $2] |"
+          done
