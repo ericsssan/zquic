@@ -21,8 +21,20 @@ const MAX_DATAGRAM = 1452;
 // Chunk size must fit inside a single QUIC packet (MAX_DATAGRAM=1452 minus
 // short header ~13 + AEAD 16 + STREAM frame header ~17 = ~46 bytes overhead).
 const SEND_CHUNK: usize = 1380;
-// Maximum concurrent file transfers per connection.
+// Maximum concurrent file transfers per connection. This is also the size of the
+// QUIC stream table (see `Conn` below), which is a SINGLE shared pool across both
+// bidirectional and unidirectional streams (StreamTable in stream.zig).
 const MAX_TRANSFERS = 64;
+
+// Advertised concurrent stream limits. Because the stream table is one shared pool,
+// the bidi and uni limits must SUM to <= MAX_TRANSFERS — otherwise a conformant peer
+// opening streams strictly within the limits we granted could fill the table, and the
+// receive path would kill the connection with INTERNAL_ERROR (getOrCreate -> null ->
+// error.TooManyStreams). Reserve a few slots for the client's unidirectional HTTP/3
+// streams (control + QPACK encoder + QPACK decoder = 3; 8 leaves headroom); the rest
+// go to bidirectional request streams. Both grow via MAX_STREAMS as streams close.
+const MAX_UNI_STREAMS = 8;
+const MAX_BIDI_STREAMS = MAX_TRANSFERS - MAX_UNI_STREAMS;
 
 // Maximum concurrent connections.
 const MAX_CONNS = 50;
@@ -45,8 +57,9 @@ var g_gso_supported: bool = false;
 // proxy reading IP_RECVTOS) can confirm the codepoint on the wire.
 const ECN_ECT0: c_int = 0x02; // RFC 3168 ECT(0) codepoint in the low TOS bits
 
-// Connection type: parameterized for 64 concurrent streams (= MAX_TRANSFERS).
-const Conn = quic.Connection(64);
+// Connection type: the stream table holds MAX_TRANSFERS concurrent streams, shared
+// across bidi + uni (which is why MAX_BIDI_STREAMS + MAX_UNI_STREAMS == MAX_TRANSFERS).
+const Conn = quic.Connection(MAX_TRANSFERS);
 
 /// A parsed HTTP/0.9 request waiting for a free transfer slot.
 const PendingTransfer = struct {
@@ -407,8 +420,10 @@ pub fn main(init: std.process.Init) !void {
         },
         .initial_quic_version = if (std.mem.eql(u8, testcase, "v2")) quic.packet.QUIC_VERSION_2 else quic.packet.QUIC_VERSION_1,
         .preferred_cipher = if (std.mem.eql(u8, testcase, "chacha20")) .chacha20_poly1305 else .aes_128_gcm,
-        .initial_max_streams_bidi = 64, // Match MAX_TRANSFERS; grows as streams close
-        .initial_max_streams_uni = 100,
+        // bidi + uni must fit the shared MAX_TRANSFERS-slot table; both grow via
+        // MAX_STREAMS as streams close (RFC 9000 §4.6).
+        .initial_max_streams_bidi = MAX_BIDI_STREAMS,
+        .initial_max_streams_uni = MAX_UNI_STREAMS,
         // RFC 9000 §18.2.3: advertise a preferred address for migration. IPv4 is
         // always advertised when CM is active; IPv6 only when we have a reachable
         // one (cm_addr6 non-null) — otherwise the v6 fields are all-zeros (absent).
