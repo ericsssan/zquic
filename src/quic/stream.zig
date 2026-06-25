@@ -411,6 +411,14 @@ pub const Stream = struct {
     /// If non-null, peekInline() returns this instead of reading from recv_buf.
     inline_recv: ?[]const u8 = null,
 
+    /// STREAM_DATA_BLOCKED throttle (RFC 9000 §19.13). The send loop retries a
+    /// flow-control-blocked stream every ~1ms, so without throttling the server
+    /// emits one STREAM_DATA_BLOCKED packet per retry (thousands/sec). Track the
+    /// limit we last advertised as blocked and when, so we send one per distinct
+    /// blocked limit and re-send at most once per PTO interval (loss resilience).
+    blocked_sdb_max: u64 = 0,
+    blocked_sdb_sent_ns: i64 = 0,
+
     /// Create a stream with a heap-allocated send buffer of `buf_cap` bytes.
     /// `buf_cap` must be a power of two and >= 1.
     pub fn init(id: u62, buf_cap: usize) !Stream {
