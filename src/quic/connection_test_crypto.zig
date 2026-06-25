@@ -1065,6 +1065,85 @@ test "connection: key generation counter increments on rotation" {
     try testing.expectEqual(@as(u32, 3), conn.current_key_generation);
 }
 
+// Mock a fresh server connection into an established-ish 1-RTT state with the
+// given AEAD suite, ready to send Short Header packets and rotate keys.
+fn mockAppKeys(conn: anytype, suite: crypto.CipherSuite) void {
+    const pk: crypto.PacketKeys = .{ .key = @as([32]u8, @splat(0)), .iv = @as([12]u8, @splat(0)), .hp = @as([32]u8, @splat(0)), .suite = suite };
+    conn.app_keys = .{ .client = pk, .server = pk };
+    conn.next_app_keys = conn.app_keys.?;
+    conn.next_client_secret = @as([32]u8, @splat(0));
+    conn.next_server_secret = @as([32]u8, @splat(0));
+    conn.tls_state.server.negotiated_cipher = suite;
+}
+
+test "connection: 1-RTT send count reaching the AES-128-GCM confidentiality limit forces a key update (RFC 9001 §6.6)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+    mockAppKeys(&conn, .aes_128_gcm);
+
+    const limit = crypto.confidentialityLimit(.aes_128_gcm);
+
+    // Pre-load the counter to one shy of the limit; the next 1-RTT send crosses it.
+    conn.app_tx_pkts = limit - 1;
+    _ = try conn.sendShortHeaderPacket(0, null, false);
+
+    // The send that hit the limit forced exactly one rotation and restarted the
+    // per-key budget; the connection stays open (key_update_pending until the peer
+    // confirms the new phase).
+    try testing.expectEqual(@as(u32, 1), conn.current_key_generation);
+    try testing.expectEqual(@as(u64, 0), conn.app_tx_pkts);
+    try testing.expect(conn.key_update_pending);
+    try testing.expect(conn.hot.state != .closing);
+
+    // A subsequent send under the fresh key does NOT rotate again.
+    _ = try conn.sendShortHeaderPacket(0, null, false);
+    try testing.expectEqual(@as(u32, 1), conn.current_key_generation);
+    try testing.expectEqual(@as(u64, 1), conn.app_tx_pkts);
+}
+
+test "connection: ChaCha20-Poly1305 does not force a key update at 2^23 packets (limit is 2^62)" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+    mockAppKeys(&conn, .chacha20_poly1305);
+
+    // 2^23 (the AES-GCM limit) is nowhere near ChaCha20's 2^62 limit.
+    conn.app_tx_pkts = (1 << 23) - 1;
+    _ = try conn.sendShortHeaderPacket(0, null, false);
+
+    try testing.expectEqual(@as(u32, 0), conn.current_key_generation);
+    try testing.expectEqual(@as(u64, 1 << 23), conn.app_tx_pkts);
+}
+
+test "connection: confidentiality limit reached with an update already pending closes with AEAD_LIMIT_REACHED" {
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(16).accept(.{}, io);
+    mockAppKeys(&conn, .aes_128_gcm);
+
+    // A prior key update is in flight (peer has not confirmed), so we cannot rotate
+    // again. Reaching the limit must close the connection rather than overrun it.
+    conn.key_update_pending = true;
+    conn.app_tx_pkts = crypto.confidentialityLimit(.aes_128_gcm) - 1;
+    _ = try conn.sendShortHeaderPacket(0, null, false);
+
+    try testing.expectEqual(ConnState.closing, conn.hot.state);
+    try testing.expectEqual(@as(u32, 0), conn.current_key_generation); // no rotation occurred
+    // The close carries the AEAD_LIMIT_REACHED (0x0f) transport error code.
+    var saw_close = false;
+    while (conn.pollEvent()) |ev| {
+        switch (ev) {
+            .connection_closed => |c| {
+                saw_close = true;
+                try testing.expectEqual(@as(u62, 0x0f), c.error_code);
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_close);
+}
+
 test "connection: deriveSecretsForGeneration returns correct generation secrets" {
     const testing = std.testing;
     const io = std.testing.io;
