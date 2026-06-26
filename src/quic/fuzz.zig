@@ -123,8 +123,11 @@ fn fuzzStreamReceive(_: void, input: FuzzInput) anyerror!void {
     s.receiveData(offset, data, fin) catch return;
 }
 
-/// RttEstimator.update must not crash, overflow, or produce NaN/zero values
-/// regardless of sample_ns, ack_delay_ns, max_ack_delay_ns inputs.
+/// RttEstimator.update must not crash or overflow on any
+/// (sample_ns, ack_delay_ns, max_ack_delay_ns) input, and the derived PTO must
+/// stay sane. Note: smoothed_rtt CAN legitimately be 0 — a 0 RTT sample sets it to
+/// 0, and the integer-division EWMA can keep it there. That is safe because ptoBase
+/// floors the variance term at K_GRANULARITY_NS, so the timer never collapses to 0.
 fn fuzzRttUpdate(_: void, input: FuzzInput) anyerror!void {
     var buf: [768]u8 = undefined;
     const bytes = getBytes(input, &buf);
@@ -137,10 +140,9 @@ fn fuzzRttUpdate(_: void, input: FuzzInput) anyerror!void {
         const ack_delay = @as(u64, bytes[i + 1]) * 1_000_000;
         const max_delay = @as(u64, bytes[i + 2]) * 1_000_000 + 1; // +1 to avoid zero
         rtt.update(sample_ns, ack_delay, max_delay);
-        // smoothed_rtt and rtt_var must always remain positive after initialization.
-        if (rtt.initialized) {
-            try std.testing.expect(rtt.smoothed_rtt > 0);
-        }
+        // A 0 sample yields smoothed_rtt == 0; the real invariant is that the PTO
+        // base never drops below the granularity floor (RFC 9002 §6.2.1).
+        try std.testing.expect(rtt.ptoBase(max_delay) >= loss_recovery_mod.K_GRANULARITY_NS);
     }
 }
 
@@ -152,7 +154,12 @@ fn fuzzFrameRoundTrip(_: void, input: FuzzInput) anyerror!void {
     const bytes = getBytes(input, &buf);
     const r1 = frame.parseFrame(bytes) catch return;
     if (r1.consumed == 0) return;
-    var enc_buf: [4096]u8 = undefined;
+    // enc_buf needs headroom over the input: a length-less STREAM frame (LEN bit
+    // clear, data to end of buffer) re-encodes WITH an explicit length varint, so the
+    // canonical form is a few bytes larger than what it parsed from. encodeFrame
+    // assumes the caller's buffer is large enough (production buffers are MTU-sized
+    // with data chunked to fit), so give it margin rather than a same-size buffer.
+    var enc_buf: [4096 + 64]u8 = undefined;
     const enc_len = frame.encodeFrame(&enc_buf, r1.frame);
     if (enc_len == 0) return;
     const r2 = frame.parseFrame(enc_buf[0..enc_len]) catch return;
@@ -246,10 +253,13 @@ fn fuzzStreamSendBuffer(_: void, input: FuzzInput) anyerror!void {
         i += 2;
         switch (op) {
             0 => {
-                // Write arg bytes
+                // Write arg bytes. `i` may already be past bytes.len (the i += 2 above
+                // can overshoot on the final opcode), so clamp the start before slicing
+                // — otherwise bytes[i..end] panics with start > end.
+                const start = @min(i, bytes.len);
                 const data_len: usize = @as(usize, arg) + 1;
-                const end = @min(i + data_len, bytes.len);
-                const data = bytes[i..end];
+                const end = @min(start + data_len, bytes.len);
+                const data = bytes[start..end];
                 i = end;
                 _ = s.bufferSendData(data);
             },
@@ -292,7 +302,7 @@ fn fuzzLossRecoveryLoop(_: void, input: FuzzInput) anyerror!void {
         const op = bytes[i] & 0x1; // 1-bit opcode
         const b = if (i + 1 < bytes.len) bytes[i + 1] else 1;
         i += 2;
-        const epoch: u8 = b & 0x3; // 0..2
+        const epoch: u8 = b % 3; // 0..2 — the 3 valid PN spaces (b & 0x3 would yield 3, out of range)
         const ack_eliciting = (b >> 2) & 0x1 != 0;
         switch (op) {
             0 => {
