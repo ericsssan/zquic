@@ -5,3 +5,7 @@ certs/
 *.pem
 *.key
 *.o
+
+# Bounded-fuzz job scratch (zig fuzzer log dir + captured output)
+tmp/
+fuzz.log
