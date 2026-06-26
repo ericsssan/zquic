@@ -8,6 +8,10 @@ on:
 env:
   ZIG_VERSION: 0.17.0-dev.657+2faf8debf
 
+# Least-privilege GITHUB_TOKEN: checkout + fuzz only (CodeQL hardening).
+permissions:
+  contents: read
+
 jobs:
   fuzz:
     name: Fuzz targets (10 min)
