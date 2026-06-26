@@ -4184,10 +4184,15 @@ pub fn Connection(comptime max_streams: usize) type {
             if (raw.len < 7) return;
             var pos: usize = 5; // skip first_byte (1) + version (4)
             const dcid_len: usize = raw[pos];
+            // RFC 9000 §17.2: long-header CID length fields MUST NOT exceed 20. A larger
+            // value is a malformed header — drop it rather than echo an oversized CID
+            // (which would overflow vn_buf when building the response).
+            if (dcid_len > cid_mod.MAX_LEN) return;
             pos += 1 + dcid_len;
             if (pos >= raw.len) return;
             const scid_len: usize = raw[pos];
             pos += 1;
+            if (scid_len > cid_mod.MAX_LEN) return;
             if (pos + scid_len > raw.len) return;
 
             const client_scid = raw[pos..][0..scid_len];
@@ -4200,6 +4205,7 @@ pub fn Connection(comptime max_streams: usize) type {
                 client_scid,
                 &self.local_cid.bytes,
             );
+            if (vn_n == 0) return; // CIDs did not fit (defensive; unreachable after the checks above)
             try self.enqueueSend(vn_buf[0..vn_n]);
         }
 

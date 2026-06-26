@@ -19,6 +19,13 @@
 //!   - Stream send buffer: bufferSendData/getSendData/onAcked ring-buffer invariants.
 //!   - Loss recovery loop: onPacketSent/onAckReceived must not corrupt bytes_in_flight.
 //!   - RTT estimator (full u64): ptoBase must be >= K_GRANULARITY_NS for any input.
+//!   - Full receive path (RAW): Connection.receive() on an arbitrary datagram must
+//!     never crash — header parsing, version negotiation, Retry, coalescing, header
+//!     protection, Initial decrypt. The off-path attacker's garbage-spray surface.
+//!   - Full receive path (AUTHENTICATED): arbitrary frame bytes sealed under known
+//!     1-RTT keys and fed to an established connection must never crash the decrypt →
+//!     processFrames → stream/flow-control/loss path. The malicious-peer surface,
+//!     deeper than parsing frames in isolation (real connection state interactions).
 
 const std = @import("std");
 const frame = @import("frame.zig");
@@ -27,6 +34,8 @@ const transport_params = @import("transport_params.zig");
 const packet = @import("packet.zig");
 const stream_mod = @import("stream.zig");
 const loss_recovery_mod = @import("loss_recovery.zig");
+const conn_mod = @import("connection.zig");
+const crypto = @import("crypto.zig");
 
 // ---------------------------------------------------------------------------
 // Compatibility shim: std.testing.fuzz changed its callback signature between
@@ -329,6 +338,66 @@ fn fuzzRttFullRange(_: void, input: FuzzInput) anyerror!void {
     try std.testing.expect(pto >= loss_recovery_mod.K_GRANULARITY_NS);
 }
 
+// A fixed source address for receive-path fuzzing.
+const fuzz_src: conn_mod.SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 4433 } };
+
+// A small connection keeps the per-iteration struct (inline stream table) cheap.
+const FuzzConn = conn_mod.Connection(4);
+
+// Fixed, all-known 1-RTT keys for the authenticated-frame target. Real values are
+// irrelevant — both ends use the same key so encrypt(plaintext) round-trips through
+// the receiver's decrypt, letting arbitrary frame bytes reach processFrames.
+const fuzz_app_pk: crypto.PacketKeys = .{
+    .key = @as([32]u8, @splat(0xAB)),
+    .iv = @as([12]u8, @splat(0xCD)),
+    .hp = @as([32]u8, @splat(0xEF)),
+    .suite = .aes_128_gcm,
+};
+
+/// Full receive path on RAW bytes: an idle server connection fed an arbitrary UDP
+/// datagram must never crash. Exercises long/short header parsing, version
+/// negotiation, Retry, coalesced-packet splitting, header-protection removal, and
+/// the Initial decrypt attempt — the exact surface an off-path attacker reaches by
+/// spraying garbage at the socket. Errors are expected (it's hostile input); only
+/// a crash / safety-checked UB is a finding.
+fn fuzzReceiveRaw(_: void, input: FuzzInput) anyerror!void {
+    var buf: [2048]u8 = undefined;
+    const bytes = getBytes(input, &buf);
+    const io = std.testing.io;
+    var conn = FuzzConn.accept(.{}, io) catch return;
+    defer conn.deinit();
+    // receive() decrypts in place, so it needs a mutable buffer — buf itself.
+    const ecn: u2 = if (bytes.len > 0) @truncate(bytes[0]) else 0;
+    conn.receive(buf[0..bytes.len], fuzz_src, 1_000_000_000, ecn, io) catch {};
+}
+
+/// Full receive path on AUTHENTICATED frames: treat the fuzz bytes as 1-RTT frame
+/// plaintext, seal them under known keys into a Short Header packet, and feed it to
+/// an established connection. This drives arbitrary frame sequences through the real
+/// decrypt → processFrames → stream table / flow control / loss recovery — i.e. the
+/// "a peer that completed the handshake then sends hostile frames" surface, far
+/// deeper than parsing frames in isolation. Only a crash is a finding.
+fn fuzzReceiveAuthenticatedFrames(_: void, input: FuzzInput) anyerror!void {
+    var buf: [1024]u8 = undefined;
+    const plaintext = getBytes(input, &buf);
+    const io = std.testing.io;
+    var conn = FuzzConn.accept(.{ .validate_addr = false }, io) catch return;
+    defer conn.deinit();
+    // Skip the handshake: install fixed 1-RTT keys and mark established.
+    conn.hot.state = .established;
+    conn.app_keys = .{ .client = fuzz_app_pk, .server = fuzz_app_pk };
+    conn.peer_cid = conn.local_cid;
+
+    var pkt: [2048]u8 = undefined;
+    const hdr_len = packet.encodeShortHeader(&pkt, &conn.local_cid.bytes, 0, false);
+    const ct_len = plaintext.len + 16;
+    if (hdr_len + ct_len > pkt.len) return;
+    // Server decrypts 1-RTT with the client's keys → seal with the client key.
+    crypto.encryptPayload(conn.app_keys.?.client, 0, pkt[0..hdr_len], plaintext, pkt[hdr_len..][0..ct_len]);
+    crypto.applyHeaderProtection(conn.app_keys.?.client, &pkt[0], pkt[hdr_len - 4 ..][0..4], pkt[hdr_len..][0..16]);
+    conn.receive(pkt[0 .. hdr_len + ct_len], fuzz_src, 1_000_000_000, 0, io) catch {};
+}
+
 // ---------------------------------------------------------------------------
 // Tests (smoke-test wrappers; each runs the fuzz target once)
 // ---------------------------------------------------------------------------
@@ -379,4 +448,12 @@ test "fuzz: loss recovery loop bytes_in_flight invariant" {
 
 test "fuzz: RTT estimator full u64 range ptoBase invariant" {
     try std.testing.fuzz({}, fuzzRttFullRange, .{});
+}
+
+test "fuzz: receive() on raw datagrams does not crash" {
+    try std.testing.fuzz({}, fuzzReceiveRaw, .{});
+}
+
+test "fuzz: receive() on authenticated 1-RTT frames does not crash" {
+    try std.testing.fuzz({}, fuzzReceiveAuthenticatedFrames, .{});
 }

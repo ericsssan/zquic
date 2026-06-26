@@ -7,6 +7,10 @@ const std = @import("std");
 
 pub const len: usize = 8;
 
+/// Maximum length of a peer connection ID we will accept on the wire
+/// (RFC 9000 §17.2: long-header DCID/SCID length fields MUST NOT exceed 20).
+pub const MAX_LEN: usize = 20;
+
 pub const ConnectionId = struct {
     bytes: [len]u8 = @as([len]u8, @splat(0)),
 

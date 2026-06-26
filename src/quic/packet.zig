@@ -325,6 +325,9 @@ pub fn encodeVersionNegotiation(
     dcid: []const u8,
     scid: []const u8,
 ) usize {
+    // first_byte(1) + version(4) + dcid_len(1) + dcid + scid_len(1) + scid + 2 versions(8).
+    // Guard so an oversized CID can never overflow `buf`; return 0 (caller drops).
+    if (buf.len < 1 + 4 + 1 + dcid.len + 1 + scid.len + 8) return 0;
     var pos: usize = 0;
 
     // First byte: long header bit set (0x80), remaining bits arbitrary.
