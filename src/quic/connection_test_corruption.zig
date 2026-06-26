@@ -504,3 +504,29 @@ test "idle timeout after successful handshake start emits idle_timed_out" {
     }
     try testing.expect(found);
 }
+
+test "connection: Version Negotiation trigger with oversized SCID is dropped, not crashed (RFC 9000 §17.2)" {
+    // Regression (found by fuzzReceiveRaw): an idle server receiving a long-header
+    // packet with an UNSUPPORTED version and a CID length field > 20 used to echo the
+    // oversized CID into a 64-byte VN buffer, overflowing it (remote-DoS panic).
+    // The malformed header must now be dropped without sending a VN or changing state.
+    const testing = std.testing;
+    const io = std.testing.io;
+    var conn = try Connection(4).accept(.{}, io);
+    defer conn.deinit();
+
+    var pkt: [256]u8 = undefined;
+    pkt[0] = 0xc0; // long header, fixed bit set
+    std.mem.writeInt(u32, pkt[1..5], 0x1a2a3a4a, .big); // unsupported version (not v1/v2)
+    pkt[5] = 0; // DCID length = 0
+    pkt[6] = 107; // SCID length = 107 (> 20 — malformed), the overflow trigger
+    @memset(pkt[7..][0..107], 0xAB);
+    const total = 7 + 107;
+
+    const src: SocketAddr = .{ .v4 = .{ .addr = [4]u8{ 127, 0, 0, 1 }, .port = 5000 } };
+    // Must not crash (the bug was an index-out-of-bounds panic here).
+    conn.receive(pkt[0..total], src, 1_000_000_000, 0, io) catch {};
+
+    // Dropped: no state transition from a malformed packet.
+    try testing.expectEqual(ConnState.idle, conn.hot.state);
+}
