@@ -157,3 +157,88 @@ jobs:
       # would silently drop 11 H3 test runs (#16).
       - name: Run oracle matrix
         run: bash oracle/run.sh --require quicgo,ngtcp2,quiche,quiche-h3
+
+  fuzz:
+    name: Fuzz (bounded)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # The fuzz targets (src/quic/fuzz.zig) — including the full receive path — are
+      # only smoke-run by the Test job (one iteration each). This job is what actually
+      # exercises them under coverage-guided fuzzing, the way the receive-path DoS and
+      # the harness contract bugs were originally caught.
+      - name: Bounded coverage-guided fuzzing
+        env:
+          FUZZ_SECONDS: 90
+        run: |
+          # `zig build test --fuzz` is coverage-guided, runs until killed, writes
+          # ./tmp/libfuzzer.log, and on a finding saves the crashing input to
+          # .zig-cache/f/crash and prints "input saved to ...".
+          #
+          # The dev-build fuzzer occasionally aborts on its own coverage bookkeeping
+          # (not a code bug); we retry those, fail ONLY on a real crash finding, and
+          # treat an unavoidable infra abort as a non-blocking warning rather than a
+          # flaky red build. Validated to exit 0 on clean code and 1 on a reintroduced
+          # target/receive-path crash.
+          mkdir -p tmp
+          run_one() {
+            rm -rf .zig-cache/f 2>/dev/null || true
+            : > fuzz.log
+            zig build test --fuzz > fuzz.log 2>&1 &
+            local fpid=$! elapsed=0
+            while kill -0 "$fpid" 2>/dev/null && [ "$elapsed" -lt "$FUZZ_SECONDS" ]; do
+              sleep 5; elapsed=$((elapsed + 5))
+            done
+            pkill -INT -P "$fpid" 2>/dev/null || true
+            kill -INT "$fpid" 2>/dev/null || true
+            sleep 2
+            pkill -P "$fpid" 2>/dev/null || true
+            pkill -f 'zig-cache/o/.*test' 2>/dev/null || true
+            kill "$fpid" 2>/dev/null || true
+            wait "$fpid" 2>/dev/null || true
+          }
+          crash=0; clean=0
+          for attempt in 1 2; do
+            echo "::group::fuzz attempt $attempt (${FUZZ_SECONDS}s)"
+            run_one
+            tail -20 fuzz.log || true
+            echo "::endgroup::"
+            if grep -qE 'input saved to' fuzz.log || { [ -f .zig-cache/f/crash ] && [ -s .zig-cache/f/crash ]; }; then
+              crash=1; break
+            fi
+            if ! grep -q 'web interface listening' fuzz.log; then
+              echo "fuzzer did not start on attempt $attempt; retrying"; continue
+            fi
+            if grep -qE "failed to open coverage file|libfuzzer.log': FileNotFound" fuzz.log; then
+              echo "fuzzer aborted on internal coverage bookkeeping on attempt $attempt; retrying"; continue
+            fi
+            clean=1; break
+          done
+          if [ "$crash" = 1 ]; then
+            echo "::error::Bounded fuzzing found a crashing input — a fuzz target or the receive path regressed."
+            grep -nE 'panic:|terminated with signal|input saved to|src/quic/.*\.zig:[0-9]+.* in ' fuzz.log | head -60
+            exit 1
+          fi
+          if [ "$clean" != 1 ]; then
+            echo "::warning::Bounded fuzzing did not complete a clean run (Zig dev-build fuzzer infra issues); not blocking the build."
+          else
+            echo "Bounded fuzzing completed cleanly with no crashes."
+          fi
+
+      - name: Upload crash artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash
+          path: |
+            .zig-cache/f/crash
+            fuzz.log
+          retention-days: 14
+          if-no-files-found: ignore
