@@ -136,6 +136,7 @@ func main() {
 	ecnFlag := flag.Bool("ecn", false, "read IP ECN bits from s2c packets via IP_RECVTOS CMSG (Linux only) and append counts to capture file (#41)")
 	shortsFlag := flag.String("shorts", "", "file path for SHORT packet hex dump used by kpcheck for KP bit wire-proof (#40)")
 	tolerantBack := flag.Bool("tolerant-back", false, "retry s2c Read after errors instead of exiting (for tests where the server restarts mid-connection)")
+	rebindAfter := flag.Int("rebind-after", 0, "after N client 1-RTT (SHORT) datagrams, rebind the server-facing socket to a fresh source port to simulate a NAT rebind (RFC 9000 §9.3.1); 0=off")
 	flag.Parse()
 	if *listen == "" || *target == "" {
 		fmt.Fprintln(os.Stderr, "proxy: -listen and -target required")
@@ -148,6 +149,16 @@ func main() {
 	must(err)
 	back, err := net.DialUDP("udp", nil, srvAddr)
 	must(err)
+	// The server-facing socket is swappable to simulate a NAT rebind (see
+	// -rebind-after): a fresh source port for the SAME connection, which the
+	// server must detect and path-validate (RFC 9000 §9.3.1). Both the forward
+	// path (main loop) and the reply reader (goroutine below) reach it through
+	// getBack(), so a swap is transparent to them.
+	var backMu sync.Mutex
+	curBack := back
+	rebound := false
+	getBack := func() *net.UDPConn { backMu.Lock(); defer backMu.Unlock(); return curBack }
+	isRebound := func() bool { backMu.Lock(); defer backMu.Unlock(); return rebound }
 
 	var capFile *os.File
 	if *capture != "" {
@@ -260,15 +271,40 @@ func main() {
 	getClient := func() net.Addr { mu.Lock(); defer mu.Unlock(); return clientAddr }
 	setClient := func(a net.Addr) { mu.Lock(); clientAddr = a; mu.Unlock() }
 
-	// -ecn: enable IP_RECVTOS on back socket so the IP TOS byte (ECN bits) of
+	// -ecn: enable IP_RECVTOS on the back socket so the IP TOS byte (ECN bits) of
 	// server-sent packets is delivered as CMSG in ReadMsgUDP (#41, Linux only).
+	// Factored into a helper so a rebound socket gets the same option.
 	useECN := *ecnFlag && runtime.GOOS == "linux"
-	if useECN {
-		if rc, e := back.SyscallConn(); e == nil {
+	enableECN := func(c *net.UDPConn) {
+		if !useECN {
+			return
+		}
+		if rc, e := c.SyscallConn(); e == nil {
 			rc.Control(func(fd uintptr) { // IP_RECVTOS = 13 on Linux
 				syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, 0xd, 1)
 			})
 		}
+	}
+	enableECN(back)
+	// rebind swaps the server-facing socket for one on a fresh source port. The
+	// new socket is installed BEFORE the old one is closed, so the reply reader's
+	// in-flight Read unblocks with an error, re-fetches getBack(), and continues
+	// on the new socket. The server sees the same connection ID arrive from a new
+	// port and must run path validation (RFC 9000 §9.3.1).
+	rebind := func() {
+		nb, e := net.DialUDP("udp", nil, srvAddr)
+		if e != nil {
+			fmt.Fprintln(os.Stderr, "proxy: rebind dial failed:", e)
+			return
+		}
+		enableECN(nb)
+		backMu.Lock()
+		old := curBack
+		curBack = nb
+		rebound = true
+		backMu.Unlock()
+		old.Close()
+		fmt.Fprintf(os.Stderr, "proxy: rebound server-facing socket %s -> %s\n", old.LocalAddr(), nb.LocalAddr())
 	}
 
 	// Server replies (back) -> client (front).
@@ -287,11 +323,12 @@ func main() {
 		var ecnSeen [4]bool
 		var oob [64]byte
 		for {
+			b := getBack()
 			var n int
 			var err error
 			if useECN {
 				var oobn int
-				n, oobn, _, _, err = back.ReadMsgUDP(buf, oob[:])
+				n, oobn, _, _, err = b.ReadMsgUDP(buf, oob[:])
 				if err == nil && oobn > 0 {
 					// Parse CMSG for IP_TOS (level=IPPROTO_IP=0, type=IP_TOS=1).
 					msgs, _ := syscall.ParseSocketControlMessage(oob[:oobn])
@@ -308,10 +345,13 @@ func main() {
 					}
 				}
 			} else {
-				n, err = back.Read(buf)
+				n, err = b.Read(buf)
 			}
 			if err != nil {
-				if *tolerantBack {
+				// A rebind closes the old socket, which surfaces here as a read
+				// error; re-fetch the current socket and continue. tolerant-back
+				// does the same for the server-restart cases.
+				if *tolerantBack || isRebound() {
 					time.Sleep(10 * time.Millisecond)
 					continue
 				}
@@ -327,6 +367,7 @@ func main() {
 
 	// Client requests (front) -> server (back).
 	buf := make([]byte, 65535)
+	shortDgrams := 0
 	for {
 		n, addr, err := front.ReadFrom(buf)
 		if err != nil {
@@ -336,13 +377,27 @@ func main() {
 		pkt := append([]byte(nil), buf[:n]...)
 		record("c2s", pkt)
 		if !drop(rngC) {
-			fwd(func(p []byte) { back.Write(p) }, maybecorrupt(rngC, pkt))
+			fwd(func(p []byte) { getBack().Write(p) }, maybecorrupt(rngC, pkt))
+		}
+		// NAT-rebind trigger: once the client is in the 1-RTT phase (SHORT
+		// packets flowing), swap the server-facing source port after N such
+		// datagrams — squarely mid-transfer, after the handshake.
+		if *rebindAfter > 0 && !isRebound() {
+			for _, c := range classifyAll(pkt) {
+				if c.label == "SHORT" {
+					shortDgrams++
+					break
+				}
+			}
+			if shortDgrams >= *rebindAfter {
+				rebind()
+			}
 		}
 	}
 	// Drain the s2c goroutine before closing the capture file (#28).
-	// Closing back unblocks back.Read; wg.Wait ensures the last record()
-	// call completes before capFile.Close() runs.
-	back.Close()
+	// Closing the current back socket unblocks its Read; wg.Wait ensures the
+	// last record() call completes before capFile.Close() runs.
+	getBack().Close()
 	wg.Wait()
 	if capFile != nil {
 		capFile.Close()

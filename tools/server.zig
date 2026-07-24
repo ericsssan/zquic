@@ -796,7 +796,24 @@ fn processPacket(
                 // old address (via s.peer_addr = from) route sends to the
                 // stale address.
                 s.peer_addr = socketAddrToIp(s.conn.peer_addr);
-                std.debug.print("[CM] path_migrated: client now at preferred_address\n", .{});
+                // Label the event so the oracle can wire-prove each cause
+                // independently. A move to our advertised preferred_address is the
+                // authoritative signal when it happened (s.cm_migrated) — a client
+                // reaching the preferred_address commonly ALSO changes its source
+                // port, so the address shape alone can't tell the two apart. Absent
+                // a preferred_address move, a port-only source change is a NAT rebind
+                // (RFC 9000 §9.3.1); anything else is a full path migration. The
+                // "[CM] path_migrated" substring is preserved for both non-rebind
+                // cases (the connectionmigration case greps it).
+                if (s.cm_migrated) {
+                    std.debug.print("[CM] path_migrated: client now at preferred_address\n", .{});
+                } else if (s.conn.prev_peer_addr != null and
+                    quic.SocketAddr.isPortOnlyChange(s.conn.prev_peer_addr.?, s.conn.peer_addr))
+                {
+                    std.debug.print("[CM] nat_rebind: client rebound to a new source port\n", .{});
+                } else {
+                    std.debug.print("[CM] path_migrated: client migrated to a new address\n", .{});
+                }
             },
             .idle_timed_out => {
                 std.debug.print("[IDLE] connection timed out\n", .{});

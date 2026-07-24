@@ -110,10 +110,11 @@ quiche when their sibling checkouts + deps are present).
 - **0-RTT is client-direction only.** The wire-check proves the zquic *client*
   sends early data (`c2s 0RTT`); zquic-*server* 0-RTT acceptance is not yet
   wire-proven.
-- **Not yet covered:** packet reordering and NAT rebinding (`rebind-addr` /
-  `rebind-port`) impairment — the proxy does loss / corruption / delay / ECN but
-  not reorder or source-port rebind — and keyupdate in the client direction against
-  quiche (#22). (0-RTT, key update, ECN, migration, resumption, version negotiation,
-  and HTTP/3 are now all covered — see `PLAN.md`.)
+- **Not yet covered:** packet reordering and NAT rebinding to a new *address*
+  (`rebind-addr`, which needs a second loopback IP) — the proxy does loss /
+  corruption / delay / ECN / source-port rebind but not reorder or address rebind —
+  and keyupdate in the client direction against quiche (#22). (0-RTT, key update,
+  ECN, migration, source-port NAT rebind, resumption, version negotiation, and
+  HTTP/3 are all covered — see `PLAN.md`.)
 
 See `PLAN.md` for the phased design.
