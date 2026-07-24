@@ -10,19 +10,30 @@ Target: the core oracle matrix runs in **seconds**, on every commit.
 
 ## Current status (what actually ships)
 
-Shipped today (`oracle/run.sh`) — **29/29 across three impls**:
+Shipped today (`oracle/run.sh`) — **74/74, verified green across four impls**
+(quicgo, ngtcp2-h3, quiche, quiche-h3), gating `main` in CI
+(`run.sh --require quicgo,ngtcp2,quiche,quiche-h3`):
 
-- **3 reference impls:** quic-go (HTTP/0.9, CI), ngtcp2 (HTTP/3, optional/local),
-  quiche (HTTP/0.9, optional/local). quiche-over-HTTP/3 stalls vs zquic — issue #4.
-- **Data-path, both directions:** handshake, transfer, multiplexing. The quic-go
-  client verifies zquic's cert against the local CA (real TLS-auth oracle); the
-  reverse direction verifies the ref server's CertificateVerify (VERIFY_PEER=1, #2).
-- **Behavioral, server direction:** retry (wire-classified `s2c RETRY`).
-- **Impairment (seeded):** handshakeloss (30%), transferloss (6%), longrtt
-  (200ms) — loss recovery + RTT, hash-verified through the proxy.
-- **HTTP/3 path:** all ngtcp2 cases run over h3, exercising zquic's H3/QPACK.
+- **4 reference impls:** quic-go (HTTP/0.9, always/CI), ngtcp2 (HTTP/3), quiche
+  (HTTP/0.9), quiche-h3 (HTTP/3 — the GREASE-frame guard, #4). ngtcp2/quiche build
+  from sibling checkouts; CI builds all four.
+- **Data-path, both directions:** handshake, transfer, multiplexing — hash-verified
+  and cert-verified both ways (ref client checks zquic's cert; zquic client with
+  VERIFY_PEER=1 checks the ref server's CertificateVerify, #2).
+- **Behavioral, wire-proven:** retry (`s2c RETRY`), versionnegotiation
+  (`s2c VERSION_NEGOTIATION`), 0-RTT (`c2s 0RTT`), key update (Key Phase bit flip via
+  `kpcheck` + `SSLKEYLOGFILE`, #40), ECN (`s2c ECT0` from the IP TOS byte, Linux-only
+  #41), amplification limit (3× via per-datagram byte accounting, RFC 9000 §8.1),
+  connection migration (`[CM] path_migrated` to a preferred_address), idle timeout
+  (`[IDLE]`), stateless reset — server *and* client direction (#42).
+- **Also green:** resumption (PSK, both directions), multiconnect, chacha20, QUIC v2.
+- **Impairment (seeded, deterministic):** handshakeloss (30%), transferloss (6%),
+  longrtt (200ms), handshakecorruption (5% bit-flip), transfercorruption (2%).
+- **HTTP/3 path:** ngtcp2 + quiche-h3 exercise zquic's H3/QPACK.
 - **Crypto:** RFC 9001 A.1/A.2/A.5 vectors as unit tests.
-- **Not yet:** 0-RTT, key update, ECN, migration, resumption wire-cases; quiche.
+- **Self-test:** 12 meta-checks assert each assertion still rejects its negative (#9).
+- **Not yet:** packet reordering / NAT-rebinding impairment; server-direction 0-RTT
+  wire-proof; ECN wire-proof on macOS; CA-chain / hostname validation.
 
 ## Why
 
@@ -94,13 +105,16 @@ Each case runs: zquic-server ↔ ref-client, and ref-server ↔ zquic-client.
   + transfer, hash-verified. Validates the whole approach.
 - **Phase 1 — clean matrix.** `run.sh` orchestrator over the clean-network cases ×
   both directions × ngtcp2. `zig build oracle` wrapper.
-- **Phase 2 — behavioral + impairment.** DONE for retry (wire-classified Retry);
-  proxy also injects -loss/-delayms for the loss/longrtt cases. Next behavioral
-  cases: versionnegotiation + 0-RTT (parse coalesced packets), then keyupdate +
-  ecn (need keylog-based decryption — both endpoints emit SSLKEYLOGFILE).
-- **Phase 3 — multi-impl + CI.** Add ngtcp2 (../ngtcp2, cmake+quictls) + quiche
-  (cargo) to build-refs and the matrix; wire a fast subset into CI. Keep the full
-  Docker matrix for the pre-release 11-client sweep only.
+- **Phase 2 — behavioral + impairment. DONE.** Wire-proven: retry,
+  versionnegotiation, 0-RTT (`c2s 0RTT`), keyupdate (Key Phase bit via `kpcheck`
+  + `SSLKEYLOGFILE`), ecn (`s2c ECT0` from IP TOS, Linux), migration, stateless
+  reset (both directions), amplification limit, idle timeout. Proxy injects seeded
+  -loss/-corrupt/-delayms. Remaining: packet reordering + NAT-rebind impairment,
+  server-direction 0-RTT.
+- **Phase 3 — multi-impl + CI. DONE.** All four impls (quicgo, ngtcp2-h3, quiche,
+  quiche-h3) build in `build-refs.sh` and gate `main` via the `oracle` CI job
+  (`run.sh --require quicgo,ngtcp2,quiche,quiche-h3`). The full Docker matrix stays
+  for the pre-release 11-client cross-impl sweep only.
 
 ## Complementary (cheap, parallel win)
 

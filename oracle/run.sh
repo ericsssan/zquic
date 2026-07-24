@@ -691,7 +691,7 @@ statelessreset_client_case() { # <sport> <pport>
   local ready=0 got=0
   for _ in $(seq 1 100); do  # up to ~10s; loopback handshake+64KiB is normally <1s
     kill -0 "$cp" 2>/dev/null || break  # client exited early → download will never progress
-    got=$(wc -c < "$d/out/big.bin" 2>/dev/null | tr -dc '0-9')
+    got=$(wc -c 2>/dev/null < "$d/out/big.bin" | tr -dc '0-9')
     if [ -n "$got" ] && [ "$got" -ge 65536 ]; then ready=1; break; fi
     sleep 0.1
   done
