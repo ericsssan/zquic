@@ -91,7 +91,7 @@ Then `oracle/run.sh -i <impl>`.
   prepends GREASE frames before the request HEADERS (RFC 9114 §9), so this guards
   zquic's h3 frame handling. (It found issue #4 — zquic dropped requests that didn't
   start with HEADERS — now fixed.) Scoped to data-path cases (loss/RTT are covered
-  by ngtcp2-h3).
+  by ngtcp2 (h3)).
 
 `oracle/run.sh` with no `-i` runs every impl that's built (quic-go always; ngtcp2 /
 quiche when their sibling checkouts + deps are present).

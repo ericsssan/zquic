@@ -11,7 +11,7 @@ Target: the core oracle matrix runs in **seconds**, on every commit.
 ## Current status (what actually ships)
 
 Shipped today (`oracle/run.sh`) — **74/74, verified green across four impls**
-(quicgo, ngtcp2-h3, quiche, quiche-h3), gating `main` in CI
+(quicgo, ngtcp2 (h3), quiche, quiche-h3), gating `main` in CI
 (`run.sh --require quicgo,ngtcp2,quiche,quiche-h3`):
 
 - **4 reference impls:** quic-go (HTTP/0.9, always/CI), ngtcp2 (HTTP/3), quiche
@@ -111,7 +111,7 @@ Each case runs: zquic-server ↔ ref-client, and ref-server ↔ zquic-client.
   reset (both directions), amplification limit, idle timeout. Proxy injects seeded
   -loss/-corrupt/-delayms. Remaining: packet reordering + NAT-rebind impairment,
   server-direction 0-RTT.
-- **Phase 3 — multi-impl + CI. DONE.** All four impls (quicgo, ngtcp2-h3, quiche,
+- **Phase 3 — multi-impl + CI. DONE.** All four impls (quicgo, ngtcp2 (h3), quiche,
   quiche-h3) build in `build-refs.sh` and gate `main` via the `oracle` CI job
   (`run.sh --require quicgo,ngtcp2,quiche,quiche-h3`). The full Docker matrix stays
   for the pre-release 11-client cross-impl sweep only.
