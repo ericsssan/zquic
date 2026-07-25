@@ -34,7 +34,7 @@ Shipped today (`oracle/run.sh`) — **76/76, verified green across four impls**
   longrtt (200ms), handshakecorruption (5% bit-flip), transfercorruption (2%).
 - **HTTP/3 path:** ngtcp2 + quiche-h3 exercise zquic's H3/QPACK.
 - **Crypto:** RFC 9001 A.1/A.2/A.5 vectors as unit tests.
-- **Self-test:** 13 meta-checks assert each assertion still rejects its negative (#9).
+- **Self-test:** 15 meta-checks assert each assertion still rejects its negative (#9).
 - **Not yet:** packet-reordering and NAT address-rebind (`rebind-addr`) impairment;
   server-direction 0-RTT wire-proof; ECN wire-proof on macOS; CA-chain / hostname
   validation.
