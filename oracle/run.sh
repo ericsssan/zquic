@@ -179,6 +179,21 @@ wait_listen() {
   return 1
 }
 stop() { kill "$@" 2>/dev/null; wait "$@" 2>/dev/null; }
+# stop_to PID... — stop a BACKGROUNDED `to` wrapper together with the command it
+# spawned. `to` runs its target as its own child, so killing only the wrapper (stop)
+# would leave that child orphaned: bash does not forward the signal to a subshell's
+# background child, so it is reparented to init and keeps running (a lingering zquic
+# client can then inject packets into a retried attempt reusing the same ports).
+# Reap the wrapper's children first (precise: -P matches only children of that exact
+# PID, unlike the pkill -f the harness avoids), then the wrapper. No-op if pkill is
+# absent (best-effort: falls back to stop's prior behavior).
+stop_to() {
+  local p
+  if command -v pkill >/dev/null 2>&1; then
+    for p in "$@"; do pkill -P "$p" 2>/dev/null; done
+  fi
+  stop "$@"
+}
 
 # wire_has TOKEN CAPFILE — true if the proxy capture contains a class+direction
 # token (e.g. "s2c RETRY"). The single chokepoint for every behavioral wire-check,
@@ -763,7 +778,7 @@ statelessreset_client_case() { # <sport> <pport>
       if [ -n "$got" ] && [ "$got" -ge 65536 ]; then ready=1; break; fi
       sleep 0.1
     done
-    if [ "$ready" != 1 ]; then last="download never reached 64KiB (handshake/reset-token not ready)"; stop "$cp" "$px" "$sp1"; sleep 0.3; continue; fi
+    if [ "$ready" != 1 ]; then last="download never reached 64KiB (handshake/reset-token not ready)"; stop_to "$cp"; stop "$px" "$sp1"; sleep 0.3; continue; fi
 
     # Kill the original quicgo (state loss simulated). SIGKILL so it exits WITHOUT a
     # CONNECTION_CLOSE — a graceful close would make the client exit cleanly instead
@@ -776,7 +791,7 @@ statelessreset_client_case() { # <sport> <pport>
     RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
       >"$d/qgsrv2.log" 2>&1 & local sp2=$!
     _HARNESS_PIDS+=("$sp2")
-    if ! wait_listen "$sp2" "$sport"; then last="phase 2: no quicgo bind"; stop "$cp" "$px" "$sp2"; sleep 0.3; continue; fi
+    if ! wait_listen "$sp2" "$sport"; then last="phase 2: no quicgo bind"; stop_to "$cp"; stop "$px" "$sp2"; sleep 0.3; continue; fi
 
     # Wait for the client to receive the reset and exit (or hit CLIENT_TIMEOUT).
     wait "$cp" 2>/dev/null || true
