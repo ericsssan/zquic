@@ -591,6 +591,60 @@ connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
   ok "connectionmigration [zquic-server → $impl preferred_addr 127.0.0.1:$mport]"
 }
 
+# rebindport_case: simulate a NAT rebind (RFC 9000 §9.3.1). The capturing proxy
+# forwards the transfer, then swaps its OWN server-facing source port mid-stream
+# (-rebind-after N, counted in client 1-RTT datagrams). The zquic server then sees
+# the same connection ID arrive from a new source port and must detect the change
+# (RFC 9000 §9.3.1), send a PATH_CHALLENGE, and keep delivering — so the download
+# completes AND the server logs [CM] nat_rebind. (Per §9.3.1 a port-only change need
+# not gate delivery on validation, so onNatRebind keeps path_validated=true.) The ref
+# client is oblivious (the rebind is on the proxy↔server
+# leg), so any impl works. Server direction only — the zquic client does not yet
+# rebind its own source port. Wire proof is twofold: the proxy must actually have
+# rebound (else the case proves nothing), and the server must have logged the
+# port-only-change detection (not a plain transfer that finished on the old path).
+rebindport_case() { # <impl> <sport> <pport>
+  local impl=$1 sport=$2 pport=$3 d="$TMP/server/rebindport"
+  rm -rf "$d/out"; mkdir -p "$d/out"; local capf="$d/capture.txt"
+  TESTCASE=transfer CERTS="$CERTS" WWW="$WWW" PORT="$sport" "$ZQUIC_SERVER" >"$d/zsrv.log" 2>&1 & local sp=$!
+  _HARNESS_PIDS+=("$sp")
+  wait_listen "$sp" "$sport" || { bad "rebindport (no server bind)"; stop "$sp"; return; }
+  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -capture "$capf" -rebind-after 3 >"$d/proxy.log" 2>&1 & local px=$!
+  _HARNESS_PIDS+=("$px")
+  wait_listen "$px" "$pport" || { bad "rebindport (no proxy bind)"; stop "$sp" "$px"; return; }
+  to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$d/out" /big.bin >"$d/cli.log" 2>&1; local rc=$?
+  stop "$sp" "$px"
+  if [ $rc -eq 124 ]; then
+    # Most likely failure is a post-rebind loss window that never recovers; CI does
+    # not upload $TMP, so surface the wire/log state inline (cf. proxied()).
+    bad "rebindport [zquic-server <-> $impl-client] (TIMEOUT)"
+    echo "  [proxy rebind]"; grep -iE 'rebound|rebind dial failed' "$d/proxy.log" 2>/dev/null | tail -3
+    echo "  [zsrv CM]"; grep '\[CM\]' "$d/zsrv.log" 2>/dev/null | tail -3
+    echo "  [zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null
+    if [ -f "$capf" ]; then echo "  [cap $(wc -l 2>/dev/null <"$capf") lines]"; sort "$capf" 2>/dev/null | uniq -c | sort -rn | head -6; fi
+    return
+  fi
+  [ $rc -eq 0 ] || { bad "rebindport [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
+  local m; if ! m="$(assert_match "$d/out" "/big.bin")"; then bad "rebindport [zquic-server <-> $impl-client] ($m)"; return; fi
+  if ! grep -q 'rebound server-facing socket' "$d/proxy.log" 2>/dev/null; then
+    # Distinguish the two causes: the proxy tried to rebind but the new-socket dial
+    # failed (logged to proxy.log), vs the transfer finished before -rebind-after
+    # datagrams went out (no rebind attempt at all).
+    if grep -q 'rebind dial failed' "$d/proxy.log" 2>/dev/null; then
+      bad "rebindport (proxy could not open a new source port: $(grep 'rebind dial failed' "$d/proxy.log" 2>/dev/null | tail -1))"
+    else
+      bad "rebindport (proxy never rebound — transfer finished before -rebind-after fired; enlarge the transfer)"
+    fi
+    return
+  fi
+  if ! grep -q '\[CM\] nat_rebind' "$d/zsrv.log" 2>/dev/null; then
+    bad "rebindport — transfer ok but server did not detect the source-port change ([CM] nat_rebind absent)"
+    echo "  [zsrv CM lines]"; grep '\[CM\]' "$d/zsrv.log" 2>/dev/null | head -3
+    return
+  fi
+  ok "rebindport [zquic-server survives NAT rebind → [CM] nat_rebind, $impl transfer intact]"
+}
+
 # statelessreset_case: server with a known RESET_KEY must emit [SRST] when it
 # receives a SHORT packet for an unknown DCID (RFC 9000 §10.3).
 # Wire proof: server log contains "[SRST] stateless reset sent".
@@ -847,6 +901,7 @@ self_test() {
   if wire_has "s2c VERSION_NEGOTIATION" "$capf"; then bad "meta: VN seen in a v1 handshake (false-pass risk)"; else ok "meta: VN wire-check fails on a v1 capture (falsification)"; fi
   if wire_has "c2s 0RTT" "$capf"; then bad "meta: 0RTT seen in a plain transfer (false-pass risk)"; else ok "meta: zerortt wire-check fails on a plain transfer (falsification)"; fi
   if grep -q "\[KPHS\]" "$d/zsrv.log"; then bad "meta: [KPHS] seen in a plain transfer (keyupdate wire-check false-pass risk)"; else ok "meta: keyupdate log-check fails on plain transfer (falsification)"; fi
+  if grep -q "\[CM\] nat_rebind" "$d/zsrv.log"; then bad "meta: [CM] nat_rebind seen in a plain transfer (rebindport wire-check false-pass risk)"; else ok "meta: rebindport log-check fails on plain transfer (falsification)"; fi
 
   # (d) kpcheck falsification (#40): uniform KP bits (no key update) must be rejected.
   # Two identical all-zero SHORT packets → same HP mask → same KP bit → no flip detected.
@@ -955,7 +1010,7 @@ if [ ${#CASES[@]} -gt 0 ]; then
   sel_data=(); sel_prox=()
   for c in "${CASES[@]}"; do
     # Standalone cases run outside the per-impl loop (server properties / behavioral).
-    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration|idletimeout|statelessreset|statelessresetclient) continue ;; esac
+    case "$c" in versionnegotiation|chacha20|v2|amplificationlimit|zerortt|resumption|multiconnect|connectionmigration|rebindport|idletimeout|statelessreset|statelessresetclient) continue ;; esac
     if [ -n "${WIRE_REQUIRE[$c]:-}${IMPAIR[$c]:-}" ]; then sel_prox+=("$c"); else sel_data+=("$c"); fi
   done
 fi
@@ -987,7 +1042,7 @@ done
 # explicitly. Each function picks the best available impl for its needs.
 _want_svr() { [ ${#CASES[@]} -eq 0 ] || printf '%s\n' "${CASES[@]}" | grep -qx "$1"; }
 _any_svr=0
-for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration idletimeout statelessreset statelessresetclient; do
+for _sc in versionnegotiation chacha20 v2 amplificationlimit zerortt resumption multiconnect connectionmigration rebindport idletimeout statelessreset statelessresetclient; do
   _want_svr "$_sc" && _any_svr=1 && break
 done
 
@@ -1055,6 +1110,15 @@ if [ "$_any_svr" -eq 1 ]; then
   if _want_svr connectionmigration; then
     trig=""; impl_ok ngtcp2 && trig=ngtcp2
     [ -n "$trig" ] && { connectionmigration_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
+  fi
+
+  # rebindport: NAT rebind (RFC 9000 §9.3.1) — the proxy swaps its server-facing
+  # source port mid-transfer; the zquic server must path-validate the new port and
+  # finish the download. The client is oblivious (rebind is on the proxy↔server leg),
+  # so any impl works; quicgo is always built, quiche is the fallback.
+  if _want_svr rebindport; then
+    trig=""; impl_ok quicgo && trig=quicgo || { impl_ok quiche && trig=quiche; }
+    [ -n "$trig" ] && { rebindport_case "$trig" "$port" "$((port + 1))"; port=$((port + 2)); }
   fi
 
   # idletimeout: server with a 3s idle timeout must emit [IDLE] after silence
