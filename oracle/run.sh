@@ -200,6 +200,13 @@ stop_to() {
 # so the self-test (#9) can prove it still discriminates present from absent.
 wire_has() { grep -q "$1" "$2" 2>/dev/null; }
 
+# srst_received CLIENTLOG — true if a client log records a *received* stateless
+# reset (RFC 9000 §10.3). The single chokepoint for the statelessreset-client
+# assertion, so the self-test (#9) can prove it still discriminates a received reset
+# from its absence — and from the server-side "[SRST] ... sent" line, so the pattern
+# can't be loosened to a bare "[SRST]" that would false-pass.
+srst_received() { grep -q '\[SRST\] stateless reset received' "$1" 2>/dev/null; }
+
 # dump_capture CAPFILE — print a sorted class summary after a wire_has failure
 # so a developer can see what the proxy DID capture without reading the file (#34).
 dump_capture() {
@@ -797,7 +804,7 @@ statelessreset_client_case() { # <sport> <pport>
     wait "$cp" 2>/dev/null || true
     stop "$sp2" "$px"
 
-    if grep -q '\[SRST\] stateless reset received' "$d/zcli.log" 2>/dev/null; then
+    if srst_received "$d/zcli.log"; then
       got_srst=1
       local tag="statelessreset-client [quicgo-server restart → zquic-client detects [SRST]]"
       [ "$k" -gt 1 ] && tag="$tag (attempt $k/$attempts)"
@@ -942,6 +949,15 @@ self_test() {
   if wire_has "c2s 0RTT" "$capf"; then bad "meta: 0RTT seen in a plain transfer (false-pass risk)"; else ok "meta: zerortt wire-check fails on a plain transfer (falsification)"; fi
   if grep -q "\[KPHS\]" "$d/zsrv.log"; then bad "meta: [KPHS] seen in a plain transfer (keyupdate wire-check false-pass risk)"; else ok "meta: keyupdate log-check fails on plain transfer (falsification)"; fi
   if grep -q "\[CM\] nat_rebind" "$d/zsrv.log"; then bad "meta: [CM] nat_rebind seen in a plain transfer (rebindport wire-check false-pass risk)"; else ok "meta: rebindport log-check fails on plain transfer (falsification)"; fi
+
+  # (e) srst_received discrimination (statelessreset-client): a client log recording
+  # a *received* reset must match; a reset-free log — INCLUDING one carrying the
+  # server-side "[SRST] ... sent" line — must NOT, so the pattern stays specific to
+  # "received" and can't be loosened into a bare "[SRST]" that false-passes.
+  printf 'zquic interop client: testcase=transfer\ninfo(quic): [SRST] stateless reset received\nClient done\n' >"$d/srst_pos.log"
+  printf 'zquic interop client: testcase=transfer\ninfo(quic): [SRST] stateless reset sent\nClient done\n' >"$d/srst_neg.log"
+  if srst_received "$d/srst_pos.log"; then ok "meta: srst_received finds a received stateless reset"; else bad "meta: srst_received missed a present [SRST] received (no-op!)"; fi
+  if srst_received "$d/srst_neg.log"; then bad "meta: srst_received matched a reset-free client log (statelessreset-client false-pass risk)"; else ok "meta: srst_received rejects a reset-free client log (falsification)"; fi
 
   # (d) kpcheck falsification (#40): uniform KP bits (no key update) must be rejected.
   # Two identical all-zero SHORT packets → same HP mask → same KP bit → no flip detected.
