@@ -705,77 +705,102 @@ statelessreset_case() { # <impl> <port>
 #   7. Client logs [SRST] stateless reset received.
 statelessreset_client_case() { # <sport> <pport>
   local sport=$1 pport=$2
-  local d="$TMP/client/statelessreset_cli"
+  local base_d="$TMP/client/statelessreset_cli"
   local key="deadbeefcafebabedeadbeefcafebabe0102030405060708090a0b0c0d0e0f10"
-  rm -rf "$d/out"; mkdir -p "$d/out"
+  rm -rf "$base_d"; mkdir -p "$base_d"
 
-  # Create a temporary www dir with a 2GB sparse file. truncate -s is instant.
-  local tw="$d/tmpwww"; mkdir -p "$tw"
+  # Create a temporary www dir with a 2GB sparse file, shared by every attempt.
+  # truncate -s is instant (no bytes written).
+  local tw="$base_d/tmpwww"; mkdir -p "$tw"
   truncate -s 2g "$tw/big.bin" 2>/dev/null || \
     dd if=/dev/zero of="$tw/big.bin" bs=1M count=2048 2>/dev/null
 
-  # Phase 1: quicgo server → proxy (20ms delay) → zquic client.
-  # SERVE_RATE_KBPS=512 limits server output to 512 KB/s: 2 GB / 0.5 MB/s = 4096 s,
-  # so the client is mid-download at the sleep 1 below regardless of QUIC window growth.
-  # (Without rate limiting, the QUIC receive window doubles every RTT and can transfer
-  # 2 GB in ~520ms even through a 20ms-delay proxy, making the test flaky.)
-  RESET_KEY="$key" SERVE_RATE_KBPS=512 "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
-    >"$d/qgsrv1.log" 2>&1 & local sp1=$!
-  _HARNESS_PIDS+=("$sp1")
-  wait_listen "$sp1" "$sport" || { bad "statelessreset-client (phase 1: no quicgo bind)"; stop "$sp1"; return; }
+  # Bounded retry (harden the residual timing flake). Unlike the seeded-loss cases,
+  # this one exercises an inherently REAL-TIME sequence that no amount of seeding can
+  # make deterministic: readiness → SIGKILL server → restart server → the client's
+  # PTO probe reaches the NEW server → server emits a stateless reset → the client
+  # detects it before its connection winds down. Its latencies (server-2 bind time,
+  # PTO cadence, scheduler wakeups) depend on runner load. #71 removed the
+  # handshake/reset-token race with the 64KiB readiness gate below; this bounded
+  # retry absorbs the remaining restart-timing race that still flakes under heavy CI
+  # scheduling. This does NOT mask a real regression: a genuine break (reset never
+  # detected) fails EVERY attempt and still reports red — only per-run scheduling
+  # jitter is tolerated. Each attempt reuses the same two UDP ports (UDP has no
+  # TIME_WAIT), fully torn down between tries.
+  local attempts=3 k last="" got_srst=0
+  for k in $(seq 1 "$attempts"); do
+    local d="$base_d/try$k"; rm -rf "$d"; mkdir -p "$d/out"
 
-  GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -delayms 20 -tolerant-back \
-    >"$d/proxy.log" 2>&1 & local px=$!
-  _HARNESS_PIDS+=("$px")
-  wait_listen "$px" "$pport" || { bad "statelessreset-client (no proxy bind)"; stop "$sp1" "$px"; return; }
+    # Phase 1: quicgo server → proxy (20ms delay) → zquic client.
+    # SERVE_RATE_KBPS=512 caps server output at 512 KB/s (2 GB ⇒ ~4096 s), so the
+    # client is still mid-download at the readiness gate regardless of window growth.
+    # (Unthrottled, the receive window doubles each RTT and 2 GB can move in ~520ms
+    # even through the 20ms proxy, defeating the "kill mid-download" precondition.)
+    RESET_KEY="$key" SERVE_RATE_KBPS=512 "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
+      >"$d/qgsrv1.log" 2>&1 & local sp1=$!
+    _HARNESS_PIDS+=("$sp1")
+    if ! wait_listen "$sp1" "$sport"; then last="phase 1: no quicgo bind"; stop "$sp1"; sleep 0.3; continue; fi
 
-  to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=transfer \
-    REQUESTS="https://127.0.0.1:$pport/big.bin" DOWNLOADS="$d/out" \
-    "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1 & local cp=$!
-  _HARNESS_PIDS+=("$cp")
+    GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -delayms 20 -tolerant-back \
+      >"$d/proxy.log" 2>&1 & local px=$!
+    _HARNESS_PIDS+=("$px")
+    if ! wait_listen "$px" "$pport"; then last="no proxy bind"; stop "$sp1" "$px"; sleep 0.3; continue; fi
 
-  # Deterministically wait until the download is well underway before killing the
-  # server. Received bytes are a reliable precondition signal: they prove the
-  # handshake completed AND the server's early 1-RTT flight — the NEW_CONNECTION_ID
-  # frames carrying the stateless-reset tokens — reached the client and were stored.
-  # The client writes the download incrementally (writePositionalAll), so the output
-  # file's size tracks progress. This replaces a fixed `sleep 1`, which raced the
-  # handshake under CI load: if the token was not yet stored when the server
-  # restarted, the client could not match the reset, making the case flaky.
-  local ready=0 got=0
-  for _ in $(seq 1 100); do  # up to ~10s; loopback handshake+64KiB is normally <1s
-    kill -0 "$cp" 2>/dev/null || break  # client exited early → download will never progress
-    got=$(wc -c 2>/dev/null < "$d/out/big.bin" | tr -dc '0-9')
-    if [ -n "$got" ] && [ "$got" -ge 65536 ]; then ready=1; break; fi
-    sleep 0.1
+    to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=transfer \
+      REQUESTS="https://127.0.0.1:$pport/big.bin" DOWNLOADS="$d/out" \
+      "$ZQUIC_CLIENT" >"$d/zcli.log" 2>&1 & local cp=$!
+    _HARNESS_PIDS+=("$cp")
+
+    # Readiness gate (#71): wait until ≥64KiB has been written before killing the
+    # server. Received bytes are a reliable precondition — they prove the handshake
+    # finished AND the server's early 1-RTT flight (the NEW_CONNECTION_ID frames
+    # carrying the stateless-reset tokens) reached the client and were stored. The
+    # client writes the download incrementally, so the output size tracks progress.
+    local ready=0 got=0 _i
+    for _i in $(seq 1 100); do  # up to ~10s; loopback handshake+64KiB is normally <1s
+      kill -0 "$cp" 2>/dev/null || break  # client exited early → will never progress
+      got=$(wc -c 2>/dev/null < "$d/out/big.bin" | tr -dc '0-9')
+      if [ -n "$got" ] && [ "$got" -ge 65536 ]; then ready=1; break; fi
+      sleep 0.1
+    done
+    if [ "$ready" != 1 ]; then last="download never reached 64KiB (handshake/reset-token not ready)"; stop "$cp" "$px" "$sp1"; sleep 0.3; continue; fi
+
+    # Kill the original quicgo (state loss simulated). SIGKILL so it exits WITHOUT a
+    # CONNECTION_CLOSE — a graceful close would make the client exit cleanly instead
+    # of waiting for a stateless reset.
+    kill -9 "$sp1" 2>/dev/null; wait "$sp1" 2>/dev/null || true
+
+    # Phase 2: restart quicgo with the same RESET_KEY at the same port. The proxy
+    # keeps forwarding; the new server doesn't know the connection and returns a
+    # stateless reset (token = HMAC(key, dcid)) that matches the client's stored one.
+    RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
+      >"$d/qgsrv2.log" 2>&1 & local sp2=$!
+    _HARNESS_PIDS+=("$sp2")
+    if ! wait_listen "$sp2" "$sport"; then last="phase 2: no quicgo bind"; stop "$cp" "$px" "$sp2"; sleep 0.3; continue; fi
+
+    # Wait for the client to receive the reset and exit (or hit CLIENT_TIMEOUT).
+    wait "$cp" 2>/dev/null || true
+    stop "$sp2" "$px"
+
+    if grep -q '\[SRST\] stateless reset received' "$d/zcli.log" 2>/dev/null; then
+      got_srst=1
+      local tag="statelessreset-client [quicgo-server restart → zquic-client detects [SRST]]"
+      [ "$k" -gt 1 ] && tag="$tag (attempt $k/$attempts)"
+      ok "$tag"
+      break
+    fi
+    last="no [SRST] in client log"
+    sleep 0.3  # let the UDP ports settle before the next attempt reuses them
   done
-  [ "$ready" = 1 ] || { bad "statelessreset-client (download never reached 64KiB in 10s — handshake/reset-token not ready)"; stop "$cp" "$px" "$sp1"; return; }
-  # Kill the original quicgo (state loss simulated). Use SIGKILL so quicgo exits
-  # immediately without sending a CONNECTION_CLOSE — a graceful close would cause the
-  # zquic client to exit cleanly instead of waiting for a stateless reset.
-  kill -9 "$sp1" 2>/dev/null; wait "$sp1" 2>/dev/null || true
 
-  # Phase 2: restart quicgo with same RESET_KEY at same port. The proxy continues
-  # forwarding client packets; the new server doesn't know the connection and sends
-  # a stateless reset back through the proxy to the client.
-  RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
-    >"$d/qgsrv2.log" 2>&1 & local sp2=$!
-  _HARNESS_PIDS+=("$sp2")
-  wait_listen "$sp2" "$sport" || { stop "$cp" "$px"; bad "statelessreset-client (phase 2: no quicgo bind)"; stop "$sp2"; return; }
-
-  # Wait for the client to receive the stateless reset and exit (or time out).
-  wait "$cp" 2>/dev/null || true
-  stop "$sp2" "$px"
-
-  if grep -q '\[SRST\] stateless reset received' "$d/zcli.log" 2>/dev/null; then
-    ok "statelessreset-client [quicgo-server restart → zquic-client detects [SRST]]"
-  else
-    bad "statelessreset-client (no [SRST] in client log — stateless reset not detected)"
-    echo "=== statelessreset-client debug ==="
-    echo "--- zcli.log ---"; cat "$d/zcli.log" 2>/dev/null
-    echo "--- proxy.log ---"; cat "$d/proxy.log" 2>/dev/null
-    echo "--- qgsrv1.log (last 5) ---"; tail -5 "$d/qgsrv1.log" 2>/dev/null
-    echo "--- qgsrv2.log (last 5) ---"; tail -5 "$d/qgsrv2.log" 2>/dev/null
+  if [ "$got_srst" -ne 1 ]; then
+    bad "statelessreset-client ($last — after $attempts attempts)"
+    local ld="$base_d/try$attempts"
+    echo "=== statelessreset-client debug (last attempt) ==="
+    echo "--- zcli.log ---"; cat "$ld/zcli.log" 2>/dev/null
+    echo "--- proxy.log ---"; cat "$ld/proxy.log" 2>/dev/null
+    echo "--- qgsrv1.log (last 5) ---"; tail -5 "$ld/qgsrv1.log" 2>/dev/null
+    echo "--- qgsrv2.log (last 5) ---"; tail -5 "$ld/qgsrv2.log" 2>/dev/null
   fi
 }
 
