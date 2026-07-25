@@ -61,7 +61,10 @@ In `oracle/run.sh`, add to the relevant maps:
 
 The proxy classifies `INITIAL / 0RTT / HANDSHAKE / RETRY / VERSION_NEGOTIATION /
 SHORT` per packet (coalescing-aware). Cleartext-detectable mechanisms (retry, VN,
-0-RTT presence) need no keys; key-update / ECN need keylog-based decryption (TODO).
+0-RTT presence) need no keys. The Key Phase bit is wire-proven by `kpcheck`, which
+strips header protection using the endpoint's `SSLKEYLOGFILE` (#40); ECN is read
+straight from the IP TOS byte via `IP_RECVTOS` (Linux only, #41) — neither needs
+payload decryption.
 
 ## Adding a reference implementation
 
@@ -88,7 +91,7 @@ Then `oracle/run.sh -i <impl>`.
   prepends GREASE frames before the request HEADERS (RFC 9114 §9), so this guards
   zquic's h3 frame handling. (It found issue #4 — zquic dropped requests that didn't
   start with HEADERS — now fixed.) Scoped to data-path cases (loss/RTT are covered
-  by ngtcp2-h3).
+  by ngtcp2 (h3)).
 
 `oracle/run.sh` with no `-i` runs every impl that's built (quic-go always; ngtcp2 /
 quiche when their sibling checkouts + deps are present).
@@ -101,7 +104,16 @@ quiche when their sibling checkouts + deps are present).
   validation is not yet implemented.
 - **Endpoints construct `Connection` by value on the stack** (band-aided with a
   large `stack_size`) — see issue #3.
-- **Not yet covered:** 0-RTT, key update, ECN, migration, resumption, version
-  negotiation, HTTP/3, and impairment beyond loss (delay/reorder).
+- **ECN wire-proof is Linux-only.** The transfer still runs on macOS, but the
+  `s2c ECT0` wire assertion is skipped there — `IP_RECVTOS` is not reliably
+  populated on Darwin loopback (#41).
+- **0-RTT is client-direction only.** The wire-check proves the zquic *client*
+  sends early data (`c2s 0RTT`); zquic-*server* 0-RTT acceptance is not yet
+  wire-proven.
+- **Not yet covered:** packet reordering and NAT rebinding (`rebind-addr` /
+  `rebind-port`) impairment — the proxy does loss / corruption / delay / ECN but
+  not reorder or source-port rebind — and keyupdate in the client direction against
+  quiche (#22). (0-RTT, key update, ECN, migration, resumption, version negotiation,
+  and HTTP/3 are now all covered — see `PLAN.md`.)
 
 See `PLAN.md` for the phased design.
