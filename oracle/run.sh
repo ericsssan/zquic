@@ -749,7 +749,12 @@ statelessreset_client_case() { # <sport> <pport>
   # detected) fails EVERY attempt and still reports red — only per-run scheduling
   # jitter is tolerated. Each attempt reuses the same two UDP ports (UDP has no
   # TIME_WAIT), fully torn down between tries.
-  local attempts=3 k last="" got_srst=0
+  # On final failure, dump the attempt that progressed FURTHEST (highest stage
+  # rank), not simply the last one — a late attempt that failed early (e.g. a bind
+  # race) is far less informative than an earlier one that ran the whole sequence
+  # and missed the reset. Ties prefer the later attempt (freshest state).
+  local attempts=3 k last="" got_srst=0 best_rank=0 best_d=""
+  note() { [ "$1" -ge "$best_rank" ] && { best_rank=$1; best_d="$d"; }; last="$2"; }
   for k in $(seq 1 "$attempts"); do
     local d="$base_d/try$k"; rm -rf "$d"; mkdir -p "$d/out"
 
@@ -761,12 +766,12 @@ statelessreset_client_case() { # <sport> <pport>
     RESET_KEY="$key" SERVE_RATE_KBPS=512 "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
       >"$d/qgsrv1.log" 2>&1 & local sp1=$!
     _HARNESS_PIDS+=("$sp1")
-    if ! wait_listen "$sp1" "$sport"; then last="phase 1: no quicgo bind"; stop "$sp1"; sleep 0.3; continue; fi
+    if ! wait_listen "$sp1" "$sport"; then note 1 "phase 1: no quicgo bind"; stop "$sp1"; sleep 0.3; continue; fi
 
     GOMAXPROCS=1 "$PROXY" -listen "127.0.0.1:$pport" -target "127.0.0.1:$sport" -delayms 20 -tolerant-back \
       >"$d/proxy.log" 2>&1 & local px=$!
     _HARNESS_PIDS+=("$px")
-    if ! wait_listen "$px" "$pport"; then last="no proxy bind"; stop "$sp1" "$px"; sleep 0.3; continue; fi
+    if ! wait_listen "$px" "$pport"; then note 2 "no proxy bind"; stop "$sp1" "$px"; sleep 0.3; continue; fi
 
     to "$CLIENT_TIMEOUT" env VERIFY_PEER=1 TESTCASE=transfer \
       REQUESTS="https://127.0.0.1:$pport/big.bin" DOWNLOADS="$d/out" \
@@ -785,7 +790,7 @@ statelessreset_client_case() { # <sport> <pport>
       if [ -n "$got" ] && [ "$got" -ge 65536 ]; then ready=1; break; fi
       sleep 0.1
     done
-    if [ "$ready" != 1 ]; then last="download never reached 64KiB (handshake/reset-token not ready)"; stop_to "$cp"; stop "$px" "$sp1"; sleep 0.3; continue; fi
+    if [ "$ready" != 1 ]; then note 3 "download never reached 64KiB (handshake/reset-token not ready)"; stop_to "$cp"; stop "$px" "$sp1"; sleep 0.3; continue; fi
 
     # Kill the original quicgo (state loss simulated). SIGKILL so it exits WITHOUT a
     # CONNECTION_CLOSE — a graceful close would make the client exit cleanly instead
@@ -798,7 +803,7 @@ statelessreset_client_case() { # <sport> <pport>
     RESET_KEY="$key" "$BIN/quicgo" server "127.0.0.1:$sport" "$CERTS/cert.pem" "$CERTS/priv.key" "$tw" \
       >"$d/qgsrv2.log" 2>&1 & local sp2=$!
     _HARNESS_PIDS+=("$sp2")
-    if ! wait_listen "$sp2" "$sport"; then last="phase 2: no quicgo bind"; stop_to "$cp"; stop "$px" "$sp2"; sleep 0.3; continue; fi
+    if ! wait_listen "$sp2" "$sport"; then note 4 "phase 2: no quicgo bind"; stop_to "$cp"; stop "$px" "$sp2"; sleep 0.3; continue; fi
 
     # Wait for the client to receive the reset and exit (or hit CLIENT_TIMEOUT).
     wait "$cp" 2>/dev/null || true
@@ -811,14 +816,14 @@ statelessreset_client_case() { # <sport> <pport>
       ok "$tag"
       break
     fi
-    last="no [SRST] in client log"
+    note 5 "no [SRST] in client log"
     sleep 0.3  # let the UDP ports settle before the next attempt reuses them
   done
 
   if [ "$got_srst" -ne 1 ]; then
     bad "statelessreset-client ($last — after $attempts attempts)"
-    local ld="$base_d/try$attempts"
-    echo "=== statelessreset-client debug (last attempt) ==="
+    local ld="${best_d:-$base_d/try$attempts}"
+    echo "=== statelessreset-client debug (furthest attempt: $ld) ==="
     echo "--- zcli.log ---"; cat "$ld/zcli.log" 2>/dev/null
     echo "--- proxy.log ---"; cat "$ld/proxy.log" 2>/dev/null
     echo "--- qgsrv1.log (last 5) ---"; tail -5 "$ld/qgsrv1.log" 2>/dev/null
