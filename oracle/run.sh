@@ -97,7 +97,7 @@ declare -A IMPL_TC=( [ngtcp2]="http3" [quiche-h3]="http3" )
 # can't coexist with a forced http3 protocol.
 # quiche-h3 exists to guard the H3 GREASE-frame handling (RFC 9114 §9) — quiche is
 # the only client that prepends GREASE. Its data-path cases do that; loss/RTT are
-# already covered by ngtcp2-h3, and quiche-h3 is slow under 30% loss, so skip them.
+# already covered by ngtcp2 (h3), and quiche-h3 is slow under 30% loss, so skip them.
 declare -A IMPL_SKIP=( [ngtcp2]="retry ecn keyupdate" [quiche]="keyupdate" [quiche-h3]="retry handshakeloss transferloss longrtt ecn keyupdate" )
 # Cases to skip only in the dp_zquic_client direction (ref server + zquic client).
 # quiche-server drops streams after a Key Phase bit flip (#22); quiche is fully skipped
