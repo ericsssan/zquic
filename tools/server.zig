@@ -805,6 +805,11 @@ fn processPacket(
                 // (RFC 9000 §9.3.1); anything else is a full path migration. The
                 // "[CM] path_migrated" substring is preserved for both non-rebind
                 // cases (the connectionmigration case greps it).
+                // Known limitation: cm_migrated is a lifetime latch, so a genuine NAT
+                // rebind that happens AFTER a preferred_address migration on the same
+                // connection is labeled path_migrated, not nat_rebind. This is a log
+                // label only (behavior is identical) and the oracle never exercises
+                // both on one connection, so it is left as-is.
                 if (s.cm_migrated) {
                     std.debug.print("[CM] path_migrated: client now at preferred_address\n", .{});
                 } else if (s.conn.prev_peer_addr != null and

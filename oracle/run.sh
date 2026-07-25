@@ -594,9 +594,11 @@ connectionmigration_case() { # <impl> <handshake_port> <migrate_port>
 # rebindport_case: simulate a NAT rebind (RFC 9000 §9.3.1). The capturing proxy
 # forwards the transfer, then swaps its OWN server-facing source port mid-stream
 # (-rebind-after N, counted in client 1-RTT datagrams). The zquic server then sees
-# the same connection ID arrive from a new source port and must path-validate the
-# new path and keep delivering — so the download completes AND the server logs
-# [CM] nat_rebind. The ref client is oblivious (the rebind is on the proxy↔server
+# the same connection ID arrive from a new source port and must detect the change
+# (RFC 9000 §9.3.1), send a PATH_CHALLENGE, and keep delivering — so the download
+# completes AND the server logs [CM] nat_rebind. (Per §9.3.1 a port-only change need
+# not gate delivery on validation, so onNatRebind keeps path_validated=true.) The ref
+# client is oblivious (the rebind is on the proxy↔server
 # leg), so any impl works. Server direction only — the zquic client does not yet
 # rebind its own source port. Wire proof is twofold: the proxy must actually have
 # rebound (else the case proves nothing), and the server must have logged the
@@ -612,11 +614,27 @@ rebindport_case() { # <impl> <sport> <pport>
   wait_listen "$px" "$pport" || { bad "rebindport (no proxy bind)"; stop "$sp" "$px"; return; }
   to "$CLIENT_TIMEOUT" ref_client "$impl" "$pport" "$d/out" /big.bin >"$d/cli.log" 2>&1; local rc=$?
   stop "$sp" "$px"
-  [ $rc -eq 124 ] && { bad "rebindport [zquic-server <-> $impl-client] (TIMEOUT)"; return; }
+  if [ $rc -eq 124 ]; then
+    # Most likely failure is a post-rebind loss window that never recovers; CI does
+    # not upload $TMP, so surface the wire/log state inline (cf. proxied()).
+    bad "rebindport [zquic-server <-> $impl-client] (TIMEOUT)"
+    echo "  [proxy rebind]"; grep -iE 'rebound|rebind dial failed' "$d/proxy.log" 2>/dev/null | tail -3
+    echo "  [zsrv CM]"; grep '\[CM\]' "$d/zsrv.log" 2>/dev/null | tail -3
+    echo "  [zsrv tail]"; tail -3 "$d/zsrv.log" 2>/dev/null
+    if [ -f "$capf" ]; then echo "  [cap $(wc -l 2>/dev/null <"$capf") lines]"; sort "$capf" 2>/dev/null | uniq -c | sort -rn | head -6; fi
+    return
+  fi
   [ $rc -eq 0 ] || { bad "rebindport [zquic-server <-> $impl-client] (client rc=$rc: $(tail -1 "$d/cli.log"))"; return; }
   local m; if ! m="$(assert_match "$d/out" "/big.bin")"; then bad "rebindport [zquic-server <-> $impl-client] ($m)"; return; fi
   if ! grep -q 'rebound server-facing socket' "$d/proxy.log" 2>/dev/null; then
-    bad "rebindport (proxy never rebound — transfer finished before -rebind-after fired; enlarge the transfer)"
+    # Distinguish the two causes: the proxy tried to rebind but the new-socket dial
+    # failed (logged to proxy.log), vs the transfer finished before -rebind-after
+    # datagrams went out (no rebind attempt at all).
+    if grep -q 'rebind dial failed' "$d/proxy.log" 2>/dev/null; then
+      bad "rebindport (proxy could not open a new source port: $(grep 'rebind dial failed' "$d/proxy.log" 2>/dev/null | tail -1))"
+    else
+      bad "rebindport (proxy never rebound — transfer finished before -rebind-after fired; enlarge the transfer)"
+    fi
     return
   fi
   if ! grep -q '\[CM\] nat_rebind' "$d/zsrv.log" 2>/dev/null; then

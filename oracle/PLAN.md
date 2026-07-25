@@ -11,7 +11,7 @@ Target: the core oracle matrix runs in **seconds**, on every commit.
 ## Current status (what actually ships)
 
 Shipped today (`oracle/run.sh`) — **76/76, verified green across four impls**
-(quicgo, ngtcp2-h3, quiche, quiche-h3), gating `main` in CI
+(quicgo, ngtcp2 (h3), quiche, quiche-h3), gating `main` in CI
 (`run.sh --require quicgo,ngtcp2,quiche,quiche-h3`):
 
 - **4 reference impls:** quic-go (HTTP/0.9, always/CI), ngtcp2 (HTTP/3), quiche
@@ -26,7 +26,8 @@ Shipped today (`oracle/run.sh`) — **76/76, verified green across four impls**
   #41), amplification limit (3× via per-datagram byte accounting, RFC 9000 §8.1),
   connection migration (`[CM] path_migrated` to a preferred_address), NAT rebind
   (`[CM] nat_rebind`, RFC 9000 §9.3.1 — the proxy swaps its server-facing source
-  port mid-transfer and the server path-validates), idle timeout (`[IDLE]`),
+  port mid-transfer; the server detects it and sends a PATH_CHALLENGE), idle timeout
+  (`[IDLE]`),
   stateless reset — server *and* client direction (#42).
 - **Also green:** resumption (PSK, both directions), multiconnect, chacha20, QUIC v2.
 - **Impairment (seeded, deterministic):** handshakeloss (30%), transferloss (6%),
@@ -34,8 +35,9 @@ Shipped today (`oracle/run.sh`) — **76/76, verified green across four impls**
 - **HTTP/3 path:** ngtcp2 + quiche-h3 exercise zquic's H3/QPACK.
 - **Crypto:** RFC 9001 A.1/A.2/A.5 vectors as unit tests.
 - **Self-test:** 13 meta-checks assert each assertion still rejects its negative (#9).
-- **Not yet:** packet-reordering impairment; server-direction 0-RTT wire-proof; ECN
-  wire-proof on macOS; CA-chain / hostname validation.
+- **Not yet:** packet-reordering and NAT address-rebind (`rebind-addr`) impairment;
+  server-direction 0-RTT wire-proof; ECN wire-proof on macOS; CA-chain / hostname
+  validation.
 
 ## Why
 
@@ -111,10 +113,10 @@ Each case runs: zquic-server ↔ ref-client, and ref-server ↔ zquic-client.
   versionnegotiation, 0-RTT (`c2s 0RTT`), keyupdate (Key Phase bit via `kpcheck`
   + `SSLKEYLOGFILE`), ecn (`s2c ECT0` from IP TOS, Linux), migration, NAT rebind
   (`[CM] nat_rebind` via proxy `-rebind-after`), stateless reset (both directions),
-  amplification limit, idle timeout. Proxy injects seeded
-  -loss/-corrupt/-delayms/-rebind-after. Remaining: packet-reordering impairment,
-  server-direction 0-RTT.
-- **Phase 3 — multi-impl + CI. DONE.** All four impls (quicgo, ngtcp2-h3, quiche,
+  amplification limit, idle timeout. Proxy injects seeded -loss/-corrupt/-delayms
+  and a count-triggered -rebind-after. Remaining: packet-reordering and
+  address-rebind (`rebind-addr`) impairment, server-direction 0-RTT.
+- **Phase 3 — multi-impl + CI. DONE.** All four impls (quicgo, ngtcp2 (h3), quiche,
   quiche-h3) build in `build-refs.sh` and gate `main` via the `oracle` CI job
   (`run.sh --require quicgo,ngtcp2,quiche,quiche-h3`). The full Docker matrix stays
   for the pre-release 11-client cross-impl sweep only.
